@@ -304,7 +304,20 @@ EXTRA_ENV = {
 
 
 def retained_stack_args() -> argparse.Namespace:
-    """``abba_driver``'s namespace for the retained arm, defaults elsewhere."""
+    """``abba_driver``'s namespace for the retained arm, defaults elsewhere.
+
+    ``--retain-events`` is the probe's ONE deviation from the measured arm's
+    flags, and it goes through the driver's own supported route rather than a
+    raw ``os.environ`` write.  The turbo profile sets ``MTPLX_DROP_EVENTS=1``;
+    the probe reports ``stats.events`` as the independent cross-check that its
+    own per-cycle hooks covered the whole run, and that list is populated only
+    at 0.
+    ``build_family_overrides`` puts it in ``family_overrides`` when the flag is
+    set -- with a comment in the driver saying exactly why ("so the
+    effective-environment drift check below still compares equal") -- so the
+    expected environment carries the probe's value and the drift check below
+    stays strict for every key, with no exclusion list.
+    """
 
     parser = driver.build_parser()
     args = parser.parse_args(
@@ -322,6 +335,7 @@ def retained_stack_args() -> argparse.Namespace:
             "--qsa-fused-kv-gather",
             "--full-frspec",
             "--compiled-mtp-prepare",
+            "--retain-events",
             "--max-tokens",
             "512",
         ]
@@ -329,32 +343,84 @@ def retained_stack_args() -> argparse.Namespace:
     return args
 
 
+#: Keys the probe writes straight to ``os.environ``, outside the turbo
+#: profile and outside ``build_family_overrides``.  None of them may collide
+#: with the expected construction environment: a key that is BOTH in the
+#: profile/family env and written raw here would make the drift check compare
+#: the profile's value against the probe's, which is what
+#: ``MTPLX_DROP_EVENTS`` did on 2026-09-02 (the profile sets 1, the probe
+#: needs 0).  The fix for such a key is to route it through the driver -- see
+#: ``retained_stack_args`` and ``--retain-events`` -- not to exclude it from
+#: the check.  ``_probe_raw_env`` builds the dict and
+#: ``_assert_probe_owns_no_expected_key`` enforces the rule.
+def _probe_raw_env() -> dict[str, str]:
+    return {
+        "HF_HUB_OFFLINE": "1",
+        "MTPLX_CONTEXT_WINDOW_TOKENS": "262144",
+        "MTPLX_NGRAM_HOT_MB": "1024",
+        "MTPLX_MEMORY_LIMIT_BYTES": str(driver.MEMORY_LIMIT_BYTES),
+        "MTPLX_WIRED_LIMIT_BYTES": str(driver.WIRED_LIMIT_BYTES),
+        "MTPLX_ADAPTIVE_DTEMP": "0",
+        "MTPLX_STATE_REBASE_EVERY": "0",
+        "MTPLX_MTP_HISTORY_LIVE_RESET_THRESHOLD": "0",
+        "MTPLX_FRSPEC_DRAFT": "1",
+        "MTPLX_FRSPEC_VOCAB": "builtin:qwen38-code-64k",
+        "MTPLX_FUSED_HC": "1",
+        **EXTRA_ENV,
+    }
+
+
+def _assert_probe_owns_no_expected_key(
+    expected: dict[str, str], raw: dict[str, str]
+) -> None:
+    """Refuse a raw write to a key the expected environment already owns.
+
+    Loud and actionable, because the alternative -- silently excluding the key
+    from the drift check -- would weaken the check for a key the probe does
+    NOT own the moment the profile's value and the probe's happen to agree.
+    """
+
+    collisions = {
+        key: (expected[key], raw[key]) for key in raw if key in expected
+    }
+    if collisions:
+        raise RuntimeError(
+            "probe writes these keys raw but the turbo profile / family "
+            f"overrides already own them: {collisions}; route them through "
+            "abba_driver.build_family_overrides (see retained_stack_args and "
+            "--retain-events) instead of writing os.environ directly"
+        )
+
+
 def apply_environment(args: argparse.Namespace) -> dict[str, Any]:
+    """Build the retained construction environment and prove it is in force.
+
+    The drift check is strict over EVERY key of the expected environment --
+    the turbo profile plus ``build_family_overrides``, which already carries
+    the probe's ``MTPLX_DROP_EVENTS=0`` because ``retained_stack_args`` passes
+    ``--retain-events``.  Nothing is excluded from the comparison.
+    """
+
     from mtplx.profiles import apply_profile_env, get_profile
 
     family_overrides, candidate_environment = driver.build_family_overrides(args)
     expected = get_profile("turbo").env_dict()
     expected.update(family_overrides)
+    if expected.get("MTPLX_DROP_EVENTS") != "0":
+        # `stats.events` is the probe's cross-check on its own per-cycle
+        # hooks; a driver that stopped routing --retain-events through the
+        # family overrides would leave that list empty and the cross-check
+        # silently vacuous.
+        raise RuntimeError(
+            "the probe needs retained events: expected MTPLX_DROP_EVENTS=0 in "
+            f"the family overrides, got {expected.get('MTPLX_DROP_EVENTS')!r}"
+        )
+    raw = _probe_raw_env()
+    _assert_probe_owns_no_expected_key(expected, raw)
     for key in expected:
         os.environ.pop(key, None)
     apply_profile_env("turbo", runtime_env_overrides=family_overrides)
-    os.environ.update(EXTRA_ENV)
-    os.environ["MTPLX_FUSED_HC"] = "1"
-    os.environ.update(
-        {
-            "HF_HUB_OFFLINE": "1",
-            "MTPLX_CONTEXT_WINDOW_TOKENS": "262144",
-            "MTPLX_NGRAM_HOT_MB": "1024",
-            "MTPLX_MEMORY_LIMIT_BYTES": str(driver.MEMORY_LIMIT_BYTES),
-            "MTPLX_WIRED_LIMIT_BYTES": str(driver.WIRED_LIMIT_BYTES),
-            "MTPLX_ADAPTIVE_DTEMP": "0",
-            "MTPLX_STATE_REBASE_EVERY": "0",
-            "MTPLX_MTP_HISTORY_LIVE_RESET_THRESHOLD": "0",
-            "MTPLX_FRSPEC_DRAFT": "1",
-            "MTPLX_FRSPEC_VOCAB": "builtin:qwen38-code-64k",
-            "MTPLX_DROP_EVENTS": "0",
-        }
-    )
+    os.environ.update(raw)
     observed = {key: os.environ.get(key) for key in expected}
     drift = {
         key: (expected[key], observed[key])
@@ -367,6 +433,7 @@ def apply_environment(args: argparse.Namespace) -> dict[str, Any]:
         "family_overrides": family_overrides,
         "candidate_environment": candidate_environment,
         "extra_environment": dict(EXTRA_ENV),
+        "probe_raw_environment": dict(raw),
     }
 
 
@@ -448,10 +515,16 @@ def run_arm(
         recorder.uninstall()
     elapsed = time.perf_counter() - started
 
+    # `stats.events` is populated only with MTPLX_DROP_EVENTS=0 (the turbo
+    # profile sets 1; `retained_stack_args` passes --retain-events).  The
+    # per-cycle records below come from this probe's own hooks, and the event
+    # count is the independent cross-check that they cover the whole run.
+    events = list(getattr(output.stats, "events", None) or [])
     return {
         "label": label,
         "fold_enabled": bool(enabled),
         "elapsed_s": elapsed,
+        "generation_events": len(events),
         "tokens": [int(token) for token in output.tokens],
         "text_head": output.text[:600] if hasattr(output, "text") else None,
         "cycles": recorder.cycles,
@@ -628,6 +701,7 @@ def main() -> int:
                     "cycles": len(record["cycles"]),
                     "elapsed_s": record["elapsed_s"],
                     "tokens": len(record["tokens"]),
+                    "generation_events": record["generation_events"],
                     "text_head": record["text_head"],
                     # The two facts the ABBA receipt could not carry.
                     "prefix_kernel_traced": record["prefix_kernel_traced"],
