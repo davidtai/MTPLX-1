@@ -43,6 +43,26 @@ COMMAND LINE
 
 (``--model`` defaults to the pack ``abba_driver`` pins, which is the one the
 server resolves; pass it only to point at a different pack.)
+
+WINDOW BUDGET
+-------------
+Measured on 2026-09-02: ``--prompt-tokens 1024 --max-tokens 512`` runs **177**
+compiled physical-M4 windows per arm (512 tokens at ~2.9 tokens/window),
+comfortably over the ``--min-cycles 150`` floor, in ~9 s of decode per arm.
+The floor is a REFUSAL, not a warning -- a run that recorded one window once
+reported "no divergence" for a comparison it never made -- so if a future
+stack accepts more tokens per window and the count falls under it, raise
+``--max-tokens`` or move to ``--prompt-tokens 16384`` (the production cell)
+rather than lowering the floor.
+
+WHAT THE PROBE PERTURBS
+-----------------------
+It digests every GDN layer's recurrent state once per window, which FORCES the
+fold's deferred lazy replay every cycle instead of letting the next window
+drop it.  That changes nothing arithmetic -- ``pending_for`` keys on object
+identity, not on whether the leaf is evaluated, so the ring evolves exactly as
+it does unarmed -- but it does mean this script is a correctness instrument
+and never a timing one.  Read speed off ``abba_window.py``.
 """
 
 from __future__ import annotations
@@ -124,18 +144,20 @@ class ArmRecorder:
             return original_install(bank, cache, **kwargs)
 
         def forward_window(bank, input_ids, *args, **kwargs):
+            # Close the PREVIOUS window first.  Right now `entry.cache[1]`
+            # holds that window's committed state -- the value this window is
+            # about to start from, and the one the fold defers -- so this is
+            # the only point where the digest means what the record says it
+            # means.  Closing only in `finish()` kept ONE record for a whole
+            # 177-window run (2026-09-02, gdn-fold-parity-1788400389).
+            recorder.close_cycle()
             before = recorder._stats()
             try:
                 ids = [int(token) for token in input_ids.reshape(-1).tolist()]
             except Exception:  # pragma: no cover - diagnostics only
                 ids = []
             result = original_window(bank, input_ids, *args, **kwargs)
-            recorder._pending = {
-                "cycle": len(recorder.cycles),
-                "window_token_ids": ids,
-                "stats_before": before,
-                "commit": None,
-            }
+            recorder.open_window(ids, before)
             return result
 
         self._patch(gb.CompiledVerifyBank, "install_fixed_m4", install_fixed_m4)
@@ -155,21 +177,13 @@ class ArmRecorder:
                 keep_tokens=keep_tokens,
                 verified_tokens=verified_tokens,
             )
-            after = recorder._stats()
-            if recorder._pending is not None:
-                recorder._pending["commit"] = {
-                    "keep_tokens": int(keep_tokens),
-                    "verified_tokens": int(verified_tokens),
-                    "committed": bool(ok),
-                    "flushed": after["flushes"] > before["flushes"],
-                    "declined": after["declines"] > before["declines"],
-                    "bypassed": (
-                        after["bypassed_commits"] > before["bypassed_commits"]
-                    ),
-                    "deferred": (
-                        after["deferred_commits"] > before["deferred_commits"]
-                    ),
-                }
+            recorder.note_commit(
+                keep_tokens=keep_tokens,
+                verified_tokens=verified_tokens,
+                committed=ok,
+                before=before,
+                after=recorder._stats(),
+            )
             return ok
 
         self._patch(qm.Qwen4ExpTextModel, "commit_verified_window", commit)
@@ -224,9 +238,9 @@ class ArmRecorder:
 
     # -- per-cycle bookkeeping -------------------------------------------
 
-    def _stats(self) -> dict[str, int]:
+    def _stats(self) -> dict[str, Any]:
         snapshot = self._fold.STATS
-        return {
+        stats: dict[str, Any] = {
             key: int(snapshot.get(key) or 0)
             for key in (
                 "windows",
@@ -237,6 +251,59 @@ class ArmRecorder:
                 "bypassed_commits",
             )
         }
+        # The ring depth a window ENTERED at is the histogram key that
+        # `note_window` incremented, which is the only place it is recorded.
+        stats["ring_depth_hist"] = dict(snapshot.get("ring_depth_hist") or {})
+        return stats
+
+    @staticmethod
+    def _entered_ring_depth(before: dict, after: dict) -> int | None:
+        """The one histogram key that moved across this window, or None."""
+
+        one, two = before.get("ring_depth_hist") or {}, after.get(
+            "ring_depth_hist"
+        ) or {}
+        moved = [
+            int(key)
+            for key in set(one) | set(two)
+            if int(two.get(key, 0)) - int(one.get(key, 0)) > 0
+        ]
+        return moved[0] if len(moved) == 1 else None
+
+    # -- what the hooks call ----------------------------------------------
+
+    def open_window(self, token_ids: list[int], before: dict) -> None:
+        """Start a record for the window that just ran."""
+
+        self._pending = {
+            "cycle": len(self.cycles),
+            "window_token_ids": list(token_ids),
+            "stats_before": before,
+            "commit": None,
+        }
+
+    def note_commit(
+        self,
+        *,
+        keep_tokens: int,
+        verified_tokens: int,
+        committed: bool,
+        before: dict,
+        after: dict,
+    ) -> None:
+        """Attribute one commit to the window record still open, if any."""
+
+        if self._pending is None:
+            return
+        self._pending["commit"] = {
+            "keep_tokens": int(keep_tokens),
+            "verified_tokens": int(verified_tokens),
+            "committed": bool(committed),
+            "flushed": after["flushes"] > before["flushes"],
+            "declined": after["declines"] > before["declines"],
+            "bypassed": after["bypassed_commits"] > before["bypassed_commits"],
+            "deferred": after["deferred_commits"] > before["deferred_commits"],
+        }
 
     def close_cycle(self) -> None:
         """Digest the committed state and close the window opened last."""
@@ -246,8 +313,17 @@ class ArmRecorder:
         pending, self._pending = self._pending, None
         if pending is None:
             return
+        # Classification first, and unconditionally: a cycle whose digest
+        # cannot be taken (no cache stamped yet) is still a cycle, and losing
+        # its flush/decline/depth is how a record becomes unreadable.
+        after = self._stats()
+        pending["stats_after"] = after
+        pending["ring_depth_at_entry"] = self._entered_ring_depth(
+            pending["stats_before"], after
+        )
         cache = self._cache
         if cache is None:
+            pending["state_digests"] = None
             self.cycles.append(pending)
             return
         states = [cache[index][1] for index in self._gdn_indices]
@@ -273,9 +349,6 @@ class ArmRecorder:
             if self.state_dir is not None and pending["cycle"] < self.keep_states:
                 arrays.append(host.copy())
         pending["state_digests"] = digests
-        after = self._stats()
-        pending["ring_depth_hist"] = dict(self._fold.STATS["ring_depth_hist"])
-        pending["stats_after"] = after
         if arrays:
             path = self.state_dir / f"{self.label}-cycle{pending['cycle']:04d}.npz"
             np.savez(path, *arrays)
@@ -520,8 +593,17 @@ def run_arm(
     # per-cycle records below come from this probe's own hooks, and the event
     # count is the independent cross-check that they cover the whole run.
     events = list(getattr(output.stats, "events", None) or [])
+    # The bank's own count of compiled physical-M4 windows.  The recorder must
+    # produce exactly one record per window; `assess` refuses the run when it
+    # does not, because a recorder that silently drops cycles reports "no
+    # divergence" for a comparison it never made (2026-09-02).
+    graphbank = dict(getattr(output.stats, "graphbank", None) or {})
+    compiled_calls = int(
+        dict(graphbank.get("compiled_verify") or {}).get("compiled_calls", 0)
+    )
     return {
         "label": label,
+        "compiled_calls": compiled_calls,
         "fold_enabled": bool(enabled),
         "elapsed_s": elapsed,
         "generation_events": len(events),
@@ -567,15 +649,77 @@ def describe(record: dict, index: int) -> dict[str, Any]:
         "cycle": index,
         "window_token_ids": cycle.get("window_token_ids"),
         "commit": commit,
-        "ring_depth_at_entry": (
-            None
-            if not after
-            else after.get("windows", 0) - before.get("windows", 0)
-        ),
+        "ring_depth_at_entry": cycle.get("ring_depth_at_entry"),
+        "windows_before": before.get("windows"),
         "flushes_total": after.get("flushes"),
         "declines_total": after.get("declines"),
         "bypassed_total": after.get("bypassed_commits"),
     }
+
+
+def assess(
+    control: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    min_cycles: int,
+    folded_layers: int = 35,
+) -> list[str]:
+    """Every reason this run does not count.  Empty list == a usable answer.
+
+    Pure: it reads the two arm records and nothing else, so the whole verdict
+    is exercised on CPU.  The refusals exist because each one has already been
+    a silent pass:
+
+    * a run that recorded ONE cycle reported "no divergence" for a comparison
+      it never made (gdn-fold-parity-1788400389, 2026-09-02) -- hence both the
+      ``min_cycles`` floor and the recorder-vs-bank equality below;
+    * an arm whose prefix kernel never entered the graph is the W66b defect
+      itself, which every host-side counter reported as perfect.
+    """
+
+    problems: list[str] = []
+    for name, record in (("control", control), ("candidate", candidate)):
+        cycles = len(record.get("cycles") or [])
+        compiled = int(record.get("compiled_calls") or 0)
+        if cycles < int(min_cycles):
+            problems.append(
+                f"{name} recorded {cycles} windows, under --min-cycles "
+                f"{int(min_cycles)} (the bank ran {compiled})"
+            )
+        # The instrument's own must-have-happened consequence.
+        if compiled and cycles != compiled:
+            problems.append(
+                f"{name} recorded {cycles} cycles for {compiled} compiled M4 "
+                "windows: the probe's per-window hook dropped records, so any "
+                "per-cycle verdict below is vacuous"
+            )
+
+    traced = int(candidate.get("prefix_kernel_traced") or 0)
+    if traced == 0:
+        problems.append(
+            "the candidate arm never called prefix_gated_delta_update: the "
+            "fold's prefix did not enter the compiled verify graph"
+        )
+    consumed = list(candidate.get("prefix_consumed") or [])
+    if not consumed:
+        problems.append(
+            "no traced verify reported a keep-mask prefix scope on the "
+            "candidate arm"
+        )
+    elif any(int(value) != int(folded_layers) for value in consumed):
+        problems.append(
+            f"a traced verify bound only {consumed} of {int(folded_layers)} "
+            "folded GDN layers to a prefix"
+        )
+    if int(control.get("prefix_kernel_traced") or 0) != 0:
+        problems.append(
+            "the control arm called prefix_gated_delta_update: the fold flag "
+            "did not actually clear between the two in-process arms"
+        )
+
+    if list(control.get("tokens") or []) != list(candidate.get("tokens") or []):
+        problems.append("the two arms produced different tokens")
+    return problems
 
 
 def max_abs_between(state_dir: Path, control: str, candidate: str, cycle: int):
@@ -699,6 +843,7 @@ def main() -> int:
                 name: {
                     "fold_enabled": record["fold_enabled"],
                     "cycles": len(record["cycles"]),
+                    "compiled_m4_calls": record["compiled_calls"],
                     "elapsed_s": record["elapsed_s"],
                     "tokens": len(record["tokens"]),
                     "generation_events": record["generation_events"],
@@ -739,19 +884,7 @@ def main() -> int:
                 ),
             }
 
-        problems = []
-        if len(control["cycles"]) < options.min_cycles:
-            problems.append(
-                f"control reached {len(control['cycles'])} windows, "
-                f"under --min-cycles {options.min_cycles}"
-            )
-        if candidate["prefix_kernel_traced"] == 0:
-            problems.append(
-                "the candidate arm never called prefix_gated_delta_update: the "
-                "fold's prefix did not enter the compiled verify graph"
-            )
-        if not report["identical_tokens"]:
-            problems.append("the two arms produced different tokens")
+        problems = assess(control, candidate, min_cycles=options.min_cycles)
         report["problems"] = problems
         report["ok"] = not problems
 

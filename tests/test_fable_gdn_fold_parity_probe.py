@@ -168,3 +168,251 @@ def test_no_raw_key_collides_with_the_expected_environment():
     # And the one key that DID collide is now owned by the family half.
     assert "MTPLX_DROP_EVENTS" not in raw
     assert expected["MTPLX_DROP_EVENTS"] == "0"
+
+
+# --------------------------------------------------------------------------
+# The per-window recorder, and the verdict that must refuse a short run
+# --------------------------------------------------------------------------
+#
+# 2026-09-02, receipt gdn-fold-parity-1788400389: a healthy run -- 512 tokens,
+# 177 compiled M4 windows, identical text on both arms -- was reported as
+# `{"cycles": 1, "first_state_divergence": null, "first_token_divergence_cycle":
+# null}`.  `close_cycle()` was only ever called from `finish()`, so every
+# window overwrote the pending record and one survived.  The comparison the
+# probe exists to make never happened, and only the `--min-cycles` floor
+# caught it.
+
+
+class _FoldStub:
+    """Just the counter surface ``ArmRecorder._stats`` reads."""
+
+    def __init__(self) -> None:
+        self.STATS = {
+            "windows": 0,
+            "folded_windows": 0,
+            "deferred_commits": 0,
+            "flushes": 0,
+            "declines": 0,
+            "bypassed_commits": 0,
+            "ring_depth_hist": {},
+        }
+
+    def run_window(self, depth: int) -> None:
+        self.STATS["windows"] += 1
+        key = str(int(depth))
+        hist = self.STATS["ring_depth_hist"]
+        hist[key] = hist.get(key, 0) + 1
+
+
+def _recorder(fold: _FoldStub):
+    rec = probe.ArmRecorder(label="unit", state_dir=None, keep_states=0)
+    rec._fold = fold
+    rec._cache = None  # skips the MLX digest; the bookkeeping is what is under test
+    return rec
+
+
+def _drive(rec, fold: _FoldStub, windows):
+    """Replay the hook order: close previous, sample, run window, open, commit."""
+
+    for depth, commit in windows:
+        rec.close_cycle()
+        before = rec._stats()
+        fold.run_window(depth)
+        rec.open_window([1, 2, 3, 4], before)
+        if commit is not None:
+            keep, kind = commit
+            after_before = rec._stats()
+            if kind == "deferred":
+                fold.STATS["deferred_commits"] += 1
+            elif kind == "flushed":
+                fold.STATS["deferred_commits"] += 1
+                fold.STATS["flushes"] += 1
+            elif kind == "declined":
+                fold.STATS["declines"] += 1
+            elif kind == "bypassed":
+                fold.STATS["bypassed_commits"] += 1
+            rec.note_commit(
+                keep_tokens=keep,
+                verified_tokens=4,
+                committed=True,
+                before=after_before,
+                after=rec._stats(),
+            )
+    rec.finish()
+
+
+def test_the_recorder_keeps_one_record_per_window():
+    fold = _FoldStub()
+    rec = _recorder(fold)
+    plan = [
+        (0, (2, "deferred")),
+        (1, (1, "deferred")),
+        (2, (3, "flushed")),
+        (1, None),            # all-accept: no commit
+        (0, (1, "declined")),
+        (0, (2, "bypassed")),
+    ]
+    _drive(rec, fold, plan)
+
+    assert len(rec.cycles) == len(plan) == fold.STATS["windows"]
+    assert [c["cycle"] for c in rec.cycles] == list(range(len(plan)))
+    assert [c["ring_depth_at_entry"] for c in rec.cycles] == [0, 1, 2, 1, 0, 0]
+
+
+def test_the_recorder_attributes_each_commit_to_its_own_window():
+    fold = _FoldStub()
+    rec = _recorder(fold)
+    _drive(
+        rec,
+        fold,
+        [
+            (0, (2, "deferred")),
+            (1, (3, "flushed")),
+            (1, None),
+            (0, (1, "declined")),
+            (0, (2, "bypassed")),
+        ],
+    )
+    commits = [c["commit"] for c in rec.cycles]
+    assert commits[0]["keep_tokens"] == 2 and commits[0]["deferred"] is True
+    assert commits[1]["flushed"] is True and commits[1]["keep_tokens"] == 3
+    assert commits[2] is None                      # the all-accept window
+    assert commits[3]["declined"] is True
+    assert commits[4]["bypassed"] is True
+
+
+def test_a_commit_with_no_open_window_is_dropped_not_misattributed():
+    fold = _FoldStub()
+    rec = _recorder(fold)
+    # A copy-round commit before any compiled window has run.
+    rec.note_commit(
+        keep_tokens=1,
+        verified_tokens=9,
+        committed=True,
+        before=rec._stats(),
+        after=rec._stats(),
+    )
+    assert rec.cycles == []
+    _drive(rec, fold, [(0, (2, "deferred"))])
+    assert len(rec.cycles) == 1
+    assert rec.cycles[0]["commit"]["verified_tokens"] == 4
+
+
+def test_entered_ring_depth_is_none_when_the_histogram_is_ambiguous():
+    before = {"ring_depth_hist": {"0": 1}}
+    assert probe.ArmRecorder._entered_ring_depth(
+        before, {"ring_depth_hist": {"0": 1, "2": 1}}
+    ) == 2
+    # Two keys moved: the record cannot say which window entered at which.
+    assert (
+        probe.ArmRecorder._entered_ring_depth(
+            before, {"ring_depth_hist": {"0": 2, "1": 1}}
+        )
+        is None
+    )
+    # A disarmed arm never records a depth at all.
+    assert (
+        probe.ArmRecorder._entered_ring_depth(
+            {"ring_depth_hist": {}}, {"ring_depth_hist": {}}
+        )
+        is None
+    )
+
+
+# -- the verdict -----------------------------------------------------------
+
+
+def _arm(*, cycles: int, compiled: int, traced: int, consumed, tokens):
+    return {
+        "cycles": [{"cycle": i} for i in range(cycles)],
+        "compiled_calls": compiled,
+        "prefix_kernel_traced": traced,
+        "prefix_consumed": list(consumed),
+        "tokens": list(tokens),
+    }
+
+
+def _healthy(min_cycles=150):
+    tokens = list(range(512))
+    control = _arm(
+        cycles=177, compiled=177, traced=0, consumed=[], tokens=tokens
+    )
+    candidate = _arm(
+        cycles=177, compiled=177, traced=36, consumed=[35], tokens=tokens
+    )
+    return control, candidate
+
+
+def test_assess_passes_a_healthy_run():
+    control, candidate = _healthy()
+    assert probe.assess(control, candidate, min_cycles=150) == []
+
+
+def test_assess_refuses_the_one_window_run():
+    """The 2026-09-02 receipt, exactly: identical tokens, one recorded cycle."""
+
+    control, candidate = _healthy()
+    for arm in (control, candidate):
+        arm["cycles"] = [{"cycle": 0}]
+    problems = probe.assess(control, candidate, min_cycles=150)
+    assert any("under --min-cycles 150" in p for p in problems)
+    # And the instrument's own check fires too: 1 record for 177 windows.
+    assert any("dropped records" in p for p in problems)
+    assert any(p.startswith("control") for p in problems)
+    assert any(p.startswith("candidate") for p in problems)
+
+
+def test_assess_refuses_a_recorder_that_dropped_cycles_above_the_floor():
+    """Even a long run is void if the records do not cover the windows."""
+
+    control, candidate = _healthy()
+    candidate["cycles"] = [{"cycle": i} for i in range(160)]
+    problems = probe.assess(control, candidate, min_cycles=150)
+    assert problems == [
+        "candidate recorded 160 cycles for 177 compiled M4 windows: the "
+        "probe's per-window hook dropped records, so any per-cycle verdict "
+        "below is vacuous"
+    ]
+
+
+def test_assess_refuses_a_candidate_whose_prefix_never_entered_the_graph():
+    control, candidate = _healthy()
+    candidate["prefix_kernel_traced"] = 0
+    candidate["prefix_consumed"] = []
+    problems = probe.assess(control, candidate, min_cycles=150)
+    assert any("did not enter the compiled verify graph" in p for p in problems)
+    assert any("no traced verify reported" in p for p in problems)
+
+
+def test_assess_refuses_a_partially_bound_prefix():
+    """W66d's defect at half strength: some layers took a prefix, some did not."""
+
+    control, candidate = _healthy()
+    candidate["prefix_consumed"] = [34]
+    problems = probe.assess(control, candidate, min_cycles=150)
+    assert any("only [34] of 35 folded GDN layers" in p for p in problems)
+
+
+def test_assess_refuses_a_control_that_ran_the_fold_kernel():
+    control, candidate = _healthy()
+    control["prefix_kernel_traced"] = 3
+    problems = probe.assess(control, candidate, min_cycles=150)
+    assert any("did not actually clear between" in p for p in problems)
+
+
+def test_assess_refuses_divergent_tokens():
+    control, candidate = _healthy()
+    candidate["tokens"] = candidate["tokens"][:-1] + [999999]
+    assert "the two arms produced different tokens" in probe.assess(
+        control, candidate, min_cycles=150
+    )
+
+
+def test_assess_reports_the_banks_window_count_in_the_floor_message():
+    """The message must name both numbers, or the next reader repeats the hunt."""
+
+    control, candidate = _healthy()
+    control["cycles"] = [{"cycle": 0}]
+    control["compiled_calls"] = 177
+    problems = probe.assess(control, candidate, min_cycles=150)
+    assert "control recorded 1 windows, under --min-cycles 150 (the bank ran 177)" in problems
