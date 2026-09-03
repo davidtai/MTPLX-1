@@ -434,3 +434,50 @@ def test_a_second_segment_starts_from_a_clean_state(tiny_runtime):
     assert trimmable_offsets(hooks.cache) == [len(PROMPT), len(PROMPT)]
     assert hooks.mtp_cache[0].offset == len(PROMPT) - 1 < grown
     hooks.close()
+
+
+def test_the_rollback_fallback_lands_the_same_prefix(tiny_runtime, monkeypatch):
+    """Route 4 of the ladder, the one that runs if the capture ever stops arming.
+
+    It is the safety net for a family whose `commit_verified_window` refuses --
+    a scope that did not arm, a snapshot the layers reject -- so it must leave
+    the cache in exactly the state the family commit would have, and the test
+    forces it rather than hoping it is never needed.
+    """
+
+    log = _replay_log()
+    segment = segment_windows(log)[0]
+    window = window_record(log, 0)
+
+    def _committed(**_kwargs):
+        hooks = _hooks(tiny_runtime)
+        hooks.start_segment(segment)
+        hooks.advance(window=window)
+        offsets = trimmable_offsets(hooks.cache)
+        history = hooks.mtp_cache[0].offset
+        hooks.close()
+        return offsets, history
+
+    expected = _committed()
+    monkeypatch.setattr(
+        type(tiny_runtime.model),
+        "commit_verified_window",
+        lambda *args, **kwargs: False,
+    )
+    assert _committed() == expected
+
+
+def test_the_prompt_history_is_staged_identically_however_it_is_chunked(
+    tiny_runtime,
+):
+    """The staging loop exists to keep one 16k-row pass off the device."""
+
+    log = _replay_log()
+    segment = segment_windows(log)[0]
+    offsets = []
+    for chunk in (2048, 4, 1):
+        hooks = _hooks(tiny_runtime, history_chunk=chunk)
+        hooks.start_segment(segment)
+        offsets.append(hooks.mtp_cache[0].offset)
+        hooks.close()
+    assert offsets == [len(PROMPT) - 1] * 3
