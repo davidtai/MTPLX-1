@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, MutableMapping
 
 from .full_stack_env import (
+    FULL_STACK_PROFILE_ALIASES,
     FULL_STACK_PROFILE_ENV,
     FULL_STACK_PROFILE_NAME,
 )
@@ -890,16 +891,33 @@ TURBO_FULL_STACK_PROFILE = RuntimeProfile(
     name=FULL_STACK_PROFILE_NAME,
     runtime_profile="native_mtp_turbo_full_stack",
     summary=(
-        "Turbo plus the three Qwen3.8 Flash-Next decode switches the ABBA "
-        "control arm sets and no server path does: the FR-Spec draft head, "
-        "its 64k code vocabulary, and compiled Qwen4 MTP preparation. "
-        "Requires --generation-mode mtp and no MTP adapter. Opt-in: no "
-        "default changes, and no other profile is affected."
+        "Turbo plus the whole retained Qwen3.8 Flash-Next stack: the FR-Spec "
+        "draft head and its 64k code vocabulary, compiled Qwen4 MTP "
+        "preparation, the twelve retained decode keys and the eight retained "
+        "prefill keys (docs/perf/pr391-stack.flags and "
+        "docs/perf/pr391-prefill.flags). Since 2026-09-03 `mtplx serve` arms "
+        "the same 23 keys BY DEFAULT on a Flash-Next pack, so on that family "
+        "this profile is turbo plus nothing the server was not already going "
+        "to do; it stays selectable for a non-server caller (prefill_bench, "
+        "the ABBA driver) and as an explicit name for the same set. Requires "
+        "--generation-mode mtp and no MTP adapter."
     ),
     env=_merge_env(
         TURBO_PROFILE.env_dict(),
-        # EXACTLY the gap, and nothing else. See mtplx/full_stack_env.py for
-        # the per-key ownership table; the rest of the 21-key control stack is
+        # Every measured key nothing else sets: the ABBA control arm's
+        # three-key gap plus both retained Fable groups (12 decode + 8
+        # prefill), 23 in all. See mtplx/full_stack_env.py for the per-key
+        # ownership table and docs/perf/pr391-{stack,prefill}.flags for the
+        # committed record the registry is asserted equal to.
+        #
+        # It replaces exactly ONE turbo value: MTPLX_PREFILL_CHUNK_SIZE,
+        # turbo's 'auto' (2048 either way) against the measured stack's fixed
+        # 4096, which travels with MTPLX_QSA_PREFILL_COMPILE_ROWS=4096
+        # because the QSA prefill graph bank captures one width and
+        # fable_prefill_chunk.assert_prefill_chunk_coherent refuses the
+        # mismatched pair.
+        #
+        # The rest of the 21-key control stack is
         # already supplied by _server_runtime_env_overrides in
         # mtplx/server/openai.py for the served pack:
         #
@@ -917,11 +935,17 @@ TURBO_FULL_STACK_PROFILE = RuntimeProfile(
         # the profile would take the A/B switch away from the operator on
         # exactly the keys the server chose to leave them.
         #
-        # This profile's own three keys ARE in
+        # All 23 of this profile's own keys ARE in
         # PROFILE_ENV_USER_OVERRIDE_KEYS, for the same reason: an operator
         # export must beat the profile. MTPLX_FRSPEC_DRAFT=0 in particular is
         # the only kill switch for a lane whose installer raises rather than
         # falling back.
+        #
+        # NINE of them are read once at module IMPORT by their call sites, so
+        # this stamp reaches them only because
+        # mtplx/full_stack_env.stamp_import_time_defaults already put them in
+        # the environment from mtplx/server/__init__.py, before openai.py's
+        # own imports ran. See BIND_IMPORT in mtplx/full_stack_env.py.
         #
         # That also means this profile has NO turbo conflicts of its own. The
         # three keys where turbo and the control arm disagree --
@@ -941,23 +965,39 @@ TURBO_FULL_STACK_PROFILE = RuntimeProfile(
         "rather than falling back), so the server refuses the profile at "
         "selection with that reason instead of failing after the weights are "
         "mapped. Use turbo for a non-MTP or adapter serve.",
-        "It adds exactly three keys to turbo -- MTPLX_FRSPEC_DRAFT, "
-        "MTPLX_FRSPEC_VOCAB and MTPLX_QWEN4_COMPILED_MTP_PREPARE -- because "
-        "those are the only ones of the ABBA control stack that no server "
-        "path sets. All three are operator-overridable: exporting "
-        "MTPLX_FRSPEC_DRAFT=0 turns the lane off and the profile announces "
-        "that the operator won.",
+        "It adds 22 keys to turbo and replaces one (MTPLX_PREFILL_CHUNK_SIZE, "
+        "turbo's 'auto' against the measured 4096): the three ABBA control-arm "
+        "keys no server path sets, plus the 12 retained decode and 8 retained "
+        "prefill keys recorded in docs/perf/pr391-stack.flags and "
+        "docs/perf/pr391-prefill.flags. All 23 are operator-overridable: "
+        "exporting MTPLX_FRSPEC_DRAFT=0 turns the lane off and the profile "
+        "announces that the operator won. MTPLX_FABLE_DISABLE=<lane,...> and "
+        "--disable-optimization <lane> turn one off by NAME instead, and "
+        "--disable-optimization all is the stock path.",
+        "MTPLX_SESSION_BANK_MAX_BYTES=8G is a serving MEMORY BUDGET, not a "
+        "speed key. Unset, the session bank auto-sizes from the machine "
+        "memory plan; the retained set pins it so two arms cannot see "
+        "different banks. Retune it per machine with "
+        "MTPLX_SESSION_BANK_MAX_BYTES=<n>G, or hand it back to the auto-sizer "
+        "with MTPLX_SESSION_BANK_MAX_BYTES=auto; either wins over the "
+        "profile, as scripts/fable/server_cell_bench.py's own COMMON_ENV "
+        "already does.",
         "MTPLX_QWEN4_RELAXED_DRAFT_TIES is deliberately NOT included: "
         "--relaxed-draft-ties is absent from abba_window.CONTROL_FLAGS and "
         "--compiled-mtp-prepare does not imply it, so the control arm never "
         "measured it.",
         "Scoped to the Qwen3.8 Flash-Next (qwen4_exp) family. The server's "
-        "auto-arm is predicated on the served config, so on any other model "
-        "this profile arms FR-Spec and one Qwen4 key and nothing else -- and "
-        "MTPLX_FRSPEC_DRAFT is family-agnostic and raises at load if the "
-        "FR-Spec head cannot install. Do not select it for another model.",
-        "Selecting it turns on a startup self-check: one line saying how many "
-        "of the 21 control-stack keys are armed, by whom, and against which "
+        "auto-arm and the retained-stack defaults are both predicated on the "
+        "served config, so on any other model this profile arms its own 23 "
+        "keys and nothing else -- and several of them raise at load rather "
+        "than falling back (MTPLX_FABLE_HC_M4 on a family-contract miss, "
+        "MTPLX_FRSPEC_DRAFT when the FR-Spec head cannot install). Do not "
+        "select it for another model; on a Flash-Next pack you do not need "
+        "to select it at all.",
+        "A Flash-Next serve prints a startup self-check on every profile: one "
+        "line saying which of the 23 retained keys the defaults armed and "
+        "which ones the operator turned off, one line saying how many "
+        "of the 41 measured-stack keys are armed, by whom, and against which "
         "serve shape (so a server predicate that did not hold is visible), "
         "then one satisfied/missing line per engagement receipt -- the "
         "FR-Spec install report (expects n=65536 from "
@@ -1025,12 +1065,14 @@ PROFILE_ALIASES = {
     "auto": DEFAULT_PROFILE_NAME,
     "sustained-max": "sustained",
     "sustained_max": "sustained",
-    # The opt-in Flash-Next restack. "full-stack" is the name the benchmark
-    # harness uses for the same env block (server_cell_bench's
-    # --require-full-stack / "branch (full stack)" cells).
-    "full-stack": FULL_STACK_PROFILE_NAME,
-    "full_stack": FULL_STACK_PROFILE_NAME,
-    "turbo_full_stack": FULL_STACK_PROFILE_NAME,
+    # The Flash-Next restack. "full-stack" is the name the benchmark harness
+    # uses for the same env block (server_cell_bench's --require-full-stack /
+    # "branch (full stack)" cells). Derived from the registry's own alias
+    # tuple so mtplx.full_stack_env.profile_name_from_argv -- which decides
+    # the pre-import stamp, before this module is importable in the serve
+    # process -- cannot disagree with this table about what the operator
+    # typed.
+    **{alias: FULL_STACK_PROFILE_NAME for alias in FULL_STACK_PROFILE_ALIASES},
 }
 
 

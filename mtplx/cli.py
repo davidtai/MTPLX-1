@@ -1209,10 +1209,19 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_profiles(args: argparse.Namespace) -> int:
+    # The retained Flash-Next optimizations are armed by DEFAULT on that
+    # family (mtplx/full_stack_env.py), so the lane names an operator would
+    # use to turn one off belong on the same surface as the profiles. No MLX
+    # import: full_stack_env is pure Python, like profiles itself.
+    from .full_stack_env import DISABLE_ENV, LANE_KEYS
+
     payload = {
         "default": DEFAULT_PROFILE_NAME,
         "flagship_default": "turbo",
         "profiles": list_profiles(),
+        "optimization_lanes": {
+            lane: list(keys) for lane, keys in LANE_KEYS.items()
+        },
     }
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -1224,6 +1233,14 @@ def _cmd_profiles(args: argparse.Namespace) -> int:
     )
     for profile in payload["profiles"]:
         print(f"{profile['name']}: {profile['summary']}")
+    print()
+    print(
+        "Qwen3.8 Flash-Next optimization lanes (armed by default on that "
+        f"family; turn one off with --disable-optimization <lane> or "
+        f"{DISABLE_ENV}=<lane,...>, and 'all' for the stock path):"
+    )
+    for lane, keys in payload["optimization_lanes"].items():
+        print(f"  {lane}: {' '.join(keys)}")
     return 0
 
 
@@ -3434,6 +3451,19 @@ def build_parser() -> argparse.ArgumentParser:
             "quantized 27B and 9B flagships (the app's launch rule), "
             "Sustained otherwise; use --profile performance-cold "
             "--max for Burst."
+        ),
+    )
+    serve_p.add_argument(
+        "--disable-optimization",
+        dest="disable_optimization",
+        action="append",
+        metavar="LANE",
+        default=None,
+        help=(
+            "Leave one retained-stack optimization unarmed on a Qwen3.8 "
+            "Flash-Next serve (repeatable); 'all' runs the stock path. The "
+            "same switch as MTPLX_FABLE_DISABLE=<lane,...>, and the two "
+            "compose. `mtplx profiles` lists the lane names."
         ),
     )
     serve_p.add_argument("--unsafe-force-unverified", action="store_true")

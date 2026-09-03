@@ -14,9 +14,16 @@ import pytest
 
 from mtplx import full_stack_env
 from mtplx.full_stack_env import (
+    CONTROL_ARM_ENV,
     FULL_STACK_PROFILE_ENV,
     FULL_STACK_PROFILE_NAME,
     FULL_STACK_RESTACK_ENV,
+    GROUP_CONTROL_ARM,
+    GROUP_FABLE_DECODE,
+    GROUP_FABLE_PREFILL,
+    GROUP_FLAG_FILES,
+    LANES,
+    LANE_KEYS,
     OWNER_PROFILE,
     OWNER_SERVER_AUTO,
     OWNER_SERVER_FORCED,
@@ -24,6 +31,8 @@ from mtplx.full_stack_env import (
     keys_owned_by,
     known_family_keys,
     registered_names,
+    group_env,
+    parse_flag_file,
     resolved_stack,
     stack_summary_line,
     text_value,
@@ -70,8 +79,10 @@ def _control_arm_env() -> dict[str, str]:
     return env
 
 
-#: The gap: control-arm keys NO server path sets. Verified against
-#: mtplx/server/openai.py:_server_runtime_env_overrides on 2026-09-02.
+#: The gap: CONTROL-ARM keys no server path sets. Verified against
+#: mtplx/server/openai.py:_server_runtime_env_overrides on 2026-09-02. The
+#: profile stamps these PLUS both retained Fable groups (see
+#: test_the_profile_stamps_every_key_nothing_else_sets).
 EXPECTED_GAP = {
     "MTPLX_QWEN4_COMPILED_MTP_PREPARE": "1",
     "MTPLX_FRSPEC_DRAFT": "1",
@@ -144,8 +155,15 @@ def test_registry_block_equals_the_real_abba_control_arm() -> None:
     flag default moves, or the registry drifts, this fails.
     """
 
-    assert FULL_STACK_RESTACK_ENV == _control_arm_env()
-    assert len(FULL_STACK_RESTACK_ENV) == 21
+    assert CONTROL_ARM_ENV == _control_arm_env()
+    assert len(CONTROL_ARM_ENV) == 21
+    # ... and the whole measured stack is that plus the two Fable groups.
+    assert len(FULL_STACK_RESTACK_ENV) == 41
+    assert FULL_STACK_RESTACK_ENV == {
+        **CONTROL_ARM_ENV,
+        **group_env(GROUP_FABLE_DECODE),
+        **group_env(GROUP_FABLE_PREFILL),
+    }
 
 
 def test_relaxed_draft_ties_is_not_in_the_control_arm() -> None:
@@ -191,7 +209,18 @@ def test_profile_is_selectable_by_name_and_by_harness_alias() -> None:
 
 
 def test_the_registry_records_who_sets_every_stack_key() -> None:
-    assert set(keys_owned_by(OWNER_PROFILE)) == set(EXPECTED_GAP)
+    # Within the control arm, the profile owns exactly the three-key gap.
+    assert set(keys_owned_by(OWNER_PROFILE, group=GROUP_CONTROL_ARM)) == set(
+        EXPECTED_GAP
+    )
+    # Both Fable groups are the profile's in full: nothing else sets any of
+    # them -- not the server's auto-arm, not a model pack's contract.
+    assert set(keys_owned_by(OWNER_PROFILE, group=GROUP_FABLE_DECODE)) == set(
+        group_env(GROUP_FABLE_DECODE)
+    )
+    assert set(keys_owned_by(OWNER_PROFILE, group=GROUP_FABLE_PREFILL)) == set(
+        group_env(GROUP_FABLE_PREFILL)
+    )
     assert set(keys_owned_by(OWNER_SERVER_AUTO)) == EXPECTED_SERVER_AUTO
     assert set(keys_owned_by(OWNER_SERVER_FORCED)) == EXPECTED_SERVER_FORCED
     # Every key is accounted for exactly once.
@@ -206,15 +235,28 @@ def test_the_registry_records_who_sets_every_stack_key() -> None:
         assert entry.owner_predicate.strip(), entry.name
 
 
-def test_the_profile_stamps_exactly_the_keys_no_server_path_sets() -> None:
-    assert FULL_STACK_PROFILE_ENV == EXPECTED_GAP
+def test_the_profile_stamps_every_key_nothing_else_sets() -> None:
+    """The gap plus both retained Fable groups -- 23 keys, and no others.
+
+    Before 2026-09-03 this was three keys and the twenty Fable ones rode as
+    hand-exported files, which is how the measured configuration became one
+    nobody serving actually got.
+    """
+
+    expected = {
+        **EXPECTED_GAP,
+        **group_env(GROUP_FABLE_DECODE),
+        **group_env(GROUP_FABLE_PREFILL),
+    }
+    assert FULL_STACK_PROFILE_ENV == expected
+    assert len(FULL_STACK_PROFILE_ENV) == 23
 
     turbo = get_profile("turbo").env_dict()
     full = get_profile(FULL_STACK_PROFILE_NAME).env_dict()
 
-    assert full == {**turbo, **EXPECTED_GAP}
+    assert full == {**turbo, **expected}
     added = {key: value for key, value in full.items() if turbo.get(key) != value}
-    assert added == EXPECTED_GAP
+    assert added == expected
 
 
 def test_the_profile_does_not_restate_a_server_armed_key() -> None:
@@ -274,7 +316,7 @@ def test_frspec_is_armed_where_nothing_else_arms_it() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_every_turbo_conflict_is_server_owned_not_the_profiles() -> None:
+def test_every_turbo_conflict_is_server_owned_but_one_the_profile_owns() -> None:
     turbo = get_profile("turbo").env_dict()
 
     conflicts = {
@@ -282,6 +324,12 @@ def test_every_turbo_conflict_is_server_owned_not_the_profiles() -> None:
         for key, value in FULL_STACK_RESTACK_ENV.items()
         if key in turbo and turbo[key] != value
     }
+    # The one conflict the PROFILE resolves, deliberately: turbo's 'auto'
+    # prefill chunk vs the measured stack's fixed 4096. It is not a
+    # server-owned key and the server does not arbitrate it, so it is
+    # excluded here and asserted in
+    # test_the_new_profile_touches_only_the_retained_stack.
+    assert conflicts.pop("MTPLX_PREFILL_CHUNK_SIZE") == ("auto", "4096")
     # MTPLX_COMPILED_VERIFY is NOT a conflict: turbo's "1" and the control
     # arm's "on" resolve to the same graphbank mode.
     assert full_stack_env.resolved_mode(
@@ -301,12 +349,15 @@ def test_every_turbo_conflict_is_server_owned_not_the_profiles() -> None:
         )
 
 
-def test_todays_turbo_serve_is_short_exactly_the_gap() -> None:
+def test_a_plain_turbo_serve_is_short_the_whole_retained_stack() -> None:
     """What `mtplx serve --profile turbo` resolves on a Flash-Next pack.
 
     Turbo's env plus the server's auto-arm for a qwen4_exp fixed-M4 pack in
-    mtp mode: 16 of the 20 driver-stack keys, missing exactly the four the
-    profile exists to supply.
+    mtp mode: 20 of the 41 keys. Everything missing is one of the 23 the
+    profile (and, since 2026-09-03, the server's retained-stack defaults)
+    supply -- minus the two whose reader default already happens to be the
+    stack value, which is exactly the present-vs-ok distinction
+    resolved_stack draws.
     """
 
     environ: dict[str, str] = {}
@@ -316,8 +367,15 @@ def test_todays_turbo_serve_is_short_exactly_the_gap() -> None:
     rows = {row["name"]: row for row in resolved_stack(environ)}
     missing = {name for name, row in rows.items() if not row["ok"]}
 
-    assert missing == set(EXPECTED_GAP)
-    assert "18/21 driver-stack keys armed" in stack_summary_line(environ)
+    assert missing <= set(FULL_STACK_PROFILE_ENV)
+    satisfied_by_reader_default = set(FULL_STACK_PROFILE_ENV) - missing
+    assert satisfied_by_reader_default == {
+        "MTPLX_FABLE_QSA_SPARSE_DECODE_TILE",
+        "MTPLX_FABLE_QSA_SPARSE_DECODE_SPLITS",
+    }
+    for name in satisfied_by_reader_default:
+        assert rows[name]["present"] is False
+    assert "20/41 driver-stack keys armed" in stack_summary_line(environ)
 
 
 def test_the_profile_plus_the_server_auto_arm_completes_the_stack() -> None:
@@ -327,9 +385,9 @@ def test_the_profile_plus_the_server_auto_arm_completes_the_stack() -> None:
 
     assert all(row["ok"] for row in resolved_stack(environ))
     line = stack_summary_line(environ, shape="mtp, qwen4_exp fixed-M4 pack")
-    assert "21/21 driver-stack keys armed" in line
+    assert "41/41 driver-stack keys armed" in line
     assert "(mtp, qwen4_exp fixed-M4 pack)" in line
-    assert "profile 3" in line
+    assert "profile 23" in line
     assert "server_auto_arm 17" in line
     assert "server_forced 1" in line
 
@@ -341,7 +399,7 @@ def test_a_predicate_that_did_not_hold_reads_as_unarmed() -> None:
     apply_profile_env(FULL_STACK_PROFILE_NAME, environ=environ)
 
     line = stack_summary_line(environ, shape="mtp, not a qwen4_exp pack")
-    assert "4/21 driver-stack keys armed" in line
+    assert "24/41 driver-stack keys armed" in line
     assert "(mtp, not a qwen4_exp pack)" in line
     assert "_served_model_type_is_qwen4_exp(args)" in line
     assert "MTPLX_FRSPEC_DRAFT" not in line  # the profile did arm that one
@@ -641,13 +699,25 @@ def test_no_shipped_profile_gained_a_gap_key() -> None:
         assert not leaked, f"{name} gained {sorted(leaked)}"
 
 
-def test_the_new_profile_touches_only_the_gap_and_nothing_else() -> None:
+def test_the_new_profile_touches_only_the_retained_stack() -> None:
+    """It ADDS 22 keys and REPLACES exactly one turbo value.
+
+    MTPLX_PREFILL_CHUNK_SIZE is the single deliberate overlap: turbo ships
+    'auto' (2048 either way) and the measured prefill stack runs a fixed
+    4096, paired with MTPLX_QSA_PREFILL_COMPILE_ROWS. Nothing else of
+    turbo's moves.
+    """
+
     turbo = get_profile("turbo").env_dict()
     full = get_profile(FULL_STACK_PROFILE_NAME).env_dict()
 
-    assert set(full) - set(turbo) == set(EXPECTED_GAP)
-    for key, value in turbo.items():
-        assert full[key] == value, key
+    added = set(full) - set(turbo)
+    assert added == set(FULL_STACK_PROFILE_ENV) - {"MTPLX_PREFILL_CHUNK_SIZE"}
+    replaced = {key for key in turbo if full[key] != turbo[key]}
+    assert replaced == {"MTPLX_PREFILL_CHUNK_SIZE"}
+    assert turbo["MTPLX_PREFILL_CHUNK_SIZE"] == "auto"
+    assert full["MTPLX_PREFILL_CHUNK_SIZE"] == "4096"
+    assert full["MTPLX_QSA_PREFILL_COMPILE_ROWS"] == "4096"
 
 
 def test_the_default_profile_is_still_sustained() -> None:
@@ -680,15 +750,12 @@ def test_the_profiles_own_keys_are_operator_overridable() -> None:
         assert key in PROFILE_ENV_USER_OVERRIDE_KEYS, key
 
 
-@pytest.mark.parametrize(
-    "key,off",
-    [
-        ("MTPLX_FRSPEC_DRAFT", "0"),
-        ("MTPLX_QWEN4_COMPILED_MTP_PREPARE", "0"),
-        ("MTPLX_FRSPEC_VOCAB", "/tmp/custom_vocab.json"),
-    ],
-)
-def test_an_operator_can_override_each_profile_key(key: str, off: str) -> None:
+@pytest.mark.parametrize("key", sorted(FULL_STACK_PROFILE_ENV))
+def test_an_operator_can_override_each_profile_key(key: str) -> None:
+    """Every one of the 23, not a sample: each is somebody's A/B switch."""
+
+    off = "0" if FULL_STACK_PROFILE_ENV[key] == "1" else "operator-value"
+    assert off != FULL_STACK_PROFILE_ENV[key]
     environ = {key: off}
 
     apply_profile_env(FULL_STACK_PROFILE_NAME, environ=environ)
@@ -735,3 +802,112 @@ def test_the_dropped_runtime_profile_alias_is_gone() -> None:
         resolve_profile_name("native_mtp_turbo_full_stack")
     assert resolve_profile_name("full-stack") == FULL_STACK_PROFILE_NAME
     assert resolve_profile_name("turbo_full_stack") == FULL_STACK_PROFILE_NAME
+
+
+# ---------------------------------------------------------------------------
+# (6) the committed flag files and the registry cannot drift apart
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _flag_file(group: str) -> dict[str, str]:
+    return parse_flag_file((REPO_ROOT / GROUP_FLAG_FILES[group]).read_text())
+
+
+def test_the_committed_flag_files_exist_and_parse() -> None:
+    for group, relative in GROUP_FLAG_FILES.items():
+        path = REPO_ROOT / relative
+        assert path.is_file(), relative
+        assert _flag_file(group), relative
+
+
+@pytest.mark.parametrize("group", sorted(GROUP_FLAG_FILES))
+def test_each_flag_file_equals_its_registry_group(group: str) -> None:
+    """The record and the source of truth, asserted equal in both directions.
+
+    The two files are the canonical record of what the PR-391 battery
+    exported by hand; mtplx/full_stack_env.py is where the same set now
+    lives as code. A key added to one and not the other is the drift this
+    test exists to make impossible -- and it is the drift that would put an
+    unmeasured lane in a serve, or leave a measured one out.
+    """
+
+    assert _flag_file(group) == group_env(group)
+
+
+def test_the_profile_env_is_exactly_the_two_files_plus_the_gap() -> None:
+    union = {
+        **EXPECTED_GAP,
+        **_flag_file(GROUP_FABLE_DECODE),
+        **_flag_file(GROUP_FABLE_PREFILL),
+    }
+
+    assert FULL_STACK_PROFILE_ENV == union
+    served = get_profile(FULL_STACK_PROFILE_NAME).env_dict()
+    for key, value in union.items():
+        assert served[key] == value, key
+
+
+def test_the_flag_files_are_shell_sourceable() -> None:
+    """`set -a; . docs/perf/pr391-stack.flags` has to actually work.
+
+    No spaces, no quotes, no shell metacharacters -- the files are documented
+    as exportable by hand for a run that bypasses the server, and a value
+    that needed quoting would silently export something else.
+    """
+
+    for group in GROUP_FLAG_FILES:
+        for key, value in _flag_file(group).items():
+            assert key == key.strip() and " " not in key
+            assert value == value.strip()
+            assert not (set(value) & set(" \t\"'$`;&|<>()\\")), (key, value)
+
+
+def test_render_flag_file_round_trips_through_the_parser() -> None:
+    from mtplx.full_stack_env import render_flag_file
+
+    for group in GROUP_FLAG_FILES:
+        rendered = render_flag_file(group, header="regenerated")
+        assert parse_flag_file(rendered) == group_env(group)
+
+
+# ---------------------------------------------------------------------------
+# (7) every optimization has a lane name, and the lanes cover the stack
+# ---------------------------------------------------------------------------
+
+
+def test_every_profile_key_belongs_to_exactly_one_lane() -> None:
+    covered = [key for keys in LANE_KEYS.values() for key in keys]
+
+    assert sorted(covered) == sorted(FULL_STACK_PROFILE_ENV)
+    assert len(covered) == len(set(covered))
+    assert set(LANES) == set(LANE_KEYS)
+
+
+def test_the_prefill_chunk_pair_shares_one_lane() -> None:
+    """Half of it is the incoherent configuration the guard refuses.
+
+    The QSA prefill graph bank captures ONE row width. Turning the chunk
+    width off without the compile rows (or the other way) is exactly the
+    mismatch fable_prefill_chunk.assert_prefill_chunk_coherent raises on, so
+    the two cannot be separate operator switches.
+    """
+
+    assert LANE_KEYS["prefill_chunk"] == (
+        "MTPLX_PREFILL_CHUNK_SIZE",
+        "MTPLX_QSA_PREFILL_COMPILE_ROWS",
+    )
+
+
+def test_lane_names_match_the_install_receipt_lanes_where_both_exist() -> None:
+    """The name an operator types is the name the verdict line prints."""
+
+    from mtplx.fable_install_receipts import LANE_KEYS as RECEIPT_LANE_KEYS
+
+    shared = set(LANE_KEYS) & set(RECEIPT_LANE_KEYS)
+    assert shared, "the two lane vocabularies stopped overlapping"
+    for lane in sorted(shared):
+        assert set(RECEIPT_LANE_KEYS[lane]) >= set(LANE_KEYS[lane]) or set(
+            LANE_KEYS[lane]
+        ) >= set(RECEIPT_LANE_KEYS[lane]), lane

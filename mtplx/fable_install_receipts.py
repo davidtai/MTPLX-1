@@ -386,8 +386,27 @@ def _raw(key: str) -> str | None:
 
 
 def _env_note(key: str) -> str:
+    """``KEY=value``, prefixed with WHO set it once that is knowable.
+
+    The retained stack is armed by default for a Flash-Next serve
+    (mtplx/full_stack_env.py), so ``MTPLX_FABLE_OPDIET='1'`` on its own no
+    longer says whether the operator asked for it or simply did not turn it
+    off -- and an operator who exports ``=0`` needs to read their own
+    decision back off the verdict line. ``value_source`` answers that from
+    what this process actually armed, and returns ``""`` in any process that
+    armed no defaults, so every existing line keeps its spelling.
+    """
+
     raw = _raw(key)
-    return f"{key} unset" if raw is None else f"{key}={raw!r}"
+    if raw is None:
+        return f"{key} unset"
+    try:
+        from .full_stack_env import value_source
+
+        source = value_source(key)
+    except Exception:  # a receipt must never fail on a diagnostic
+        source = ""
+    return f"{source}: {key}={raw}" if source else f"{key}={raw!r}"
 
 
 def _gib(value: int) -> str:
@@ -1046,6 +1065,184 @@ def _session_bank_verdict(context: Mapping[str, Any]) -> Verdict:
 
 
 # ---------------------------------------------------------------------------
+# 10. MTPLX_FABLE_ROUTE_KERNEL  (W93: defaults-on needs a verdict per key)
+# ---------------------------------------------------------------------------
+def _route_kernel_verdict(context: Mapping[str, Any]) -> Verdict:
+    from mtplx import qwen4_m4_stage3 as lane
+
+    key = lane.FABLE_ROUTE_KERNEL_ENV
+    decided_at = (
+        "mtplx/qwen4_m4_stage3.py:fable_route_kernel_enabled() -- cached in a "
+        "lazy global, so the FIRST read in the process fixes it"
+    )
+    readers = (
+        "mtplx/qwen4_m4_stage3.py:fable_route_kernel_enabled",
+        "mtplx/qwen4_m4_stage3.py (stage-3 MoE combine tail)",
+    )
+    armed = bool(lane.fable_route_kernel_enabled())
+    fields: dict[str, Any] = {"armed": armed}
+    try:
+        fields["vec_lanes"] = int(lane.fable_route_kernel_vec_lanes())
+    except Exception as exc:  # a bad sweep value: report, never raise
+        fields["vec_lanes"] = f"unresolvable: {exc}"
+    if not armed:
+        return Verdict(
+            lane="route_kernel",
+            keys=(key,),
+            state=STATE_OFF,
+            reason=f"{_env_note(key)} at {decided_at}",
+            decided_at=decided_at,
+            readers=readers,
+            fields=fields,
+        )
+    return Verdict(
+        lane="route_kernel",
+        keys=(key,),
+        state=STATE_ARMED,
+        engages_at="every stage-3 M4 MoE combine tail",
+        detail=(
+            f"route GEMV + top-k in two dispatches instead of ten, "
+            f"vec_lanes={fields['vec_lanes']}; needs MTPLX_QWEN4_M4_STAGE3, "
+            "which the runtime already requires (it raises on the "
+            "child-routes-without-stage3 combination)"
+        ),
+        decided_at=decided_at,
+        readers=readers,
+        fields=fields,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 11. MTPLX_FABLE_GRAPH_BUILD_OVERLAP (+ _LAYERS)
+# ---------------------------------------------------------------------------
+GRAPH_BUILD_OVERLAP_KEYS = (
+    "MTPLX_FABLE_GRAPH_BUILD_OVERLAP",
+    "MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS",
+)
+
+
+def _graph_build_overlap_verdict(context: Mapping[str, Any]) -> Verdict:
+    from mtplx import graph_build_overlap as lane
+
+    decided_at = (
+        "mtplx/graph_build_overlap.py:enabled() -- lru_cached, so the FIRST "
+        "read in the process fixes it"
+    )
+    readers = (
+        "mtplx/graph_build_overlap.py:enabled",
+        "mtplx/graph_build_overlap.py:layers",
+        "mtplx/qwen4_fixed_verify.py (fixed-M4 overlap split, at install)",
+    )
+    try:
+        armed = bool(lane.enabled())
+    except ValueError as exc:
+        # The reader raises on an unparseable spelling. Say so here rather
+        # than letting the first request carry the traceback.
+        return Verdict(
+            lane="graph_build_overlap",
+            keys=GRAPH_BUILD_OVERLAP_KEYS,
+            state=STATE_REFUSED,
+            reason=str(exc),
+            decided_at=decided_at,
+            readers=readers,
+            fields={"armed": None},
+        )
+    fields: dict[str, Any] = {"armed": armed, "default_layers": int(lane.DEFAULT_LAYERS)}
+    if not armed:
+        return Verdict(
+            lane="graph_build_overlap",
+            keys=GRAPH_BUILD_OVERLAP_KEYS,
+            state=STATE_OFF,
+            reason=f"{_env_note(lane.ENV_FLAG)} at {decided_at}",
+            decided_at=decided_at,
+            readers=readers,
+            fields=fields,
+        )
+    try:
+        layers = int(lane.layers())
+    except ValueError as exc:
+        return Verdict(
+            lane="graph_build_overlap",
+            keys=GRAPH_BUILD_OVERLAP_KEYS,
+            state=STATE_REFUSED,
+            reason=str(exc),
+            decided_at=decided_at,
+            readers=readers,
+            fields=fields,
+        )
+    fields["layers"] = layers
+    fields["items"] = sorted(lane.items())
+    return Verdict(
+        lane="graph_build_overlap",
+        keys=GRAPH_BUILD_OVERLAP_KEYS,
+        state=STATE_ARMED,
+        engages_at=(
+            "every compiled fixed-M4 verify whose plan can be partitioned at "
+            "the requested prefix depth"
+        ),
+        detail=(
+            f"{layers}-layer compiled prefix ({_env_note(lane.LAYERS_ENV)}, "
+            f"default {lane.DEFAULT_LAYERS}), items={fields['items'] or 'none'}; "
+            "host graph build runs behind the prefix's GPU time"
+        ),
+        decided_at=decided_at,
+        readers=readers,
+        fields=fields,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 12. MTPLX_GDN_BLOCKED_PREFILL
+# ---------------------------------------------------------------------------
+GDN_BLOCKED_PREFILL_KEY = "MTPLX_GDN_BLOCKED_PREFILL"
+
+
+def _gdn_blocked_prefill_verdict(context: Mapping[str, Any]) -> Verdict:
+    from mtplx.kernels import gdn_blocked_prefill as lane
+
+    decided_at = (
+        "mtplx/kernels/gdn_blocked_prefill.py:blocked_prefill_env_enabled() "
+        "-- an UNCACHED read on the prefill path; this verdict is its value "
+        "at install"
+    )
+    readers = (
+        "mtplx/kernels/gdn_blocked_prefill.py:blocked_prefill_env_enabled",
+        "mtplx/models/qwen4_exp.py (GDN prefill route selection)",
+    )
+    armed = bool(lane.blocked_prefill_env_enabled())
+    fields: dict[str, Any] = {"armed": armed}
+    try:
+        fields["min_route_t"] = int(lane._min_route_t())
+    except Exception as exc:
+        fields["min_route_t"] = f"unresolvable: {exc}"
+    if not armed:
+        return Verdict(
+            lane="gdn_blocked_prefill",
+            keys=(GDN_BLOCKED_PREFILL_KEY,),
+            state=STATE_OFF,
+            reason=f"{_env_note(GDN_BLOCKED_PREFILL_KEY)}",
+            decided_at=decided_at,
+            readers=readers,
+            fields=fields,
+        )
+    return Verdict(
+        lane="gdn_blocked_prefill",
+        keys=(GDN_BLOCKED_PREFILL_KEY,),
+        state=STATE_ARMED,
+        engages_at=(
+            f"any GDN prefill chunk of at least {fields['min_route_t']} tokens"
+        ),
+        detail=(
+            "blocked (chunked-scan) GDN prefill route in place of the "
+            f"per-token recurrence; min_route_t={fields['min_route_t']}"
+        ),
+        decided_at=decided_at,
+        readers=readers,
+        fields=fields,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Registration.  Order is the print order.
 # ---------------------------------------------------------------------------
 _register("opdiet", OPDIET_KEYS, _opdiet_verdict)
@@ -1083,6 +1280,20 @@ _register(
     _qsa_prefill_compile_rows_verdict,
 )
 _register(SESSION_BANK_LANE, (SESSION_BANK_KEY,), _session_bank_verdict)
+# W93: the retained stack is armed by DEFAULT for a Flash-Next serve
+# (mtplx/full_stack_env.py), and the program's rule is that every armed flag
+# prints an install-time verdict.  These three lanes had none.
+_register("route_kernel", ("MTPLX_FABLE_ROUTE_KERNEL",), _route_kernel_verdict)
+_register(
+    "graph_build_overlap",
+    GRAPH_BUILD_OVERLAP_KEYS,
+    _graph_build_overlap_verdict,
+)
+_register(
+    "gdn_blocked_prefill",
+    (GDN_BLOCKED_PREFILL_KEY,),
+    _gdn_blocked_prefill_verdict,
+)
 
 #: Lanes in print order.
 LANES: tuple[str, ...] = tuple(_REGISTRY)
