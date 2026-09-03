@@ -155,45 +155,128 @@ encoder, so there is no host sync between them.
 
 **3.9x fewer bytes, 637 MB/cycle removed, 48 fewer dispatches/cycle.**
 
-### What that is worth, against a MEASURED baseline
-
-The 2026-09-02 guarded run timed the production attention chain end to end at
-M=4 / 16K on the queued lane:
+### MEASURED, 2026-09-02 (second guarded run, M=4 / 16K / queued lane)
 
 | arm | ms/layer | ms/cycle (12 layers) | GB/s of 544 |
 | --- | ---: | ---: | ---: |
-| `production_gather_kernel` — fused gather + score + mask + softmax + cast + P@V | **0.230** | **2.764** | 309 |
-| `portable_take_reference` — same math and bytes, gathering via two `mx.take` | 0.542 | 6.504 | 131 |
+| `portable_take_reference` — parity reference only, NOT a baseline | 0.531 | 6.375 | 134 |
+| **`production_gather_kernel`** — the baseline the ABBA replaces | **0.226** | **2.712** | 315 |
+| **`native_bk128_dc32_s17`** — the split-K kernel | **0.094–0.099** | **1.13–1.19** | 204–216 |
 
-**`production_gather_kernel` is the baseline; the 6.5 ms figure is not.** The
-portable arm exists only as the numerics reference for parity: it moves the
-same bytes but through MLX's generic gather instead of the one-dispatch fused
-kernel, and is 2.35x slower for that reason alone. Quoting a speedup against it
-would inflate the result by more than the result.
+**2.4x the production attention chain, −1.58 ms/cycle**, or 4.0 % of a 39.7 ms
+cycle: about +2.7 tok/s at 68. That lands inside the 1.3–2.1 ms range predicted
+from the byte model before anything ran.
 
-Cross-check: `micro_qsa_m4.py` attributes 1.501 ms/cycle of that 2.764 to the
-fused gather plus the transposed-K copy — **54 % of the production attention
-chain is the materialisation this kernel deletes outright.**
+#### It is occupancy, exactly as feared, and the split is what fixed it
 
-Scaling the measured baseline by the byte ratio (217 vs 852 MB/cycle):
+| threadgroups | BK:DC | splits | ms/layer | x baseline | ms x tgs |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 32 | 128:32 | 4 | 0.325 | 0.70 | 10.4 |
+| 48 | 128:32 | 8 | 0.210 | 1.08 | 10.1 |
+| 72 | 128:32 | 16 | 0.149 | 1.52 | 10.7 |
+| 136 | 128:32 | 17 / 32 | 0.099 / 0.094 | 2.28 / 2.41 | 13.5 / 12.8 |
+| 136 | 64:64 | 17 / 32 | 0.098 / 0.090 | 2.30 / 2.51 | 13.3 / 12.3 |
 
-| if the kernel achieves | its ms/cycle | saving vs 2.764 | share of a 39.7 ms cycle |
-| --- | ---: | ---: | ---: |
-| 309 GB/s (the baseline's own rate) | 0.70 | 2.06 ms | 5.2 % |
-| 200 GB/s | 1.09 | 1.68 ms | 4.2 % |
-| 150 GB/s | 1.45 | 1.32 ms | 3.3 % |
+`ms x threadgroups` is flat to 72 and rises only ~25 % at 136 — near-perfect
+inverse scaling in the grid size. So the kernel is **occupancy-bound, not
+bandwidth-bound**: at 136 threadgroups it achieves 216 GB/s of 544 and still
+wins 2.4x, purely because it moves 0.28x the bytes. Below 4 threadgroups per
+core, cores sit idle; W50's single-pass grid would have been 8 threadgroups and
+is off the bottom of this table.
 
-So roughly **+2.2 to +3.6 tok/s at 68 tok/s**, and the 54 % that is pure
-materialisation is a firm floor on the opportunity.
+`bk128_dc64` is the outlier at 136 tgs (0.123 ms). Its threadgroup memory is
+`max(BK*LDV, DC*LDK)*2 + Qs + selected` = 18.4 + 2.3 + 0.5 = **21 KB**, against
+~12 KB for `128:32` and ~11.8 KB for `64:64`, so fewer threadgroups stay
+resident per core. Same grid, worse residency.
 
-The risk is the other direction. At M=4 with 6 splits the grid is 48
-threadgroups of 64 threads on 40 cores — better than 8, still thin. If the
-kernel turns out latency-bound rather than bandwidth-bound, the deleted bytes
-do not convert. That is what the split sweep in
-`scripts/fable/micro_qsa_sparse_decode.py` is for, and it is why nothing here
-may be reported as a win before the 16K ABBA: W16 turned an isolated -1.9 ms
-into 0 end-to-end, and W19's lightning lane lost to dense at 16K after looking
-good in isolation.
+#### The noise floor, measured for free
+
+At BK=128 there are 17 tiles over the 2,051 selected keys, so split targets 17
+and 32 **clamp to the same 17-split, 136-threadgroup grid** — identical work,
+measured twice. They differ by 5.3 %. BK=64 s17/s32 likewise (8.2 %); BK=256
+s16/s17/s32 likewise (3.4 %).
+
+**The bench's noise floor is 3–8 %.** Averaging the duplicate pairs gives
+`64:64` at 0.0941 and `128:32` at 0.0966 — a 2.6 % gap, well inside it. They
+are the same performance class and no arm may be called a winner on a margin
+under ~8 %.
+
+#### Untested and worth one more sweep point
+
+BK=64 has 33 tiles, so 17 and 32 both clamp to 17 splits; **33 is the first
+value that reaches 33 splits = 264 threadgroups**, and the first sweep never
+covered it. Given the inverse scaling above it is the obvious next point, and
+it is now in `SPLIT_TARGETS`. It does not block the ABBA.
+
+### Parity: the delta is the REFERENCE's, and the gate now says so
+
+Every one of the twenty configurations reported the same parity to four
+significant figures — max abs `1.953e-3` (= `2**-9` exactly), rel L2
+`4.78e-3`, top-1 `1.0000` — across BK 64/128/256, DC 32/64 and splits 4..32.
+DC changes the fp32 score contraction order and the split count changes the
+online-softmax merge tree. A delta that does not move across either is not the
+kernel's.
+
+The shipped path carries two bf16 roundings this kernel does not:
+
+1. **the scores.** `mx.matmul(q_view, k_view)` has bf16 operands, so its output
+   is bf16 — the shipped path rounds the scores *before* `.astype(float32) *
+   scale` and the softmax (the census shows this as `gemv_bfloat16...` feeding
+   `block_softmax_float32`). A relative score error `u = 2**-9` shifts a logit
+   by `u*|x|`, and with scaled logits of order 5 that is ~`2e-2` relative on
+   the probabilities.
+2. **the probabilities.** `probs.astype(bfloat16)` before P@V (census op 17,
+   `vn_copyfloat32bfloat16`): another `u = 2e-3`.
+
+So (1) should dominate (2) by roughly an order of magnitude, and the measured
+`4.78e-3` sits between the two predictions. That is a prediction, so it is
+**tested rather than asserted**: the micro now runs a three-rung reference
+ladder — `shipped` (both casts), `shipped_fp32_probs` (probability cast
+removed), `fp32` (both removed) — and reports the gaps.
+
+The gate follows from that, and it is two gates because a threshold on
+kernel-vs-shipped is really a threshold on how much bf16 rounding the *shipped*
+path does, which no improvement to this kernel can move:
+
+| vs | max abs | rel L2 | top-1 | why |
+| --- | ---: | ---: | ---: | --- |
+| `fp32_reference` (DECIDES) | 2 bf16 ulp | 5e-4 | 0.98 | the only differences left are fp32 reassociation (`sqrt(2051)*2**-24` = 2.7e-6 relative) and one bf16 store, so both sides round the same real number and agree except where it straddles a boundary |
+| `stock_reference` (SANITY) | — | 5e-2 | 0.98 | bounds the shipped path's own quantisation, derived at ~2e-2 above; an order of magnitude over the measured 4.78e-3 |
+
+The tight bar is deliberately **below** the measured 4.78e-3: if the
+attribution is wrong and the kernel really does carry that delta, the fp32
+comparison fails and says so. A gate set above it would certify nothing.
+
+Neither is a quality gate. This kernel is rounding class; whether the
+difference matters is answered by model-level greedy-token agreement plus a
+full HumanEval run.
+
+### M=1 confirmed dead, by crash
+
+The M=1 cell died at `k_sel.swapaxes(-1,-2).reshape(...)`:
+`Cannot reshape array of size 4202496 into shape (1,2,1,1,256,2052)`. 4,202,496
+is `2*4*2052*256` — the shipped fused K/V gather compiles `_ROWS = 4`
+(`kernels/qwen4_qsa_m4_fused_kv_gather.py:82`) and emits four rows whatever it
+is handed. There is no M=1 production attention to baseline against, which is
+the same conclusion section 2 reached from the census. The arm now refuses
+`rows != 4` up front and the M=1 cell is opt-in (`--include-m1`).
+
+### The ABBA candidate
+
+```
+MTPLX_FABLE_QSA_SPARSE_DECODE=1
+MTPLX_FABLE_QSA_SPARSE_DECODE_TILE=128:32
+MTPLX_FABLE_QSA_SPARSE_DECODE_SPLITS=17
+```
+
+`128:32` over the statistically tied `64:64` because it is the tile the prefill
+lane already defaults to, and because at BK=128 `splits=17` is exactly one tile
+per threadgroup — the smallest value that reaches the full 136-threadgroup grid
+and the point past which the knob stops doing anything. Both are now the
+built-in defaults, so the two `_TILE`/`_SPLITS` lines are belt-and-braces and
+`MTPLX_FABLE_QSA_SPARSE_DECODE=1` alone selects the same configuration.
+
+`MTPLX_FABLE_QSA_SPARSE_DRAFT` stays off: no target.
 
 ## 3a. The nanobind ABI defect (found 2026-09-02, inherited from W50)
 
@@ -294,12 +377,12 @@ The gate is asymmetric, per `mtplx/kernels/qwen4_m4_route.py`:
 * **Contract failure RAISES.** Decided in `TensorOffsetQSACache.__init__` — cache
   install, model build time, outside any `mx.compile` trace.
 * **Parity failure DISABLES** for the process and records the deltas. The install
-  probe runs four synthetic cells (M=4 and M=1, one long-context and one just
-  past the crossover so invisible ids really appear) against
-  `qsa_sparse_decode.stock_reference`, a transcription of the shipped
-  rows-gather lane. Gates: max abs diff <= 8 bf16 ulp at the reference's own
-  magnitude, relative L2 <= 2e-3, head-dim top-1 agreement >= 0.98. These are a
-  sanity gate, not the quality gate.
+  probe runs synthetic cells (one long-context and one just past the crossover
+  so invisible ids really appear) against BOTH references — the tight bar
+  against `fp32_reference` decides, the loose one against `stock_reference` is
+  a sanity bound. Thresholds and their derivations are in the "Parity" section
+  above and in the module's own gate note. These are sanity gates, not the
+  quality gate.
 
 Engagement line: `mtplx.kernels.qsa_sparse_decode.engagement()` reports
 `verify_kernel` / `draft_kernel` call counts, the install verdict and the probe

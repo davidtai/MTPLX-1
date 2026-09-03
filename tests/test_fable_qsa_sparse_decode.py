@@ -24,7 +24,9 @@ Numeric Metal parity belongs to the operator-controlled guarded window; see
 
 from __future__ import annotations
 
+import json
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -456,9 +458,12 @@ def test_tile_flag_accepts_only_instantiated_tiles():
 
 
 def test_splits_flag_is_bounded():
-    from mtplx.runtime_options import _parse_sparse_decode_splits
+    from mtplx.runtime_options import (
+        FABLE_QSA_SPARSE_DECODE_DEFAULT_SPLITS as default,
+        _parse_sparse_decode_splits,
+    )
 
-    assert _parse_sparse_decode_splits(None) == 8
+    assert _parse_sparse_decode_splits(None) == default == 17
     assert _parse_sparse_decode_splits("17") == 17
     for bad in ("0", "65", "-1", "eight"):
         with pytest.raises(ValueError):
@@ -482,9 +487,133 @@ def test_engagement_reports_a_pending_install_as_not_installed():
 
 
 def test_parity_thresholds_are_stated_not_implicit():
-    assert lane.PARITY_MAX_ABS_ULPS == 8.0
-    assert lane.PARITY_MAX_REL_L2 == 2.0e-3
+    assert lane.PARITY_FP32_MAX_ABS_ULPS == 2.0
+    assert lane.PARITY_FP32_MAX_REL_L2 == 5.0e-4
+    assert lane.PARITY_SHIPPED_MAX_REL_L2 == 5.0e-2
     assert lane.PARITY_MIN_TOP1 == 0.98
+
+
+# ---------------------------------------------------------------------------
+# 7. what the 2026-09-02 runs settled
+# ---------------------------------------------------------------------------
+def test_the_tight_gate_is_tighter_than_the_measured_shipped_delta():
+    """The fp32 gate must be able to FAIL if the attribution is wrong.
+
+    Every configuration measured rel_l2 4.78e-3 against the shipped path.  If
+    that delta really is the shipped path's own bf16 score and probability
+    casts, the same comparison against the fp32 reference collapses to output
+    rounding.  A gate set above 4.78e-3 could not tell those apart, so it
+    would certify nothing.
+    """
+
+    measured_vs_shipped = 4.78e-3
+    assert lane.PARITY_FP32_MAX_REL_L2 < measured_vs_shipped
+    # ... while the loose bar stays an order of magnitude above it, because it
+    # bounds the reference's quantisation, not the kernel's error.
+    assert lane.PARITY_SHIPPED_MAX_REL_L2 > 10 * measured_vs_shipped
+
+
+def test_the_reference_ladder_has_three_distinct_rungs():
+    import inspect
+
+    src = inspect.getsource(lane.reference_attention)
+    # The shipped rung must keep BOTH bf16 roundings...
+    assert "probs = probs.astype(queries.dtype)" in src
+    # ...and the fp32 rung must remove them by UPCASTING (exact), never by
+    # changing the operands.
+    assert "q_view = q_view.astype(mx.float32)" in src
+    assert "v_view = v_view.astype(mx.float32)" in src
+    for fn, scores, probs in (
+        (lane.stock_reference, False, False),
+        (lane.shipped_fp32_probs_reference, False, True),
+        (lane.fp32_reference, True, True),
+    ):
+        wrapped = inspect.getsource(fn)
+        assert f"fp32_scores={scores}" in wrapped
+        assert f"fp32_probs={probs}" in wrapped
+
+
+def test_every_reference_rung_returns_the_query_dtype():
+    """All three must be comparable element for element against bf16 output."""
+
+    import inspect
+
+    src = inspect.getsource(lane.reference_attention)
+    assert src.rstrip().endswith(".astype(queries.dtype)")
+
+
+def test_the_default_split_target_reaches_one_tile_per_threadgroup():
+    """17 is the tile count at BK=128, so it is the knob's saturation point."""
+
+    from mtplx.runtime_options import (
+        FABLE_QSA_SPARSE_DECODE_DEFAULT_SPLITS as default,
+    )
+
+    n_tiles, per_split, n_splits = qsa_sparse_gqa_decode_split_geometry(
+        lane.SELECTED_TOKENS, 128, default
+    )
+    assert (n_tiles, per_split, n_splits) == (17, 1, 17)
+    assert lane.VERIFY_ROWS * lane.KV_HEADS * n_splits == 136
+
+
+@pytest.mark.parametrize("larger", [18, 32, 33, 64])
+def test_split_targets_above_the_tile_count_are_the_same_configuration(larger):
+    """Why the first sweep's s17 and s32 rows are one config measured twice.
+
+    Their 5.3% spread is therefore the bench's noise floor, not a result, and
+    nothing may be called a winner on a margin under it.
+    """
+
+    at_17 = qsa_sparse_gqa_decode_split_geometry(lane.SELECTED_TOKENS, 128, 17)
+    assert qsa_sparse_gqa_decode_split_geometry(
+        lane.SELECTED_TOKENS, 128, larger
+    ) == at_17
+
+
+def test_bk64_needs_33_splits_to_saturate_and_that_is_in_the_sweep():
+    """BK=64 has 33 tiles, so 17 and 32 both clamp to 17 -- 33 does not."""
+
+    at_32 = qsa_sparse_gqa_decode_split_geometry(lane.SELECTED_TOKENS, 64, 32)
+    at_33 = qsa_sparse_gqa_decode_split_geometry(lane.SELECTED_TOKENS, 64, 33)
+    assert at_32[2] == 17 and at_33[2] == 33
+    assert lane.VERIFY_ROWS * lane.KV_HEADS * at_33[2] == 264
+    harness = (ROOT / "scripts" / "fable" / "micro_qsa_sparse_decode.py").read_text()
+    assert "SPLIT_TARGETS = (4, 8, 16, 17, 32, 33, 64)" in harness
+
+
+def test_the_lane_and_the_native_wrapper_agree_on_the_default():
+    from mtplx import native
+    from mtplx.runtime_options import (
+        FABLE_QSA_SPARSE_DECODE_DEFAULT_SPLITS as default,
+    )
+
+    assert native._DEFAULT_KEY_SPLITS == default
+    assert native._DEFAULT_TILE == (128, 32)
+
+
+def test_the_micro_refuses_the_production_gather_arm_off_the_m4_geometry():
+    """kernels/qwen4_qsa_m4_fused_kv_gather.py compiles _ROWS = 4.
+
+    Handing it a 1-row cell made it emit 4 rows anyway, and the crash landed
+    three arms later at the reshape, after the M=4 results were already in.
+    """
+
+    gather = (
+        ROOT / "mtplx" / "kernels" / "qwen4_qsa_m4_fused_kv_gather.py"
+    ).read_text()
+    assert "_ROWS = 4" in gather
+    harness = (ROOT / "scripts" / "fable" / "micro_qsa_sparse_decode.py").read_text()
+    assert "if rows != lane.VERIFY_ROWS:" in harness
+    # and the refusal must come BEFORE the reshape that used to raise
+    body = harness.split("def gather_kernel_arm")[1]
+    assert body.index("if rows != lane.VERIFY_ROWS:") < body.index("swapaxes(-1, -2)")
+
+
+def test_the_m1_cell_is_opt_in():
+    harness = (ROOT / "scripts" / "fable" / "micro_qsa_sparse_decode.py").read_text()
+    assert '"--include-m1"' in harness
+    assert 'cells = [("verify-m4-16k", 4, 16_380, CAPACITY)]' in harness
+    assert "if args.include_m1:" in harness
 
 
 # ---------------------------------------------------------------------------
@@ -593,3 +722,308 @@ def test_the_wrappers_omit_a_none_stream():
     assert source.count("if stream is None:") == 2
     assert "stream=stream)" in source
     assert "stream=stream,\n    )" not in source
+
+
+# ---------------------------------------------------------------------------
+# 8. the micro's parity-gate ladder
+#
+# The two-gate ladder renamed PARITY_MAX_ABS_ULPS -> PARITY_FP32_MAX_ABS_ULPS
+# (and PARITY_MAX_REL_L2 -> PARITY_FP32_MAX_REL_L2), and
+# scripts/fable/micro_qsa_sparse_decode.py kept reading the old names in its
+# report header -- so it crashed with AttributeError at startup, INSIDE a
+# guarded window, after the operator had already taken the box.  These pin the
+# gate-building surface so that class of drift fails here instead.
+#
+# Nothing below dispatches Metal: the gate builders are fed stubbed numbers,
+# and the one call to the micro's own ``compare`` runs on the CPU stream.
+# ---------------------------------------------------------------------------
+MICRO = ROOT / "scripts" / "fable" / "micro_qsa_sparse_decode.py"
+
+
+def _load_micro():
+    spec = importlib.util.spec_from_file_location("micro_qsa_sparse_decode", MICRO)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+micro = _load_micro()
+
+
+#: Comfortably inside every threshold, so a test can break exactly one.
+PASSING_STATS = {
+    "vs_fp32": {"max_abs_bf16_ulps": 1.0, "rel_l2": 1.0e-4, "top1": 1.0},
+    "vs_shipped": {"max_abs_bf16_ulps": 9.0, "rel_l2": 4.78e-3, "top1": 1.0},
+}
+
+
+def _stats(reference=None, key=None, value=None):
+    """The passing stats, optionally with ONE statistic pushed out of bounds."""
+
+    out = {k: dict(v) for k, v in PASSING_STATS.items()}
+    if reference is not None:
+        out[reference][key] = value
+    return out
+
+
+def test_the_micro_no_longer_reads_the_pre_ladder_constant_names():
+    """The exact crash: a name the lane module no longer defines."""
+
+    source = MICRO.read_text()
+    for gone in ("PARITY_MAX_ABS_ULPS", "PARITY_MAX_REL_L2"):
+        assert not re.search(rf"lane\.{gone}\b", source)
+        assert not hasattr(lane, gone)
+
+
+def test_every_gate_names_a_threshold_the_lane_module_actually_defines():
+    """Read by name at call time -- never copied, so a rename cannot drift."""
+
+    for spec in micro.GATE_SPECS:
+        assert hasattr(lane, spec.threshold_name), spec.threshold_name
+        assert micro.gate_threshold(spec) == float(
+            getattr(lane, spec.threshold_name)
+        )
+
+
+def test_the_micro_gates_are_exactly_the_checks_install_runs():
+    """A rung added to the lane's ladder must not silently go unreported."""
+
+    import inspect
+
+    used = set(re.findall(r"PARITY_[A-Z0-9_]+", inspect.getsource(lane.install)))
+    assert used == {spec.threshold_name for spec in micro.GATE_SPECS}
+    # ...and both references are represented, tight and loose.
+    assert {spec.reference for spec in micro.GATE_SPECS} == {
+        "vs_fp32",
+        "vs_shipped",
+    }
+
+
+def test_the_ladder_summary_states_both_rungs_before_any_measurement():
+    ladder = micro.parity_gate_ladder()
+    assert json.loads(json.dumps(ladder)) == ladder
+    assert set(ladder["gates"]) == {spec.name for spec in micro.GATE_SPECS}
+    for spec in micro.GATE_SPECS:
+        row = ladder["gates"][spec.name]
+        assert row["threshold_name"] == spec.threshold_name
+        assert row["threshold"] == float(getattr(lane, spec.threshold_name))
+        assert row["comparison"] in ("<=", ">=")
+        assert row["rung"] in ("tight", "loose")
+    assert ladder["gates"]["fp32_rel_l2"]["rung"] == "tight"
+    assert ladder["gates"]["shipped_rel_l2"]["rung"] == "loose"
+
+
+def test_each_gate_reports_threshold_observed_and_pass():
+    stats = _stats()
+    gates = micro.parity_gates(stats["vs_fp32"], stats["vs_shipped"])
+    assert set(gates) == {spec.name for spec in micro.GATE_SPECS}
+    for name, gate in gates.items():
+        assert set(gate) >= {
+            "threshold_name",
+            "threshold",
+            "comparison",
+            "observed",
+            "pass",
+            "reference",
+            "rung",
+            "statistic",
+        }, name
+        assert gate["pass"] is True
+    assert micro.gate_verdict(gates) is True
+    assert micro.gate_failures(gates) == []
+
+
+@pytest.mark.parametrize(
+    "gate_name,reference,key,bad",
+    [
+        ("fp32_max_abs_ulps", "vs_fp32", "max_abs_bf16_ulps", 2.5),
+        ("fp32_rel_l2", "vs_fp32", "rel_l2", 6.0e-4),
+        ("fp32_top1", "vs_fp32", "top1", 0.97),
+        ("shipped_rel_l2", "vs_shipped", "rel_l2", 6.0e-2),
+        ("shipped_top1", "vs_shipped", "top1", 0.97),
+    ],
+)
+def test_each_gate_fails_on_its_own_statistic(gate_name, reference, key, bad):
+    stats = _stats(reference, key, bad)
+    gates = micro.parity_gates(stats["vs_fp32"], stats["vs_shipped"])
+    failed = {n for n, g in gates.items() if not g["pass"]}
+    # top-1 is shared by both rungs, so breaking one reference's top-1 must
+    # break that rung's gate and ONLY that one.
+    assert failed == {gate_name}, failed
+    assert micro.gate_verdict(gates) is False
+    lines = micro.gate_failures(gates)
+    assert len(lines) == 1
+    assert gates[gate_name]["threshold_name"] in lines[0]
+    assert gates[gate_name]["observed"] == bad
+
+
+def test_the_loose_rung_has_no_ulp_gate():
+    """The shipped path's bf16 casts move elements by many ulp by construction."""
+
+    stats = _stats("vs_shipped", "max_abs_bf16_ulps", 1.0e6)
+    gates = micro.parity_gates(stats["vs_fp32"], stats["vs_shipped"])
+    assert micro.gate_verdict(gates) is True
+
+
+def test_the_ulp_column_is_read_under_either_spelling():
+    """``lane._compare`` says max_abs_ulps; this script says max_abs_bf16_ulps."""
+
+    vs_fp32 = {"max_abs_ulps": 1.0, "rel_l2": 1.0e-4, "top1": 1.0}
+    gates = micro.parity_gates(vs_fp32, dict(PASSING_STATS["vs_shipped"]))
+    assert gates["fp32_max_abs_ulps"]["observed"] == 1.0
+    assert micro.gate_verdict(gates) is True
+
+
+def test_a_missing_statistic_is_a_hard_error_not_a_skipped_gate():
+    with pytest.raises(KeyError, match="fp32_max_abs_ulps"):
+        micro.parity_gates(
+            {"rel_l2": 1.0e-4, "top1": 1.0}, dict(PASSING_STATS["vs_shipped"])
+        )
+
+
+def test_the_micro_compare_emits_every_statistic_the_gates_read():
+    """CPU stream only -- this is the key-name contract, not a numeric check."""
+
+    import mlx.core as mx
+
+    with mx.stream(mx.cpu):
+        ref = mx.zeros((2, 4), dtype=mx.float32)
+        got = mx.zeros((2, 4), dtype=mx.float32)
+        stats = micro.compare(ref, got)
+    for spec in micro.GATE_SPECS:
+        assert any(k in stats for k in spec.statistics), spec.name
+    gates = micro.parity_gates(stats, stats)
+    assert micro.gate_verdict(gates) is True
+
+
+# --- the verdict roll-up, which is what the process status is --------------
+def _arm(passed: bool):
+    """One arm's report body, as ``run_cell`` builds it."""
+
+    stats = _stats() if passed else _stats("vs_fp32", "rel_l2", 1.0)
+    gates = micro.parity_gates(stats["vs_fp32"], stats["vs_shipped"])
+    return {
+        "parity": {
+            "gates": gates,
+            "gate": micro.gate_verdict(gates),
+            "gate_failures": micro.gate_failures(gates),
+        }
+    }
+
+
+def test_a_cell_verdict_ignores_skipped_arms_but_not_failed_ones():
+    arms = {
+        "native_bk128_dc32_s17": _arm(True),
+        "native_bk64_dc64_s33": _arm(False),
+        "native_bk256_dc32_s4": {"skipped": "tile not instantiated"},
+    }
+    verdict = micro.cell_verdict(arms)
+    assert verdict["arms_measured"] == [
+        "native_bk128_dc32_s17",
+        "native_bk64_dc64_s33",
+    ]
+    assert verdict["arms_failed"] == ["native_bk64_dc64_s33"]
+    assert verdict["pass"] is False
+    assert verdict["failures"]["native_bk64_dc64_s33"]
+
+
+def test_exit_code_is_zero_only_when_every_measured_arm_held():
+    cells = {"verify-m4-16k": {"parity_verdict": micro.cell_verdict({"a": _arm(True)})}}
+    verdict = micro.roll_up_verdict(cells)
+    assert verdict == {
+        "arms_measured": ["verify-m4-16k/a"],
+        "arms_failed": [],
+        "pass": True,
+    }
+    assert micro.verdict_exit_code(verdict) == 0
+
+
+def test_exit_code_is_one_when_a_gate_failed():
+    cells = {
+        "verify-m4-16k": {
+            "parity_verdict": micro.cell_verdict({"a": _arm(True), "b": _arm(False)})
+        }
+    }
+    verdict = micro.roll_up_verdict(cells)
+    assert verdict["arms_failed"] == ["verify-m4-16k/b"]
+    assert verdict["pass"] is False
+    assert micro.verdict_exit_code(verdict) == 1
+
+
+def test_exit_code_is_three_when_nothing_was_measured():
+    """No arm ran, so the ladder returned no verdict -- that is not a pass."""
+
+    cells = {
+        "verify-m4-16k": {
+            "parity_verdict": micro.cell_verdict({"a": {"skipped": "no kernel"}})
+        }
+    }
+    verdict = micro.roll_up_verdict(cells)
+    assert verdict["pass"] is False
+    assert micro.verdict_exit_code(verdict) == 3
+
+
+def test_main_returns_the_ladder_verdict_rather_than_a_constant_zero():
+    import inspect
+
+    src = inspect.getsource(micro.main)
+    assert "verdict_exit_code(" in src
+    assert "return status" in src
+    assert "\n    return 0\n" not in src
+
+
+def test_main_builds_its_report_header_and_writes_it(tmp_path, monkeypatch):
+    """The exact crash site: ``main`` reading the ladder's thresholds.
+
+    The AttributeError that broke W68 was raised while building
+    ``report[...]``, AFTER both availability guards -- i.e. inside a guarded
+    window, with the box already taken.  Everything that dispatches Metal is
+    stubbed here; what runs is the header build, the roll-up and the status.
+    """
+
+    monkeypatch.setattr(micro, "native_qsa_available", lambda: True)
+    monkeypatch.setattr(micro.mx.metal, "is_available", lambda: True)
+    monkeypatch.setattr(
+        micro,
+        "run_cell",
+        lambda name, rows, q_offset, total, args: {
+            "arms": {"native_bk128_dc32_s17": _arm(True)},
+            "parity_verdict": micro.cell_verdict(
+                {"native_bk128_dc32_s17": _arm(True)}
+            ),
+        },
+    )
+    out = tmp_path / "report.json"
+    monkeypatch.setattr(
+        sys, "argv", ["micro", "--out", str(out), "--tiles", "128:32", "--splits", "17"]
+    )
+    assert micro.main() == 0
+
+    report = json.loads(out.read_text())
+    ladder = report["parity_ladder"]["gates"]
+    assert ladder["fp32_max_abs_ulps"]["threshold_name"] == "PARITY_FP32_MAX_ABS_ULPS"
+    assert ladder["fp32_max_abs_ulps"]["threshold"] == lane.PARITY_FP32_MAX_ABS_ULPS
+    assert ladder["fp32_rel_l2"]["threshold"] == lane.PARITY_FP32_MAX_REL_L2
+    assert ladder["shipped_rel_l2"]["threshold"] == lane.PARITY_SHIPPED_MAX_REL_L2
+    assert ladder["shipped_top1"]["threshold"] == lane.PARITY_MIN_TOP1
+    assert report["parity_verdict"]["pass"] is True
+    # ...and the old single-gate block is gone, not merely shadowed.
+    assert "parity_gates" not in report
+
+
+def test_main_returns_one_when_the_stubbed_arm_misses_a_gate(tmp_path, monkeypatch):
+    monkeypatch.setattr(micro, "native_qsa_available", lambda: True)
+    monkeypatch.setattr(micro.mx.metal, "is_available", lambda: True)
+    monkeypatch.setattr(
+        micro,
+        "run_cell",
+        lambda name, rows, q_offset, total, args: {
+            "arms": {"native_bk128_dc32_s17": _arm(False)},
+            "parity_verdict": micro.cell_verdict(
+                {"native_bk128_dc32_s17": _arm(False)}
+            ),
+        },
+    )
+    monkeypatch.setattr(sys, "argv", ["micro", "--tiles", "128:32", "--splits", "17"])
+    assert micro.main() == 1

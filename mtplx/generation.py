@@ -81,12 +81,15 @@ from .fable_device_k20 import (
 from .fable_draft_k20_prescatter import (
     DraftK20PrescatterIneligible,
     claim_draft_route as _fable_draft_k20_prescatter_claim,
+    greedy_chain_step as _fable_draft_k20_prescatter_greedy_step,
     is_enabled as _fable_draft_k20_prescatter_enabled,
     read_draft as _fable_draft_k20_prescatter_read,
     release_draft_route as _fable_draft_k20_prescatter_release,
 )
 from .fable_prefill_chunk import (
+    COHERENCE_NARROW_EAGER,
     DEFAULT_CHUNK_SIZE as _FABLE_DEFAULT_CHUNK_SIZE,
+    NARROW_EAGER_COUNTER,
     assert_prefill_chunk_coherent,
     guard_prefill_chunk_geometry,
     summarize_spans,
@@ -401,9 +404,10 @@ _FABLE_BLOCK_VERIFY = _fable_block_verify_enabled()
 # this module existed -- same selector, same syncs, same uniforms, same order.
 #
 # When on (and the request is eligible -- see
-# `fable_device_k20.claim_request_route`, which RAISES rather than falling back
-# silently) the per-cycle draft chain runs its three MTP steps without a host
-# round trip: selection is the exact device top-20 kernel and the drafted token
+# `fable_device_k20.claim_request_route`, which DECLINES to the stock selector
+# for a request shape it does not serve and raises only for an install-time
+# contract violation) the per-cycle draft chain runs its three MTP steps
+# without a host round trip: selection is the exact device top-20 kernel and the drafted token
 # is sampled on device from the same PCG64 double `rng.choice` would have
 # consumed.  Sync count per cycle drops from four (three draft selections +
 # the target support) to two (one chain materialisation + the target support).
@@ -443,9 +447,10 @@ _FABLE_DEVICE_DRAFT_CHAIN = _fable_device_draft_chain_enabled()
 # the one draft-read site below is behind `is not None`, so the retained stock
 # lane runs the code it ran before this module existed.
 #
-# When on (and the request is eligible -- the claim RAISES rather than falling
-# back) each draft step builds its K20 support from the FR-Spec head's 65,536
-# compact row instead of the 248,320 scattered one: no `put_along_axis`, a
+# When on (and the request is eligible -- the claim DECLINES to the stock draft
+# read for a request shape it does not serve, and raises only for an
+# install-time contract violation) each draft step builds its K20 support from
+# the FR-Spec head's 65,536 compact row instead of the 248,320 scattered one: no `put_along_axis`, a
 # 65,536-lane `argpartition` and `logsumexp` instead of 248,320-lane ones, and
 # the same `(ids, probs)` support because the ranked id table is strictly
 # ascending.  See that module's docstring for the exactness argument.
@@ -745,8 +750,9 @@ def _guard_prefill_chunk_geometry(
 
     The coherence check reads the CONFIGURED width, not the widest observed
     span: a short prompt or a GDN-boundary tail grid legitimately cuts spans
-    below the configured chunk, and refusing those would break every
-    sub-chunk request.
+    below the configured chunk, and only the configured width tells the
+    mis-paired serve (refused) apart from a partial chunk (admitted, and
+    counted as an eager-selector fallback).
     """
 
     chunks, widest = summarize_spans(spans)
@@ -756,7 +762,14 @@ def _guard_prefill_chunk_geometry(
     configured = (
         _prefill_chunk_size() if chunk_size is None else max(1, int(chunk_size))
     )
-    assert_prefill_chunk_coherent(configured)
+    if assert_prefill_chunk_coherent(configured) == COHERENCE_NARROW_EAGER:
+        # A chunk narrower than MTPLX_QSA_PREFILL_COMPILE_ROWS (a warm-up
+        # ladder rung, a restored suffix) is served by the eager selector by
+        # design. Legal, but it is not the compiled lane, so put it on the
+        # receipt instead of leaving the demotion invisible.
+        rt.diagnostic_counters[NARROW_EAGER_COUNTER] = (
+            int(rt.diagnostic_counters.get(NARROW_EAGER_COUNTER, 0)) + 1
+        )
     plan = guard_prefill_chunk_geometry(
         chunk_size=widest,
         total_tokens=total,
@@ -769,6 +782,190 @@ def _guard_prefill_chunk_geometry(
             plan.projected_peak_bytes
         )
         rt.diagnostic_counters["prefill_chunk_plan_width"] = int(plan.chunk_size)
+
+
+def _text_model_args(rt: MTPLXRuntime):
+    """The served ``TextArgs``, or None for a family that has none."""
+
+    node = getattr(rt, "model", None)
+    for _ in range(4):
+        if node is None:
+            return None
+        args = getattr(node, "args", None)
+        if args is not None and hasattr(args, "num_experts_per_tok"):
+            return args
+        node = getattr(node, "language_model", None) or getattr(node, "model", None)
+    return None
+
+
+def _expert_major_groups(
+    rt: MTPLXRuntime,
+    spans: Sequence[tuple[int, int]],
+    *,
+    chunk_size: int | None,
+    capture_boundaries: bool,
+    vision_splice: Any | None,
+) -> tuple[list[list[tuple[int, int]]], Any]:
+    """Partition prefill spans into expert-major groups (or one span each).
+
+    ``MTPLX_FABLE_PREFILL_EXPERT_MAJOR``, off by default and decided ONCE per
+    request, before any kernel is submitted -- the same construction-time
+    contract as ``mtplx.fable_prefill_chunk``.  Returns
+    ``(groups, plan_or_None)``; ``plan is None`` means the shipped chunk-major
+    loop runs and the process is byte-identical to an unarmed one.
+
+    Every way this can decline bumps a counter.  A lane that quietly serves
+    the control while wearing the candidate's label is the one failure an A/B
+    cannot survive.
+    """
+
+    from mtplx import fable_prefill_expert_major as expert_major
+
+    singles = [[span] for span in spans]
+    if not expert_major.enabled():
+        return singles, None
+    if not spans:
+        expert_major.count("declined_no_spans")
+        return singles, None
+    if vision_splice is not None:
+        raise expert_major.ExpertMajorRefusal(
+            f"{expert_major.ENV_FLAG}=1 does not compose with a vision splice"
+        )
+    policy = expert_major.boundary_policy()
+    if capture_boundaries and policy == "refuse":
+        # Layer-major never holds all 48 layers' recurrent state at an
+        # interior chunk end, so per-chunk GDN boundary capture and grouping
+        # are mutually exclusive.  Default is to keep the boundaries.
+        expert_major.count("refused_boundary_capture")
+        return singles, None
+    args = _text_model_args(rt)
+    if args is None:
+        expert_major.count("declined_no_model_args")
+        return singles, None
+    if getattr(rt, "model", None) is None or not hasattr(
+        rt.model, "forward_prefill_group"
+    ):
+        raise expert_major.ExpertMajorRefusal(
+            f"{expert_major.ENV_FLAG}=1 on a model with no group schedule"
+        )
+
+    from mtplx.fable_prefill_chunk import (
+        _default_resident_bytes,
+        resolve_budget_bytes,
+    )
+
+    configured = (
+        _prefill_chunk_size() if chunk_size is None else max(1, int(chunk_size))
+    )
+    plan = expert_major.plan_group(
+        chunk_rows=configured,
+        top_k=int(args.num_experts_per_tok),
+        num_experts=int(args.num_experts),
+        hidden=int(args.hidden_size),
+        moe_intermediate=int(args.moe_intermediate_size),
+        hc_count=int(args.hc_count),
+        budget_bytes=resolve_budget_bytes(),
+        resident_bytes=int(_default_resident_bytes() or 0),
+        policy=policy,
+    )
+    rt.diagnostic_counters["prefill_expert_major_group"] = int(plan.group)
+    rt.diagnostic_counters["prefill_expert_major_rows_per_expert"] = int(
+        plan.rows_per_expert
+    )
+    rt.diagnostic_counters["prefill_expert_major_delta_bytes"] = int(
+        plan.delta_bytes
+    )
+    if not plan.engaged:
+        expert_major.count("declined_budget")
+        return singles, plan
+    groups = expert_major.group_spans(spans, plan.group, chunk_rows=configured)
+    expert_major.count("groups", len(groups))
+    expert_major.count("grouped_chunks", sum(len(g) for g in groups if len(g) > 1))
+    if capture_boundaries:
+        expert_major.count(
+            "boundaries_coarsened", len(spans) - len(groups)
+        )
+    return groups, plan
+
+
+def _prefill_group_forward(
+    rt: MTPLXRuntime,
+    body_array,
+    group: Sequence[tuple[int, int]],
+    cache,
+    *,
+    base_hidden_variant: str,
+    final_logits_only: bool,
+    history_window_tokens: int | None,
+    history_start_token_index: int,
+    cursor: int,
+    vision_splice: Any | None,
+) -> list[tuple[Any, Any]]:
+    """One forward for a group of chunks; ``[(logits, hidden)]`` in order.
+
+    A one-span group is the shipped chunk-major call, expression for
+    expression -- including the cache-only route for a chunk whose hidden the
+    history window does not need, and the same three-way eval.  Only a
+    multi-span group takes the layer-major schedule, which always returns
+    hidden (it is the ``_last_widened`` the trunk already built).
+    """
+
+    if len(group) == 1:
+        start, end = group[0]
+        chunk_array = body_array[:, start:end]
+        chunk_len = end - start
+        token_end_index = cursor + 1 + chunk_len
+        needs_history_hidden = (
+            history_window_tokens is None
+            or token_end_index > history_start_token_index
+        )
+        chunk_embeddings = None
+        if vision_splice is not None:
+            from mtplx.vision.splice import spliced_chunk_embeddings
+
+            chunk_embeddings = spliced_chunk_embeddings(
+                rt.embed_tokens, chunk_array, vision_splice
+            )
+        with attention_phase("prefill"):
+            if needs_history_hidden:
+                logits_chunk, hidden_chunk = rt.forward_ar(
+                    chunk_array,
+                    cache=cache,
+                    return_hidden=True,
+                    hidden_variant=base_hidden_variant,
+                    emit_logits=not final_logits_only,
+                    input_embeddings=chunk_embeddings,
+                )
+            else:
+                hidden_chunk = None
+                logits_chunk = _prefill_cache_only_forward(
+                    rt, chunk_array, cache, input_embeddings=chunk_embeddings
+                )
+        if hidden_chunk is None:
+            if logits_chunk is None:
+                _eval_cache_roots(cache)
+            else:
+                _eval(logits_chunk)
+        elif logits_chunk is None:
+            _eval(hidden_chunk)
+        else:
+            _eval(logits_chunk, hidden_chunk)
+        return [(logits_chunk, hidden_chunk)]
+
+    with attention_phase("prefill"):
+        outputs = rt.forward_ar_prefill_group(
+            [body_array[:, start:end] for start, end in group],
+            cache=cache,
+            return_hidden=True,
+            hidden_variant=base_hidden_variant,
+            emit_logits=not final_logits_only,
+        )
+    leaves = [leaf for pair in outputs for leaf in pair if leaf is not None]
+    if leaves:
+        _eval(*leaves)
+    else:
+        _eval_cache_roots(cache)
+    return [tuple(pair) for pair in outputs]
 
 
 def _ple_stage_seconds() -> float:
@@ -6714,164 +6911,172 @@ def _prefill_committed_mtp_history_streaming(
     _guard_prefill_chunk_geometry(
         rt, mtp_streaming_spans, chunk_size=prefill_chunk_size
     )
+    # Expert-major grouping (MTPLX_FABLE_PREFILL_EXPERT_MAJOR, off by
+    # default). Unarmed this is one group per span and every expression below
+    # is the shipped one; armed, a group's chunks share one layer-major
+    # forward so the routed MoE GEMM sees the whole group's rows at once.
+    prefill_groups, _ = _expert_major_groups(
+        rt,
+        mtp_streaming_spans,
+        chunk_size=prefill_chunk_size,
+        capture_boundaries=capture_boundaries,
+        vision_splice=vision_splice,
+    )
     # PLE n-gram prefill lookahead (MTPLX_FABLE_PLE_PREFILL_LOOKAHEAD, off
     # by default). Every prompt token is known here, so a worker thread can
     # hash and page-warm chunk k+1's 32,768 sidecar rows while chunk k's
     # forward owns the GPU. The census measures those gathers as 8 host-late
-    # stalls totalling 2,313 ms with the GPU fully idle.
+    # stalls totalling 2,313 ms with the GPU fully idle. It stays keyed on
+    # CHUNK spans: the group stages its chunks one at a time, at the PLE
+    # layer, in chunk order.
     with _ple_prefill_lookahead_scope(rt, body, mtp_streaming_spans):
-        for start, end in mtp_streaming_spans:
+        for group_spans_ in prefill_groups:
             _check_postcommit_abort(abort_check)
-            chunk_array = body_array[:, start:end]
-            chunk_len = end - start
-            token_start_index = cursor + 1
-            token_end_index = token_start_index + chunk_len
-            needs_history_hidden = (
-                history_window_tokens is None or token_end_index > history_start_token_index
+            group_started = time.perf_counter()
+            group_gather_before = _ple_stage_seconds()
+            group_outputs = _prefill_group_forward(
+                rt,
+                body_array,
+                group_spans_,
+                cache,
+                base_hidden_variant=base_hidden_variant,
+                final_logits_only=final_logits_only,
+                history_window_tokens=history_window_tokens,
+                history_start_token_index=history_start_token_index,
+                cursor=cursor,
+                vision_splice=vision_splice,
             )
-            chunk_embeddings = None
-            if vision_splice is not None:
-                from mtplx.vision.splice import spliced_chunk_embeddings
-
-                chunk_embeddings = spliced_chunk_embeddings(
-                    rt.embed_tokens, chunk_array, vision_splice
+            group_wall_s = time.perf_counter() - group_started
+            group_gather_s = _ple_stage_seconds() - group_gather_before
+            for group_index, ((start, end), (logits_chunk, hidden_chunk)) in enumerate(
+                zip(group_spans_, group_outputs)
+            ):
+                _check_postcommit_abort(abort_check)
+                chunk_len = end - start
+                token_start_index = cursor + 1
+                token_end_index = token_start_index + chunk_len
+                started = group_started
+                # A group's chunks share one forward, so the whole wall is charged
+                # to the chunk that opened it (nothing in the group is available
+                # before the group finishes) and the rest record 0.  ``group_chunks``
+                # is on every record so a reader cannot mistake a 0 for a fast chunk.
+                chunk_wall_s = group_wall_s if group_index == 0 else 0.0
+                target_forward_time += chunk_wall_s
+                # Cheap: two perf_counter reads and one dict per chunk.  The PLE
+                # gather is a host stall INSIDE the chunk's wall, so recording both
+                # separates "the GPU was slow" from "the host was late".
+                _record_prefill_chunk(
+                    start=float(start),
+                    end=float(end),
+                    wall_s=chunk_wall_s,
+                    ple_gather_s=group_gather_s if group_index == 0 else 0.0,
+                    group_chunks=float(len(group_spans_)),
                 )
-            started = time.perf_counter()
-            gather_before = _ple_stage_seconds()
-            with attention_phase("prefill"):
-                if needs_history_hidden:
-                    logits_chunk, hidden_chunk = rt.forward_ar(
-                        chunk_array,
-                        cache=cache,
-                        return_hidden=True,
-                        hidden_variant=base_hidden_variant,
-                        emit_logits=not final_logits_only,
-                        input_embeddings=chunk_embeddings,
-                    )
-                else:
-                    hidden_chunk = None
-                    logits_chunk = _prefill_cache_only_forward(
-                        rt, chunk_array, cache, input_embeddings=chunk_embeddings
-                    )
-            if hidden_chunk is None:
-                if logits_chunk is None:
-                    _eval_cache_roots(cache)
-                else:
-                    _eval(logits_chunk)
-            elif logits_chunk is None:
-                _eval(hidden_chunk)
-            else:
-                _eval(logits_chunk, hidden_chunk)
-            chunk_wall_s = time.perf_counter() - started
-            target_forward_time += chunk_wall_s
-            # Cheap: two perf_counter reads and one dict per chunk.  The PLE
-            # gather is a host stall INSIDE the chunk's wall, so recording both
-            # separates "the GPU was slow" from "the host was late".
-            _record_prefill_chunk(
-                start=float(start),
-                end=float(end),
-                wall_s=chunk_wall_s,
-                ple_gather_s=_ple_stage_seconds() - gather_before,
-            )
-            _runtime_count(rt, "prefill_chunks")
-            if chunk_callback is not None:
-                try:
-                    now = time.perf_counter()
-                    phase_start = chunk_started_s if chunk_started_s is not None else started
-                    chunk_elapsed = max(0.0, now - started)
-                    elapsed = max(0.0, now - phase_start)
-                    tokens_done = int(cursor + chunk_len)
-                    chunk_tok_s = (
-                        float(chunk_len) / chunk_elapsed
-                        if chunk_elapsed > 0.0
-                        else None
-                    )
-                    cumulative_tok_s = (
-                        float(tokens_done) / elapsed
-                        if elapsed > 0.0 and tokens_done > 0
-                        else None
-                    )
-                    chunk_callback(
-                        {
-                            "phase": "chunk",
-                            "tokens_done": tokens_done,
-                            "tokens_total": int(len(prompt_ids)),
-                            "cached_tokens": int(cached_tokens),
-                            "elapsed_s": elapsed,
-                            "prefill_tok_s": cumulative_tok_s,
-                            "cumulative_prefill_tok_s": cumulative_tok_s,
-                            "prefill_wall_tok_s": cumulative_tok_s,
-                            "live_prefill_tok_s": (
-                                chunk_tok_s if chunk_tok_s is not None else cumulative_tok_s
-                            ),
-                            "chunk_size": int(chunk_len),
-                            "chunk_elapsed_s": chunk_elapsed,
-                            "chunk_prefill_tok_s": chunk_tok_s,
-                        }
-                    )
-                except Exception:
-                    pass
-            _check_postcommit_abort(abort_check)
-
-            if hidden_chunk is not None:
-                token_ids = prompt_ids[token_start_index : token_start_index + chunk_len]
-                slice_start = max(0, history_start_token_index - token_start_index)
-                if slice_start < len(token_ids):
-                    sliced_token_ids = token_ids[slice_start:]
-                    sliced_hidden = hidden_chunk[
-                        :,
-                        slice_start : slice_start + len(sliced_token_ids),
-                        :,
-                    ]
-                    history_embeddings = None
-                    if vision_splice is not None and pad_prefix_counts is not None:
-                        window_start = token_start_index + slice_start
-                        window_end = window_start + len(sliced_token_ids)
-                        if (
-                            pad_prefix_counts[window_end]
-                            > pad_prefix_counts[window_start]
-                        ):
-                            from mtplx.vision.splice import (
-                                spliced_embeddings_for_window,
-                            )
-
-                            history_embeddings = spliced_embeddings_for_window(
-                                rt.embed_tokens,
-                                prompt_array[:, window_start:window_end],
-                                vision_splice,
-                                rows_before=pad_prefix_counts[window_start],
-                            )
-                    prompt_history_time += _append_mtp_history(
-                        rt,
-                        mtp_history_cache,
-                        sliced_hidden,
-                        sliced_token_ids,
-                        phase="prefill",
-                        mtp_hidden_variant=mtp_hidden_variant,
-                        position_offset=(
-                            token_start_index + slice_start
-                            if use_absolute_positions
-                            else token_start_index + slice_start - 1
-                            if history_window_tokens is not None
+                _runtime_count(rt, "prefill_chunks")
+                if chunk_callback is not None:
+                    try:
+                        now = time.perf_counter()
+                        phase_start = chunk_started_s if chunk_started_s is not None else started
+                        chunk_elapsed = max(0.0, now - started)
+                        elapsed = max(0.0, now - phase_start)
+                        tokens_done = int(cursor + chunk_len)
+                        chunk_tok_s = (
+                            float(chunk_len) / chunk_elapsed
+                            if chunk_elapsed > 0.0
                             else None
-                        ),
-                        force_eval=True,
-                        input_embeddings=history_embeddings,
-                    )
-                    _check_postcommit_abort(abort_check)
-            cursor += chunk_len
-            boundary_hidden = (
-                hidden_chunk[:, -1:, :] if hidden_chunk is not None else None
-            )
-            del hidden_chunk
-            del logits_chunk
-            target_forward_time += _prefill_chunk_cache_cleanup(rt)
-            if capture_boundaries:
-                _capture_gdn_boundary(
-                    gdn_boundary_sink, cursor, cache, hidden_last=boundary_hidden
+                        )
+                        cumulative_tok_s = (
+                            float(tokens_done) / elapsed
+                            if elapsed > 0.0 and tokens_done > 0
+                            else None
+                        )
+                        chunk_callback(
+                            {
+                                "phase": "chunk",
+                                "tokens_done": tokens_done,
+                                "tokens_total": int(len(prompt_ids)),
+                                "cached_tokens": int(cached_tokens),
+                                "elapsed_s": elapsed,
+                                "prefill_tok_s": cumulative_tok_s,
+                                "cumulative_prefill_tok_s": cumulative_tok_s,
+                                "prefill_wall_tok_s": cumulative_tok_s,
+                                "live_prefill_tok_s": (
+                                    chunk_tok_s if chunk_tok_s is not None else cumulative_tok_s
+                                ),
+                                "chunk_size": int(chunk_len),
+                                "chunk_elapsed_s": chunk_elapsed,
+                                "chunk_prefill_tok_s": chunk_tok_s,
+                            }
+                        )
+                    except Exception:
+                        pass
+                _check_postcommit_abort(abort_check)
+
+                if hidden_chunk is not None:
+                    token_ids = prompt_ids[token_start_index : token_start_index + chunk_len]
+                    slice_start = max(0, history_start_token_index - token_start_index)
+                    if slice_start < len(token_ids):
+                        sliced_token_ids = token_ids[slice_start:]
+                        sliced_hidden = hidden_chunk[
+                            :,
+                            slice_start : slice_start + len(sliced_token_ids),
+                            :,
+                        ]
+                        history_embeddings = None
+                        if vision_splice is not None and pad_prefix_counts is not None:
+                            window_start = token_start_index + slice_start
+                            window_end = window_start + len(sliced_token_ids)
+                            if (
+                                pad_prefix_counts[window_end]
+                                > pad_prefix_counts[window_start]
+                            ):
+                                from mtplx.vision.splice import (
+                                    spliced_embeddings_for_window,
+                                )
+
+                                history_embeddings = spliced_embeddings_for_window(
+                                    rt.embed_tokens,
+                                    prompt_array[:, window_start:window_end],
+                                    vision_splice,
+                                    rows_before=pad_prefix_counts[window_start],
+                                )
+                        prompt_history_time += _append_mtp_history(
+                            rt,
+                            mtp_history_cache,
+                            sliced_hidden,
+                            sliced_token_ids,
+                            phase="prefill",
+                            mtp_hidden_variant=mtp_hidden_variant,
+                            position_offset=(
+                                token_start_index + slice_start
+                                if use_absolute_positions
+                                else token_start_index + slice_start - 1
+                                if history_window_tokens is not None
+                                else None
+                            ),
+                            force_eval=True,
+                            input_embeddings=history_embeddings,
+                        )
+                        _check_postcommit_abort(abort_check)
+                cursor += chunk_len
+                boundary_hidden = (
+                    hidden_chunk[:, -1:, :] if hidden_chunk is not None else None
                 )
-            del boundary_hidden
-            _check_postcommit_abort(abort_check)
+                del hidden_chunk
+                del logits_chunk
+                target_forward_time += _prefill_chunk_cache_cleanup(rt)
+                # A GROUP is the boundary granularity, never a chunk inside
+                # one: layer-major leaves ``cache`` holding the state after
+                # the WHOLE group at every layer, so a snapshot taken at an
+                # interior chunk end would be labelled with a position it does
+                # not describe.  Ungrouped (the default) this is every chunk,
+                # exactly as before.
+                if capture_boundaries and group_index == len(group_spans_) - 1:
+                    _capture_gdn_boundary(
+                        gdn_boundary_sink, cursor, cache, hidden_last=boundary_hidden
+                    )
+                del boundary_hidden
+                _check_postcommit_abort(abort_check)
 
     started = time.perf_counter()
     _check_postcommit_abort(abort_check)
@@ -9070,6 +9275,10 @@ def generate_mtpk(
         _pr391_stop_ids = None
         _pr391_stop_count = None
     if _FABLE_K20_LOG:
+        # One process serves many requests and they all append to one buffer;
+        # the committed stream does not run across the join, so the carry
+        # accounting is reset here (mtplx/fable_k20_log.py:begin_request).
+        k20_log.begin_request()
         # The stock lane's rows arrive ALREADY shaped, so an offline
         # re-temperature needs the temperature that shaped them.
         k20_log.set_sampler(sampler=sampler, draft_sampler=draft_sampler)
@@ -9392,11 +9601,18 @@ def generate_mtpk(
         if _graph_overlap_engagement is not None:
             print(_graph_overlap_engagement, flush=True)
     elif _graph_build_overlap.enabled():
-        # An armed flag that quietly ran the shipped route would make the
-        # receipts lie about which code the candidate arm measured.
-        raise RuntimeError(
-            f"{_graph_build_overlap.ENV_FLAG} requires the installed "
-            "physical-M4 compiled verify on the batched verify route"
+        # Request-shaped: `verify_strategy` is a per-request argument and the
+        # compiled verify can be off for this context length, so a miss stands
+        # aside (one warning + a receipt counter) instead of raising.  Raising
+        # here made every capture_commit request a 500.  A measured arm that
+        # must prove the lane ran sets MTPLX_FABLE_STRICT_CLAIMS=1, which
+        # turns the decline back into the RuntimeError.
+        _graph_build_overlap.decline(
+            "requires the installed physical-M4 compiled verify on the "
+            f"batched verify route (verify_strategy={verify_strategy!r}, "
+            f"compiled_verify_mode={_compiled_verify_mode!r}, "
+            f"bank={'yes' if compiled_verify_bank is not None else 'no'}, "
+            f"fixed_m4={bool(qwen4_fixed_m4_compiled_verify)})"
         )
     elif _graph_build_overlap.layers() != _graph_build_overlap.DEFAULT_LAYERS:
         # W67: a depth knob without the lever is the same lie in miniature --
@@ -10577,9 +10793,11 @@ def generate_mtpk(
     # branch below preserves v2.10's original rollback/reappend behavior.
     qsa_mtp_precompute_active = qsa_mtp_precompute_enabled()
     # MTPLX_FABLE_DEVICE_K20 (default off).  Claimed ONCE, here, where every
-    # request-invariant term the route depends on already exists.  The claim
-    # raises on an unsupported request instead of falling back: an armed flag
-    # that silently ran the stock selector would make the receipts lie.
+    # request-invariant term the route depends on already exists.  A request
+    # shape this lane does not serve DECLINES to the stock selector (logged +
+    # counted in fable_claim_contract.DECLINE_COUNTS); only an install-time
+    # contract violation raises.  Every site below is behind
+    # `_device_k20_plan is not None`, so a decline runs the shipped code.
     #
     # `fused_verify_input=False` is not a placeholder.  Merging the chain's
     # materialisation into the target sync needs the verify forward to accept
@@ -10621,21 +10839,23 @@ def generate_mtpk(
             a3b_target_prefix_route=a3b_target_prefix_route,
             pr391_route=_pr391_route,
             adaptive_dtemp_active=_dtemp_controller is not None,
+            draft_core=draft_core,
         )
-        if _device_k20_plan is not None and draft_core != "stock":
-            raise DeviceK20Ineligible(
-                "device K20 requires the stock draft route selector"
-            )
     # MTPLX_FABLE_DRAFT_K20_PRESCATTER (default off).  Claimed ONCE, here,
-    # after every request-invariant term it refuses on already exists.  The
-    # claim arms the FR-Spec head's compact-row stash and raises on an
-    # unsupported request instead of falling back, so the receipt below can
-    # only say `installed: True` when the pre-scatter selector really ran.
+    # after every request-invariant term it decides on already exists.  The
+    # claim arms the FR-Spec head's compact-row stash.  A request shape this
+    # lane does not serve DECLINES to the stock draft read and stamps the
+    # receipt (`declined`); only an install-time contract violation raises.
+    # The receipt can therefore only say `installed: True` when the
+    # pre-scatter selector really ran.  Serving contract, not a benchmark one:
+    # a greedy request used to 500 the server here (2026-09-02 HumanEval).
     _draft_k20_prescatter_plan = None
     _draft_k20_prescatter_receipt: dict[str, object] = {"installed": False}
     if _FABLE_DRAFT_K20_PRESCATTER:
         _draft_k20_prescatter_plan = _fable_draft_k20_prescatter_claim(
             rt,
+            greedy_chain_enabled=_greedy_chain_eligible,
+            receipt=_draft_k20_prescatter_receipt,
             draft_sampler=draft_sampler,
             draft_core=draft_core,
             target_prefix_verify=target_prefix_verify,
@@ -10660,12 +10880,6 @@ def generate_mtpk(
             steer_active=bool(loop_guard) or thinking_guard is not None,
         )
         if _draft_k20_prescatter_plan is not None:
-            if _greedy_chain_eligible:
-                _fable_draft_k20_prescatter_release(_draft_k20_prescatter_plan)
-                raise DraftK20PrescatterIneligible(
-                    "MTPLX_FABLE_DRAFT_K20_PRESCATTER: the greedy device chain "
-                    "owns the draft read"
-                )
             _draft_k20_prescatter_receipt = _draft_k20_prescatter_plan.to_dict()
     # MTPLX_FABLE_DEVICE_DRAFT_CHAIN (default off).  Claimed ONCE, here, after
     # every request-invariant term it refuses on already exists -- including
@@ -10678,6 +10892,7 @@ def generate_mtpk(
     _device_draft_chain_receipt: dict[str, object] = {"installed": False}
     if _FABLE_DEVICE_DRAFT_CHAIN:
         _device_draft_chain_plan = _fable_device_draft_chain_claim(
+            receipt=_device_draft_chain_receipt,
             rt=rt,
             state_tree_fn=_device_core_state_tree,
             promote_fn=promote_kv_cache_offsets,
@@ -10857,6 +11072,11 @@ def generate_mtpk(
                     time.perf_counter() - decode_loop_entered_s
                 )
             tokens.append(primary)
+            if _FABLE_K20_LOG:
+                # No-op unless a context-copy round has committed tokens since
+                # the last logged window: then this primary sits inside that
+                # gap and is nowhere else in the log.
+                k20_log.carry_primary(int(primary))
             emit_new_tokens()
             if constraint is not None:
                 # Everything later this cycle (copy-block truncation, the
@@ -11152,6 +11372,11 @@ def generate_mtpk(
                         cache, _cc_ladder, hidden_variant=base_hidden_variant
                     )
             if _cc_block:
+                if _FABLE_K20_LOG:
+                    # This cycle consumes a primary that no K20 window will
+                    # claim; open the gap so the log stays a complete record of
+                    # the emitted stream (mtplx/fable_k20_log.py:carry_round).
+                    k20_log.carry_round()
                 if _pr391_carried_d3 is not None:
                     _pr391_carried_d3 = None
                 _cc_T = 1 + len(_cc_block)
@@ -11358,6 +11583,11 @@ def generate_mtpk(
                 if _cc_stop_idx is not None:
                     _cc_acc = _cc_acc[:_cc_stop_idx + 1]
                 tokens.extend(_cc_acc)
+                if _FABLE_K20_LOG:
+                    # This round commits without a K20 row; record what it put
+                    # in the emitted stream or the trajectory cannot be
+                    # reconstructed from the log.
+                    k20_log.carry(_cc_acc)
                 _cc_finished = _cc_stop_idx is not None
                 if constraint is not None and _cc_correction is not None and (
                     constraint.validate_prefix([*_cc_acc, int(_cc_correction)])
@@ -11374,6 +11604,8 @@ def generate_mtpk(
                     # its forward exactly like an MTP rejection: the pending
                     # primary's KV is computed by whichever forward runs next.
                     tokens.append(int(_cc_correction))
+                    if _FABLE_K20_LOG:
+                        k20_log.carry((int(_cc_correction),))
                     correction_tokens += 1
                     pending_primary = int(_cc_correction)
                     if _is_stop(int(_cc_correction), stop_token_ids):
@@ -11463,6 +11695,11 @@ def generate_mtpk(
                 if constraint is not None:
                     _cb_block = _cb_block[: constraint.validate_prefix(_cb_block)]
             if _cb_block:
+                if _FABLE_K20_LOG:
+                    # This cycle consumes a primary that no K20 window will
+                    # claim; open the gap so the log stays a complete record of
+                    # the emitted stream (mtplx/fable_k20_log.py:carry_round).
+                    k20_log.carry_round()
                 if _pr391_carried_d3 is not None:
                     _pr391_carried_d3 = None
                 _cb_T = 1 + len(_cb_block)
@@ -11653,6 +11890,9 @@ def generate_mtpk(
                 if _cb_stop_idx is not None:
                     _cb_acc = _cb_acc[: _cb_stop_idx + 1]
                 tokens.extend(_cb_acc)
+                if _FABLE_K20_LOG:
+                    # Same contract as the eager round above.
+                    k20_log.carry(_cb_acc)
                 _cb_finished = _cb_stop_idx is not None
                 if constraint is not None and _cb_correction is not None and (
                     constraint.validate_prefix([*_cb_acc, int(_cb_correction)])
@@ -11661,6 +11901,8 @@ def generate_mtpk(
                     _cb_correction = None
                 if _cb_correction is not None and not _cb_finished:
                     tokens.append(int(_cb_correction))
+                    if _FABLE_K20_LOG:
+                        k20_log.carry((int(_cb_correction),))
                     correction_tokens += 1
                     pending_primary = int(_cb_correction)
                     if _is_stop(int(_cb_correction), stop_token_ids):
@@ -12116,15 +12358,38 @@ def generate_mtpk(
                     mtp_depth=_chain_depth + 1,
                     position_offset=_chain_offset,
                 )
-                _chain_row = _chain_logits[:, -1, :][0]
-                _chain_arg = mx.argmax(_chain_row, axis=-1)
-                _chain_pending.append(_chain_arg)
-                if _draft_conf_trace:
-                    # Greedy: max(row) IS the drafted token's logit, so this
-                    # is p(drafted) without a gather. Lazy — rides the eval.
-                    _chain_conf_pending.append(
-                        mx.exp(mx.max(_chain_row) - mx.logsumexp(_chain_row))
+                if _draft_k20_prescatter_plan is not None:
+                    # MTPLX_FABLE_DRAFT_K20_PRESCATTER on the greedy chain:
+                    # the same argmax (and the same traced confidence) taken
+                    # over the FR-Spec head's 65,536-row PRE-scatter output,
+                    # with the winning local row mapped to its real token id
+                    # by one device `mx.take` through the strictly ascending
+                    # ranked table. Same token, same tie-break — the proof is
+                    # in `fable_draft_k20_prescatter.greedy_chain_step`. Both
+                    # arrays stay unevaluated, so this still costs the one
+                    # `_eval` below and the 248,320-lane scatter behind
+                    # `_chain_logits` is built and dropped, never run.
+                    _chain_arg, _chain_conf = (
+                        _fable_draft_k20_prescatter_greedy_step(
+                            _draft_k20_prescatter_plan,
+                            _chain_logits,
+                            want_confidence=_draft_conf_trace,
+                        )
                     )
+                    _chain_pending.append(_chain_arg)
+                    if _chain_conf is not None:
+                        _chain_conf_pending.append(_chain_conf)
+                else:
+                    _chain_row = _chain_logits[:, -1, :][0]
+                    _chain_arg = mx.argmax(_chain_row, axis=-1)
+                    _chain_pending.append(_chain_arg)
+                    if _draft_conf_trace:
+                        # Greedy: max(row) IS the drafted token's logit, so
+                        # this is p(drafted) without a gather. Lazy — rides
+                        # the eval.
+                        _chain_conf_pending.append(
+                            mx.exp(mx.max(_chain_row) - mx.logsumexp(_chain_row))
+                        )
                 _chain_tok = _chain_arg.reshape(1, 1).astype(mx.int32)
                 _chain_hidden = _chain_hidden_next[:, -1:, :]
                 draft_hidden_for_update.append(_chain_hidden)

@@ -406,7 +406,9 @@ _SELECTED_TOKENS = _TOP_K_BLOCKS * _COMPRESS_RATIO + (_COMPRESS_RATIO - 1)
 #: Partial rows are [O(head_dim) | m | l] in fp32.
 _PARTIAL_LD = _HEAD_DIM + 2
 _MAX_KEY_SPLITS = 64
-_DEFAULT_KEY_SPLITS = 8
+#: Matches mtplx.runtime_options.FABLE_QSA_SPARSE_DECODE_DEFAULT_SPLITS; a
+#: test pins the two together so the bench and the lane cannot drift.
+_DEFAULT_KEY_SPLITS = 17
 _INTEGER_DTYPES = (
     mx.int8,
     mx.int16,

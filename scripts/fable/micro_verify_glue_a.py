@@ -295,8 +295,32 @@ def compare(got, ref):
     A differing-element COUNT, not just a max: one flipped bf16 ulp on a
     query element can move a top-k tie, and a max-abs column alone hides how
     many elements moved.
+
+    Both failure modes below are HARNESS bugs, not numerical results, so they
+    raise rather than returning a number that would be read as parity:
+
+    * ``ref is None`` -- a candidate was evaluated before the stock arm.  The
+      first spelling of this bench iterated ``FAMILIES[family]`` in table
+      order, whose first rope entry is ``rope_prediet``, not the stock arm, so
+      ``zip(got, None)`` died at the first comparison.  ``arm_order`` now puts
+      the reference first; this is the belt to that braces.
+    * a length mismatch -- ``zip`` truncates silently, so an arm that emitted
+      fewer outputs than the reference would score parity on the prefix it did
+      emit and report a smaller ``elements`` count that nothing checks.
     """
 
+    if ref is None:
+        raise RuntimeError(
+            "compare() has no reference: the stock arm must be evaluated "
+            "before any candidate (see arm_order). This is a harness "
+            "ordering bug, not a numerical verdict."
+        )
+    if len(got) != len(ref):
+        raise RuntimeError(
+            f"compare() got {len(got)} outputs against {len(ref)} reference "
+            "outputs; an arm that emits a different number of tensors is not "
+            "the same computation and cannot be scored for parity."
+        )
     worst = 0.0
     differing = 0
     total = 0
@@ -307,6 +331,22 @@ def compare(got, ref):
         differing += int(mx.sum(af != bf).item())
         total += int(a.size)
     return worst, differing, total
+
+
+def arm_order(family):
+    """Execution order for ``family``: the STOCK arm first, then the rest.
+
+    ``FAMILIES`` is the PRINT order (pre-diet, stock, scoped, fused reads as a
+    progression).  Execution has to start at the reference every other arm is
+    compared against, and the two orders are not the same for ``rope``.
+    """
+
+    stock = STOCK[family]
+    if stock not in FAMILIES[family]:
+        raise RuntimeError(
+            f"family {family!r} has no stock arm {stock!r} in {FAMILIES[family]}"
+        )
+    return (stock, *(name for name in FAMILIES[family] if name != stock))
 
 
 def build_data(args, layers):
@@ -402,8 +442,10 @@ def main(argv=None) -> int:
     for family in families:
         inputs = cycle_inputs(family, data, layers)
         for lane in lanes:
+            # Stock FIRST: it is the reference. Printing still follows
+            # FAMILIES[family]; only execution is reordered.
             ref_out = None
-            for name in FAMILIES[family]:
+            for name in arm_order(family):
                 eager = make_cycle(name, data, layers)
                 fn = eager if lane == "eager" else mx.compile(eager)
                 # Count on a FRESHLY BUILT graph: export_to_dot walks the

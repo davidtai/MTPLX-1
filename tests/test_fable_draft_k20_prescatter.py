@@ -21,8 +21,10 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+import re
 from types import SimpleNamespace
 
+import mtplx.fable_claim_contract as contract
 import mtplx.fable_draft_k20_prescatter as prescatter
 import mtplx.fast_sampling as fast_sampling
 import mtplx.frspec_draft as frspec_draft
@@ -60,16 +62,26 @@ def _ranked_ids(rows: int, vocab_rows: int, seed: int) -> np.ndarray:
     ).astype(np.int64)
 
 
-def _plan(rows: int, vocab_rows: int, seed: int, head=None) -> DraftK20PrescatterPlan:
+def _plan(
+    rows: int,
+    vocab_rows: int,
+    seed: int,
+    head=None,
+    *,
+    greedy: bool = False,
+) -> DraftK20PrescatterPlan:
+    ids_np = _ranked_ids(rows, vocab_rows, seed)
     return DraftK20PrescatterPlan(
         head=head,
-        ids_np=_ranked_ids(rows, vocab_rows, seed),
+        ids_np=ids_np,
+        ids_mx=mx.array(ids_np, dtype=mx.int32),
         rows=rows,
         vocab_rows=vocab_rows,
-        top_k=TOP_K,
-        temperature=TEMPERATURE,
+        top_k=0 if greedy else TOP_K,
+        temperature=0.0 if greedy else TEMPERATURE,
         top_p=TOP_P,
         route="native_mtp_head",
+        greedy=greedy,
     )
 
 
@@ -295,6 +307,184 @@ def test_greedy_argmax_tie_picks_the_lowest_real_id():
     )
     assert token == int(plan.ids_np[17])
     assert token == int(mx.argmax(dense.astype(mx.float32), axis=-1).item())
+
+
+# ---------------------------------------------------------------------------
+# 3b. The greedy DEVICE chain read (`generate_mtpk`'s one-sync greedy path)
+# ---------------------------------------------------------------------------
+
+
+def _greedy_plan(rows, vocab_rows, seed, row=None, *, dtype=mx.float32):
+    """A greedy plan plus the (dense, compact) pair its head would stash."""
+
+    plan = _plan(rows, vocab_rows, seed, greedy=True)
+    compact = _compact_row(rows, seed + 1, dtype=dtype) if row is None else row
+    dense = _scatter(compact, plan)
+    plan = DraftK20PrescatterPlan(
+        **{**plan.__dict__, "head": _FakeHead(dense, compact)}
+    )
+    return plan, compact, dense
+
+
+@pytest.mark.parametrize("seed", [701, 702, 703, 704])
+def test_greedy_chain_step_token_is_the_stock_dense_argmax(seed):
+    """The whole point: same token, from a row 3.8x narrower."""
+
+    plan, _, dense = _greedy_plan(prescatter.FRSPEC_ROWS, 248_320, seed)
+    token, confidence = prescatter.greedy_chain_step(
+        plan, dense, want_confidence=False
+    )
+    assert confidence is None
+    assert int(token.item()) == int(mx.argmax(dense, axis=-1).item())
+
+
+def test_greedy_chain_step_returns_unevaluated_device_arrays():
+    """It must add NO sync: the chain's own single `mx.eval` covers it."""
+
+    plan, _, dense = _greedy_plan(4_096, 16_384, 711)
+    token, confidence = prescatter.greedy_chain_step(
+        plan, dense, want_confidence=True
+    )
+    assert isinstance(token, mx.array)
+    assert isinstance(confidence, mx.array)
+    # The id map is a device gather, so the token carries the table's dtype
+    # and reshapes into the chain's next input token without a host round trip.
+    assert token.dtype == mx.int32
+    assert tuple(token.reshape(1, 1).shape) == (1, 1)
+
+
+def test_greedy_chain_step_tie_picks_the_lowest_real_id():
+    """``argmax``'s lowest-LOCAL-index tie-break maps to the lowest real id.
+
+    The map is strictly increasing, so it preserves the tie-break itself --
+    not merely produces an equally valid winner.
+    """
+
+    rows, vocab_rows = 1_024, 4_096
+    row = np.full(rows, -3.0, dtype=np.float32)
+    row[[17, 900, 1_000]] = 9.0  # three-way exact tie at the maximum
+    plan, _, dense = _greedy_plan(rows, vocab_rows, 713, row=mx.array(row))
+    token, _ = prescatter.greedy_chain_step(plan, dense, want_confidence=False)
+    assert int(token.item()) == int(plan.ids_np[17])
+    assert int(token.item()) == int(mx.argmax(dense, axis=-1).item())
+
+
+def test_greedy_chain_step_from_a_bfloat16_head_row():
+    """The sentinel is finite in bfloat16 (-9.9964e29), not an inf or a NaN."""
+
+    plan, _, dense = _greedy_plan(8_192, 32_768, 715, dtype=mx.bfloat16)
+    assert dense.dtype == mx.bfloat16
+    token, _ = prescatter.greedy_chain_step(plan, dense, want_confidence=False)
+    assert int(token.item()) == int(mx.argmax(dense, axis=-1).item())
+
+
+@pytest.mark.parametrize("seed", [721, 722])
+def test_greedy_chain_step_confidence_agrees_but_not_to_the_bit(seed):
+    """The sentinel contributes nothing; the REDUCTION SHAPE still costs ULP.
+
+    ``max`` is bit-identical -- which is what settles the token.  The
+    ``logsumexp`` behind the confidence is the same real number computed from
+    the same terms, but 65,536 partial sums associate differently from
+    248,320, so the pair lands ~2e-6 apart.  That is why
+    ``claim_draft_route`` routes confidence-tracing requests to the stock
+    reader instead of shaving a step and moving a printed number.
+    """
+
+    plan, _, dense = _greedy_plan(prescatter.FRSPEC_ROWS, 248_320, seed)
+    _, confidence = prescatter.greedy_chain_step(
+        plan, dense, want_confidence=True
+    )
+    stock = mx.exp(mx.max(dense) - mx.logsumexp(dense))
+    mx.eval(confidence, stock)
+    got = float(np.asarray(confidence, dtype=np.float32))
+    want = float(np.asarray(stock, dtype=np.float32))
+    assert got == pytest.approx(want, rel=1e-5)
+    # Close, but NOT the same bits -- that is the whole point of the routing.
+    assert 0.0 < abs(got - want) < 1e-5 * want or got == want
+
+
+def test_the_max_behind_the_greedy_confidence_is_bit_identical(seed=723):
+    """``max`` -- unlike the sum -- is exact on both rows, so the token is."""
+
+    plan, compact, dense = _greedy_plan(prescatter.FRSPEC_ROWS, 248_320, seed)
+    a = mx.max(compact.reshape(-1))
+    b = mx.max(dense)
+    mx.eval(a, b)
+    assert _same_bits(
+        np.asarray(a, dtype=np.float32).reshape(1),
+        np.asarray(b, dtype=np.float32).reshape(1),
+    )
+
+
+def test_a_confidence_tracing_request_is_routed_to_the_stock_reader(armed):
+    """The routing that keeps the ULP above out of any receipt."""
+
+    rt, head, _ = _runtime()
+    contract.reset_for_test()
+    receipt: dict[str, object] = {}
+    plan = prescatter.claim_draft_route(
+        rt,
+        draft_sampler=_config(temperature=0.0, top_k=0),
+        receipt=receipt,
+        greedy_chain_enabled=True,
+        **{**_ELIGIBLE, "draft_confidence_needed": True},
+    )
+    assert plan is None
+    assert receipt["declined"] == "draft_confidence"
+    assert head._prescatter_capture is False
+
+
+def test_greedy_chain_step_refuses_a_stale_stash():
+    """A head that changed mid-request must not silently score another step."""
+
+    plan, _, _ = _greedy_plan(4_096, 16_384, 731)
+    other = mx.zeros((1, 1, plan.vocab_rows))
+    with pytest.raises(DraftK20PrescatterIneligible, match="did not capture"):
+        prescatter.greedy_chain_step(plan, other, want_confidence=False)
+
+
+def test_a_whole_greedy_chain_matches_the_stock_chain_token_for_token():
+    """Three depths, one `mx.eval`, exactly as `generate_mtpk` runs it.
+
+    Mirrors the chain's shape: each depth feeds the previous depth's token
+    back in, everything stays lazy, and the single eval at the end is the only
+    sync.  The stock arm runs the same rows through `mx.argmax(dense)`.
+    """
+
+    rows, vocab_rows = prescatter.FRSPEC_ROWS, 248_320
+    plan = _plan(rows, vocab_rows, 741, greedy=True)
+    compacts = [_compact_row(rows, 742 + d) for d in range(3)]
+    denses = [_scatter(c, plan) for c in compacts]
+
+    pending, feed = [], []
+    for compact, dense in zip(compacts, denses):
+        plan = DraftK20PrescatterPlan(
+            **{**plan.__dict__, "head": _FakeHead(dense, compact)}
+        )
+        token, _ = prescatter.greedy_chain_step(
+            plan, dense, want_confidence=False
+        )
+        pending.append(token)
+        # what the chain feeds the next depth
+        feed.append(token.reshape(1, 1).astype(mx.int32))
+    mx.eval(*pending, *feed)  # the chain's ONE sync
+
+    stock = [int(mx.argmax(dense, axis=-1).item()) for dense in denses]
+    assert [int(t.item()) for t in pending] == stock
+    assert [int(f.reshape(-1)[0].item()) for f in feed] == stock
+
+
+def test_the_greedy_chain_call_site_uses_the_plan():
+    """`generate_mtpk`'s greedy chain reads the compact row when armed."""
+
+    import inspect
+
+    from mtplx import generation
+
+    source = inspect.getsource(generation.generate_mtpk)
+    assert "_fable_draft_k20_prescatter_greedy_step(" in source
+    # ...and still has the stock chain for a flag-off / declined request.
+    assert "_chain_arg = mx.argmax(_chain_row, axis=-1)" in source
 
 
 def test_sampled_read_returns_the_row_it_sampled_from():
@@ -679,32 +869,143 @@ def test_the_real_install_legacy_swap_is_also_recognised(monkeypatch):
         ({"steer_active": True}, "real token id"),
     ],
 )
-def test_claim_refuses_every_unsupported_request_term(armed, override, match):
+def test_claim_declines_every_unsupported_request_term(armed, override, match):
+    """Request-shaped ineligibility stands aside; it does not raise.
+
+    Every override here is a property of ONE REQUEST, and the stock draft
+    reader serves all of them.  Raising made each one an HTTP 500 in serving
+    -- the greedy case took down the composed-stack HumanEval gate on its very
+    first request, 2026-09-02.
+    """
+
     rt, head, _ = _runtime()
+    contract.reset_for_test()
     kwargs = {**_ELIGIBLE, **override}
-    with pytest.raises(DraftK20PrescatterIneligible, match=match):
-        prescatter.claim_draft_route(rt, draft_sampler=_config(), **kwargs)
+    receipt: dict[str, object] = {}
+    plan = prescatter.claim_draft_route(
+        rt, draft_sampler=_config(), receipt=receipt, **kwargs
+    )
+    assert plan is None
+    assert receipt["installed"] is False
+    assert re.search(match, str(receipt["declined_detail"]))
+    assert contract.decline_counts(prescatter._ENV_VAR)[receipt["declined"]] == 1
+    # The stash stays disarmed: the stock reader owns the dense row.
     assert head._prescatter_capture is False
 
 
-def test_claim_refuses_draft_sampler_penalties(armed):
+@pytest.mark.parametrize("top_k", [0, 20])
+def test_a_greedy_request_claims_the_greedy_route(armed, top_k):
+    """The 2026-09-02 production failure, fixed: greedy WORKS here.
+
+    HumanEval -- and every ``temperature: 0`` API call -- is greedy, and the
+    greedy chain owns the draft read on those requests.  The lane serves it
+    (``greedy_chain_step``) instead of standing aside, so the pre-scatter is
+    exactly where the sentinel lanes are most wasteful.  ``top_k`` is not part
+    of a greedy contract: the read is an argmax, so both spellings of a greedy
+    sampler claim.
+    """
+
+    rt, head, _ = _runtime()
+    contract.reset_for_test()
+    receipt: dict[str, object] = {}
+    plan = prescatter.claim_draft_route(
+        rt,
+        draft_sampler=_config(temperature=0.0, top_k=top_k),
+        receipt=receipt,
+        greedy_chain_enabled=True,
+        **_ELIGIBLE,
+    )
+    assert plan is not None
+    assert plan.greedy is True
+    assert plan.to_dict()["read"] == "greedy_argmax"
+    assert head._prescatter_capture is True
+    assert receipt == {}
+    assert contract.decline_counts(prescatter._ENV_VAR) == {}
+    prescatter.release_draft_route(plan)
+
+
+def test_a_sampled_request_still_claims_the_k20_route(armed):
+    """The temperature-1 shape the ABBA windows measure is unchanged."""
+
+    rt, head, _ = _runtime()
+    contract.reset_for_test()
+    plan = prescatter.claim_draft_route(
+        rt,
+        draft_sampler=_config(temperature=1.0, top_k=TOP_K),
+        greedy_chain_enabled=False,
+        **_ELIGIBLE,
+    )
+    assert plan is not None
+    assert plan.greedy is False
+    assert plan.top_k == TOP_K
+    assert plan.to_dict()["read"] == "sampled_k20"
+    assert head._prescatter_capture is True
+    prescatter.release_draft_route(plan)
+
+
+def test_a_greedy_request_claims_without_the_chain_too(armed):
+    """A greedy cycle that falls out of the chain reads the compact row too.
+
+    ``ccopy``, a mid-generation steering arm and a depth-0 cycle all drop the
+    greedy chain for that cycle; those land in ``read_draft``'s own
+    ``temperature <= 0`` branch, which is the same argmax on the host.
+    """
+
     rt, _, _ = _runtime()
+    plan = prescatter.claim_draft_route(
+        rt,
+        draft_sampler=_config(temperature=0.0, top_k=0),
+        greedy_chain_enabled=False,
+        **_ELIGIBLE,
+    )
+    assert plan is not None and plan.greedy is True
+    prescatter.release_draft_route(plan)
+
+
+def test_strict_claims_turns_a_decline_back_into_a_failure(armed, monkeypatch):
+    """A measured arm still fails closed under MTPLX_FABLE_STRICT_CLAIMS."""
+
+    monkeypatch.setattr(contract, "_STRICT", True)
+    rt, head, _ = _runtime()
+    with pytest.raises(DraftK20PrescatterIneligible, match="reranker"):
+        prescatter.claim_draft_route(
+            rt,
+            draft_sampler=_config(),
+            **{**_ELIGIBLE, "mtp_topk_reranker": object()},
+        )
+    assert head._prescatter_capture is False
+
+
+def test_claim_declines_draft_sampler_penalties(armed):
+    rt, _, _ = _runtime()
+    contract.reset_for_test()
     config = SamplerConfig(
         temperature=TEMPERATURE,
         top_p=TOP_P,
         top_k=TOP_K,
         presence_penalty=0.2,
     )
-    with pytest.raises(DraftK20PrescatterIneligible, match="penalties"):
-        prescatter.claim_draft_route(rt, draft_sampler=config, **_ELIGIBLE)
-
-
-def test_claim_refuses_without_top_k(armed):
-    rt, _, _ = _runtime()
-    with pytest.raises(DraftK20PrescatterIneligible, match="top-k"):
+    receipt: dict[str, object] = {}
+    assert (
         prescatter.claim_draft_route(
-            rt, draft_sampler=_config(top_k=0), **_ELIGIBLE
+            rt, draft_sampler=config, receipt=receipt, **_ELIGIBLE
         )
+        is None
+    )
+    assert receipt["declined"] == "draft_sampler_penalties"
+
+
+def test_claim_declines_without_top_k(armed):
+    rt, _, _ = _runtime()
+    contract.reset_for_test()
+    receipt: dict[str, object] = {}
+    assert (
+        prescatter.claim_draft_route(
+            rt, draft_sampler=_config(top_k=0), receipt=receipt, **_ELIGIBLE
+        )
+        is None
+    )
+    assert receipt["declined"] == "no_top_k"
 
 
 # ---------------------------------------------------------------------------
@@ -730,3 +1031,26 @@ def test_the_draft_loop_reads_the_plan_before_the_stock_reader():
     assert "elif _draft_k20_prescatter_plan is not None:" in source
     assert "_fable_draft_k20_prescatter_read(" in source
     assert "draft_k20_prescatter=_draft_k20_prescatter_receipt," in source
+
+
+def test_the_call_site_declines_instead_of_raising_on_a_greedy_request():
+    """The 2026-09-02 outage, pinned at the call site.
+
+    The greedy-chain term is decided INSIDE the claim (so it declines like
+    every other request term) and the receipt dict is handed in, so a decline
+    is recorded rather than raised.  A `raise DraftK20PrescatterIneligible`
+    in `generate_mtpk` would put the 500 back.
+    """
+
+    import inspect
+
+    from mtplx import generation
+
+    source = inspect.getsource(generation.generate_mtpk)
+    assert "greedy_chain_enabled=_greedy_chain_eligible," in source
+    assert "receipt=_draft_k20_prescatter_receipt," in source
+    assert "raise DraftK20PrescatterIneligible(" not in source
+    # The device-K20 sibling's CLAIM-site raise went too; the only
+    # DeviceK20Ineligible left in the loop is the mid-decode guard, which is
+    # a different class of failure (see the module's report).
+    assert "device K20 requires the stock draft route selector" not in source

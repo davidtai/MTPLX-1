@@ -990,3 +990,34 @@ def test_the_log_refuses_to_mix_an_armed_and_an_unarmed_run(armed_log):
             bonus_allowed=True,
             greedy=False,
         )
+
+
+def test_the_guard_routes_greedy_windows_instead_of_raising():
+    """Block verification is a SPECULATIVE-SAMPLING acceptance scheme.
+
+    A greedy window has no draft distributions at all, so there is no ladder
+    to build. The guard says so with a plain `sampler.temperature > 0` term:
+    the greedy window takes the shipped accept path, nothing raises, and the
+    temperature-1 window still gets the ladder.
+    """
+
+    import ast
+    import inspect
+
+    from mtplx import generation
+
+    source = inspect.getsource(generation.generate_mtpk)
+    tree = ast.parse(
+        "def f():\n" + "\n".join("    " + line for line in source.splitlines())
+    )
+    condition = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and "_FABLE_BLOCK_VERIFY" in ast.unparse(node.test):
+            condition = ast.unparse(node.test)
+            break
+    assert condition is not None, "the block-verify guard moved"
+    assert "sampler.temperature > 0" in condition
+    # ...and the whole flag surface raises nothing per request.
+    assert "raise" not in inspect.getsource(
+        __import__("mtplx.fable_block_verify", fromlist=["build_verifier"]).build_verifier
+    )

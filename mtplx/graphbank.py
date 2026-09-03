@@ -890,22 +890,61 @@ class TensorOffsetQSACache:
         self.fable_qsa_sparse_draft = bool(fable_qsa_sparse_draft)
         self.fable_qsa_sparse_decode_rows = 0
         self.fable_qsa_sparse_draft_rows = 0
-        if fable_qsa_sparse_decode or fable_qsa_sparse_draft:
+        # W68 -- an armed flag that reaches a cache constructed WITHOUT it is
+        # the armed-but-inert failure mode, and it is silent: the cache simply
+        # carries ``fable_qsa_sparse_decode_rows = 0`` and every routing
+        # decision downstream declines. Every construction site that can be
+        # reached with the flag armed must pass it through, so a site that
+        # forgot is a bug in THIS file and dies here rather than in a benchmark
+        # receipt four hours later.
+        armed_decode = fable_qsa_sparse_decode_enabled()
+        armed_draft = fable_qsa_sparse_draft_enabled()
+        if armed_decode and not self.fable_qsa_sparse_decode:
+            raise RuntimeError(
+                "MTPLX_FABLE_QSA_SPARSE_DECODE is armed but this QSA cache was "
+                "constructed without the lane; the construction site did not "
+                "pass fable_qsa_sparse_decode through, so the kernel would be "
+                "inert on this cache"
+            )
+        if armed_draft and not self.fable_qsa_sparse_draft:
+            raise RuntimeError(
+                "MTPLX_FABLE_QSA_SPARSE_DRAFT is armed but this QSA cache was "
+                "constructed without the lane; the construction site did not "
+                "pass fable_qsa_sparse_draft through, so the kernel would be "
+                "inert on this cache"
+            )
+        if self.fable_qsa_sparse_decode or self.fable_qsa_sparse_draft:
             from .kernels import qsa_sparse_decode as _qsa_sparse
 
-            if _qsa_sparse.install(
+            if not _qsa_sparse.install(
                 self.kv.keys,
                 self.kv.values,
                 compress_ratio=self.ratio,
                 verify=bool(fable_qsa_sparse_decode),
                 draft=bool(fable_qsa_sparse_draft),
             ):
-                self.fable_qsa_sparse_decode_rows = (
-                    _qsa_sparse.VERIFY_ROWS if fable_qsa_sparse_decode else 0
+                # install() recorded the measured deltas before returning
+                # False; this turns them into a build failure instead of a
+                # silent revert to the stock chain. See the gate note in
+                # kernels/qsa_sparse_decode.py for why the stance changed:
+                # an armed arm that runs the stock chain is worse than an
+                # outage, because it looks like a result.
+                raise RuntimeError(
+                    "MTPLX_FABLE_QSA_SPARSE_DECODE/_DRAFT is armed but the "
+                    "split-K lane declined to install: "
+                    + (
+                        _qsa_sparse.disabled_reason()
+                        or "the lane returned no verdict"
+                    )
+                    + " -- read the deltas off the [fable] qsa_sparse_decode "
+                    "stderr line, then unarm the flag deliberately"
                 )
-                self.fable_qsa_sparse_draft_rows = (
-                    _qsa_sparse.DRAFT_ROWS if fable_qsa_sparse_draft else 0
-                )
+            self.fable_qsa_sparse_decode_rows = (
+                _qsa_sparse.VERIFY_ROWS if fable_qsa_sparse_decode else 0
+            )
+            self.fable_qsa_sparse_draft_rows = (
+                _qsa_sparse.DRAFT_ROWS if fable_qsa_sparse_draft else 0
+            )
 
     @staticmethod
     def _fixed_bank(value: mx.array, capacity: int, axis: int) -> mx.array:
@@ -5294,12 +5333,8 @@ class CompiledVerifyBank:
                     # the stock QSA chain -- the armed-but-inert failure mode.
                     fable_qsa_m4=entry.fable_qsa_m4,
                     fable_qsa_m4_kt=entry.fable_qsa_m4_kt,
-                    fable_qsa_sparse_decode=getattr(
-                        entry, "fable_qsa_sparse_decode", False
-                    ),
-                    fable_qsa_sparse_draft=getattr(
-                        entry, "fable_qsa_sparse_draft", False
-                    ),
+                    fable_qsa_sparse_decode=entry.fable_qsa_sparse_decode,
+                    fable_qsa_sparse_draft=entry.fable_qsa_sparse_draft,
                 )
             elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
                 if isinstance(entry, TensorOffsetKVCache):
@@ -5514,6 +5549,16 @@ class CompiledVerifyBank:
                     fold_indices, trailing, lambda index: shadow[index]
                 )
             # (2) The existing runtime forward, on shadow containers only.
+            #
+            # W68: sample the sparse-decode lane's route counter across the
+            # forward. The routing decision is host-side and happens in THIS
+            # python body, so a trace that ends with no hit is an armed flag
+            # that is not in the graph -- and the graph is what the next few
+            # hundred cycles replay. Raising here costs one trace; the
+            # alternative cost a whole window on 2026-09-02.
+            from .kernels import qsa_sparse_decode as _qsa_sparse_lane
+
+            sparse_route_before = _qsa_sparse_lane.route_counters()["route_hits"]
             with _gdn_fold.fold_prefix_scope(fold_scope):
                 with attention_phase("decode_verify"):
                     result = live._runtime_forward(
@@ -5523,13 +5568,23 @@ class CompiledVerifyBank:
                         hidden_variant=hidden_variant,
                         compiled_aux=compiled_aux,
                     )
-            # W66d: the fold is only exact because the step kernel that was
-            # handed the ring's BASE also replayed the ring.  A layer that
-            # missed its prefix does not decline -- it runs the stock
-            # recurrence from that base and silently drops committed windows,
-            # which no downstream counter can see.  Checked once, at trace.
+            # Two trace-time engagement checks, both on the graph this body
+            # just built and both fatal, because the graph is what the next
+            # few hundred cycles replay.
+            #
+            # W66d first, because it is the CORRECTNESS one: the fold is only
+            # exact because the step kernel that was handed the ring's BASE
+            # also replayed the ring.  A layer that missed its prefix does not
+            # decline -- it runs the stock recurrence from that base and
+            # silently drops committed windows, which no downstream counter
+            # can see.  W68 second: an armed sparse-decode flag that never
+            # routed is an inert arm, which costs a measurement rather than an
+            # answer.
             _gdn_fold.assert_prefix_consumed(
                 fold_scope, label="compiled fixed-M4 verify"
+            )
+            _qsa_sparse_lane.assert_traced(
+                length, before=sparse_route_before, where="compiled verify"
             )
             logits, hidden, captures = result
             # (3) Read every leaf back out and return it explicitly.
@@ -5896,12 +5951,8 @@ class CompiledVerifyBank:
                     # the stock QSA chain -- the armed-but-inert failure mode.
                     fable_qsa_m4=entry.fable_qsa_m4,
                     fable_qsa_m4_kt=entry.fable_qsa_m4_kt,
-                    fable_qsa_sparse_decode=getattr(
-                        entry, "fable_qsa_sparse_decode", False
-                    ),
-                    fable_qsa_sparse_draft=getattr(
-                        entry, "fable_qsa_sparse_draft", False
-                    ),
+                    fable_qsa_sparse_decode=entry.fable_qsa_sparse_decode,
+                    fable_qsa_sparse_draft=entry.fable_qsa_sparse_draft,
                 )
             elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
                 if isinstance(entry, TensorOffsetKVCache):

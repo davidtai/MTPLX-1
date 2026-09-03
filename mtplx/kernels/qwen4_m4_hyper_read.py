@@ -448,7 +448,21 @@ def check_shapes(
         raise ValueError(
             f"M4 hyper read is wired for {rows_min}..{rows_max} rows; got {rows}"
         )
-    dt = x.dtype
+    check_weight_shapes(gamma, wd, wu, wi, dtype=x.dtype)
+    return rows
+
+
+def check_weight_shapes(gamma, wd, wu, wi, *, dtype=None) -> None:
+    """Validate the WEIGHT half of the family contract.
+
+    Split out of :func:`check_shapes` so the same list can run at INSTALL
+    time, where the weights exist but no activation does: a pack the kernel
+    cannot read is a deployment error, and it should stop the server coming up
+    rather than fail the first request that happens to reach verify width.
+    ``dtype`` is the activation dtype when there is one to compare against;
+    ``None`` skips only that check.  One list, two callers.
+    """
+
     checks = (
         ("hc_norm.weight", gamma, (HCD,)),
         ("input_mix_weight_down.weight", wd, (R_LOWRANK, HCD)),
@@ -461,12 +475,11 @@ def check_shapes(
             raise ValueError(
                 f"M4 hyper read: {name} must be {want}; got {tuple(arr.shape)}"
             )
-        if arr.dtype != dt:
+        if dtype is not None and arr.dtype != dtype:
             raise ValueError(
                 f"M4 hyper read: {name} dtype {arr.dtype} != hyper input dtype "
-                f"{dt} (the kernel reads the module's unquantized weights)"
+                f"{dtype} (the kernel reads the module's unquantized weights)"
             )
-    return rows
 
 
 def fused_hc_read_m4(

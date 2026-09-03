@@ -51,7 +51,9 @@ get into the graph at all".
 
 from __future__ import annotations
 
+import json
 import logging
+import sys
 from typing import Any, Dict, Iterable, Optional
 
 import mlx.core as mx
@@ -62,6 +64,22 @@ from mtplx.runtime_options import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _emit(line: str) -> None:
+    """Put an engagement line where a benchmark log will actually see it.
+
+    ``logger.info`` alone is INVISIBLE in a driver run: the 2026-09-02 W70
+    ABBA carried no engagement evidence at all, and the log proves why --
+    ``[qwen4-fixed-M4-verify]`` and ``[qwen4-compiled-MTP-prepare]``, both
+    ``logger.info``, are missing from it too, while
+    ``[MTPLX_FABLE_GRAPH_BUILD_OVERLAP] armed:`` (a plain ``print``) is
+    there. An arm that cannot prove it ran is an arm nobody can read, so this
+    goes to stderr as well as to the log.
+    """
+
+    logger.info("%s", line)
+    print(line, file=sys.stderr, flush=True)
 
 #: Verify/draft widths the items serve.  Prefill keeps the stock chain: these
 #: kernels are latency plays on a 4-row window, and a 16 K prefill row count
@@ -259,9 +277,7 @@ def install(
 
         ok = _rope.install(layers, rows=int(rows), logger=logger)
         report["items"]["qsa_rope"] = _rope.engagement()
-        logger.info(
-            "%s", _rope.engagement_line(layers=len(layers), enabled=ok)
-        )
+        _emit(_rope.engagement_line(layers=len(layers), enabled=ok))
 
     if fable_verify_glue_enabled("qsa_rope_idx"):
         if _IDX_DISABLED_REASON is None:
@@ -300,15 +316,18 @@ def install(
                     reason,
                 )
         report["items"]["qsa_rope_idx"] = _idx_engagement()
-        logger.info(
-            "%s",
+        _emit(
             idx_engagement_line(
-                layers=len(layers), enabled=qsa_rope_idx_installed()
-            ),
+                layers=len(layers), enabled=_IDX_DISABLED_REASON == ""
+            )
         )
 
     _REPORT.clear()
     _REPORT.update(report)
+    _emit(
+        "[fable] verify-glue install: "
+        + json.dumps(receipt(), sort_keys=True)
+    )
     return report
 
 
@@ -334,6 +353,81 @@ def idx_engagement_line(*, layers: int, enabled: bool) -> str:
         f"prep_calls={_IDX_COUNTS['prep_calls']}, "
         f"probe_failures={_IDX_COUNTS['probe_failures']}"
     )
+
+
+#: Per-item hot-path call counters, by item name.  These are the ENGAGEMENT
+#: PROOF a benchmark receipt carries: an arm whose item shows zero calls never
+#: got into the graph, whatever its flag said.
+ITEM_CALL_COUNTERS = {
+    "qsa_rope": ("qk_calls", "k_only_calls"),
+    "qsa_rope_idx": ("prep_calls",),
+}
+
+
+def receipt() -> Dict[str, Any]:
+    """The compact engagement block a benchmark receipt stores.
+
+    Reads the raw per-item state directly -- never through
+    :func:`qsa_rope_installed`, which RAISES while a probe is pending, and a
+    receipt builder must be able to describe that state rather than die on it.
+    """
+
+    from mtplx.kernels import qwen4_m4_rope as _rope
+
+    armed = bool(fable_verify_glue_enabled())
+    selected = [
+        item for item in FABLE_VERIFY_GLUE_ITEMS if fable_verify_glue_enabled(item)
+    ]
+    state = {
+        "qsa_rope": (_rope.disabled_reason(), _rope.pending(), _rope.installed()),
+        "qsa_rope_idx": (
+            qsa_rope_idx_disabled_reason(),
+            _IDX_DISABLED_REASON is None,
+            _IDX_DISABLED_REASON == "",
+        ),
+    }
+    counters = dict(_rope.counters())
+    counters.update(_IDX_COUNTS)
+    installed = [name for name in selected if state[name][2]]
+    pending = [name for name in selected if state[name][1]]
+    disabled = {
+        name: state[name][0] for name in selected if state[name][0] is not None
+    }
+    calls = {
+        name: {key: int(counters.get(key, 0)) for key in keys}
+        for name, keys in ITEM_CALL_COUNTERS.items()
+        if name in selected
+    }
+    return {
+        "armed": armed,
+        "known_items": list(FABLE_VERIFY_GLUE_ITEMS),
+        "selected": selected,
+        "installed": installed,
+        "pending": pending,
+        "disabled": disabled,
+        "layers": int(_REPORT.get("qsa_layers", 0)),
+        "rows": int(_REPORT.get("rows", 0)),
+        "calls": calls,
+        "probe_runs": int(counters.get("probe_runs", 0)),
+        "probe_failures": int(counters.get("probe_failures", 0)),
+    }
+
+
+def uncalled_items(block: Dict[str, Any] | None = None) -> list:
+    """Selected+installed items whose hot path never ran.  The A/B falsifier.
+
+    An item that installed but shows zero calls means the candidate arm
+    executed the control while its receipt claimed otherwise.  Callers that
+    own an A/B claim (the benchmark driver) refuse to report such a run.
+    """
+
+    data = receipt() if block is None else block
+    out = []
+    for name in data.get("installed", ()):
+        counts = data.get("calls", {}).get(name, {})
+        if not counts or not any(int(v) > 0 for v in counts.values()):
+            out.append(name)
+    return out
 
 
 def engagement() -> Dict[str, Any]:
@@ -366,7 +460,10 @@ __all__ = [
     "note_prep_call",
     "qsa_rope_idx_disabled_reason",
     "qsa_rope_idx_installed",
+    "ITEM_CALL_COUNTERS",
     "qsa_rope_installed",
+    "receipt",
     "reset_for_tests",
     "serves_rows",
+    "uncalled_items",
 ]
