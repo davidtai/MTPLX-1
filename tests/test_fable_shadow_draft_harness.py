@@ -473,6 +473,107 @@ def test_window_record_hands_the_replay_the_carry_to_commit():
 
 
 # ---------------------------------------------------------------------------
+# The model surface: what the replay is allowed to know about a model
+# ---------------------------------------------------------------------------
+
+
+def _build_replay_hooks_ast():
+    tree = ast.parse(HARNESS_PATH.read_text())
+    return next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "build_replay_hooks"
+    )
+
+
+def test_the_replay_reaches_the_model_only_through_the_runtime_api():
+    """Family-generic by construction, checked rather than hoped for.
+
+    The third hardware run died on ``layer.input_layernorm`` -- a Llama-shaped
+    name Flash-Next's ``DecoderLayer`` does not have, reached because the
+    harness called ``rt.forward_ar_capture``.  The lesson is not "rename it":
+    it is that a replay must not know a model's layer tree at all.  This pins
+    the surface it may use.
+    """
+
+    function = _build_replay_hooks_ast()
+    attributes = {
+        node.attr
+        for node in ast.walk(function)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "runtime"
+    }
+    assert attributes == {
+        "make_cache",
+        "make_mtp_cache",
+        "forward_ar",
+        "draft_mtp",
+        "update_mtp_cache",
+        "model",
+    }
+
+
+def test_every_model_tree_lookup_has_a_default_so_a_family_may_lack_it():
+    function = _build_replay_hooks_ast()
+    names = set()
+    for node in ast.walk(function):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+        ):
+            continue
+        # No two-argument getattr: an absent attribute must degrade to the
+        # generic path, never raise in the middle of a capture.
+        assert len(node.args) == 3, ast.dump(node)
+        if isinstance(node.args[1], ast.Constant):
+            names.add(node.args[1].value)
+    assert names == {
+        # the runtime's model wrapper, and the frspec stamp on it
+        "language_model",
+        "_mtplx_frspec_ids",
+        # the model's OWN prefix-commit surface; absent -> trim or rollback
+        "commit_verified_window",
+        "verify_capture_scope",
+        "clear_verify_capture",
+        # a shaped distribution's two fields
+        "token_ids",
+        "probs",
+    }
+
+
+def test_no_layer_tree_name_appears_anywhere_in_the_harness():
+    tree = ast.parse(HARNESS_PATH.read_text())
+    # Every attribute name a `qwen4_exp` / llama-shaped decoder layer carries.
+    # A harness that mentions one of these has started guessing at a family.
+    forbidden = {
+        "input_layernorm",
+        "post_attention_layernorm",
+        "self_attn",
+        "linear_attn",
+        "attn_hyper_connection",
+        "mlp_hyper_connection",
+        "hyper_connection_mixer",
+        "embed_tokens",
+        "lm_head",
+        "layers",
+        "ple",
+        # and the capture forward that reaches for them
+        "forward_ar_capture",
+    }
+    used = {
+        node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+    } | {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        and node.value in forbidden
+    }
+    assert not (used & forbidden), sorted(used & forbidden)
+
+
+# ---------------------------------------------------------------------------
 # Replay bookkeeping: what advance owes the model, window by window
 # ---------------------------------------------------------------------------
 

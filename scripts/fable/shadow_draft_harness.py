@@ -669,6 +669,20 @@ class CommitStep:
 
     NONE = -1
 
+    @property
+    def full(self) -> bool:
+        """Every fed row stays committed, so the forward IS the commit.
+
+        Nothing was speculated away: every cache entry -- trimmable or
+        recurrent -- is already exactly where the commit would leave it, so
+        there is no commit work to do and no snapshot to take.  Production
+        takes the same short cut (``generate_mtpk`` skips its trim on a full
+        accept; the copy round only commits ``if _cc_nacc < len(_cc_block)``).
+        Always true of a carry step, and of a window that accepted every draft.
+        """
+
+        return self.keep == len(self.fed)
+
     kind: str
     fed: tuple[int, ...]
     keep: int
@@ -737,9 +751,9 @@ def untrimmable_entries(cache: Sequence[Any]) -> list[int]:
     commits a verified prefix by trimming offsets therefore works on a
     KV-only model and cannot work here -- which is what
     ``_trim_cache_to_offset`` refusing a NO-OP trim after window 0 of the W51
-    capture meant.  The commit has to go through
-    ``gdn_capture.commit_captured_prefix`` instead, and this is the predicate
-    that says so.
+    capture meant.  The commit has to go through the model's own
+    ``commit_verified_window`` (or a rollback and re-forward) instead, and
+    this is the predicate that says so.
     """
 
     out: list[int] = []
@@ -779,7 +793,8 @@ class ReplayHooks:
     Contract, per segment, per window, in this order:
 
     ``start_segment(segment)``
-        prefill the prompt and position the state so that the next
+        prefill the prompt, stage the draft head's history over it exactly as
+        the logged run's prefill did, and position the state so that the next
         ``draft_rows`` call starts from the hidden state that produced
         ``segment.tokens[0]`` -- the first window's ``primary``.
     ``draft_rows(variant=..., forced_tokens=...)``
@@ -901,11 +916,14 @@ def replay_windows(
 
 def build_replay_hooks(
     *,
-    model_path: str,
+    model_path: str | None = None,
     prompt_ids: Sequence[int] | None = None,
     prompt_builder: Callable[[Any], Sequence[int]] | None = None,
     sampler_settings: Mapping[str, Any] | None = None,
     mtp_hidden_variant: str | None = None,
+    mtp_history_policy: str = "committed",
+    history_chunk: int = 2048,
+    runtime: Any = None,
 ) -> ReplayHooks:
     """Bind :class:`ReplayHooks` to a live MTPLX runtime.  **Touches the GPU.**
 
@@ -917,7 +935,10 @@ def build_replay_hooks(
     ``start_segment``
         ``rt.forward_ar(prompt_ids, cache, return_hidden=True)``.  The last
         hidden row is the one whose logits produced the segment's first token,
-        which is the row the first draft chain starts from.
+        which is the row the first draft chain starts from.  The rest of the
+        rows are not waste: they are the draft head's history, staged through
+        ``rt.update_mtp_cache`` the way the prefill stages it -- token ``i``
+        against the hidden of token ``i - 1``.
     ``draft_rows``
         the stock chain of ``generation.py`` (the ``depth_index`` loop at
         ``:11894``) reduced to its proposal: for depth ``d``,
@@ -931,14 +952,29 @@ def build_replay_hooks(
         drafted.  The MTP cache offset is read before the chain and restored in
         a ``finally``, so variant 2 starts where variant 1 started.
     ``advance``
-        ``rt.forward_ar_capture([primary] + draft_tokens, cache,
-        return_hidden=True, capture_backend=...)`` -- the verify forward --
-        then ``gdn_capture.commit_captured_prefix`` to keep ``primary`` plus
-        the accepted drafts, take the next window's starting hidden from row
-        ``accepted`` of this forward (the row that produced the emitted
-        selection), and re-stage the MTP history over the committed tokens.
-        A carry runs the same step again over the tokens the copy lane
-        committed.
+        ``rt.forward_ar([primary] + draft_tokens, cache, return_hidden=True)``
+        -- the verify forward, inside the model's ``verify_capture_scope`` when
+        it has one -- then the prefix commit ladder in ``_commit_prefix`` to
+        keep ``primary`` plus the accepted drafts, take the next window's
+        starting hidden from row ``accepted`` of this forward (the row that
+        produced the emitted selection), and re-stage the MTP history over the
+        committed tokens.  A carry runs the same step again over the tokens
+        the copy lane committed.
+
+    The whole model surface
+    -----------------------
+    Family-generic by construction, and
+    ``test_the_replay_reaches_the_model_only_through_the_runtime_api`` keeps it
+    that way.  On the runtime: ``make_cache``, ``make_mtp_cache``,
+    ``forward_ar``, ``draft_mtp``, ``update_mtp_cache``, ``model``.  On the
+    model, every one through ``getattr`` with a default, so a family that lacks
+    it degrades instead of raising: ``language_model``, ``_mtplx_frspec_ids``,
+    and the three that make up a family's own window commit --
+    ``verify_capture_scope``, ``commit_verified_window``,
+    ``clear_verify_capture``.  On a cache entry: ``is_trimmable()`` and
+    ``offset``.  **No layer-tree name appears anywhere in this file**, and the
+    shaping, hidden variant and RoPE-offset policy are resolved by calling
+    ``generate_mtpk``'s own helpers rather than re-deriving them from env keys.
 
     Why the commit is a capture and not a trim
     ------------------------------------------
@@ -954,21 +990,48 @@ def build_replay_hooks(
     prefix commit on any hybrid model, and never was; it only ever worked
     because nothing had run this on one.
 
-    ``generate_mtpk`` never trims that cache either.  It captures the
-    recurrence during the verify forward and rebuilds each recurrent leaf at
-    the kept row (``gdn_capture.commit_captured_prefix``), trimming the
-    trimmable entries in the same pass, with rollback + re-forward as the
-    fallback.  ``advance`` now does exactly that, and asserts the resulting
-    offset rather than assuming it.
+    ``generate_mtpk`` never trims that cache either.  On the batched lane it
+    forwards plainly inside ``rt.model.verify_capture_scope()`` and commits
+    with the model's own ``commit_verified_window``, which replays each
+    recurrent layer from the pre-verify snapshot over the kept rows and trims
+    the trimmable entries in the same pass; a refusal falls back to
+    ``rollback_after_verify`` plus a re-forward of the kept prefix.  ``advance``
+    now follows that ladder, and asserts the resulting offset rather than
+    assuming it.
+
+    The second hardware run (same day) then died in
+    ``gdn_capture.forward_with_gdn_capture`` on
+    ``layer.input_layernorm`` -- ``rt.forward_ar_capture`` routes there, and
+    that loop is written against a Llama-shaped ``DecoderLayer``.
+    Flash-Next's has ``linear_attn`` / ``self_attn``, ``mlp``,
+    ``attn_hyper_connection`` and ``mlp_hyper_connection``, and no
+    ``input_layernorm`` at all: the norms live inside the hyper-connections
+    and the residual is not ``h + r``.  That capture forward is a
+    ``qwen3_next``-shaped path, and the batched lane never uses it -- which is
+    why ``advance`` does not either.
+
+    The draft head's history is the other half of the state
+    -------------------------------------------------------
+    A replay that gets the target cache right and the MTP cache wrong produces
+    a perfectly-committed stream and garbage rows.  Until 2026-09-02 ``advance``
+    trimmed the MTP cache to offset 0 every window and re-appended only that
+    window's tokens, and ``start_segment`` never staged the prompt at all -- so
+    the drafter proposed from four tokens of context where the logged run had
+    sixteen thousand.  ``abba_driver`` records under
+    ``mtp_history_policy="committed"``, which means the head's cache is the
+    whole committed prefix; both are now built that way, with the same
+    (hidden of the previous token, token) pairing production uses, and the
+    policy comes from ``_resolve_mtp_history_policy`` rather than an
+    assumption.
 
     Not verified on hardware
     ------------------------
-    The piece most likely to need adjustment next is the MTP-history restage in
-    ``advance``: production does it through ``generate_mtpk``'s nested
-    ``reconcile_mtp_indexer_history`` (``generation.py:9650``), which keeps the
-    QSA indexer's raw and pooled frontiers in lockstep with the rollback.  What
-    is here is the same intent expressed through the public
-    ``rt.update_mtp_cache``.
+    The pairing and the policy are read off ``generate_mtpk``, not guessed, but
+    no GPU has run them here yet.  ``reconcile_mtp_indexer_history``
+    (``generation.py:9650``) additionally keeps the QSA indexer's raw and
+    pooled frontiers in lockstep across a rollback; this reaches the same state
+    through the public ``rt.update_mtp_cache``, and the fidelity gate is what
+    proves it.
 
     That is not a reason to distrust the numbers, because the fidelity gate in
     :func:`score` is not a smoke test: the ``stock`` arm re-drafts the same
@@ -982,33 +1045,54 @@ def build_replay_hooks(
 
     import mlx.core as mx
 
-    from mtplx.cache_state import rollback_after_verify, snapshot_untrimmable_cache
-    from mtplx.gdn_capture import commit_captured_prefix, resolve_gdn_capture_backend
+    from mtplx.cache_state import (
+        rollback_after_verify,
+        snapshot_untrimmable_cache,
+        trim_verified_window_to_prefix,
+    )
     from mtplx.generation import (
         _distribution_from_mlx_logits,
         _mtp_cache_offset,
+        _mtp_history_last_window_tokens,
+        _mtp_history_uses_committed_cache,
         _mtp_position_offset,
+        _resolve_mtp_history_policy,
+        _resolve_runtime_base_hidden_variant,
+        _resolve_runtime_mtp_position_mode,
         _rollback_mtp_cache,
     )
     from mtplx.runtime import load
     from mtplx.sampling import SamplerConfig
 
-    runtime = load(model_path, mtp=True)
+    if runtime is None:
+        if model_path is None:
+            raise ValueError("build_replay_hooks needs model_path or runtime")
+        runtime = load(model_path, mtp=True)
     settings = dict(sampler_settings or {"temperature": 1.0, "top_p": 0.95, "top_k": 20})
     draft_sampler = SamplerConfig(**settings)
 
     # The stock run's draft-side RoPE policy, read from the same env keys
     # `generate_mtpk` reads. "default" returns None, which is what the shipped
     # lane passes and what leaves the offset with the KV cache.
-    # The GDN capture backend, from the same env key `generate_mtpk` reads
-    # (`MTPLX_CAPTURE_CUSTOM_KERNEL`); unset resolves to "stock", which is the
-    # capture path every hybrid family supports.  A uniform full-attention
-    # model has no recurrent state and `forward_ar_capture` degrades to the
-    # plain forward with empty captures, so this is family-generic.
-    capture_backend = resolve_gdn_capture_backend(None)
-    position_mode = os.environ.get("MTPLX_MTP_POSITION_MODE", "default")
-    position_cap = int(os.environ.get("MTPLX_MTP_POSITION_CAP", "0") or 0)
-    position_period = int(os.environ.get("MTPLX_MTP_POSITION_PERIOD", "0") or 0)
+    # The model's OWN prefix-commit surface, if it has one.  Nothing here
+    # reaches into the layer tree: a family that can commit a verify window
+    # exposes these three methods (qwen4_exp does), and one that cannot leaves
+    # them absent and takes the generic routes below.  This is the whole of
+    # the harness's coupling to a model's internals.
+    family_commit = getattr(runtime.model, "commit_verified_window", None)
+    family_scope = getattr(runtime.model, "verify_capture_scope", None)
+    family_clear = getattr(runtime.model, "clear_verify_capture", None)
+    family_capture = callable(family_commit) and callable(family_scope)
+    # Resolved through `generate_mtpk`'s OWN helpers, not re-derived here: the
+    # env key is only half the answer, the model's MTP contract is the other
+    # half, and a harness that guessed "post_norm" would feed the MTP head a
+    # different hidden than the run it is replaying and only find out through
+    # a failed fidelity gate.  Flash-Next's contract says post_norm/post_norm/
+    # cache, so these currently agree -- and now they cannot silently stop.
+    base_hidden_variant = _resolve_runtime_base_hidden_variant(runtime, None)
+    position_mode = _resolve_runtime_mtp_position_mode(runtime)
+    position_cap = max(0, int(os.environ.get("MTPLX_MTP_POSITION_CAP") or 4096))
+    position_period = max(0, int(os.environ.get("MTPLX_MTP_POSITION_PERIOD") or 4096))
 
     def _position_offset(mtp_cache: Any) -> int | None:
         return _mtp_position_offset(
@@ -1024,6 +1108,20 @@ def build_replay_hooks(
             raise ValueError("build_replay_hooks needs prompt_ids or prompt_builder")
         prompt_ids = list(prompt_builder(runtime))
     prompt = [int(token) for token in prompt_ids]
+
+    # The draft head's history policy, resolved by `generate_mtpk`'s own helper
+    # from the policy the RECORDING driver asked for.  `abba_driver` passes
+    # "committed" (scripts/fable/abba_driver.py, the generate_mtpk call), so
+    # the head's cache holds the whole committed prefix -- the prompt from
+    # token 1, then every committed token as it lands.  A replay that leaves
+    # that cache empty gives the drafter a handful of tokens of context where
+    # the logged run had 16k, and every row it proposes is a different
+    # distribution; the fidelity gate would fail and say nothing about why.
+    history_policy = _resolve_mtp_history_policy(mtp_history_policy, len(prompt))
+    history_committed = _mtp_history_uses_committed_cache(history_policy)
+    history_window = (
+        _mtp_history_last_window_tokens() if history_policy == "last_window" else 0
+    )
 
     text_model = getattr(runtime.model, "language_model", runtime.model)
     frspec_stamp = getattr(text_model, "_mtplx_frspec_ids", None)
@@ -1058,12 +1156,43 @@ def build_replay_hooks(
             self.cache = runtime.make_cache()
             self.mtp_cache = runtime.make_mtp_cache()
             _logits, hidden = runtime.forward_ar(
-                mx.array([prompt]), cache=self.cache, return_hidden=True
+                mx.array([prompt]),
+                cache=self.cache,
+                return_hidden=True,
+                hidden_variant=base_hidden_variant,
             )
             mx.eval(hidden)
             self.hidden = hidden[:, -1:, :]
             self.primary = int(segment.tokens[0])
             self.committed = len(prompt)
+            self._stage_prompt_history(hidden)
+
+        def _stage_prompt_history(self, hidden: Any) -> None:
+            """Give the draft head the history the logged run's prefill built.
+
+            Production pairs every committed token with the target hidden of
+            the token BEFORE it -- ``prompt_ids[1:]`` against
+            ``prompt_hidden[:, :-1, :]`` (generation.py:4895) -- and under the
+            ``last_window`` policy keeps only the last N of those.  Appended in
+            chunks for the same reason the trunk prefill is chunked: one
+            16k-row pass through the head is a needless transient.
+            """
+
+            if not history_committed or len(prompt) < 2:
+                return
+            ids = prompt[1:]
+            start = 0
+            if history_window:
+                start = max(0, len(ids) - int(history_window))
+            for begin in range(start, len(ids), max(1, int(history_chunk))):
+                stop = min(len(ids), begin + max(1, int(history_chunk)))
+                runtime.update_mtp_cache(
+                    hidden[:, begin:stop, :],
+                    mx.array([ids[begin:stop]]),
+                    mtp_cache=self.mtp_cache,
+                    mtp_hidden_variant=mtp_hidden_variant,
+                    position_offset=_position_offset(self.mtp_cache),
+                )
 
         def draft_rows(
             self, *, variant: ProposalVariant, forced_tokens: Sequence[int]
@@ -1102,70 +1231,132 @@ def build_replay_hooks(
                 self._commit_step(step, index=int(window["index"]))
 
         def _commit_step(self, step: CommitStep, *, index: int) -> None:
-            """One verify forward and its prefix commit, the way production does it.
+            """One verify forward and its prefix commit, production's ladder.
 
-            NOT a trim.  ``_trim_cache_to_offset`` only commits a prefix on an
-            all-trimmable (KV-only) cache; a hybrid model's recurrent layers
-            hold state that cannot be trimmed at all, so on Flash-Next it
-            refuses even a no-op.  The prefix commit that works on both is the
-            one ``generate_mtpk`` uses: capture the recurrence during the
-            verify forward and rebuild each recurrent leaf at the kept row
-            (``commit_captured_prefix``), trimming the trimmable entries in the
-            same pass.  The pre-verify snapshot pays for the fallback, which is
-            the copy round's: roll the whole window back and re-forward the
-            kept prefix.
+            NOT ``forward_ar_capture``.  That routes to
+            ``gdn_capture.forward_with_gdn_capture``, whose layer loop is
+            written against a Llama-shaped ``DecoderLayer``
+            (``input_layernorm`` / ``self_attn`` / ``post_attention_layernorm``
+            / ``mlp``, residual ``h + r``).  Flash-Next's layer has none of
+            those names and none of that algebra -- its residual runs through
+            ``attn_hyper_connection`` / ``mlp_hyper_connection`` -- so that
+            path is not merely misnamed for this family, it does not apply.
+            ``generate_mtpk`` never calls it on the batched lane either: it
+            forwards plainly (or through the compiled bank) and commits with
+            the MODEL's own ``commit_verified_window``.
+
+            So: forward plainly, then commit by the same ladder
+            ``generate_mtpk`` uses, most specific first --
+
+            1. nothing at all when the window was fully accepted (the forward
+               already left every entry where the commit would),
+            2. the family's own window commit, which replays each recurrent
+               layer from the pre-verify snapshot over the kept rows (needs
+               the rows the capture scope retains during the forward),
+            3. an offset trim, valid only when every entry is trimmable,
+            4. roll the whole window back and re-forward the kept prefix --
+               always available, always exact, one extra forward.
             """
 
             fed = list(step.fed)
-            before = snapshot_untrimmable_cache(self.cache)
-            _logits, hidden, captures = runtime.forward_ar_capture(
-                mx.array([fed]),
-                cache=self.cache,
-                return_hidden=True,
-                capture_backend=capture_backend,
-            )
-            mx.eval(hidden)
             kept = fed[: step.keep]
-            if not commit_captured_prefix(
-                self.cache,
-                captures,
-                keep_tokens=step.keep,
-                verified_tokens=len(fed),
-            ):
-                # Same fallback the context-copy round takes when its capture
-                # commit refuses: undo the whole verify window and re-forward
-                # the committed prefix.  `hidden` is still the authoritative
-                # target hidden for those rows -- it was evaluated above, and
-                # the re-forward recomputes the same rows.
-                rollback_after_verify(self.cache, before, verified_tokens=len(fed))
-                _repair_logits, repair_hidden = runtime.forward_ar(
-                    mx.array([kept]), cache=self.cache, return_hidden=True
-                )
-                mx.eval(repair_hidden)
+            # The hidden of the token BEFORE this step's first fed token: the
+            # row the previous step deferred on.  The MTP history pairing needs
+            # it, and `self.hidden` is about to be overwritten.
+            preceding_hidden = self.hidden
+            # Only a partial keep needs a commit, and only a commit needs the
+            # snapshot of the recurrent state.
+            before = None if step.full else snapshot_untrimmable_cache(self.cache)
+            scope = (
+                family_scope()
+                if (family_capture and not step.full)
+                else nullcontext()
+            )
+            try:
+                with scope:
+                    _logits, hidden = runtime.forward_ar(
+                        mx.array([fed]),
+                        cache=self.cache,
+                        return_hidden=True,
+                        hidden_variant=base_hidden_variant,
+                    )
+                    mx.eval(hidden)
+                self._commit_prefix(step, before=before, kept=kept, index=index)
+            finally:
+                if callable(family_clear):
+                    family_clear(self.cache)
             offsets = trimmable_offsets(self.cache)
             if any(offset != step.offset for offset in offsets):
                 raise RuntimeError(
                     f"after the {step.kind} step of window {index} the target "
                     f"cache sits at {sorted(set(offsets))}, not {step.offset}; "
-                    f"the prefix commit did not land "
-                    f"(untrimmable entries: {untrimmable_entries(self.cache)})"
+                    f"the prefix commit did not land (untrimmable entries: "
+                    f"{untrimmable_entries(self.cache)})"
                 )
             self.hidden = hidden[:, step.hidden_row : step.hidden_row + 1, :]
             self.primary = step.primary
             self.committed = step.offset
-            # Restage the MTP history over exactly the committed tokens, from
-            # authoritative target hidden. Production does this through
-            # `reconcile_mtp_indexer_history` (generation.py:9650); this is the
-            # same intent through the public API, and the fidelity gate is what
-            # proves it right.
-            _rollback_mtp_cache(self.mtp_cache, 0)
+            # Extend the MTP history by exactly the committed tokens, from
+            # authoritative target hidden, pairing each with the hidden of the
+            # token BEFORE it -- the pairing `generate_mtpk` uses everywhere
+            # (the copy round's `[hidden, _cc_hidden[:, :nacc, :]]` against
+            # `[primary] + _cc_acc`, generation.py:11440).  APPEND, not
+            # restage: under the committed policy the head's cache is the whole
+            # prefix, and wiping it to 0 each window -- which this did until
+            # 2026-09-02 -- left the drafter with four tokens of context.
+            history_hidden = mx.concatenate(
+                [preceding_hidden, hidden[:, : step.keep - 1, :]], axis=1
+            )
+            if not history_committed:
+                # Cycle policy: the head keeps only this window.
+                _rollback_mtp_cache(self.mtp_cache, 0)
             runtime.update_mtp_cache(
-                hidden[:, : step.keep, :],
+                history_hidden,
                 mx.array([kept]),
                 mtp_cache=self.mtp_cache,
                 mtp_hidden_variant=mtp_hidden_variant,
                 position_offset=_position_offset(self.mtp_cache),
             )
+
+        def _commit_prefix(
+            self,
+            step: CommitStep,
+            *,
+            before: Any,
+            kept: Sequence[int],
+            index: int,
+        ) -> None:
+            """Routes 1-4 of the ladder above.  Raises only if all four fail."""
+
+            if step.full:
+                return
+            verified = len(step.fed)
+            if family_capture and family_commit(
+                self.cache,
+                before.states,
+                keep_tokens=step.keep,
+                verified_tokens=verified,
+            ):
+                return
+            if trim_verified_window_to_prefix(
+                self.cache,
+                before,
+                verified_tokens=verified,
+                keep_tokens=step.keep,
+            ):
+                return
+            # Undo the whole verify window and re-forward the committed
+            # prefix -- the context-copy round's own fallback.  `hidden` from
+            # the first forward stays authoritative for those rows: it is
+            # already evaluated, and the re-forward recomputes the same ones.
+            rollback_after_verify(self.cache, before, verified_tokens=verified)
+            _repair_logits, repair_hidden = runtime.forward_ar(
+                mx.array([list(kept)]),
+                cache=self.cache,
+                return_hidden=True,
+                hidden_variant=base_hidden_variant,
+            )
+            mx.eval(repair_hidden)
 
         def close(self) -> None:
             self.cache = None

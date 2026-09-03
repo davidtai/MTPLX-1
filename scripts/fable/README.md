@@ -2361,13 +2361,60 @@ untrimmable on purpose ("Attention KV caches can roll back by trimming their
 offset. GDN recurrent caches cannot"). An offset trim is not a prefix commit on
 any hybrid model.
 
-`generate_mtpk` never trims that cache either: it captures the recurrence during
-the verify forward and rebuilds each recurrent leaf at the kept row
-(`gdn_capture.commit_captured_prefix`), trimming the trimmable entries in the
-same pass, with rollback + re-forward as the fallback. `advance` now does the
-same, and asserts the resulting offset instead of assuming it. The schedule it
-follows — one forward per window plus one per carry, what each commits, and
-which token stays deferred — is `commit_steps`, a pure function with CPU tests.
+`generate_mtpk` never trims that cache either. On the batched lane it forwards
+plainly inside `rt.model.verify_capture_scope()` and commits with the model's own
+`commit_verified_window`, which replays each recurrent layer from the pre-verify
+snapshot over the kept rows and trims the trimmable entries in the same pass.
+`advance` now follows that ladder, most specific first — nothing at all on a full
+accept, the family commit, an offset trim for a KV-only cache, then
+`rollback_after_verify` plus a re-forward of the kept prefix — and asserts the
+resulting offset instead of assuming it. The schedule it follows (one forward per
+window plus one per carry, what each commits, which token stays deferred) is
+`commit_steps`, a pure function with CPU tests.
+
+#### The replay may not know a model's layer tree
+
+The third GPU run died on `AttributeError: 'DecoderLayer' object has no attribute
+'input_layernorm'`, inside `gdn_capture.forward_with_gdn_capture` — where
+`rt.forward_ar_capture` routes. That loop is written against a Llama-shaped
+decoder layer (`input_layernorm` / `self_attn` / `post_attention_layernorm` /
+`mlp`, residual `h + r`). Flash-Next's has `linear_attn` / `self_attn`, `mlp`,
+`attn_hyper_connection`, `mlp_hyper_connection` and an optional `ple`; the norms
+live *inside* the hyper-connections and the residual is not `h + r`. Renaming
+would not have helped — that capture forward is a `qwen3_next`-shaped path and
+the batched lane never uses it.
+
+So the harness's whole model surface is now: on the runtime, `make_cache`,
+`make_mtp_cache`, `forward_ar`, `draft_mtp`, `update_mtp_cache`, `model` (plus
+`tokenizer`, through the prompt builder); on the model, `language_model`,
+`_mtplx_frspec_ids` and the three-method commit surface, **every one through
+`getattr` with a default** so a family that lacks it degrades instead of raising;
+on a cache entry, `is_trimmable()` and `offset`. No layer-tree name appears in the
+file, and three tests fail if one reappears. Shaping, hidden variant, RoPE-offset
+policy and history policy are resolved by calling `generate_mtpk`'s own helpers,
+never re-derived from env keys.
+
+#### The draft head's history is the other half of the state
+
+Found by audit rather than by a crash, and it would have failed the fidelity gate
+without saying why: `advance` trimmed the MTP cache to offset 0 every window and
+re-appended only that window's tokens, and `start_segment` never staged the prompt
+at all — so the drafter proposed from four tokens of context where the logged run
+had 16,384. `abba_driver` records under `mtp_history_policy="committed"`, so the
+head's cache is the whole committed prefix. `start_segment` now stages
+`prompt[1:]` against `hidden[:, :-1, :]` (production's pairing) in chunks, and
+`advance` appends each step's committed tokens with the same (hidden of the
+previous token, token) pairing the copy round uses.
+
+#### Testing it without a GPU
+
+`tests/test_fable_shadow_replay_qwen4.py` builds `mtplx.models.qwen4_exp` for real
+at toy dimensions — a genuinely hybrid four-layer tree, a PLE layer, a real
+`Qwen4ExpMTP` head, random weights, no pack on disk, no Metal — and runs
+`replay_windows` through `build_replay_hooks` (which takes a `runtime=` for this).
+All three defects above were re-introduced and the file re-run: each one fails it,
+with the same error the GPU produced. Three seconds instead of three guarded
+windows.
 
 `--expect-segments 3` asserts the reconstruction found three requests; if it
 finds two the trajectory does not match the run and the harness refuses to
