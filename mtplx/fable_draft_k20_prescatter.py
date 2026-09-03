@@ -404,8 +404,12 @@ def claim_draft_route(
 
     if not _ENABLED:
         return None
+    # W84: the engagement half of this flag's install verdict, bound AFTER the
+    # `_ENABLED` guard so an unarmed process runs none of it.
+    from . import fable_install_receipts as _fable_install_receipts
+
     try:
-        return _claim_draft_route(
+        plan = _claim_draft_route(
             rt,
             draft_sampler=draft_sampler,
             draft_core=draft_core,
@@ -434,7 +438,15 @@ def claim_draft_route(
         if receipt is not None:
             receipt.clear()
             receipt.update(stamped)
+        # A decline is BY DESIGN -- the shipped draft path runs and produces
+        # the same tokens -- so it is counted, never printed.
+        _fable_install_receipts.note_decline(
+            "draft_k20_prescatter", str(stamped.get("declined") or "declined")
+        )
         return None
+    if plan is not None:
+        _fable_install_receipts.note_engagement("draft_k20_prescatter")
+    return plan
 
 
 def _claim_draft_route(

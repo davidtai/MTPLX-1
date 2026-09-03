@@ -1983,6 +1983,31 @@ def fable_qsa_sparse_decode_block(*, require_calls: bool, strict: bool = True) -
     return block
 
 
+def fable_install_receipts_block(runtime=None) -> dict:
+    """W84 install-time verdicts for the nine flags that had no receipt.
+
+    ``mtplx/runtime.py`` prints one ``[fable] <lane> armed: ...`` /
+    ``off (...)`` / ``refused (...)`` / ``resolved: ...`` line per lane at
+    model load; this is the same information as a dict, re-read AFTER the run
+    so the per-request engagement counters are populated.
+
+    Read-only and never raises.  Unlike ``fable_verify_glue_block`` and
+    ``fable_qsa_sparse_decode_block`` it does NOT fail an arm: three of the
+    nine keys are plain server knobs with no armed/unarmed distinction, and
+    the ones that do arm state their own engagement condition ("engages at a
+    prefill cut into 2+ chunks", ...) which only the cell's shape can satisfy.
+    Judging engagement is the reader's job; publishing the evidence is this
+    function's.
+    """
+
+    try:
+        from mtplx.fable_install_receipts import receipts
+
+        return receipts({"runtime": runtime})
+    except Exception as exc:  # never fail a finished run over a receipt
+        return {"unavailable": f"{type(exc).__name__}: {exc}"}
+
+
 def is_raw_env_mtplx_key(key: str) -> bool:
     """Does this MTPLX_* key belong on the raw ``--env`` passthrough?"""
 
@@ -3026,6 +3051,12 @@ def main() -> int:
         "qsa_sparse_decode": fable_qsa_sparse_decode_block(
             require_calls=True, strict=False
         ),
+        # W84: install-time verdict per armed flag for the nine keys that
+        # had none -- the op diet, block verification, the K20 pre-scatter,
+        # the two PLE prefill lanes, the QSA query tile, and the three
+        # prefill/session-bank knobs.  Read AFTER the run so the engagement
+        # counters are populated.
+        "fable_install_receipts": fable_install_receipts_block(runtime),
         "paired_routed_glu": {
             "expected": candidate_environment.get("MTPLX_QWEN4_M4_ROUTED_GLU")
             == "1",
