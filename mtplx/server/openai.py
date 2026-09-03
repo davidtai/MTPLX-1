@@ -15920,6 +15920,27 @@ def _mtplx_apply_settings_payload(
     return applied
 
 
+def _fable_install_receipts_payload(state: Any) -> dict[str, Any]:
+    """W84 install-time flag verdicts for ``/health``.
+
+    Read-only.  ``mtplx/runtime.py`` publishes the block on the runtime at
+    model load (and prints one ``[fable] <lane> ...`` line per lane to
+    stderr); this re-reads it live so the per-request engagement counters are
+    current.  Nothing here installs, decides or measures anything.
+
+    When ``worker/w61-restack-profile`` merges, this belongs inside its
+    ``engagement_reports`` payload -- the two are the same idea at two levels
+    (that one reports LANES, this one reports FLAGS).
+    """
+
+    try:
+        from mtplx.fable_install_receipts import receipts
+
+        return receipts({"runtime": getattr(state, "runtime", None)})
+    except Exception:
+        return {}
+
+
 def _env_bool_setting(name: str, *, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -27014,6 +27035,9 @@ def create_app(state: ServerState) -> FastAPI:
             "reasoning_parser": state.args.reasoning_parser,
             "load_time_s": getattr(state, "load_time_s", None),
             "draft_lm_head": state.draft_lm_head,
+            # W84: one install-time verdict per armed flag, in the same place
+            # /health already carries the draft-head install report.
+            "fable_install_receipts": _fable_install_receipts_payload(state),
             "draft_sampler": (
                 asdict(getattr(state, "draft_sampler", None))
                 if is_dataclass(getattr(state, "draft_sampler", None))

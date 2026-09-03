@@ -768,6 +768,35 @@ stack plus one item. Swap the item for `qsa_rope_idx`, or drop
 combined arm cannot attribute a win, which is the whole reason the items are
 separately selectable.
 
+## Install-time verdicts (`[fable] <lane> ...`)
+
+Nine keys of the served set used to arm with no receipt anywhere: bare
+`os.environ.get` reads at request or construction time, printing nothing
+either way. `mtplx/fable_install_receipts.py` gives each one an install-time
+verdict, printed once per process to stderr from `mtplx/runtime.py:load()`,
+in the same shape the sparse-decode and verify-glue lanes use:
+
+```
+[fable] opdiet armed: items=k20 (MTPLX_FABLE_OPDIET_ITEMS='k20') of bank,rope,resid,k20; ...
+[fable] block_verify armed, engages at an accept window with temperature>0, ...
+[fable] prefill_chunk_size resolved: full serving chunk widths [4096] (...)
+[fable] ple_prefill_lookahead refused (Qwen4ExpTextModel has no PLE stage layer: ...)
+```
+
+| state | meaning |
+| --- | --- |
+| `armed: ...` | the flag is on and its fate is settled at install |
+| `armed, engages at <condition>: ...` | on, but the lane only runs on a request that fits; the receipt carries an engagement counter, and a by-design decline (short prompt, greedy window) is counted, never printed |
+| `off (<reason>)` | not armed; the reason names the key |
+| `refused (<reason>)` | armed, but the code shows it cannot engage in THIS process (no PLE stage, a query tile wider than the chunk, a qwen4-only op-diet selection on another family). A printed verdict, not an exception -- nothing here changes what a flag does |
+| `resolved: ...` | a server knob with no armed/unarmed distinction (`MTPLX_PREFILL_CHUNK_SIZE`, `MTPLX_QSA_PREFILL_COMPILE_ROWS`, `MTPLX_SESSION_BANK_MAX_BYTES`): the value this process is running |
+
+The same blocks ride the abba receipt at `fable_install_receipts` and the
+server's `GET /health` under `fable_install_receipts`, with each lane's
+`engagements`, `declines` and the env it actually read.
+`tests/test_fable_install_receipts.py` names the nine keys and fails when a
+flag is added without a verdict.
+
 ## PYTHONPATH
 
 Always export

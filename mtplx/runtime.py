@@ -682,6 +682,33 @@ def _install_architectures_declared_module_alias(config: dict[str, Any]) -> bool
     return False
 
 
+def _publish_fable_install_receipts(runtime: Any) -> None:
+    """W84 -- one install-time verdict per armed flag, to stderr, once.
+
+    Nine keys (the op diet, block verification, the K20 pre-scatter, the two
+    PLE prefill lanes, the QSA query tile, and the three prefill/session-bank
+    server knobs) were read with a bare ``os.environ.get`` at request or
+    construction time and printed nothing: an arm that cannot prove which code
+    it ran is unreadable, which is the failure ``mtplx/fable_verify_glue.py``
+    and ``mtplx/kernels/qsa_sparse_decode.py`` already fixed for their lanes.
+
+    Called at INSTALL time only, once per model load, immediately before the
+    runtime is handed back -- the same point the ``[qwen4-*]`` reports publish
+    from, and the one place ``mtplx serve``, ``scripts/fable/abba_driver.py``
+    and ``mtplx/prefill_bench.py`` all pass through.  Every verdict OBSERVES
+    state its owning module already decided; nothing here can raise into a
+    model load, and nothing changes what the flags do.
+    """
+
+    try:
+        from .fable_install_receipts import emit_all, receipts
+
+        emit_all(context={"runtime": runtime})
+        runtime.fable_install_receipts = receipts({"runtime": runtime})
+    except Exception:  # a receipt must never be able to fail a load
+        pass
+
+
 def load(
     model_path: Path | str,
     *,
@@ -739,6 +766,7 @@ def load(
             runtime.model_path = path
             runtime.path = path
             runtime.bundle_path = path
+            _publish_fable_install_receipts(runtime)
             return runtime
         path = Path(gemma4_pair["target_model"])
     config = load_config(path)
@@ -1202,6 +1230,7 @@ def load(
             install_qwen3_next_packed_concats(model)
     except ImportError:
         pass
+    _publish_fable_install_receipts(runtime)
     return runtime
 
 

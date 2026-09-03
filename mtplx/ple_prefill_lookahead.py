@@ -112,6 +112,14 @@ def count(name: str, n: int = 1) -> None:
     COUNTERS[name] = COUNTERS.get(name, 0) + int(n)
 
 
+def _install_receipts():
+    """The W84 verdict registry, imported lazily to keep this module a leaf."""
+
+    from mtplx import fable_install_receipts
+
+    return fable_install_receipts
+
+
 def snapshot_counters() -> dict[str, int]:
     return dict(COUNTERS)
 
@@ -439,8 +447,18 @@ def first_gather_early_scope(early: "EarlyFirstGather | None", reason: str | Non
     if early is None:
         _LAST_EARLY["armed"] = False
         _LAST_EARLY["reason"] = reason
+        if reason is not None and early_enabled():
+            # A request the lane declines by design (empty prompt, an
+            # unpredictable first span, a span the sidecar owns): counted,
+            # never printed.  Gated on the flag so an unarmed process records
+            # nothing -- an empty prompt is not a decline of a lane nobody
+            # armed.
+            _install_receipts().note_decline(
+                "ple_first_gather_early", str(reason)
+            )
         yield None
         return
+    _install_receipts().note_engagement("ple_first_gather_early")
     _LAST_EARLY["armed"] = True
     _LAST_EARLY["span"] = list(early.span)
     token = _EARLY_ACTIVE.set(early)
@@ -799,6 +817,12 @@ def prefill_lookahead_scope(lookahead: "PrefillLookahead | None"):
             }
         )
         count(f"scope_skipped_{lookahead.inert_reason}")
+        # W84 install-verdict counter.  A skipped scope is a BY-DESIGN decline
+        # (one chunk, or every span below the sidecar's hot-row threshold), so
+        # it is counted and never printed.
+        _install_receipts().note_decline(
+            "ple_prefill_lookahead", str(lookahead.inert_reason)
+        )
         lookahead.close()
         yield None
         return
@@ -811,6 +835,7 @@ def prefill_lookahead_scope(lookahead: "PrefillLookahead | None"):
             "span_tokens": lookahead.span_tokens,
         }
     )
+    _install_receipts().note_engagement("ple_prefill_lookahead")
     token = _ACTIVE.set(lookahead)
     # Start the first chunk's preparation before the caller does anything
     # else: chunk 0 is the one with the largest measured stall (450 ms vs

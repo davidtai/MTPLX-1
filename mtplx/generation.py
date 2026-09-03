@@ -57,6 +57,11 @@ from .fable_block_verify import (
     is_enabled as _fable_block_verify_enabled,
 )
 from .fable_compiled_draft import maybe_build_compiled_draft_chain
+# W84: install-time verdict registry.  Nothing here decides anything --
+# `note_engagement` / `note_decline` are dict increments on paths that are
+# already behind the flag's own gate, so a flag-off process runs no extra
+# code at all.
+from . import fable_install_receipts as _fable_install_receipts
 from .fable_device_draft_chain import (
     COUNTERS as _fable_device_draft_chain_counters,
     DeviceDraftChainIneligible,
@@ -13942,6 +13947,16 @@ def generate_mtpk(
                     else None
                 ),
             )
+            # Engagement half of the install verdict: `build_verifier`
+            # returns None for a window that does not already hold every row
+            # the ladder needs, which is a BY-DESIGN decline (a count, never a
+            # print).  Inside the armed guard, so an unarmed run is untouched.
+            if _bv is None:
+                _fable_install_receipts.note_decline(
+                    "block_verify", "rows_not_all_on_host"
+                )
+            else:
+                _fable_install_receipts.note_engagement("block_verify")
         if _FABLE_K20_LOG and _host_accept_drafts:
             # MTPLX_FABLE_K20_LOG (default off): the stock native-MTP lane's
             # own K20 rows. Everything copied here is an array this lane has
