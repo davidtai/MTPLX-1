@@ -141,6 +141,14 @@ DEFAULT_COPY_ROUND_COST_S = 0.0210
 #: Fitted marginal cost of one verified context-copy row, seconds (C1).
 DEFAULT_COPY_TOKEN_COST_S = 0.003636
 
+#: A primary-metric delta smaller than this, in per cent of the control, is
+#: inside the noise this harness can resolve -- the "rounding class".  A
+#: candidate that lands in it AND reproduces the control's exact token stream
+#: on every seed did not engage; saying so on the window's own summary is what
+#: this constant is for (2026-09-02, where that proof was three by-hand hashes
+#: of ``response_text_head`` + ``response_text_tail``).
+DEFAULT_ROUNDING_CLASS_PCT = 1.0
+
 
 # --------------------------------------------------------------------------
 # Pure planning / argv construction (unit-tested)
@@ -313,6 +321,28 @@ def extract_run_row(
             f"arm receipt must hold exactly one measured row, got {len(rows)}"
         )
     row = rows[0]
+    # An arm LABEL is not unique across attempts, so a stale receipt sitting
+    # at the expected path reads as this run's evidence unless the sequence is
+    # checked.  The sequence IS unique per arm within a window.
+    receipt_sequence = row.get("sequence", receipt.get("sequence"))
+    if receipt_sequence is not None and int(receipt_sequence) != int(
+        run["sequence"]
+    ):
+        raise ValueError(
+            f"receipt is sequence {int(receipt_sequence)} but this arm is "
+            f"sequence {int(run['sequence'])}: refusing to read another run's "
+            "receipt as this one"
+        )
+    # sha256 over the raw uint32 id bytes (mtplx/fable_token_source.py).
+    # Receipts written before that field existed fall back to the older
+    # comma-joined digest; the comparison is only ever within one window, so
+    # a consistent fallback is still a valid identity test.
+    ids_digest = row.get("output_ids_sha256")
+    ids_digest_source = "output_ids_sha256"
+    if not ids_digest:
+        ids_digest = row["response_token_sha256"]
+        ids_digest_source = "response_token_sha256"
+    token_sources = row.get("token_sources") or {}
     compiled_calls = int(row.get("compiled_m4_calls") or 0)
     decode_s = float(row["decode_elapsed_s"])
     generated = int(row["generated_tokens"])
@@ -366,6 +396,15 @@ def extract_run_row(
         "verify_forward_s": float(row["verify_forward_time_s"]),
         "draft_s": float(row["draft_time_s"]),
         "digest": str(row["response_token_sha256"]),
+        # -- output identity + provenance ----------------------------------
+        "output_ids_sha256": str(ids_digest),
+        "output_ids_digest_source": ids_digest_source,
+        "token_sources_available": bool(token_sources.get("available")),
+        "token_sources_complete": bool(token_sources.get("complete")),
+        "token_source_counts": dict(token_sources.get("counts") or {}),
+        # -- which write produced this row ---------------------------------
+        "run_id": row.get("run_id") or receipt.get("run_id"),
+        "attempt": int(row.get("attempt") or receipt.get("attempt") or 1),
         "peak_bytes": int(row["peak_memory_bytes"]),
         "ready_c": thermal.get("ready_c"),
         "page_cache_regime": row.get("page_cache_regime"),
@@ -397,11 +436,102 @@ def _delta_pct(candidate: float | None, control: float | None) -> float | None:
     return 100.0 * (candidate - control) / control
 
 
+def row_output_digest(row: Mapping[str, Any]) -> str:
+    """The identity of a row's generated token stream.
+
+    ``output_ids_sha256`` (sha256 over the raw uint32 ids) when the receipt
+    carries it, the older comma-joined ``digest`` otherwise.  Never the text
+    head/tail: on 2026-09-02 a duplicated subword sat outside both 600-char
+    windows and two different outputs hashed the same by hand.
+    """
+
+    return str(row.get("output_ids_sha256") or row["digest"])
+
+
+def output_identity(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    primary_delta_pct: float | None,
+    rounding_class_pct: float = DEFAULT_ROUNDING_CLASS_PCT,
+) -> dict[str, Any]:
+    """Per-seed output identity and the non-engagement verdict.
+
+    Two questions the window could not answer without opening receipts:
+
+    * did every arm of a seed emit the SAME tokens (the exactness gate), and
+    * did the candidate reproduce the control on every seed while its primary
+      delta stayed inside the rounding class -- which is what an arm that
+      never engaged looks like, and is indistinguishable from a real bit-exact
+      win on timings alone.
+    """
+
+    seeds = sorted({int(row["seed"]) for row in rows})
+    per_seed: list[dict[str, Any]] = []
+    matches = 0
+    paired_seeds = 0
+    for seed in seeds:
+        seed_rows = [r for r in rows if int(r["seed"]) == seed]
+        control = [r for r in seed_rows if r["arm"] == "A"]
+        candidate = [r for r in seed_rows if r["arm"] == "B"]
+        digests = {row_output_digest(r) for r in seed_rows}
+        control_digests = {row_output_digest(r) for r in control}
+        candidate_digests = {row_output_digest(r) for r in candidate}
+        matched = bool(
+            control_digests
+            and candidate_digests
+            and control_digests == candidate_digests
+            and len(control_digests) == 1
+        )
+        if control and candidate:
+            paired_seeds += 1
+            matches += int(matched)
+        per_seed.append(
+            {
+                "seed": seed,
+                "identical": len(digests) == 1,
+                "candidate_matches_control": matched,
+                "digests": sorted(digests),
+            }
+        )
+    in_rounding_class = (
+        primary_delta_pct is not None
+        and abs(float(primary_delta_pct)) < float(rounding_class_pct)
+    )
+    return {
+        "digest_key": "output_ids_sha256",
+        "digest_sources": sorted(
+            {
+                str(row.get("output_ids_digest_source") or "digest")
+                for row in rows
+            }
+        ),
+        "per_seed": per_seed,
+        "identical_per_seed": all(entry["identical"] for entry in per_seed),
+        "candidate_matches_control_seeds": matches,
+        "paired_seeds": paired_seeds,
+        "rounding_class_pct": float(rounding_class_pct),
+        "primary_delta_pct": (
+            None if primary_delta_pct is None else float(primary_delta_pct)
+        ),
+        "in_rounding_class": bool(in_rounding_class),
+        "non_engagement": bool(
+            paired_seeds > 0 and matches == paired_seeds and in_rounding_class
+        ),
+        "token_sources_available": all(
+            bool(row.get("token_sources_available")) for row in rows
+        ),
+        "token_sources_complete": all(
+            bool(row.get("token_sources_complete")) for row in rows
+        ),
+    }
+
+
 def summarize(
     rows: Sequence[Mapping[str, Any]],
     *,
     copy_round_cost_s: float = DEFAULT_COPY_ROUND_COST_S,
     copy_token_cost_s: float = DEFAULT_COPY_TOKEN_COST_S,
+    rounding_class_pct: float = DEFAULT_ROUNDING_CLASS_PCT,
 ) -> dict[str, Any]:
     """Per-arm aggregates, per-seed paired deltas, and adjacent-pair deltas.
 
@@ -627,11 +757,17 @@ def summarize(
         ),
         "all_digests_match": len({str(row["digest"]) for row in rows}) == 1,
     }
+    identity = output_identity(
+        rows,
+        primary_delta_pct=overall.get("delta_mean_ms_per_m4_window_net_pct"),
+        rounding_class_pct=rounding_class_pct,
+    )
     return {
         "arms": arms,
         "per_seed": paired,
         "adjacent_pairs": adjacent,
         "overall": overall,
+        "output_identity": identity,
         "copy_cost_model": {
             "copy_round_cost_s": float(copy_round_cost_s),
             "copy_token_cost_s": float(copy_token_cost_s),
@@ -658,20 +794,26 @@ def render_markdown(
     """Render the per-run table plus the paired-delta table."""
 
     lines = [
-        "| # | Arm | Seed | Decode tok/s | Decode s | ms/window | ms/M4win net "
+        "| # | Seq | Arm | Seed | Decode tok/s | Decode s | ms/window "
+        "| ms/M4win net "
         "| tok/window | tok/M4win | ccopy rounds | ccopy accepted "
-        "| Accepted by depth | Verify fwd s | Digest | Peak bytes | Ready C "
-        "| Page cache |",
-        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
-        "| ---: | --- | ---: | --- | ---: | ---: | --- |",
+        "| Accepted by depth | Verify fwd s | Output ids sha256 | Peak bytes "
+        "| Ready C | Page cache |",
+        "| ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
+        "| ---: | ---: | --- | ---: | --- | ---: | ---: | --- |",
     ]
-    for row in sorted(rows, key=lambda r: int(r["index"])):
+    # Keyed by SEQUENCE, not label: an arm label repeats on every attempt at
+    # that arm, and reading the wrong attempt's row is exactly the failure
+    # this column exists to make impossible.
+    for row in sorted(rows, key=lambda r: int(r["sequence"])):
         lines.append(
-            "| {index} | {arm_name} ({arm}) | {seed} | {tok_s} | {decode_s} "
+            "| {index} | {sequence} | {arm_name} ({arm}) | {seed} | {tok_s} "
+            "| {decode_s} "
             "| {ms} | {ms_net} | {tpw} | {tpw_net} | {rounds} | {accepted} "
             "| {depths} | {vf} | {digest} | {peak:,} | {ready} "
             "| {regime} |".format(
                 index=int(row["index"]),
+                sequence=int(row["sequence"]),
                 arm_name=row["arm_name"],
                 arm=row["arm"],
                 seed=int(row["seed"]),
@@ -685,7 +827,7 @@ def render_markdown(
                 accepted=_format(row.get("context_copy_accepted_tokens"), "d"),
                 depths=",".join(str(int(v)) for v in row["accepted_by_depth"]),
                 vf=_format(row["verify_forward_s"], ".6f"),
-                digest=str(row["digest"])[:12],
+                digest=row_output_digest(row)[:12],
                 peak=int(row["peak_bytes"]),
                 ready=_format(row["ready_c"], ".4f"),
                 regime=row["page_cache_regime"] or "n/a",
@@ -821,6 +963,71 @@ def render_markdown(
         "Every arm produced the same response-token digest: "
         + ("yes" if overall["all_digests_match"] else "NO")
     )
+
+    # -- the two lines that would have saved 2026-09-02 --------------------
+    # Both read output_ids_sha256 (sha256 over the raw uint32 generated ids),
+    # never response_text_head/tail: 600 characters at each end of a 1,024
+    # token completion is not the completion.
+    identity = summary.get("output_identity") or output_identity(
+        rows, primary_delta_pct=overall.get("delta_mean_ms_per_m4_window_net_pct")
+    )
+    mismatched = [
+        entry["seed"] for entry in identity["per_seed"] if not entry["identical"]
+    ]
+    lines.append(
+        "outputs identical per seed: {verdict} ({key}{fallback}{detail})".format(
+            verdict="yes" if identity["identical_per_seed"] else "no",
+            key=identity["digest_key"],
+            fallback=(
+                ""
+                if identity["digest_sources"] == ["output_ids_sha256"]
+                else " via " + "/".join(identity["digest_sources"])
+            ),
+            detail=(
+                "; seeds that differ: "
+                + ",".join(str(seed) for seed in mismatched)
+                if mismatched
+                else ""
+            ),
+        )
+    )
+    matched = int(identity["candidate_matches_control_seeds"])
+    paired_seeds = int(identity["paired_seeds"])
+    engagement = (
+        "candidate == control on {matched}/{total} seeds "
+        "(identical output ids)".format(matched=matched, total=paired_seeds)
+    )
+    if identity["non_engagement"]:
+        engagement += (
+            "; primary delta {delta} is inside the +/-{band:.2f}% rounding "
+            "class -- NON-ENGAGEMENT: this arm reproduced the control exactly "
+            "and moved nothing measurable.".format(
+                delta=_format(identity["primary_delta_pct"], "+.4f") + "%",
+                band=identity["rounding_class_pct"],
+            )
+        )
+    elif paired_seeds and matched == paired_seeds:
+        engagement += (
+            "; primary delta {delta} is OUTSIDE the +/-{band:.2f}% rounding "
+            "class, so this is a bit-exact change, not an inert arm.".format(
+                delta=_format(identity["primary_delta_pct"], "+.4f") + "%",
+                band=identity["rounding_class_pct"],
+            )
+        )
+    else:
+        engagement += "."
+    lines.append(engagement)
+    if not identity["token_sources_available"]:
+        lines.append(
+            "Per-token source column: NOT recorded on every row -- provenance "
+            "for this window is unknown, not observed-and-empty."
+        )
+    elif not identity["token_sources_complete"]:
+        lines.append(
+            "Per-token source column: recorded but INCOMPLETE on at least one "
+            "row -- a lane committed tokens through a site the recorder does "
+            "not cover (mtplx/fable_token_source.py)."
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -1027,6 +1234,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "C1: fitted marginal cost of one verified context-copy row "
             f"(default {DEFAULT_COPY_TOKEN_COST_S})."
+        ),
+    )
+    parser.add_argument(
+        "--rounding-class-pct",
+        type=float,
+        default=DEFAULT_ROUNDING_CLASS_PCT,
+        metavar="PCT",
+        help=(
+            "Primary-metric delta below which a candidate that reproduced the "
+            "control's exact token stream on every seed is reported as "
+            f"NON-ENGAGEMENT (default {DEFAULT_ROUNDING_CLASS_PCT}%%)."
         ),
     )
     parser.add_argument(
@@ -1314,6 +1532,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             + shlex.join(command),
             flush=True,
         )
+        receipt_path = out_dir / receipt_name(args.label_prefix, run)
+        # A receipt already at this path is a previous ATTEMPT at this arm.
+        # The driver replaces it and stamps `attempt`; recording the fact here
+        # means the window says so too, rather than the reader discovering it
+        # from an mtime.
+        preexisting = receipt_path.exists()
         arm_started = time.time()
         completed = subprocess.run(command, env=arm_environment, check=False)
         arm_wall = time.time() - arm_started
@@ -1322,9 +1546,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "command": command,
             "returncode": completed.returncode,
             "arm_wall_s": arm_wall,
-            "receipt_path": str(
-                out_dir / receipt_name(args.label_prefix, run)
-            ),
+            "receipt_preexisting": preexisting,
+            "receipt_path": str(receipt_path),
         }
         arm_records.append(record)
         if completed.returncode != 0:
@@ -1337,6 +1560,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             break
         receipt = json.loads(Path(record["receipt_path"]).read_text())
         record["status"] = "measured"
+        record["run_id"] = receipt.get("run_id")
+        record["attempt"] = receipt.get("attempt")
         rows.append(
             extract_run_row(
                 receipt,
@@ -1353,6 +1578,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             rows,
             copy_round_cost_s=args.copy_round_cost_s,
             copy_token_cost_s=args.copy_token_cost_s,
+            rounding_class_pct=args.rounding_class_pct,
         )
         table = render_markdown(rows, summary)
         print(table, flush=True)
@@ -1391,8 +1617,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             },
             "primary_metric": "ms_per_m4_window_net",
         },
+        "rounding_class_pct": float(args.rounding_class_pct),
         "arms": arm_records,
         "rows": rows,
+        # The same rows, keyed by the one field that is unique per arm across
+        # re-runs.  ``rows`` stays a list so existing readers keep working.
+        "rows_by_sequence": {str(int(row["sequence"])): row for row in rows},
         "summary": summary,
         "markdown": table,
     }

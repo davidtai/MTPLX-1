@@ -541,7 +541,14 @@ class TestProductionReceiptCostModel(unittest.TestCase):
                 "arm": arm,
                 "arm_name": window.ARM_NAMES[arm],
                 "seed": seed,
-                "sequence": 1788400081 + index,
+                # The receipt's OWN sequence: `extract_run_row` refuses a
+                # receipt whose sequence is not this arm's, which is what
+                # stops a stale attempt being read as this run's evidence.
+                "sequence": int(
+                    receipt["rows"][0].get(
+                        "sequence", receipt.get("sequence", 1788400081 + index)
+                    )
+                ),
             }
             row = window.extract_run_row(receipt, run)
             rows.append(row)
@@ -771,6 +778,7 @@ class TestMarkdown(unittest.TestCase):
         lines = text.splitlines()
         header = lines[0]
         for column in (
+            "Seq",
             "Decode tok/s",
             "Decode s",
             "ms/window",
@@ -781,7 +789,10 @@ class TestMarkdown(unittest.TestCase):
             "ccopy accepted",
             "Accepted by depth",
             "Verify fwd s",
-            "Digest",
+            # Renamed from "Digest": the column now shows
+            # `output_ids_sha256`, the digest over the raw uint32 generated
+            # ids, not the older comma-joined `response_token_sha256`.
+            "Output ids sha256",
             "Peak bytes",
             "Ready C",
             "Page cache",
@@ -1859,3 +1870,314 @@ class RealTokenizerPromptTest(unittest.TestCase):
             driver.build_production_prompt_ids(tokenizer, prompt_tokens=65_536),
             matrix,
         )
+
+
+# --------------------------------------------------------------------------
+# W76: run identity and the forensics the window summary owes the reader
+# --------------------------------------------------------------------------
+
+
+def make_identity_rows(
+    *, control_ids, candidate_ids, control_tok_s=77.0, candidate_tok_s=77.0
+):
+    """Three seeds of paired rows with explicit output_ids_sha256 values."""
+
+    rows = []
+    seeds = (20260829, 20260830, 20260831)
+    for position, seed in enumerate(seeds):
+        rows.append(
+            make_row(
+                2 * position,
+                "A",
+                seed,
+                control_tok_s,
+                output_ids_sha256=control_ids[position],
+                output_ids_digest_source="output_ids_sha256",
+                token_sources_available=True,
+                token_sources_complete=True,
+            )
+        )
+        rows.append(
+            make_row(
+                2 * position + 1,
+                "B",
+                seed,
+                candidate_tok_s,
+                output_ids_sha256=candidate_ids[position],
+                output_ids_digest_source="output_ids_sha256",
+                token_sources_available=True,
+                token_sources_complete=True,
+            )
+        )
+    return rows
+
+
+class TestReceiptIdentity(unittest.TestCase):
+    """An arm LABEL repeats on every attempt; a sequence does not."""
+
+    def _receipt(self, sequence, **row_overrides):
+        row = {
+            "sequence": sequence,
+            "seed": 20260829,
+            "arm": "fable-w76-control-A0-s20260829",
+            "decode_elapsed_s": 13.0,
+            "decode_tok_s": 78.0,
+            "wall_s": 27.0,
+            "generated_tokens": 1024,
+            "compiled_m4_calls": 382,
+            "accepted_by_depth": [259, 187, 120],
+            "drafted_by_depth": [382, 382, 382],
+            "verify_forward_time_s": 11.5,
+            "draft_time_s": 1.5,
+            "response_token_sha256": "a" * 64,
+            "peak_memory_bytes": 87_393_848_312,
+            "thermal_gate": {"ready_c": 39.5},
+            "reference_token_parity": {"status": "match"},
+            "context_copy": {"rounds": 10, "accepted_tokens": 66,
+                             "drafted_tokens": 133, "active": True},
+            "page_cache_regime": "as-found",
+            "per_cycle": {"available": False},
+            "ple_hot_rows": {"available": False},
+            "run_id": f"fable-w76-control-A0-s20260829-{sequence}-2026-09-02T20:00:00Z",
+            "attempt": 2,
+            "output_ids_sha256": "b" * 64,
+            "token_sources": {"available": True, "complete": True,
+                              "counts": {"primary": 300}},
+        }
+        row.update(row_overrides)
+        return {"label": "fable-w76-control-A0-s20260829", "sequence": sequence,
+                "rows": [row]}
+
+    def _run(self, sequence):
+        return {
+            "index": 0,
+            "position_in_seed": 0,
+            "arm": "A",
+            "arm_name": "control",
+            "seed": 20260829,
+            "sequence": sequence,
+        }
+
+    def test_a_receipt_from_another_run_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            window.extract_run_row(self._receipt(1788400082), self._run(1788400081))
+        self.assertIn("refusing to read another run's receipt", str(caught.exception))
+
+    def test_run_id_and_attempt_reach_the_row(self):
+        row = window.extract_run_row(
+            self._receipt(1788400081), self._run(1788400081)
+        )
+        self.assertEqual(row["attempt"], 2)
+        self.assertIn("1788400081", row["run_id"])
+        self.assertEqual(row["output_ids_sha256"], "b" * 64)
+        self.assertEqual(row["output_ids_digest_source"], "output_ids_sha256")
+        self.assertTrue(row["token_sources_available"])
+
+    def test_an_old_receipt_falls_back_to_the_comma_joined_digest(self):
+        receipt = self._receipt(1788400081)
+        del receipt["rows"][0]["output_ids_sha256"]
+        del receipt["rows"][0]["token_sources"]
+        row = window.extract_run_row(receipt, self._run(1788400081))
+        self.assertEqual(row["output_ids_sha256"], "a" * 64)
+        self.assertEqual(row["output_ids_digest_source"], "response_token_sha256")
+        self.assertFalse(row["token_sources_available"])
+
+
+class TestLabelUniqueness(unittest.TestCase):
+    def test_receipt_filenames_carry_the_sequence(self):
+        first = window.plan_runs([20260829], "ABBA", 1788400081)
+        second = window.plan_runs([20260829], "ABBA", 1788500001)
+        labels = {window.arm_label("fable-w76", run) for run in first}
+        repeat = {window.arm_label("fable-w76", run) for run in second}
+        # The LABEL is identical across the two attempts ...
+        self.assertEqual(labels, repeat)
+        # ... and the receipt NAME is not.
+        names = {window.receipt_name("fable-w76", run) for run in first}
+        repeat_names = {window.receipt_name("fable-w76", run) for run in second}
+        self.assertEqual(len(names), 4)
+        self.assertFalse(names & repeat_names)
+        for run in first:
+            self.assertTrue(
+                window.receipt_name("fable-w76", run).endswith(
+                    f"-{run['sequence']}.json"
+                )
+            )
+
+    def test_driver_forces_the_sequence_into_a_hand_passed_path(self):
+        path = Path("/tmp/fable-w76-gdn-fold-alone-control-A0-s20260829.json")
+        unique = driver.unique_receipt_path(path, 1788400081)
+        self.assertEqual(unique.name, path.stem + "-1788400081.json")
+        # Already carrying it: unchanged, so abba_window's own naming is a
+        # no-op through this function.
+        self.assertEqual(driver.unique_receipt_path(unique, 1788400081), unique)
+
+    def test_driver_auto_name_carries_the_sequence(self):
+        name = driver.default_receipt_name(
+            "fable-w76-control-A0-s20260829",
+            1788400081,
+            benchmark_matrix=False,
+            natural_stop=False,
+            max_tokens=1024,
+        )
+        self.assertTrue(name.startswith("abba-1788400081-"))
+        self.assertTrue(name.endswith("seeds-16k-1k.json"))
+
+    def test_attempt_counts_writes_at_a_path(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "arm.json"
+            self.assertEqual(driver.receipt_attempt(path), 1)
+            path.write_text(json.dumps({"attempt": 1}))
+            self.assertEqual(driver.receipt_attempt(path), 2)
+            path.write_text(json.dumps({"attempt": 2}))
+            self.assertEqual(driver.receipt_attempt(path), 3)
+            path.write_text("not json")
+            self.assertEqual(driver.receipt_attempt(path), 1)
+
+    def test_run_id_separates_two_attempts_at_one_arm(self):
+        label = "fable-w76-gdn-fold-alone-control-A0-s20260829"
+        first = driver.build_run_id(label, 1788400081, "2026-09-02T18:00:00Z")
+        second = driver.build_run_id(label, 1788400081, "2026-09-02T21:30:00Z")
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.startswith(label))
+        self.assertIn("1788400081", first)
+
+
+class TestOutputIdentitySummary(unittest.TestCase):
+    """The two lines that would have saved 2026-09-02."""
+
+    def test_identical_outputs_report_yes_from_the_id_digest(self):
+        rows = make_identity_rows(
+            control_ids=["c1", "c2", "c3"], candidate_ids=["c1", "c2", "c3"]
+        )
+        text = window.render_markdown(rows, window.summarize(rows))
+        self.assertIn("outputs identical per seed: yes", text)
+
+    def test_a_differing_seed_reports_no_and_names_it(self):
+        rows = make_identity_rows(
+            control_ids=["c1", "c2", "c3"], candidate_ids=["c1", "XX", "c3"]
+        )
+        text = window.render_markdown(rows, window.summarize(rows))
+        self.assertIn("outputs identical per seed: no", text)
+        self.assertIn("seeds that differ: 20260830", text)
+
+    def test_the_verdict_reads_ids_not_the_text_head(self):
+        # Same `digest` (the old comma-joined field), different generated
+        # ids.  Reading `digest` would call this identical; the whole reason
+        # this line exists is that it must not.
+        rows = make_identity_rows(
+            control_ids=["c1", "c2", "c3"], candidate_ids=["c1", "c2", "DIFF"]
+        )
+        self.assertEqual(len({row["digest"] for row in rows}), 1)
+        summary = window.summarize(rows)
+        self.assertTrue(summary["overall"]["all_digests_match"])
+        self.assertFalse(summary["output_identity"]["identical_per_seed"])
+        self.assertIn(
+            "outputs identical per seed: no",
+            window.render_markdown(rows, summary),
+        )
+
+    def test_non_engagement_when_every_seed_matches_inside_the_rounding_class(self):
+        rows = make_identity_rows(
+            control_ids=["c1", "c2", "c3"],
+            candidate_ids=["c1", "c2", "c3"],
+            control_tok_s=77.0,
+            candidate_tok_s=77.02,
+        )
+        summary = window.summarize(rows)
+        identity = summary["output_identity"]
+        self.assertEqual(identity["candidate_matches_control_seeds"], 3)
+        self.assertEqual(identity["paired_seeds"], 3)
+        self.assertTrue(identity["in_rounding_class"])
+        self.assertTrue(identity["non_engagement"])
+        text = window.render_markdown(rows, summary)
+        self.assertIn("candidate == control on 3/3 seeds", text)
+        self.assertIn("NON-ENGAGEMENT", text)
+
+    def test_a_bit_exact_win_is_not_called_non_engagement(self):
+        rows = make_identity_rows(
+            control_ids=["c1", "c2", "c3"],
+            candidate_ids=["c1", "c2", "c3"],
+            control_tok_s=77.0,
+            candidate_tok_s=84.0,
+        )
+        summary = window.summarize(rows)
+        self.assertFalse(summary["output_identity"]["non_engagement"])
+        text = window.render_markdown(rows, summary)
+        self.assertIn("candidate == control on 3/3 seeds", text)
+        self.assertNotIn("NON-ENGAGEMENT", text)
+        self.assertIn("bit-exact change, not an inert arm", text)
+
+    def test_partial_match_reports_the_count(self):
+        rows = make_identity_rows(
+            control_ids=["c1", "c2", "c3"], candidate_ids=["c1", "XX", "YY"]
+        )
+        summary = window.summarize(rows)
+        self.assertEqual(
+            summary["output_identity"]["candidate_matches_control_seeds"], 1
+        )
+        self.assertIn(
+            "candidate == control on 1/3 seeds",
+            window.render_markdown(rows, summary),
+        )
+        self.assertFalse(summary["output_identity"]["non_engagement"])
+
+    def test_missing_provenance_is_reported_as_unknown_not_empty(self):
+        rows = make_identity_rows(
+            control_ids=["c1", "c2", "c3"], candidate_ids=["c1", "c2", "c3"]
+        )
+        for row in rows:
+            row["token_sources_available"] = False
+        text = window.render_markdown(rows, window.summarize(rows))
+        self.assertIn("Per-token source column: NOT recorded", text)
+
+    def test_incomplete_provenance_is_called_out(self):
+        rows = make_identity_rows(
+            control_ids=["c1", "c2", "c3"], candidate_ids=["c1", "c2", "c3"]
+        )
+        rows[3]["token_sources_complete"] = False
+        text = window.render_markdown(rows, window.summarize(rows))
+        self.assertIn("recorded but INCOMPLETE", text)
+
+    def test_rounding_class_band_is_configurable(self):
+        rows = make_identity_rows(
+            control_ids=["c1", "c2", "c3"],
+            candidate_ids=["c1", "c2", "c3"],
+            control_tok_s=77.0,
+            candidate_tok_s=79.0,
+        )
+        loose = window.summarize(rows, rounding_class_pct=10.0)
+        tight = window.summarize(rows, rounding_class_pct=0.01)
+        self.assertTrue(loose["output_identity"]["non_engagement"])
+        self.assertFalse(tight["output_identity"]["non_engagement"])
+
+    def test_the_table_is_keyed_by_sequence(self):
+        rows = make_identity_rows(
+            control_ids=["c1", "c2", "c3"], candidate_ids=["c1", "c2", "c3"]
+        )
+        text = window.render_markdown(rows, window.summarize(rows))
+        header = text.splitlines()[0]
+        self.assertIn("| Seq |", header)
+        body = [
+            line
+            for line in text.splitlines()
+            if line.startswith("| ") and "control (A)" in line
+        ]
+        sequences = [int(line.split("|")[2].strip()) for line in body]
+        self.assertEqual(sequences, sorted(sequences))
+        self.assertEqual(len(set(sequences)), len(sequences))
+
+    def test_existing_digest_line_survives_for_older_readers(self):
+        rows = make_identity_rows(
+            control_ids=["c1", "c2", "c3"], candidate_ids=["c1", "c2", "c3"]
+        )
+        text = window.render_markdown(rows, window.summarize(rows))
+        # abba_report.py's fallback reads the per-seed table's last column.
+        self.assertIn("Every arm produced the same response-token digest:", text)
+        per_seed = [
+            line
+            for line in text.splitlines()
+            if re.match(r"\| \d{8} \|.*\| (yes|no|NO) \|\s*$", line)
+        ]
+        self.assertEqual(len(per_seed), 3)
