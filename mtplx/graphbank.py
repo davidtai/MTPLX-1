@@ -5550,15 +5550,16 @@ class CompiledVerifyBank:
                 )
             # (2) The existing runtime forward, on shadow containers only.
             #
-            # W68: sample the sparse-decode lane's route counter across the
+            # W68: sample the sparse-decode lane's route counters across the
             # forward. The routing decision is host-side and happens in THIS
-            # python body, so a trace that ends with no hit is an armed flag
-            # that is not in the graph -- and the graph is what the next few
-            # hundred cycles replay. Raising here costs one trace; the
-            # alternative cost a whole window on 2026-09-02.
+            # python body, so a trace that ends with neither a route hit nor a
+            # short-context decline is an armed flag that is not in the graph
+            # -- and the graph is what the next few hundred cycles replay.
+            # Raising here costs one trace; the alternative cost a whole
+            # window on 2026-09-02.
             from .kernels import qsa_sparse_decode as _qsa_sparse_lane
 
-            sparse_route_before = _qsa_sparse_lane.route_counters()["route_hits"]
+            sparse_route_before = _qsa_sparse_lane.route_snapshot()
             with _gdn_fold.fold_prefix_scope(fold_scope):
                 with attention_phase("decode_verify"):
                     result = live._runtime_forward(

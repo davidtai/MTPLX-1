@@ -2963,13 +2963,17 @@ class QSAIndexer(nn.Module):
                 f"block_topk={int(self.block_topk)}"
             )
         if int(k_eff) != int(self.block_topk):
-            raise RuntimeError(
-                f"{lane} needs a full {int(self.block_topk)}-block budget -- "
-                f"the kernel's ABI is a fixed [M, {int(self.block_topk)}] "
-                f"selection -- but this forward selects {int(k_eff)} blocks. "
-                "A context below (block_topk + 1) * ratio tokens cannot "
-                "produce one; unarm the flag for short-context serving"
-            )
+            # ROUTING, and the one decline that is a property of the REQUEST.
+            # The kernel's ABI is a fixed [M, 512] selection and 512 complete
+            # blocks exist only from (block_topk + 1) * ratio = 2,052 tokens;
+            # below that there is no analogue to fall to, and padding the
+            # selection would attend keys the shipped lane does not. Context
+            # length is a per-request shape the server must accept, so the
+            # stock chain serves it. Counted, never printed -- this is once
+            # per QSA layer per short request, and a 500 here took the
+            # HumanEval fullset down on 2026-09-02.
+            _qsa_sparse.note_short_context(site, k_eff)
+            return False
         _qsa_sparse.note_route_hit(site)
         return True
 
@@ -4506,6 +4510,14 @@ def _qsa_blocks_to_dense_mask(
     return ((token_selected | tail) & causal)[None, None]
 
 
+def _sparse_route_snapshot():
+    """``qsa_sparse_decode.route_snapshot()``, imported only when armed."""
+
+    from mtplx.kernels import qsa_sparse_decode as _qsa_sparse
+
+    return _qsa_sparse.route_snapshot()
+
+
 class Attention(nn.Module):
     """Gated GQA (qwen3_5 style: double-width q_proj, sigmoid output gate,
     per-head q/k RMSNorm, partial rotary) masked by the QSA indexer."""
@@ -4574,6 +4586,49 @@ class Attention(nn.Module):
             return False
         return bool(getattr(cache, "fixed_capacity", False))
 
+    def _require_sparse_decode_lane(self, sel_mask, *, rows: int, before) -> None:
+        """The armed lane is IN this graph, or this forward legitimately isn't.
+
+        W68 -- the trace-time proof.  Every ``sel_mask`` branch below is a
+        DIFFERENT attention, and the 2026-09-02 window took one of them
+        (rows-gather) for 394 cycles with the flag armed and nothing saying
+        so.  The selection is decided in this Python body, which under
+        ``mx.compile`` runs at TRACE time, so this raises while the graph is
+        being built rather than after a window.
+
+        TWO ways to pass.  The selection is ``sparse_blocks``; or the indexer
+        declined because this request's context is below
+        ``SHORT_CONTEXT_TOKENS``, where the kernel's fixed ``[M, 512]`` ABI
+        has no analogue and the stock chain is the correct lane.  A full-budget
+        forward that got any other lane still raises -- that is the armed-but-
+        inert failure this guard exists for.
+        """
+
+        if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "sparse_blocks":
+            return
+        from mtplx.kernels import qsa_sparse_decode as _qsa_sparse
+
+        now = _qsa_sparse.route_snapshot()
+        if now["short_context"] > int(before["short_context"]):
+            return
+        lane = (
+            "MTPLX_FABLE_QSA_SPARSE_DECODE"
+            if int(rows) != 1
+            else "MTPLX_FABLE_QSA_SPARSE_DRAFT"
+        )
+        took = (
+            sel_mask[0]
+            if isinstance(sel_mask, tuple) and sel_mask
+            else ("dense_mask" if sel_mask is not None else "no_selection")
+        )
+        raise RuntimeError(
+            f"{lane} is armed and this is its {int(rows)}-row width on the "
+            f"fixed QSA cache with a full {_qsa_sparse.TOP_K}-block budget, "
+            f"but the indexer handed attention the {took!r} lane: the split-K "
+            "kernel is not in this graph and the arm would replay the stock "
+            "chain"
+        )
+
     def _verify_glue_rope(self, rows: int) -> bool:
         """True when ``MTPLX_FABLE_VERIFY_GLUE``'s ``qsa_rope`` serves this call.
 
@@ -4608,6 +4663,13 @@ class Attention(nn.Module):
         B, S, _ = x.shape
         pos_start = cache.offset
         vrope = vision_rope_state()
+        # W68: the armed lane's per-layer proof. Sampled BEFORE the indexer,
+        # because the routing decision is taken inside it -- and a forward can
+        # prove engagement two ways: it routed to the kernel, or it declined
+        # for a context below SHORT_CONTEXT_TOKENS, where the kernel has no
+        # analogue and the stock chain is correct.
+        sparse_required = self._sparse_decode_required(cache, S)
+        sparse_before = _sparse_route_snapshot() if sparse_required else None
 
         fused = getattr(self, "qkv_fused", None)
         if fused is not None:
@@ -4731,35 +4793,10 @@ class Attention(nn.Module):
             # which remains correct under M-RoPE; only rope reads the axes.
             sel_mask = None
 
-        if vrope is None and self._sparse_decode_required(cache, int(S)):
-            # W68 -- the construction-time proof that the armed lane is IN
-            # this graph.  Every branch below is a DIFFERENT attention, and
-            # the 2026-09-02 window took one of them (rows-gather) for 394
-            # cycles with the flag armed and nothing saying so.  The selection
-            # is decided in this Python body, which under mx.compile runs at
-            # TRACE time -- so this raises while the graph is being built, not
-            # after a window.
-            if not (
-                isinstance(sel_mask, tuple)
-                and sel_mask
-                and sel_mask[0] == "sparse_blocks"
-            ):
-                lane = (
-                    "MTPLX_FABLE_QSA_SPARSE_DECODE"
-                    if int(S) != 1
-                    else "MTPLX_FABLE_QSA_SPARSE_DRAFT"
-                )
-                took = (
-                    sel_mask[0]
-                    if isinstance(sel_mask, tuple) and sel_mask
-                    else ("dense_mask" if sel_mask is not None else "no_selection")
-                )
-                raise RuntimeError(
-                    f"{lane} is armed and this is its {int(S)}-row width on "
-                    f"the fixed QSA cache, but the indexer handed attention "
-                    f"the {took!r} lane: the split-K kernel is not in this "
-                    "graph and the arm would replay the stock chain"
-                )
+        if vrope is None and sparse_required:
+            self._require_sparse_decode_lane(
+                sel_mask, rows=int(S), before=sparse_before
+            )
 
         if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "flash":
             # Block-sparse flash attention over the indexer's exact visible

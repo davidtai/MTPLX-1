@@ -81,13 +81,32 @@ server accepts, or it fails loudly at install.**  Concretely:
   arm that runs the stock chain is worse than an outage: it is a measurement
   that looks like a result.  Read the deltas off the stderr line and the
   receipt, then unarm the flag deliberately.
-* ROUTE narrowing RAISES at the width the flag arms.  Widths the flag does
-  not arm (prefill rows, the S=1 D3 route under a verify-only arm) and caches
-  the lane never installed on are routing, not failure: they return False and
-  are COUNTED in :data:`_ROUTE_DECLINES` so "the flag did nothing" always has
-  a readable cause.
+* ROUTE narrowing RAISES for a genuinely wrong CONFIGURATION at the width the
+  flag arms -- a ratio that is not 4, a top-k that is not 512, a cache whose
+  wired row count disagrees with the module.  Those are things an operator
+  chose, and they cannot be fixed by declining.
+* ROUTE narrowing ROUTES for the shapes a server is entitled to send.  Widths
+  the flag does not arm (prefill rows, the S=1 D3 route under a verify-only
+  arm), caches the lane never installed on, and -- the case that matters most
+  -- a context below :data:`SHORT_CONTEXT_TOKENS`.  All return False; the last
+  two are COUNTED in :data:`_ROUTE_DECLINES` so "the flag did nothing" always
+  has a readable cause.
 * An armed lane that is not in the traced verify graph RAISES from
-  :func:`assert_traced`, called inside the compiled verify body.
+  :func:`assert_traced`, called inside the compiled verify body -- unless the
+  forward declined for short context, which is a legitimate stock lane.
+
+THE LANE ENGAGES ONLY ABOVE 2,052 TOKENS, AND THAT IS THE DESIGN
+-----------------------------------------------------------------
+The kernel's ABI is a fixed ``[M, 512]`` block selection, and 512 complete
+pooled blocks exist only from ``(512 + 1) * 4 = 2,052`` tokens
+(:data:`SHORT_CONTEXT_TOKENS`).  Below that the indexer selects fewer than a
+full budget and there is no smaller kernel to fall to -- padding the selection
+would attend keys the shipped lane does not.  Context length is a per-REQUEST
+shape the server must accept, so a short request routes to the stock
+attention, is counted as ``short_context``, and prints nothing.  A HumanEval
+prompt of a few hundred tokens is served, not refused; an armed 16 K decode
+still has to bind or the assertions fire.  This is the documented behaviour of
+the flag, not a fallback.
 """
 
 from __future__ import annotations
@@ -222,7 +241,24 @@ _COUNTS: Dict[str, int] = {
     # of a compiled verify graph runs once per retrace, so read these as "did
     # this lane get into the graph at all", never as a per-cycle count.
     "route_hits": 0,
+    # Forwards that routed to the stock chain because the context is below
+    # SHORT_CONTEXT_TOKENS.  This is the ONE decline that is a property of the
+    # REQUEST rather than of the configuration (see SHORT_CONTEXT_TOKENS), so
+    # it is counted separately and the engagement assertions accept it.
+    "short_context": 0,
 }
+
+#: Smallest context the lane can serve, in tokens.  The kernel's ABI is a
+#: fixed ``[M, TOP_K]`` selection, so it needs a FULL budget: ``TOP_K``
+#: complete pooled blocks exist only once the context reaches
+#: ``(TOP_K + 1) * COMPRESS_RATIO`` = 2,052 tokens.  Below that there is no
+#: analogue -- not a smaller kernel, not a padded one -- so the stock chain
+#: serves the request and the receipt says how often.
+SHORT_CONTEXT_TOKENS = (TOP_K + 1) * COMPRESS_RATIO
+
+#: Widest and narrowest short-context budget observed, so the receipt carries
+#: the block counts without giving ``_ROUTE_DECLINES`` an unbounded key space.
+_SHORT_CONTEXT_BLOCKS: Dict[str, int] = {}
 
 #: ``site -> hits``.  The 2026-09-02 window failed because ONE of the two call
 #: sites existed for the verify width and the other asked the draft question;
@@ -288,6 +324,44 @@ def note_route_decline(reason: str) -> None:
     _ROUTE_DECLINES[reason] = _ROUTE_DECLINES.get(reason, 0) + 1
 
 
+def note_short_context(site: str, blocks: int) -> None:
+    """This forward's context is below :data:`SHORT_CONTEXT_TOKENS`.
+
+    Routing, not failure, and the ONLY decline that is a property of the
+    request rather than of the configuration: a server accepts whatever
+    context length it is sent, and the kernel has no analogue below a full
+    budget.  Counted (never printed -- this is per request) and accepted by
+    :func:`assert_traced`, so a short prompt runs the stock chain instead of
+    returning a 500.
+
+    The block count rides in :data:`_SHORT_CONTEXT_BLOCKS` as a min/max pair
+    rather than in the decline key, which would otherwise grow one key per
+    distinct context length.
+    """
+
+    blocks = int(blocks)
+    _COUNTS["short_context"] += 1
+    note_route_decline(f"{site}: short_context")
+    low = _SHORT_CONTEXT_BLOCKS.get("min")
+    high = _SHORT_CONTEXT_BLOCKS.get("max")
+    _SHORT_CONTEXT_BLOCKS["min"] = blocks if low is None else min(low, blocks)
+    _SHORT_CONTEXT_BLOCKS["max"] = blocks if high is None else max(high, blocks)
+
+
+def route_snapshot() -> Dict[str, int]:
+    """The two counters to sample around a forward, for :func:`assert_traced`.
+
+    A forward proves the armed lane engaged either by ROUTING to the kernel
+    (``route_hits``) or by declining for a reason the contract allows
+    (``short_context``).  Anything else is an inert flag.
+    """
+
+    return {
+        "route_hits": int(_COUNTS["route_hits"]),
+        "short_context": int(_COUNTS["short_context"]),
+    }
+
+
 def route_counters() -> Dict[str, Any]:
     """Per-site hits and per-cause declines, for the receipt."""
 
@@ -295,6 +369,9 @@ def route_counters() -> Dict[str, Any]:
         "route_hits": int(_COUNTS["route_hits"]),
         "route_sites": dict(_ROUTE_SITES),
         "route_declines": dict(_ROUTE_DECLINES),
+        "short_context": int(_COUNTS["short_context"]),
+        "short_context_blocks": dict(_SHORT_CONTEXT_BLOCKS),
+        "short_context_tokens": SHORT_CONTEXT_TOKENS,
     }
 
 
@@ -384,25 +461,34 @@ def engagement_line(*, enabled: bool) -> str:
     )
 
 
-def assert_traced(rows: int, *, before: int, where: str) -> None:
+def assert_traced(rows: int, *, before: Dict[str, int], where: str) -> None:
     """The armed verify lane must be IN this graph, not merely armed.
 
-    ``before`` is ``_COUNTS["route_hits"]`` sampled before the
-    traced forward.  A trace of the armed width that ends with no additional
-    route hit is an inert flag, and replaying that graph a few hundred times
-    produces a delta nobody can attribute -- which is what the 2026-09-02
-    window did.
+    ``before`` is :func:`route_snapshot` sampled before the traced forward.  A
+    trace of the armed width that ends with no additional route hit is an
+    inert flag, and replaying that graph a few hundred times produces a delta
+    nobody can attribute -- which is what the 2026-09-02 window did.
+
+    A forward that declined for SHORT CONTEXT satisfies this: the request's
+    own context is below :data:`SHORT_CONTEXT_TOKENS`, the kernel has no
+    analogue there, and the stock chain is the correct lane.  That is the one
+    decline the assertion accepts, and it is why a HumanEval prompt does not
+    take the server down with the flag armed.
     """
 
     if not armed() or int(rows) != VERIFY_ROWS:
         return
-    gained = int(_COUNTS["route_hits"]) - int(before)
-    if gained > 0:
+    now = route_snapshot()
+    if now["route_hits"] > int(before["route_hits"]):
+        return
+    if now["short_context"] > int(before["short_context"]):
         return
     raise SparseDecodeContractError(
         "MTPLX_FABLE_QSA_SPARSE_DECODE is armed but the split-K kernel is not "
-        f"in the traced {where} graph at {int(rows)} rows: the QSA attention "
-        "took another path, so this arm would replay the stock chain. "
+        f"in the traced {where} graph at {int(rows)} rows, and this forward's "
+        f"context is at or above {SHORT_CONTEXT_TOKENS} tokens so the lane "
+        "should have served it: the QSA attention took another path, and this "
+        "arm would replay the stock chain. "
         f"route_sites={dict(_ROUTE_SITES)} declines={dict(_ROUTE_DECLINES)}"
     )
 
@@ -421,6 +507,7 @@ def reset_for_tests() -> None:
     _PROBE_REPORT.clear()
     _ROUTE_SITES.clear()
     _ROUTE_DECLINES.clear()
+    _SHORT_CONTEXT_BLOCKS.clear()
     for key in _COUNTS:
         _COUNTS[key] = 0
 
@@ -975,8 +1062,11 @@ __all__ = [
     "assert_traced",
     "engagement_line",
     "installed",
+    "SHORT_CONTEXT_TOKENS",
     "note_route_decline",
     "note_route_hit",
+    "note_short_context",
+    "route_snapshot",
     "pending",
     "receipt",
     "route_counters",

@@ -220,11 +220,71 @@ def test_a_geometry_the_metallib_is_not_built_for_raises(armed_verify):
         )
 
 
-def test_a_short_budget_raises_and_says_what_to_do(armed_verify):
-    with pytest.raises(RuntimeError, match="full 512-block budget"):
-        indexer()._sparse_decode_route(
-            fixed_cache(), rows=4, k_eff=256, draft=False, site="select_eager_verify"
+# ---------------------------------------------------------------------------
+# Short context: ROUTING, not failure.  A HumanEval prompt must be served.
+# ---------------------------------------------------------------------------
+def test_a_short_context_routes_to_stock_instead_of_returning_500(armed_verify):
+    """The 2026-09-02 fullset regression, as a unit.
+
+    The server saw ``selects 7 blocks`` at warmup and ``selects 33 blocks`` on
+    a chat completion, and raised both times.  Context length is a per-request
+    shape the server must accept and the kernel has no analogue below a full
+    budget, so this is the routing case in the contract.
+    """
+
+    assert not indexer()._sparse_decode_route(
+        fixed_cache(), rows=4, k_eff=33, draft=False, site="select_eager_verify"
+    )
+    counters = lane.route_counters()
+    assert counters["route_hits"] == 0
+    assert counters["short_context"] == 1
+    assert counters["route_declines"] == {"select_eager_verify: short_context": 1}
+
+
+def test_the_short_context_decline_key_stays_bounded(armed_verify):
+    """One key per site, never one per context length; blocks ride min/max."""
+
+    route = indexer()._sparse_decode_route
+    for blocks in (7, 33, 511, 33):
+        assert not route(
+            fixed_cache(), rows=4, k_eff=blocks, draft=False,
+            site="select_eager_verify",
         )
+    counters = lane.route_counters()
+    assert counters["route_declines"] == {"select_eager_verify: short_context": 4}
+    assert counters["short_context"] == 4
+    assert counters["short_context_blocks"] == {"min": 7, "max": 511}
+    assert counters["short_context_tokens"] == 2052
+
+
+def test_the_threshold_is_the_full_budget_the_abi_needs():
+    assert lane.SHORT_CONTEXT_TOKENS == (lane.TOP_K + 1) * lane.COMPRESS_RATIO == 2052
+
+
+def test_a_full_budget_forward_still_binds_after_a_short_one(armed_verify):
+    """Short requests must not poison the long-context arm."""
+
+    route = indexer()._sparse_decode_route
+    assert not route(
+        fixed_cache(), rows=4, k_eff=33, draft=False, site="select_eager_verify"
+    )
+    assert route(
+        fixed_cache(), rows=4, k_eff=512, draft=False, site="select_eager_verify"
+    )
+    counters = lane.route_counters()
+    assert counters["route_hits"] == 1
+    assert counters["short_context"] == 1
+
+
+def test_a_short_context_prints_nothing(armed_verify, capsys):
+    """Once per QSA layer per short request: a print here is a log flood."""
+
+    indexer()._sparse_decode_route(
+        fixed_cache(), rows=4, k_eff=33, draft=False, site="select_eager_verify"
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 def test_nothing_raises_when_the_flag_is_off():
@@ -264,36 +324,103 @@ def test_a_layer_without_an_indexer_is_never_required(armed_verify):
     assert not required(fixed_cache(), 4, indexer_present=False)
 
 
-def test_the_attention_guard_refuses_every_other_lane():
-    """The guard names the lane attention actually got, so a log says which."""
+def guard(sel_mask, *, rows=4, before=None):
+    stub = SimpleNamespace()
+    return Attention._require_sparse_decode_lane(
+        stub,
+        sel_mask,
+        rows=rows,
+        before=before or {"route_hits": 0, "short_context": 0},
+    )
+
+
+def test_the_guard_accepts_the_sparse_lane(armed_verify):
+    guard(("sparse_blocks", object()))
+
+
+def test_the_guard_accepts_a_forward_that_routed_for_short_context(armed_verify):
+    """The HumanEval case: the indexer declined, and that is correct."""
+
+    before = lane.route_snapshot()
+    lane.note_short_context("select_eager_verify", 33)
+    guard(("gather_rows", object(), object()), before=before)
+
+
+def test_the_guard_refuses_a_full_budget_forward_on_another_lane(armed_verify):
+    with pytest.raises(RuntimeError, match="gather_rows"):
+        guard(("gather_rows", object(), object()))
+
+
+@pytest.mark.parametrize(
+    "sel_mask, name",
+    [
+        (("flash", object(), 0), "flash"),
+        (("flash_prefill", object(), object()), "flash_prefill"),
+        (None, "no_selection"),
+        (object(), "dense_mask"),
+    ],
+)
+def test_the_guard_names_the_lane_attention_actually_got(armed_verify, sel_mask, name):
+    with pytest.raises(RuntimeError, match=name):
+        guard(sel_mask)
+
+
+def test_the_guard_sits_before_every_other_attention_branch():
+    source = inspect.getsource(Attention.__call__)
+    call = source.index("self._require_sparse_decode_lane(")
+    for lane_name in ("flash", "flash_prefill", "sparse_blocks", "gather_rows"):
+        assert call < source.index(f'sel_mask[0] == "{lane_name}"')
+
+
+def test_the_guard_samples_before_the_indexer_runs():
+    """The routing happens inside ``self.indexer(...)``, so the baseline must
+    be taken above it or the delta would always be zero."""
 
     source = inspect.getsource(Attention.__call__)
-    guard = source[source.index("_sparse_decode_required") :]
-    assert 'sel_mask[0] == "sparse_blocks"' in guard
-    assert "the split-K kernel is not in this" in guard
-    # It must sit BEFORE every branch that would serve a different attention.
-    for lane_name in ("flash", "flash_prefill", "sparse_blocks", "gather_rows"):
-        assert source.index("_sparse_decode_required") < source.index(
-            f'sel_mask[0] == "{lane_name}"'
-        )
+    assert source.index("sparse_before = _sparse_route_snapshot()") < source.index(
+        "self.indexer("
+    )
 
 
 def test_the_guard_skips_vision_requests():
     source = inspect.getsource(Attention.__call__)
-    assert "if vrope is None and self._sparse_decode_required(" in source
+    assert "if vrope is None and sparse_required:" in source
 
 
 # ---------------------------------------------------------------------------
 # The graph-level proof
 # ---------------------------------------------------------------------------
+ZERO = {"route_hits": 0, "short_context": 0}
+
+
 def test_assert_traced_raises_when_the_armed_lane_missed_the_graph(armed_verify):
     with pytest.raises(lane.SparseDecodeContractError, match="not in the traced"):
-        lane.assert_traced(4, before=0, where="compiled verify")
+        lane.assert_traced(4, before=ZERO, where="compiled verify")
 
 
 def test_assert_traced_passes_once_a_route_hit_landed(armed_verify):
     lane.note_route_hit("select_eager_verify")
-    lane.assert_traced(4, before=0, where="compiled verify")
+    lane.assert_traced(4, before=ZERO, where="compiled verify")
+
+
+def test_assert_traced_accepts_a_forward_that_routed_for_short_context(
+    armed_verify,
+):
+    """The stock lane IS correct below 2,052 tokens; the assertion says so."""
+
+    lane.note_short_context("select_eager_verify", 33)
+    lane.assert_traced(4, before=ZERO, where="compiled verify")
+
+
+def test_assert_traced_still_raises_on_an_unbound_full_budget_forward(
+    armed_verify,
+):
+    """A short forward earlier in the run must not vouch for this one."""
+
+    lane.note_short_context("select_eager_verify", 33)
+    before = lane.route_snapshot()
+    with pytest.raises(lane.SparseDecodeContractError, match="at or above 2052"):
+        lane.assert_traced(4, before=before, where="compiled verify")
 
 
 def test_assert_traced_measures_the_delta_not_the_total(armed_verify):
@@ -301,16 +428,25 @@ def test_assert_traced_measures_the_delta_not_the_total(armed_verify):
 
     lane.note_route_hit("select_eager_verify")
     with pytest.raises(lane.SparseDecodeContractError):
-        lane.assert_traced(4, before=1, where="compiled verify")
+        lane.assert_traced(
+            4, before={"route_hits": 1, "short_context": 0}, where="compiled verify"
+        )
 
 
 def test_assert_traced_is_silent_off_the_armed_width(armed_verify):
-    lane.assert_traced(1, before=0, where="compiled verify")
-    lane.assert_traced(16, before=0, where="compiled verify")
+    lane.assert_traced(1, before=ZERO, where="compiled verify")
+    lane.assert_traced(16, before=ZERO, where="compiled verify")
 
 
 def test_assert_traced_is_silent_when_nothing_is_armed():
-    lane.assert_traced(4, before=0, where="compiled verify")
+    lane.assert_traced(4, before=ZERO, where="compiled verify")
+
+
+def test_the_snapshot_carries_both_ways_a_forward_can_prove_engagement():
+    assert lane.route_snapshot() == {"route_hits": 0, "short_context": 0}
+    lane.note_route_hit("x")
+    lane.note_short_context("x", 9)
+    assert lane.route_snapshot() == {"route_hits": 1, "short_context": 1}
 
 
 def test_the_compiled_verify_body_samples_and_asserts_across_the_forward():
@@ -460,11 +596,15 @@ def test_route_hits_and_kernel_calls_are_separate_counters(armed_verify):
 def test_reset_clears_the_route_state_too():
     lane.note_route_hit("a")
     lane.note_route_decline("b")
+    lane.note_short_context("a", 9)
     lane.reset_for_tests()
     assert lane.route_counters() == {
         "route_hits": 0,
         "route_sites": {},
         "route_declines": {},
+        "short_context": 0,
+        "short_context_blocks": {},
+        "short_context_tokens": 2052,
     }
 
 
@@ -515,6 +655,32 @@ def test_a_route_hit_with_no_kernel_call_is_refused(armed_verify, monkeypatch):
     driver = load_driver()
     with pytest.raises(RuntimeError, match="zero kernel calls"):
         driver.fable_qsa_sparse_decode_block(require_calls=True)
+
+
+def test_a_short_context_only_cell_is_refused_with_the_reason(
+    armed_verify, monkeypatch
+):
+    """Not an inert flag -- a cell measured below the lane's own threshold."""
+
+    monkeypatch.setattr(lane, "_DISABLED_REASON", "")
+    lane.note_short_context("select_eager_verify", 33)
+    driver = load_driver()
+    with pytest.raises(RuntimeError, match="never reached 2052 tokens"):
+        driver.fable_qsa_sparse_decode_block(require_calls=True)
+
+
+def test_a_long_cell_that_also_served_short_requests_passes(
+    armed_verify, monkeypatch
+):
+    monkeypatch.setattr(lane, "_DISABLED_REASON", "")
+    lane.note_short_context("select_eager_verify", 33)
+    lane.note_route_hit("select_eager_verify")
+    lane._COUNTS["verify_kernel"] += 12
+    driver = load_driver()
+    block = driver.fable_qsa_sparse_decode_block(require_calls=True)
+    assert block["problems"] == []
+    assert block["short_context"] == 1
+    assert block["route_hits"] == 1
 
 
 def test_a_fully_engaged_arm_passes(armed_verify, monkeypatch):

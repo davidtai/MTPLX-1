@@ -2003,22 +2003,38 @@ way of failing to engage is fatal to the arm:
 
    A probe that failed prints `off (<reason>)` with the measured deltas.
 
-2. **Loud gates instead of silent declines.** An armed flag that cannot bind
-   raises where it cannot bind: `TensorOffsetQSACache.__init__` raises when a
-   construction site did not pass the lane through *or* when the parity probe
-   disabled it (read the deltas off the stderr line, then unarm the flag
-   deliberately); `_sparse_decode_route` raises on a geometry or budget
-   mismatch at the width the flag arms; and `Attention.__call__` raises at
-   TRACE time if the indexer handed it any lane other than `sparse_blocks`.
-   Widths the flag does not arm and growable caches stay routing, and the
-   growable case is counted in `route_declines`.
+2. **Loud gates for configuration, routing for request shape.** An armed flag
+   that cannot bind raises where it cannot bind: `TensorOffsetQSACache.__init__`
+   raises when a construction site did not pass the lane through *or* when the
+   parity probe disabled it (read the deltas off the stderr line, then unarm
+   the flag deliberately); `_sparse_decode_route` raises on a wrong ratio,
+   top-k or wired row count; and `Attention.__call__` raises at TRACE time if
+   a **full-budget** forward was handed any lane other than `sparse_blocks`.
+   Widths the flag does not arm, growable caches and short contexts stay
+   routing, counted in `route_declines`.
+
+   **The lane engages only above 2,052 tokens, by design.** The kernel's ABI
+   is a fixed `[M, 512]` selection, and 512 complete pooled blocks exist only
+   from `(512 + 1) * 4` tokens. Below that the indexer selects a partial
+   budget and there is no smaller kernel to fall to -- padding would attend
+   keys the shipped lane does not. Context length is a per-request shape the
+   server must accept, so a short request routes to the stock attention,
+   counts as `short_context` in the receipt (with `short_context_blocks`
+   min/max), and prints nothing. A HumanEval prompt is served, not refused;
+   an armed 16 K decode still has to bind or the assertions fire. Raising
+   here instead took the 2026-09-02 composed fullset down with HTTP 500s at
+   7 and 33 blocks.
 
 3. **A `qsa_sparse_decode` block on the receipt row**, read *after* the run:
    `armed`, `installed`, `disabled_reason`, `tile`, `splits`, `probe` (both
    ladder rungs, per cell), `cache_installs`, `route_hits`, `route_sites`
-   (per call site), `route_declines`, `kernel_calls`. The driver refuses the
-   arm -- after writing the receipt -- when the probe never ran, the lane
-   disabled itself, `route_hits` is zero, or no kernel call was issued.
+   (per call site), `route_declines`, `short_context` +
+   `short_context_blocks` + `short_context_tokens`, `kernel_calls`. The driver
+   refuses the arm -- after writing the receipt -- when the probe never ran,
+   the lane disabled itself, `route_hits` is zero, or no kernel call was
+   issued. A cell whose every forward declined for short context is refused
+   with that named reason: it is the control by construction, so measure this
+   lane on a long-context cell.
 
 Read `route_sites` first. It and `kernel_calls` count TRACES, not decode
 cycles: under `mx.compile` the Python body runs once per retrace and the C++
