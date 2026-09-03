@@ -177,6 +177,11 @@ mtplx serve --model ... --generation-mode mtp \
 mtplx serve --model ... --generation-mode mtp --disable-optimization all
 ```
 
+`--profile turbo` is **not** the opt-out. The defaults live in the server's
+own env resolution, behind the served-config predicate, not in a profile — so
+they apply under `turbo`, `sustained` and every other profile alike.
+`--disable-optimization all` is the way to run the stock path.
+
 Disabling a lane leaves its keys **unset** rather than stamping `0`: nine of
 the twenty-three are widths, budgets, name lists or a vocabulary path, and
 `MTPLX_PREFILL_CHUNK_SIZE=0` is not a configuration. Unset is what restores
