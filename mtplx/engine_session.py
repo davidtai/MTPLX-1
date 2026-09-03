@@ -1455,6 +1455,24 @@ class EngineSessionManager:
                 "MTPLX_SESSION_BANK_PER_SESSION_BYTES (sizes like 12G or 12GiB).",
                 flush=True,
             )
+        # W84: the install verdict for MTPLX_SESSION_BANK_MAX_BYTES prints at
+        # model load, which happens BEFORE this constructor, so the budget the
+        # bank is actually running arrives as a recorded fact on the same
+        # receipt rather than as a second, contradicting line.
+        try:
+            from mtplx.fable_install_receipts import record as _record_receipt
+
+            _record_receipt(
+                "session_bank_max_bytes",
+                bank_max_bytes=int(bank.max_bytes),
+                bank_per_session_max_bytes=int(bank.per_session_max_bytes),
+                bank_max_entries=int(bank.max_entries),
+                model_weights_bytes=(
+                    int(model_weights_bytes) if model_weights_bytes else None
+                ),
+            )
+        except Exception:
+            pass
         self.bank = bank
         self.idle_ttl_s = float(idle_ttl_s)
         self._sessions: dict[str, EngineSession] = {}

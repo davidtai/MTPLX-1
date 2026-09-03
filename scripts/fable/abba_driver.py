@@ -65,7 +65,8 @@ import subprocess
 import sys
 import time
 import warnings
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -453,6 +454,106 @@ def prewarm_ngram_table(path: Path) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
+def default_receipt_name(
+    label: str, sequence: int, *, benchmark_matrix: bool,
+    natural_stop: bool, max_tokens: int,
+) -> str:
+    """The auto receipt filename for an arm the window did not name."""
+
+    safe_label = "".join(
+        character if character.isalnum() or character in "-_" else "-"
+        for character in str(label)
+    )
+    if benchmark_matrix:
+        suffix = "benchmark-matrix.json"
+    elif natural_stop:
+        suffix = f"variable-16k-max{int(max_tokens)}.json"
+    elif int(max_tokens) != 1024:
+        suffix = f"fixed-16k-output{int(max_tokens)}.json"
+    else:
+        suffix = "seeds-16k-1k.json"
+    return f"abba-{int(sequence)}-{safe_label}-{suffix}"
+
+
+def unique_receipt_path(path: Path, sequence: int) -> Path:
+    """``path`` with the sequence number in its stem.
+
+    Arm LABELS are not unique across re-runs -- ``fable-w66b-gdn-fold-alone-
+    control-A0-s20260829`` is the label of *every* attempt at that arm -- so a
+    filename built from the label alone can be silently overwritten, and worse,
+    a stale one can be read as this run's evidence.  The sequence number IS
+    unique per arm within a window, so it goes in the name.  ``abba_window``
+    already names receipts ``<label>-<sequence>.json``; this makes the property
+    hold for a hand-passed ``--receipt-path`` too, and is a no-op when the
+    sequence is already there.
+    """
+
+    path = Path(path)
+    token = f"-{int(sequence)}"
+    if token in path.stem or path.stem.endswith(str(int(sequence))):
+        return path
+    return path.with_name(f"{path.stem}{token}{path.suffix}")
+
+
+def receipt_attempt(path: Path) -> int:
+    """1 for a fresh receipt path, previous attempt + 1 for a re-run.
+
+    Recorded so a receipt states, on its face, that it is the Nth write at
+    this path rather than leaving the reader to infer it from an mtime.
+    """
+
+    try:
+        previous = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return 1
+    if not isinstance(previous, dict):
+        return 1
+    try:
+        return max(1, int(previous.get("attempt") or 0)) + 1
+    except (TypeError, ValueError):
+        return 2
+
+
+def build_run_id(label: str, sequence: int, started_iso: str) -> str:
+    """``label + sequence + ISO timestamp`` -- unique across re-runs."""
+
+    return f"{label}-{int(sequence)}-{started_iso}"
+
+
+def utc_now_iso() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def token_provenance(tokens: Sequence[Any]) -> dict[str, Any]:
+    """The generated ids, their digest, and the per-token source column.
+
+    Until 2026-09-02 a receipt kept the ids only when a parity check FAILED,
+    and the surviving trace of a passing run was 600 characters of head plus
+    600 of tail.  That is what made a duplicated subword in one candidate's
+    output cost an afternoon of n-gram probes, and what made "this candidate
+    reproduced the control byte for byte" a claim proved by hashing two text
+    fragments by hand.  All three keys are cheap: a 1,024-token arm adds
+    5,464 + 1,368 characters of base64 to a receipt row already tens of KiB.
+
+    ``token_sources`` carries ``available: false`` when the recorder was not
+    armed, so an all-``unknown`` column can never be misread as an observed
+    one.  See ``mtplx/fable_token_source.py`` for the code table.
+    """
+
+    from mtplx.fable_token_source import token_source
+
+    block = dict(token_source.receipt(tokens))
+    return {
+        "output_ids_sha256": block.pop("output_ids_sha256"),
+        "output_ids_b64": block.pop("output_ids_b64"),
+        "token_sources": block,
+    }
+
+
 def stats_receipt(
     output: Any, arm: str, sequence: int, seed: int, wall_s: float
 ) -> dict[str, Any]:
@@ -465,6 +566,18 @@ def stats_receipt(
     )
     first_primary_sample_time_s = float(
         getattr(stats, "first_primary_sample_time_s", 0.0)
+    )
+    accept_probability_sums = getattr(
+        stats, "accept_probability_sum_by_depth", None
+    )
+    accept_probability_block: dict[str, Any] = (
+        {}
+        if accept_probability_sums is None
+        else {
+            "accept_probability_sum_by_depth": [
+                float(value) for value in accept_probability_sums
+            ]
+        }
     )
     return {
         "sequence": sequence,
@@ -488,6 +601,13 @@ def stats_receipt(
         "drafted_tokens": int(stats.drafted_tokens),
         "accepted_by_depth": list(stats.accepted_by_depth),
         "drafted_by_depth": list(stats.drafted_by_depth),
+        # The conditional expectation of the same accept coin
+        # ``accepted_by_depth`` counts: generate_mtpk sums the per-draft accept
+        # PROBABILITY at each depth, so sum/drafted is the same acceptance the
+        # counter estimates with the coin-flip variance taken out.  Omitted
+        # entirely (not zero-filled) when the runtime did not record it, so a
+        # receipt can never claim an unobserved acceptance of 0.
+        **accept_probability_block,
         "bonus_tokens": int(stats.bonus_tokens),
         "correction_tokens": int(stats.correction_tokens),
         "verify_calls": int(stats.verify_calls),
@@ -511,6 +631,9 @@ def stats_receipt(
         "response_token_sha256": hashlib.sha256(
             ",".join(str(int(token)) for token in output.tokens).encode()
         ).hexdigest(),
+        # The ids themselves, their own digest over the raw little-endian
+        # uint32 bytes, and one uint8 lane code per token.
+        **token_provenance(output.tokens),
         "compiled_verify": dict((stats.graphbank or {}).get("compiled_verify") or {}),
         "draft_core": dict(stats.draft_core or {}),
         # MTPLX_FABLE_DEVICE_DRAFT_CHAIN engagement.  `{"installed": False}` on
@@ -1860,6 +1983,31 @@ def fable_qsa_sparse_decode_block(*, require_calls: bool, strict: bool = True) -
     return block
 
 
+def fable_install_receipts_block(runtime=None) -> dict:
+    """W84 install-time verdicts for the nine flags that had no receipt.
+
+    ``mtplx/runtime.py`` prints one ``[fable] <lane> armed: ...`` /
+    ``off (...)`` / ``refused (...)`` / ``resolved: ...`` line per lane at
+    model load; this is the same information as a dict, re-read AFTER the run
+    so the per-request engagement counters are populated.
+
+    Read-only and never raises.  Unlike ``fable_verify_glue_block`` and
+    ``fable_qsa_sparse_decode_block`` it does NOT fail an arm: three of the
+    nine keys are plain server knobs with no armed/unarmed distinction, and
+    the ones that do arm state their own engagement condition ("engages at a
+    prefill cut into 2+ chunks", ...) which only the cell's shape can satisfy.
+    Judging engagement is the reader's job; publishing the evidence is this
+    function's.
+    """
+
+    try:
+        from mtplx.fable_install_receipts import receipts
+
+        return receipts({"runtime": runtime})
+    except Exception as exc:  # never fail a finished run over a receipt
+        return {"unavailable": f"{type(exc).__name__}: {exc}"}
+
+
 def is_raw_env_mtplx_key(key: str) -> bool:
     """Does this MTPLX_* key belong on the raw ``--env`` passthrough?"""
 
@@ -2454,6 +2602,39 @@ def main() -> int:
         "peak_bytes": int(mx.get_peak_memory()),
     }
 
+    # -- run identity ------------------------------------------------------
+    # An arm LABEL repeats on every attempt at that arm; a sequence number
+    # does not, and neither does a timestamp.  Resolved BEFORE the first run
+    # so `attempt` can read whatever receipt is already sitting at this path.
+    receipt_out = (
+        Path(args.receipt_path)
+        if args.receipt_path is not None
+        else OUT_DIR
+        / default_receipt_name(
+            args.label,
+            args.sequence,
+            benchmark_matrix=bool(args.benchmark_matrix),
+            natural_stop=bool(args.natural_stop),
+            max_tokens=int(args.max_tokens),
+        )
+    )
+    receipt_out = unique_receipt_path(receipt_out, args.sequence)
+    receipt_attempt_number = receipt_attempt(receipt_out)
+    run_started_iso = utc_now_iso()
+    if receipt_attempt_number > 1:
+        print(
+            f"[fable-abba] attempt {receipt_attempt_number} at {receipt_out} "
+            "(a receipt already exists at this path and will be replaced)",
+            flush=True,
+        )
+
+    # Per-token provenance for every row this process writes.  Armed here,
+    # once, because this driver ALWAYS writes a receipt; `generate_mtpk`
+    # snapshots the flag per request, so nothing pays for it elsewhere.
+    from mtplx.fable_token_source import token_source as _token_source
+
+    _token_source.enabled = True
+
     def run(
         cell: dict[str, Any],
         sequence: int,
@@ -2549,6 +2730,12 @@ def main() -> int:
             seed,
             time.perf_counter() - started,
         )
+        # Unique per run, unlike `arm`: the same label is written by every
+        # attempt at that arm, so a receipt read out of a directory could not
+        # say which attempt it belonged to.
+        row["run_id"] = build_run_id(cell["label"], sequence, run_started_iso)
+        row["attempt"] = receipt_attempt_number
+        row["run_started_utc"] = run_started_iso
         row["pre_run_reset"] = reset_receipt
         # MTPLX_FABLE_INDEXER_REUSE engagement. On an unarmed arm both are 0,
         # which is what "the control really was the control" looks like.
@@ -2749,6 +2936,14 @@ def main() -> int:
         "schema": "mtplx-fable-abba-arm-v1",
         "status": "arm_measured",
         "label": args.label,
+        # Identity of THIS write.  `label` alone repeats across attempts;
+        # `sequence` is unique per arm inside a window and `run_id` is unique
+        # everywhere.  `attempt` counts writes at this receipt path.
+        "sequence": int(args.sequence),
+        "run_id": build_run_id(args.label, args.sequence, run_started_iso),
+        "attempt": receipt_attempt_number,
+        "run_started_utc": run_started_iso,
+        "receipt_path": str(receipt_out),
         "source_commit": source_receipt["observed_commit"],
         "source_path": str(source_path),
         "source": source_receipt,
@@ -2856,6 +3051,12 @@ def main() -> int:
         "qsa_sparse_decode": fable_qsa_sparse_decode_block(
             require_calls=True, strict=False
         ),
+        # W84: install-time verdict per armed flag for the nine keys that
+        # had none -- the op diet, block verification, the K20 pre-scatter,
+        # the two PLE prefill lanes, the QSA query tile, and the three
+        # prefill/session-bank knobs.  Read AFTER the run so the engagement
+        # counters are populated.
+        "fable_install_receipts": fable_install_receipts_block(runtime),
         "paired_routed_glu": {
             "expected": candidate_environment.get("MTPLX_QWEN4_M4_ROUTED_GLU")
             == "1",
@@ -2880,22 +3081,9 @@ def main() -> int:
         "guard": guard,
         "rows": rows,
     }
-    safe_label = "".join(
-        character if character.isalnum() or character in "-_" else "-"
-        for character in args.label
-    )
-    if args.receipt_path is not None:
-        out = args.receipt_path
-    else:
-        if args.benchmark_matrix:
-            suffix = "benchmark-matrix.json"
-        elif args.natural_stop:
-            suffix = f"variable-16k-max{args.max_tokens}.json"
-        elif args.max_tokens != 1024:
-            suffix = f"fixed-16k-output{args.max_tokens}.json"
-        else:
-            suffix = "seeds-16k-1k.json"
-        out = OUT_DIR / f"abba-{args.sequence}-{safe_label}-{suffix}"
+    # Resolved before the first run (see the run-identity block above) so the
+    # attempt counter could read the receipt already at this path.
+    out = receipt_out
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     print(f"[fable-abba] wrote {out}", flush=True)

@@ -129,6 +129,57 @@ Outputs land in
 * `abba-window-<sequence>-<label-prefix>.md` (the markdown table, also printed
   to stdout).
 
+### What identifies a run
+
+An arm **label** repeats on every attempt at that arm --
+`fable-w66b-gdn-fold-alone-control-A0-s20260829` is the label of *all* of
+them -- so nothing that has to be unique is built from the label alone:
+
+* the receipt **filename** carries the sequence (`<label>-<sequence>.json`),
+  and `abba_driver` forces it in even for a hand-passed `--receipt-path`;
+* every receipt carries `run_id` (label + sequence + ISO timestamp),
+  `attempt` (the number of writes at this path), `sequence` and
+  `run_started_utc`;
+* `extract_run_row` **refuses** a receipt whose `sequence` is not the arm's,
+  so a stale attempt sitting at the expected path cannot be read as this
+  run's evidence;
+* the window table's rows are keyed and sorted by `Seq`, and the window
+  receipt carries `rows_by_sequence` alongside `rows`.
+
+### Per-token provenance
+
+Every measured row carries the whole generated stream, not 600 characters of
+each end:
+
+| key | meaning |
+| --- | --- |
+| `output_ids_sha256` | sha256 over the raw little-endian `uint32` ids -- the identity of the output |
+| `output_ids_b64` | those ids, base64 (4 bytes/token) |
+| `token_sources.token_sources_b64` | one `uint8` lane code per token, base64 |
+| `token_sources.counts` | per-lane totals (`primary`, `bonus`, `correction`, `copy`, `copy_correction`, `draft_d1`..) |
+| `token_sources.complete` | false means a lane committed through a site the recorder does not cover |
+
+The code table and the decoder are in `mtplx/fable_token_source.py`
+(`decode_receipt` returns `(ids, sources)`).  Recording covers the accept
+loop *and* both context-copy round paths, which commit without a verify
+window of their own -- the same gap `carry_len` / `carry_tokens` cover in the
+K20 log, and the two recorders fire side by side at every one of those sites.
+A 1,024-token arm pays about 7.4 KB of receipt for it.
+
+The window summary ends with two lines computed from `output_ids_sha256`
+(never from `response_text_head`/`_tail`):
+
+```
+outputs identical per seed: yes (output_ids_sha256)
+candidate == control on 3/3 seeds (identical output ids); primary delta
+-0.0269% is inside the +/-1.00% rounding class -- NON-ENGAGEMENT: this arm
+reproduced the control exactly and moved nothing measurable.
+```
+
+The band is `--rounding-class-pct` (default 1.0). A candidate that matches the
+control on every seed but lands *outside* the band is reported as a bit-exact
+change instead, not as an inert arm.
+
 ## 3. Passing a candidate
 
 Construction-time MTPLX settings (arm B only):
@@ -767,6 +818,35 @@ stack plus one item. Swap the item for `qsa_rope_idx`, or drop
 `MTPLX_FABLE_VERIFY_GLUE_ITEMS` entirely to measure both at once -- but a
 combined arm cannot attribute a win, which is the whole reason the items are
 separately selectable.
+
+## Install-time verdicts (`[fable] <lane> ...`)
+
+Nine keys of the served set used to arm with no receipt anywhere: bare
+`os.environ.get` reads at request or construction time, printing nothing
+either way. `mtplx/fable_install_receipts.py` gives each one an install-time
+verdict, printed once per process to stderr from `mtplx/runtime.py:load()`,
+in the same shape the sparse-decode and verify-glue lanes use:
+
+```
+[fable] opdiet armed: items=k20 (MTPLX_FABLE_OPDIET_ITEMS='k20') of bank,rope,resid,k20; ...
+[fable] block_verify armed, engages at an accept window with temperature>0, ...
+[fable] prefill_chunk_size resolved: full serving chunk widths [4096] (...)
+[fable] ple_prefill_lookahead refused (Qwen4ExpTextModel has no PLE stage layer: ...)
+```
+
+| state | meaning |
+| --- | --- |
+| `armed: ...` | the flag is on and its fate is settled at install |
+| `armed, engages at <condition>: ...` | on, but the lane only runs on a request that fits; the receipt carries an engagement counter, and a by-design decline (short prompt, greedy window) is counted, never printed |
+| `off (<reason>)` | not armed; the reason names the key |
+| `refused (<reason>)` | armed, but the code shows it cannot engage in THIS process (no PLE stage, a query tile wider than the chunk, a qwen4-only op-diet selection on another family). A printed verdict, not an exception -- nothing here changes what a flag does |
+| `resolved: ...` | a server knob with no armed/unarmed distinction (`MTPLX_PREFILL_CHUNK_SIZE`, `MTPLX_QSA_PREFILL_COMPILE_ROWS`, `MTPLX_SESSION_BANK_MAX_BYTES`): the value this process is running |
+
+The same blocks ride the abba receipt at `fable_install_receipts` and the
+server's `GET /health` under `fable_install_receipts`, with each lane's
+`engagements`, `declines` and the env it actually read.
+`tests/test_fable_install_receipts.py` names the nine keys and fails when a
+flag is added without a verdict.
 
 ## PYTHONPATH
 

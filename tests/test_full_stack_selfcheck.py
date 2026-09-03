@@ -364,6 +364,55 @@ def test_health_engagement_reports_registry_covers_every_runtime_report() -> Non
     assert published <= registered, sorted(published - registered)
 
 
+def test_every_runtime_published_install_artifact_reaches_health() -> None:
+    """The ``_report`` scan above is a suffix match; this one is not.
+
+    W84 publishes ``runtime.fable_install_receipts`` -- an install artifact
+    with no ``_report`` suffix, so the scan above passes it by. It reaches
+    ``/health`` through its OWN payload function rather than through
+    ``_ENGAGEMENT_REPORT_ATTRS``, and that is correct: the two registries
+    answer different questions (``engagement_reports`` reports LANES, keyed
+    by lane, off a bare ``getattr``; ``fable_install_receipts`` reports
+    FLAGS, and re-reads live so per-request engagement counters are current).
+    Registering it in both would publish it twice under two names.
+
+    So assert the invariant that actually matters -- every install artifact
+    the runtime hands back is served somewhere at ``/health`` -- and name the
+    route for each, so a third registry cannot be added without a decision.
+    """
+
+    from pathlib import Path
+    import re
+
+    root = Path(__file__).resolve().parents[1] / "mtplx"
+    runtime_source = (root / "runtime.py").read_text()
+    server_source = (root / "server" / "openai.py").read_text()
+
+    published = set(re.findall(r"runtime\.([a-z0-9_]+)\s*=", runtime_source))
+    install_artifacts = {
+        name
+        for name in published
+        if name.endswith("_report") or name.endswith("_receipts")
+    }
+    assert "fable_install_receipts" in install_artifacts, sorted(install_artifacts)
+
+    via_engagement_reports = set(
+        re.findall(
+            r'\(\s*"[a-z0-9_]+"\s*,\s*"([a-z0-9_]+_report)"\s*\)',
+            server_source,
+        )
+    )
+    # W84's own route: a top-level /health key fed by its payload function.
+    via_own_payload = {"fable_install_receipts"}
+    assert '"fable_install_receipts": _fable_install_receipts_payload(state)' in (
+        server_source
+    )
+    assert '"engagement_reports": _engagement_reports_payload(state)' in server_source
+
+    unserved = install_artifacts - via_engagement_reports - via_own_payload
+    assert not unserved, sorted(unserved)
+
+
 def test_hc_m4_install_report_reaches_health() -> None:
     """W42c's MTPLX_FABLE_HC_M4 pack validation is a registered lane."""
 
