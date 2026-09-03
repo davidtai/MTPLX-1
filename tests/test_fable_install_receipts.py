@@ -55,6 +55,14 @@ KEY_LANES = {
     "MTPLX_PREFILL_CHUNK_SIZE": "prefill_chunk_size",
     "MTPLX_QSA_PREFILL_COMPILE_ROWS": "qsa_prefill_compile_rows",
     "MTPLX_SESSION_BANK_MAX_BYTES": "session_bank_max_bytes",
+    # W93 (2026-09-03): the retained stack is armed by DEFAULT for a
+    # Flash-Next serve, and the program's rule is that every armed flag
+    # prints an install-time verdict. These three had none. (Before W93 this
+    # table was the nine-key/9-lane pre-battery set above.)
+    "MTPLX_FABLE_ROUTE_KERNEL": "route_kernel",
+    "MTPLX_FABLE_GRAPH_BUILD_OVERLAP": "graph_build_overlap",
+    "MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS": "graph_build_overlap",
+    "MTPLX_GDN_BLOCKED_PREFILL": "gdn_blocked_prefill",
 }
 
 #: The env that arms every armable key at once, for the one-line-per-lane and
@@ -72,6 +80,10 @@ ARMED_ENV = {
     "MTPLX_PREFILL_CHUNK_SIZE": "4096",
     "MTPLX_QSA_PREFILL_COMPILE_ROWS": "4096",
     "MTPLX_SESSION_BANK_MAX_BYTES": "8G",
+    "MTPLX_FABLE_ROUTE_KERNEL": "1",
+    "MTPLX_FABLE_GRAPH_BUILD_OVERLAP": "1",
+    "MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS": "3",
+    "MTPLX_GDN_BLOCKED_PREFILL": "1",
 }
 
 
@@ -207,6 +219,11 @@ def test_armed_process_states_armed_or_resolved_for_every_key():
         "prefill_chunk_size": "resolved",
         "qsa_prefill_compile_rows": "resolved",
         "session_bank_max_bytes": "resolved",
+        # W93: the three lanes that had no verdict before the retained stack
+        # became a served default.
+        "route_kernel": "armed",
+        "graph_build_overlap": "armed",
+        "gdn_blocked_prefill": "armed",
     }
 
 

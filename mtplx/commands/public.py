@@ -9617,6 +9617,12 @@ def cmd_serve_public(args: Any) -> int:
     if bool(getattr(args, "experimental_mtp_cohorts", False)):
         cmd.append("--experimental-mtp-cohorts")
     ssd_session_cache = str(getattr(args, "ssd_session_cache", "on") or "on")
+    # One `--disable-optimization <lane>` per requested lane. The daemon is a
+    # separate process, so a lane chosen here has to travel on argv --
+    # MTPLX_FABLE_DISABLE is inherited through the environment and needs no
+    # forwarding, which is why only the flag is repeated here.
+    for lane in getattr(args, "disable_optimization", None) or ():
+        cmd.extend(["--disable-optimization", str(lane)])
     cmd.extend(["--ssd-session-cache", ssd_session_cache])
     ssd_dir = getattr(args, "ssd_session_cache_dir", None)
     if ssd_dir:

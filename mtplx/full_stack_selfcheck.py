@@ -6,6 +6,10 @@ with a bare ``os.environ.get`` and a default, so a key that never reaches
 the reader -- misspelled, stomped, or refused because the model is not
 qwen4_exp -- leaves the lane off while every other receipt still says ok.
 
+Arming an env flag is also not the same as an operator having chosen it: the
+23 retained keys are armed by default now, so the receipts have to say who
+won, and ``mtplx.full_stack_env.value_source`` is what lets them.
+
 ``scripts/fable/server_cell_bench.py --require-full-stack`` answers the same
 question by grepping a finished log for three proofs: an FR-Spec install
 report at ``n=65536``, an M4 route reported as installed, and an all-ok
@@ -49,13 +53,22 @@ the receipt it summarizes.
 The same reports are readable after boot at ``GET /health`` under
 ``engagement_reports``.
 
-These markers are the LANE level. The env level -- is each of the 20
-driver-stack keys armed, and by whom -- is
-``mtplx.full_stack_env.stack_summary_line``, which the server prints once,
-just above these lines. The two answer different questions: the profile
-stamps only the three keys nothing else sets, so a lane can be missing
-because the server's own auto-arm predicate did not match the served pack,
-and only the env line can say that.
+These markers are the LANE level. The env level -- is each of the 41
+measured-stack keys armed, and by whom -- is
+``mtplx.full_stack_env.stack_summary_line``, and what the retained defaults
+armed against what the operator turned off is
+``mtplx.full_stack_env.defaults_summary_line``; the server prints both once,
+just above these lines. They answer different questions: a lane can be
+missing because the server's own auto-arm predicate did not match the served
+pack, or because an operator exported the key off, and only the env lines can
+say which.
+
+Since 2026-09-03 these markers run on ANY Flash-Next serve, not only under
+``--profile turbo-full-stack``: the retained stack is that family's default,
+and a default nobody can see armed is exactly as unreadable as the opt-in was.
+Per-KEY verdicts (as opposed to these per-LANE markers) are
+``mtplx/fable_install_receipts.py``, whose ``[fable]`` lines now say whether
+each value came from the defaults or from the operator.
 
 Pure functions over plain dicts: the server passes what it has, nothing here
 touches MLX, the model, or the GPU.

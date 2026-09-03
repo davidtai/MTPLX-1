@@ -1,0 +1,18 @@
+# PR-391 retained DECODE stack -- the canonical record.
+# Source of truth in code: mtplx/full_stack_env.py (group fable_decode).
+# tests/test_full_stack_profile.py asserts this file == that group, so
+# neither can drift. These keys are armed BY DEFAULT for a served Qwen3.8
+# Flash-Next pack; this file exists as the record, and to export by hand
+# (set -a; . docs/perf/pr391-stack.flags) for a run that bypasses the server.
+MTPLX_FABLE_HC_M4=1
+MTPLX_FABLE_OPDIET=1
+MTPLX_FABLE_BLOCK_VERIFY=1
+MTPLX_FABLE_ROUTE_KERNEL=1
+MTPLX_FABLE_DRAFT_K20_PRESCATTER=1
+MTPLX_FABLE_GRAPH_BUILD_OVERLAP=1
+MTPLX_FABLE_GRAPH_BUILD_OVERLAP_LAYERS=3
+MTPLX_FABLE_VERIFY_GLUE=1
+MTPLX_FABLE_VERIFY_GLUE_ITEMS=qsa_rope,qsa_rope_idx
+MTPLX_FABLE_QSA_SPARSE_DECODE=1
+MTPLX_FABLE_QSA_SPARSE_DECODE_TILE=128:32
+MTPLX_FABLE_QSA_SPARSE_DECODE_SPLITS=17

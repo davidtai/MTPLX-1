@@ -142,6 +142,13 @@ from mtplx.full_stack_env import (
     FULL_STACK_PROFILE_NAME,
     resolved_stack,
     stack_summary_line,
+    DISABLE_ENV,
+    LANES,
+    fable_default_env,
+    fable_defaults_report,
+    defaults_summary_line,
+    record_defaults_applied,
+    resolve_disable_lanes,
     warn_unknown_family_keys,
 )
 from mtplx.full_stack_selfcheck import (
@@ -878,6 +885,33 @@ def _server_runtime_env_overrides(
                     overrides.pop(key, None)
                 else:
                     overrides.setdefault(key, "1")
+        # ---- the retained Flash-Next stack, ON by default (2026-09-03) ----
+        # The twelve decode keys, the eight prefill keys and the three
+        # FR-Spec/compiled-prepare keys the PR-391 battery measured. Until
+        # today they were an opt-in that reached a serve only by exporting
+        # docs/perf/pr391-stack.flags and docs/perf/pr391-prefill.flags by
+        # hand; the measured configuration being the one nobody actually got
+        # is how a benchmark result stops meaning anything.
+        #
+        # Armed exactly the way the sixteen keys above are armed -- setdefault
+        # behind this same served-config predicate -- which is what makes an
+        # operator export the off switch: MTPLX_FABLE_QSA_SPARSE_DECODE=0
+        # turns that one lane off and its install verdict says
+        # "off (operator: ...)". MTPLX_FABLE_DISABLE=<lane,...> and
+        # --disable-optimization <lane> do the same by NAME, and
+        # --disable-optimization all is the stock path.
+        #
+        # Nine of these keys are read at module IMPORT (mtplx.runtime_options
+        # and friends), which this function is far too late for; those are
+        # armed identically by mtplx/server/__init__.py before openai.py's
+        # own imports run, and are already in os.environ here, so
+        # fable_default_env skips them.
+        retained_defaults = fable_default_env(
+            os.environ, disabled_lanes=_disabled_optimization_lanes(args)
+        )
+        for key, value in retained_defaults.items():
+            overrides.setdefault(key, value)
+        record_defaults_applied(retained_defaults)
         if os.environ.get("MTPLX_NAX_VERIFY") is None:
             # The turbo profile arms the 27B NAX verify patch
             # (MTPLX_NAX_VERIFY=1); on this family it is unmeasured and
@@ -890,6 +924,24 @@ def _server_runtime_env_overrides(
             # the profile env (apply_profile_env), so this beats turbo's 1.
             overrides["MTPLX_NAX_VERIFY"] = "0"
     return overrides
+
+
+def _disabled_optimization_lanes(args: argparse.Namespace) -> frozenset[str]:
+    """Lanes the operator asked to leave unarmed, from the flag and the env.
+
+    ``--disable-optimization`` (repeatable) and ``MTPLX_FABLE_DISABLE`` are
+    the same switch spelled two ways and they compose. An unknown lane name
+    RAISES here rather than disabling nothing: a typo that silently left the
+    optimization on would make an A/B measure the same arm twice. ``argv=[]``
+    because the flag is already parsed onto ``args``; re-reading ``sys.argv``
+    would pick up a test runner's arguments.
+    """
+
+    return resolve_disable_lanes(
+        os.environ,
+        [],
+        extra=getattr(args, "disable_optimization", None) or (),
+    )
 
 
 def _served_model_type_is_qwen4_exp(args: argparse.Namespace) -> bool:
@@ -1585,6 +1637,23 @@ def _full_stack_profile_selected(args: Any) -> bool:
         return False
 
 
+def _full_stack_selfcheck_applies(args: Any) -> bool:
+    """Is there a retained stack to check on this serve?
+
+    Until 2026-09-03 the answer was "only if the operator asked for the
+    opt-in profile". The stack is now the DEFAULT for a Flash-Next pack, so
+    the self-check has to run there too -- a default nobody can see armed is
+    the same unreadable configuration the opt-in was.
+    """
+
+    if _full_stack_profile_selected(args):
+        return True
+    try:
+        return bool(_served_model_type_is_qwen4_exp(args))
+    except Exception:
+        return False
+
+
 def _serve_shape(state: Any) -> str:
     """The serve shape the stack line is read against.
 
@@ -1657,16 +1726,26 @@ def _emit_full_stack_selfcheck(state: Any, *, phase: str = "startup") -> dict[st
     installed or measured here; this only says whether each one is there.
     """
 
-    if not _full_stack_profile_selected(getattr(state, "args", None)):
+    args = getattr(state, "args", None)
+    if not _full_stack_selfcheck_applies(args):
         return {}
     try:
-        # Env level first, and only once: the profile stamps only the three
-        # keys nothing else sets, so the rest of the stack depends on the
-        # server's own auto-arm and its model predicates. A predicate that
-        # did not hold shows up here as an unarmed key, which is the thing
-        # that explains a missing lane below. The env cannot change between
-        # startup and post-warmup, so the re-run skips this line.
+        # Env level first, and only once. Two lines, because there are two
+        # questions: WHAT the retained defaults armed and what the operator
+        # turned off (the defaults line), and whether the whole 41-key stack
+        # -- ours plus the server's own M4 auto-arm -- actually resolved
+        # (the stack line). A server predicate that did not hold shows up in
+        # the second as an unarmed key, which is what explains a missing
+        # lane below. Neither can change between startup and post-warmup, so
+        # the re-run skips both.
         if phase == "startup":
+            _safe_stdout_print(
+                f"[full-stack] {phase} "
+                + defaults_summary_line(
+                    disabled_lanes=_disabled_optimization_lanes(args),
+                    model_gate=_serve_shape(state),
+                )
+            )
             _safe_stdout_print(
                 f"[full-stack] {phase} "
                 f"{stack_summary_line(shape=_serve_shape(state))}"
@@ -1680,6 +1759,10 @@ def _emit_full_stack_selfcheck(state: Any, *, phase: str = "startup") -> dict[st
             _safe_stdout_print(line)
         payload = selfcheck_payload(statuses, phase=phase)
         payload["stack"] = resolved_stack()
+        payload["fable_defaults"] = fable_defaults_report(
+            disabled_lanes=_disabled_optimization_lanes(args),
+            model_gate=_serve_shape(state),
+        )
         state.full_stack_selfcheck = payload
         return payload
     except Exception as error:  # a self-check must never break startup
@@ -1728,6 +1811,17 @@ def _engagement_reports_payload(state: Any) -> dict[str, Any]:
         name: getattr(runtime, attr, None) for name, attr in _ENGAGEMENT_REPORT_ATTRS
     }
     payload["full_stack_selfcheck"] = getattr(state, "full_stack_selfcheck", None)
+    # Which retained-stack optimizations this process armed by default, and
+    # which ones the operator turned off. Read live rather than off the
+    # startup snapshot, so a /health poll after a restart-free config change
+    # cannot report a stale answer.
+    try:
+        payload["fable_defaults"] = fable_defaults_report(
+            disabled_lanes=_disabled_optimization_lanes(getattr(state, "args", None)),
+            model_gate=_serve_shape(state),
+        )
+    except Exception:
+        payload["fable_defaults"] = None
     payload["unknown_family_env_keys"] = list(
         getattr(state, "unknown_family_env_keys", []) or []
     )
@@ -34122,6 +34216,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--profile", choices=PROFILE_CHOICES, default=DEFAULT_PROFILE_NAME
+    )
+    parser.add_argument(
+        "--disable-optimization",
+        dest="disable_optimization",
+        action="append",
+        metavar="LANE",
+        choices=(*LANES, "all"),
+        default=None,
+        help=(
+            "Leave one retained-stack optimization unarmed on a Qwen3.8 "
+            "Flash-Next serve (repeatable). 'all' runs the stock path. Same "
+            f"switch as {DISABLE_ENV}=<lane,...>; the two compose. Lanes: "
+            + ", ".join(LANES)
+        ),
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
