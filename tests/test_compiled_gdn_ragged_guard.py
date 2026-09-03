@@ -275,17 +275,21 @@ def test_make_mask_is_what_keeps_the_compiled_path_off_a_ragged_cache():
     assert create_ssm_mask(h, with_padding) is not None
 
 
-def test_merging_empty_arrays_caches_seeds_left_padding():
+@pytest.mark.parametrize("batch", [1, 3])
+def test_merging_empty_arrays_caches_seeds_left_padding(batch):
     """The live producer: mlx-lm's all-empty merge (ar_batch admission).
 
     ``ArraysCache.merge`` stamps ``left_padding = [0] * B`` on every merged
-    all-empty cache and nothing clears it, so the AR batch lane decodes with
-    the metadata live -- which is exactly why the ssm-mask gate, not the
-    absence of producers, is what keeps the compiled path clean.
+    all-empty cache and nothing clears it -- at B=1 too -- so the AR batch
+    lane decodes with the metadata live, ``create_ssm_mask`` returns an array
+    every step, and the compiled GDN path (with every ``mask is None`` fused
+    kernel) is off for that batch.  Which is exactly why the ssm-mask gate,
+    not the absence of producers, is what keeps the compiled path clean.
     """
 
     from mlx_lm.models.cache import ArraysCache
 
-    merged = ArraysCache.merge([ArraysCache(size=2) for _ in range(3)])
+    merged = ArraysCache.merge([ArraysCache(size=2) for _ in range(batch)])
     assert merged.left_padding is not None
     assert ci.ragged_metadata_fields(merged) == ("left_padding",)
+    assert merged.make_mask(1) is not None
