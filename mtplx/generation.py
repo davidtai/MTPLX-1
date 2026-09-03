@@ -95,6 +95,7 @@ from .fable_prefill_chunk import (
     summarize_spans,
 )
 from .fable_k20_log import is_enabled as _fable_k20_log_enabled, k20_log
+from .fable_token_source import token_source as _fable_token_source
 from .fable_mtp_kv_only import (
     claim_model_route as _fable_mtp_kv_only_claim,
     is_enabled as _fable_mtp_kv_only_enabled,
@@ -9274,6 +9275,14 @@ def generate_mtpk(
     else:
         _pr391_stop_ids = None
         _pr391_stop_count = None
+    # MTPLX_FABLE_TOKEN_SOURCE / ``abba_driver`` arming the singleton
+    # directly: per-token provenance for THIS request.  Snapshotted into a
+    # local once here so every emission site below costs one local bool test
+    # when the recorder is off, and the recorder is cleared per request
+    # because one process serves many (mtplx/fable_token_source.py).
+    _track_token_sources = bool(_fable_token_source.enabled)
+    if _track_token_sources:
+        _fable_token_source.begin_request()
     if _FABLE_K20_LOG:
         # One process serves many requests and they all append to one buffer;
         # the committed stream does not run across the join, so the carry
@@ -11072,6 +11081,8 @@ def generate_mtpk(
                     time.perf_counter() - decode_loop_entered_s
                 )
             tokens.append(primary)
+            if _track_token_sources:
+                _fable_token_source.primary()
             if _FABLE_K20_LOG:
                 # No-op unless a context-copy round has committed tokens since
                 # the last logged window: then this primary sits inside that
@@ -11583,6 +11594,11 @@ def generate_mtpk(
                 if _cc_stop_idx is not None:
                     _cc_acc = _cc_acc[:_cc_stop_idx + 1]
                 tokens.extend(_cc_acc)
+                if _track_token_sources:
+                    # The copy lane commits WITHOUT a verify window of its own
+                    # (the gap the K20 log had to grow a carry column for,
+                    # 00ac2690); marked here or these tokens read as unknown.
+                    _fable_token_source.copy_block(len(_cc_acc))
                 if _FABLE_K20_LOG:
                     # This round commits without a K20 row; record what it put
                     # in the emitted stream or the trajectory cannot be
@@ -11604,6 +11620,8 @@ def generate_mtpk(
                     # its forward exactly like an MTP rejection: the pending
                     # primary's KV is computed by whichever forward runs next.
                     tokens.append(int(_cc_correction))
+                    if _track_token_sources:
+                        _fable_token_source.copy_correction()
                     if _FABLE_K20_LOG:
                         k20_log.carry((int(_cc_correction),))
                     correction_tokens += 1
@@ -11890,6 +11908,9 @@ def generate_mtpk(
                 if _cb_stop_idx is not None:
                     _cb_acc = _cb_acc[: _cb_stop_idx + 1]
                 tokens.extend(_cb_acc)
+                if _track_token_sources:
+                    # Same contract as the eager round above.
+                    _fable_token_source.copy_block(len(_cb_acc))
                 if _FABLE_K20_LOG:
                     # Same contract as the eager round above.
                     k20_log.carry(_cb_acc)
@@ -11901,6 +11922,8 @@ def generate_mtpk(
                     _cb_correction = None
                 if _cb_correction is not None and not _cb_finished:
                     tokens.append(int(_cb_correction))
+                    if _track_token_sources:
+                        _fable_token_source.copy_correction()
                     if _FABLE_K20_LOG:
                         k20_log.carry((int(_cb_correction),))
                     correction_tokens += 1
@@ -14505,6 +14528,9 @@ def generate_mtpk(
                 )
             committed = [primary] + draft_tokens
             tokens.extend(draft_tokens)
+            if _track_token_sources:
+                # All-accept: every draft token landed, depths 1..K in order.
+                _fable_token_source.draft_run(len(draft_tokens))
             if (
                 _mtp_history_uses_committed_cache(mtp_history_policy)
                 and not _pr391_mtp_handoff_owns_cycle
@@ -14703,6 +14729,8 @@ def generate_mtpk(
                     emit_trace()
                     continue
                 tokens.append(bonus)
+                if _track_token_sources:
+                    _fable_token_source.bonus()
                 pending_primary = bonus
                 bonus_tokens += 1
                 event["bonus_token"] = int(bonus)
@@ -14724,6 +14752,10 @@ def generate_mtpk(
             committed.append(rejection_correction)
             correction_tokens += 1
             tokens.extend(committed[1:])
+            if _track_token_sources:
+                # committed[1:] is draft_tokens[:accepted_count] followed by
+                # the correction this route always appends, in that order.
+                _fable_token_source.mtp_commit(accepted_count, correction=True)
             # Deferred-correction fold: no repair_m1 forward.  The correction
             # is emitted as the pending primary; the next verify runs the M2
             # graph FROM the stashed post-primary state and computes the
@@ -14801,6 +14833,10 @@ def generate_mtpk(
             committed.append(rejection_correction)
             correction_tokens += 1
         tokens.extend(committed[1:])
+        if _track_token_sources:
+            _fable_token_source.mtp_commit(
+                accepted_count, correction=rejection_correction is not None
+            )
 
         committed_prefix_len = 1 + accepted_count
         committed_from_capture = _pr391_target_state_device_committed
