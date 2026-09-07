@@ -12,9 +12,9 @@ Arm C fastest ABAB decode is 82.84 tokens per second.
 
 | lane | class | KO decode (range) | Δ vs C fastest | Δ% | gate rc |
 | --- | --- | --- | ---: | ---: | ---: |
-| hc_m4 | PR opt | 79.45 (71.90–79.45) | -3.39 | -4.1% | 0 |
-| qsa_sparse_decode | PR opt | 82.00 (70.46–82.00) | -0.84 | -1.0% | 0 |
-| mask_fuse | PR opt | 81.94 (72.15–81.94) | -0.90 | -1.1% | 0 |
+| hc_m4 | PR opt | — | — | — | 0 |
+| qsa_sparse_decode | PR opt | — | — | — | 0 |
+| mask_fuse | PR opt | — | — | — | 0 |
 
 The gate on each window checked that the removed lane read off and the other
 nine read on. hc_m4 read armed:false. qsa_sparse_decode dropped from the

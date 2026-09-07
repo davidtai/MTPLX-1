@@ -36,8 +36,11 @@ C at two thresholds.
 
 ## Contents
 
-- `charts/` — the per-metric SVG charts and `manifest.json` (each chart's key,
-  label, caption, alt text, and the engines and seed counts behind it).
+- `charts/` — the per-metric SVG charts, the 16K per-window interleave chart
+  (`decode_16k_windows.svg`), and `manifest.json` (each chart's key, label,
+  caption, alt text, and the engines and seed counts behind it). The chart inputs
+  are filtered before plotting: superseded, failed, warm, and over-knob records
+  are excluded, and each cell's remaining record count is asserted.
 - `tables/` — the result tables (see `tables/README.md`): decode by context, the
   full per-arm metric ladder, the 16K ABAB paired deltas, the arm-C knock-outs,
   and the 255K long-context verdict.
