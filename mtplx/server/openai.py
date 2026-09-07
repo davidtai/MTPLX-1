@@ -925,6 +925,15 @@ def _server_runtime_env_overrides(
                 "MTPLX_QWEN4_BLOCK_VERIFY",
                 "MTPLX_QWEN4_PLE_PREFILL_LOOKAHEAD",
                 "MTPLX_QWEN4_PLE_FIRST_GATHER_EARLY",
+                # PR #475 (davidtai), measured at the 16,384/1,024 cell on the
+                # same fixed-M4 geometry: the cached async PLE auxiliary plane
+                # (native CPU-stream rows, produced outside the compiled
+                # verifier via mx.async_eval; declines to stock and prints a
+                # reason when the native extension is not built) and the
+                # construction-bound fixed-M4 pooled-key rowsel install. Both
+                # exact by construction (byte-identical output).
+                "MTPLX_QWEN4_PLE_CACHED_AUX",
+                "MTPLX_QSA_POOLED_ROWSEL",
                 "MTPLX_SESSION_BANK_SHED_BOUNDARIES",
                 "MTPLX_SESSION_BANK_PROTECTED_TERMINAL",
                 # PR #391 remainder ports (davidtai), same fixed-M4 geometry.
@@ -944,6 +953,15 @@ def _server_runtime_env_overrides(
                 # The tail also requires the fused gate+up owners, so the
                 # MTPLX_FUSED_GATE_UP kill switch drops it with them.
                 lane_defaults.append("MTPLX_QWEN4_M4_STAGE3")
+            # PR #475 aux lanes: mirror an operator's old MTPLX_FABLE_* export
+            # onto the primary MTPLX_QWEN4_*/MTPLX_QSA_* key when the primary is
+            # unset, so the alias arms or kills the lane before the default
+            # stamp. setdefault below then leaves the mirrored value in place.
+            for _primary, _alias in _QWEN4_AUX_LANE_ALIASES.items():
+                if os.environ.get(_primary) is None:
+                    _alias_val = os.environ.get(_alias)
+                    if _alias_val is not None and _alias_val.strip():
+                        overrides[_primary] = _alias_val
             for key in lane_defaults:
                 if os.environ.get(key) is None:
                     overrides.setdefault(key, "1")
@@ -1143,6 +1161,11 @@ _QWEN4_PORT_KEYS = (
     "MTPLX_QWEN4_VERIFY_GLUE_ITEMS",
     "MTPLX_QWEN4_PLE_PREFILL_LOOKAHEAD",
     "MTPLX_QWEN4_PLE_FIRST_GATHER_EARLY",
+    # PR #475 aux lanes (davidtai): the cached async PLE auxiliary and the
+    # fixed-M4 pooled-key rowsel install. Both exact by construction; each is
+    # its own kill switch through the pop loop below.
+    "MTPLX_QWEN4_PLE_CACHED_AUX",
+    "MTPLX_QSA_POOLED_ROWSEL",
     "MTPLX_SESSION_BANK_SHED_BOUNDARIES",
     "MTPLX_SESSION_BANK_PROTECTED_TERMINAL",
     # PR #391 remainder ports (davidtai): each is its own kill switch through
@@ -1152,6 +1175,13 @@ _QWEN4_PORT_KEYS = (
     "MTPLX_QSA_SPARSE_DECODE",
     "MTPLX_NGRAM_PREWARM",
 )
+# PR #475's aux lanes were spelled MTPLX_FABLE_* under PR #391. Upstream has no
+# full_stack_env, so the primary keys are the MTPLX_QWEN4_*/MTPLX_QSA_* names
+# above; the old names are honoured as aliases when the primary is unset.
+_QWEN4_AUX_LANE_ALIASES = {
+    "MTPLX_QWEN4_PLE_CACHED_AUX": "MTPLX_FABLE_PLE_CACHED_AUX",
+    "MTPLX_QSA_POOLED_ROWSEL": "MTPLX_FABLE_QSA_POOLED_ROWSEL",
+}
 # Every key the fixed-M4 lane defaults may stamp; an explicit operator
 # export (any non-empty value) always beats a stamped value for these.
 _QWEN4_LANE_KEYS = _QWEN4_PORT_KEYS + (
@@ -18726,6 +18756,19 @@ def _qwen4_install_reports(state: Any) -> dict[str, Any]:
         report = qwen4_opdiet_report()
         if report.get("armed"):
             out["opdiet"] = report
+    except Exception:
+        pass
+    # PR #475 aux lanes: their own per-window observable. Read-only
+    # {armed (read at use) + the load-time install report on the runtime}, so a
+    # served window can tell an engaged lane from a decline-to-stock. Present
+    # only when ARMED, like the lanes above.
+    try:
+        from mtplx import qwen4_aux_lanes as _aux
+
+        for _lane in ("ple_cached_aux", "qsa_pooled_rowsel"):
+            entry = _aux.health_report(_lane, runtime)
+            if entry is not None:
+                out[_lane] = entry
     except Exception:
         pass
     try:

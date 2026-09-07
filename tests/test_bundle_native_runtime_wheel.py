@@ -32,6 +32,8 @@ spec.loader.exec_module(bundler)
 EXT = "mtplx_qsa_kernels/_ext.cpython-314-darwin.so"
 DYLIB = "mtplx_qsa_kernels/libmtplx_qsa_kernel_ops.dylib"
 METALLIB = "mtplx_qsa_kernels/kernels.metallib"
+PLE_EXT = "mtplx_native_ple_cpu_rows/_ext.cpython-314-darwin.so"
+PLE_DYLIB = "mtplx_native_ple_cpu_rows/libmtplx_native_ple_cpu_rows.dylib"
 
 # PR #391 remainder port: the split-K QSA sparse-GQA decode extension is a
 # second native wheel (mtplx_native_qsa) that also carries a metallib.
@@ -80,6 +82,25 @@ def _inputs(tmp_path: Path) -> tuple[Path, Path]:
         },
     )
     return pure, native
+
+
+def _ple_input(tmp_path: Path) -> Path:
+    return _write_wheel(
+        tmp_path / "mtplx_native_ple_cpu_rows-9.9.9-cp314-cp314-macosx_15_0_arm64.whl",
+        {
+            "mtplx_native_ple_cpu_rows/__init__.py": b"",
+            PLE_EXT: b"PLE-MACHO-EXT",
+            PLE_DYLIB: b"PLE-MACHO-DYLIB",
+            "mtplx_native_ple_cpu_rows-9.9.9.dist-info/METADATA": (
+                b"Metadata-Version: 2.1\nName: mtplx-native-ple-cpu-rows\nVersion: 9.9.9\n"
+                b"Requires-Dist: mlx==0.32.2\n"
+            ),
+            "mtplx_native_ple_cpu_rows-9.9.9.dist-info/WHEEL": (
+                b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: false\n"
+                b"Tag: cp314-cp314-macosx_15_0_arm64\n"
+            ),
+        },
+    )
 
 
 def _run_bundler(monkeypatch, pure: Path, native: Path, out: Path, *extra: str) -> Path:
@@ -250,3 +271,40 @@ def test_qsa_native_missing_its_metallib_is_rejected(tmp_path, monkeypatch) -> N
     )
     with pytest.raises(SystemExit):
         _run_bundler_multi(monkeypatch, pure, [native, qsa], tmp_path / "out")
+
+
+def test_ple_cpu_rows_extension_is_bundled_and_signed_with_the_qsa_kernels(tmp_path, monkeypatch) -> None:
+    # PR #475's cached async PLE lane ships a second native extension,
+    # mtplx_native_ple_cpu_rows. It must be bundled and Developer-ID signed
+    # alongside the QSA kernels, or notarization rejects its ad-hoc-signed
+    # Mach-O the way it rejected the QSA kernels before ea2560a2.
+    pure, native = _inputs(tmp_path)
+    ple = _ple_input(tmp_path)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(bundler.subprocess, "run", _fake_codesign(calls))
+    bundled = _run_bundler_multi(
+        monkeypatch, pure, [native, ple], tmp_path / "out",
+        "--codesign-identity", "Developer ID Application: Test",
+    )
+    with zipfile.ZipFile(bundled) as archive:
+        assert archive.read(EXT) == b"SIGNED:MACHO-EXT"
+        assert archive.read(PLE_EXT) == b"SIGNED:PLE-MACHO-EXT"
+        assert archive.read(PLE_DYLIB) == b"SIGNED:PLE-MACHO-DYLIB"
+        top_level = archive.read("mtplx-9.9.9.dist-info/top_level.txt").decode()
+        record = archive.read("mtplx-9.9.9.dist-info/RECORD").decode().splitlines()
+    assert "mtplx_qsa_kernels" in top_level.split()
+    assert "mtplx_native_ple_cpu_rows" in top_level.split()
+    hashes = {line.split(",")[0]: line.split(",")[1] for line in record if line}
+    assert hashes[PLE_EXT] == _record_hash(b"SIGNED:PLE-MACHO-EXT")
+    with WheelFile(bundled) as reopened:  # the rewritten RECORD verifies
+        assert reopened.read(PLE_EXT) == b"SIGNED:PLE-MACHO-EXT"
+    signed = [Path(call[-1]).name for call in calls if "--sign" in call]
+    assert "_ext.cpython-314-darwin.so" in signed  # QSA
+    assert "libmtplx_native_ple_cpu_rows.dylib" in signed  # PLE
+
+
+def test_ple_cpu_rows_alone_is_rejected_without_the_required_qsa_kernels(tmp_path, monkeypatch) -> None:
+    pure, _native = _inputs(tmp_path)
+    ple = _ple_input(tmp_path)
+    with pytest.raises(SystemExit):
+        _run_bundler_multi(monkeypatch, pure, [ple], tmp_path / "out")

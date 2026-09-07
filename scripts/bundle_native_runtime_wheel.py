@@ -24,10 +24,11 @@ from wheel.wheelfile import WheelFile
 # The native extensions the runtime wheel may carry, each in its own platform
 # wheel. mtplx_qsa_kernels is the metallib-bearing QSA lane (ea2560a2);
 # mtplx_native_qsa is the metallib-bearing split-K QSA sparse-GQA decode
-# extension the MTPLX_QSA_SPARSE_DECODE lane needs. Every Mach-O member
-# (.so/.dylib) of each is
-# Developer-ID + hardened-runtime + secure-timestamp signed before packaging,
-# so notarization does not reject an ad-hoc-signed member found inside the zip.
+# extension the MTPLX_QSA_SPARSE_DECODE lane needs; mtplx_native_ple_cpu_rows is
+# the CPU-stream PLE row extension the cached async PLE lane (PR #475) needs.
+# Every Mach-O member (.so/.dylib) of each is Developer-ID + hardened-runtime +
+# secure-timestamp signed before packaging, so notarization does not reject an
+# ad-hoc-signed member found inside the zip.
 _KNOWN_NATIVE = {
     "mtplx_qsa_kernels": {
         "required_files": ("NOTICE", "LICENSE.txt", "MLX_LICENSE.txt"),
@@ -36,6 +37,10 @@ _KNOWN_NATIVE = {
     "mtplx_native_qsa": {
         "required_files": (),
         "require_metallib": True,
+    },
+    "mtplx_native_ple_cpu_rows": {
+        "required_files": (),
+        "require_metallib": False,
     },
 }
 _REQUIRED_NATIVE = "mtplx_qsa_kernels"
