@@ -1,8 +1,15 @@
-# Two stacked decode lanes for Qwen3.8 Flash-Next
+# Two stacked decode optimizations for Qwen3.8 Flash-Next
 
-This report covers two lanes from an external optimization pass that stack on top
-of the Qwen3.8 Flash-Next stack. Both lanes keep the output identical to the stock path. Both lanes change
-only the decode timing.
+This report covers two exact serving optimizations that stack on top of the
+Qwen3.8 Flash-Next stack. Both optimizations keep the output identical to the
+stock path. Both optimizations change only the decode timing.
+
+> The full serving battery for these optimizations -- the charts, the result
+> tables, and the paired ABAB reports -- is in `docs/perf/qwen38-475-battery/`.
+> Every number there is the fastest of the seeds (at 16K, the fastest ABAB record
+> over the nine windows), shown with the slow-to-fast range; the cell, the
+> fastest-of rule, and the arm serve SHAs are in
+> `docs/perf/qwen38-475-battery/README.md`.
 
 Terms:
 
