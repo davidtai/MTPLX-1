@@ -59,8 +59,8 @@ this document records the engagement contract each optimization now satisfies.
   own bits/group_size, so only the packed-weight column count differs between the
   two; every other geometry still raises at model load.
 - **Effect.** The shared-expert half of the stage-3 combine engages on
-  Bare-Speed. The routed-expert half needs the Q4/g64 routed kernels (the next
-  optimization).
+  Bare-Speed. The routed-expert half needs the Q4/g64 routed kernels — the next
+  optimization.
 - **Exactness.** Bit-exact — the change is predicate-only; the combine math is
   unchanged and reads bits/group_size dynamically.
 - **Files.** `mtplx/server/openai.py`, `mtplx/qwen4_m4_stage3.py`.
@@ -68,6 +68,39 @@ this document records the engagement contract each optimization now satisfies.
   `=0` opt-out); its routed children `MTPLX_QWEN4_M4_ROUTED_DOWN_REDUCE`,
   `MTPLX_QWEN4_M4_ROUTED_DOWN_RESIDUAL_TAIL`, and `MTPLX_QWEN4_M4_ROUTED_GLU` arm
   with it.
+
+## Routed-expert Q4/g64 GLU and down kernels
+
+- **Problem.** The paired routed GLU (`qwen4_m4_routed_glu`) and the routed-down
+  reduce (`qwen4_m4_routed_down`) specialize MLX 0.32.2's affine q4/group-32
+  arithmetic with `GROUP_SIZE = 32` baked in as a Metal constexpr. Bare-Speed's
+  routed experts are Q4/g64, so the routed half of the stage-3 combine could not
+  run on them.
+- **Change.** Parameterize both kernels by group size (`bind(group_size)`), one
+  compiled kernel cached per size. `GROUP_SIZE` is the only constexpr that
+  changes: every scale/bias stride derives from it (`GROUPS_PER_ROW`,
+  `BLOCK_SIZE / GROUP_SIZE`, `lane / (GROUP_SIZE / VALUES_PER_THREAD)`) and the
+  4-bit packing is group-size-independent (`WEIGHT_BYTES_PER_ROW = HIDDEN / 2`).
+  The installer selects the kernel from the pack's routed group size, and the
+  routed contracts accept Q4/g64 (half the scale/bias group count of g32). The
+  shared-add and residual-tail kernels are unchanged — they combine already
+  computed activations, not quantized weights.
+- **Effect.** The routed half of the stage-3 combine engages on Bare-Speed.
+  Speed is a GPU-phase measurement.
+- **Exactness.** Rounding-class. The existing construction-time self-check runs
+  per layer and requires `dmax <= 2**-9` against the stock routed forward; the
+  GPU parity probe (under the flock) signs the g64 kernels off. Until then the
+  g64 path is fail-closed only when explicitly required
+  (`MTPLX_STRICT_CLAIMS=1`); under default arming a self-check miss or a build
+  failure declines the whole combine to the stock MoE forward and prints a
+  verdict line, so the pack still serves. The g32 (Optimized-Speed) path keeps
+  its raise-always contract.
+- **Files.** `mtplx/kernels/qwen4_m4_routed_glu.py`,
+  `mtplx/kernels/qwen4_m4_routed_down.py`, `mtplx/qwen4_m4_stage3.py`.
+- **Switch.** `MTPLX_QWEN4_M4_ROUTED_GLU`,
+  `MTPLX_QWEN4_M4_ROUTED_DOWN_REDUCE`,
+  `MTPLX_QWEN4_M4_ROUTED_DOWN_RESIDUAL_TAIL` (arm with `MTPLX_QWEN4_M4_STAGE3`;
+  `=0` opt-out); `MTPLX_STRICT_CLAIMS=1` makes the g64 self-check fail closed.
 
 ## Deferred: the two-kernel route head
 

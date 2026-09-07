@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import os
+import sys
 from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from .qwen4_claim_contract import strict_claims
 from .kernels.qwen4_m4_stage3 import bind
 from .kernels.qwen4_m4_routed_down import (
     bind as bind_routed_down_reduce,
@@ -587,16 +589,33 @@ _SHARED_GATE_CONTRACTS = (
         (1, 40),
     ),
 )
-_ROUTED_GU_CONTRACT = (
-    4,
-    32,
-    "affine",
-    mx.uint32,
-    mx.bfloat16,
-    mx.bfloat16,
-    (512, 1280, 320),
-    (512, 1280, 80),
-    (512, 1280, 80),
+# Routed experts: Optimized-Speed ships them Q4/g32, Bare-Speed Q4/g64. Both
+# are accepted -- the paired routed GLU / routed-down kernels instantiate the
+# matching GROUP_SIZE constexpr (bind(group_size=...)). Bits are Q4 in both, so
+# only the scale/bias group count differs (g32 -> twice the groups of g64).
+_ROUTED_GU_CONTRACTS = (
+    (
+        4,
+        32,
+        "affine",
+        mx.uint32,
+        mx.bfloat16,
+        mx.bfloat16,
+        (512, 1280, 320),
+        (512, 1280, 80),
+        (512, 1280, 80),
+    ),
+    (
+        4,
+        64,
+        "affine",
+        mx.uint32,
+        mx.bfloat16,
+        mx.bfloat16,
+        (512, 1280, 320),
+        (512, 1280, 40),
+        (512, 1280, 40),
+    ),
 )
 _SHARED_GU_CONTRACTS = (
     (
@@ -622,16 +641,29 @@ _SHARED_GU_CONTRACTS = (
         (1280, 40),
     ),
 )
-_ROUTED_DOWN_CONTRACT = (
-    4,
-    32,
-    "affine",
-    mx.uint32,
-    mx.bfloat16,
-    mx.bfloat16,
-    (512, 2560, 80),
-    (512, 2560, 20),
-    (512, 2560, 20),
+_ROUTED_DOWN_CONTRACTS = (
+    (
+        4,
+        32,
+        "affine",
+        mx.uint32,
+        mx.bfloat16,
+        mx.bfloat16,
+        (512, 2560, 80),
+        (512, 2560, 20),
+        (512, 2560, 20),
+    ),
+    (
+        4,
+        64,
+        "affine",
+        mx.uint32,
+        mx.bfloat16,
+        mx.bfloat16,
+        (512, 2560, 80),
+        (512, 2560, 10),
+        (512, 2560, 10),
+    ),
 )
 _SHARED_DOWN_CONTRACTS = (
     (
@@ -684,11 +716,11 @@ def _validate_block_contract(block: Any, *, index: int) -> None:
         raise ValueError(f"{label} router mismatch")
     if _projection_contract(block.shared_expert_gate) not in _SHARED_GATE_CONTRACTS:
         raise ValueError(f"{label} shared gate mismatch")
-    if _fused_gu_contract(block.switch_mlp) != _ROUTED_GU_CONTRACT:
+    if _fused_gu_contract(block.switch_mlp) not in _ROUTED_GU_CONTRACTS:
         raise ValueError(f"{label} routed fused GU mismatch")
     if _fused_gu_contract(block.shared_expert) not in _SHARED_GU_CONTRACTS:
         raise ValueError(f"{label} shared fused GU mismatch")
-    if _projection_contract(block.switch_mlp.down_proj) != _ROUTED_DOWN_CONTRACT:
+    if _projection_contract(block.switch_mlp.down_proj) not in _ROUTED_DOWN_CONTRACTS:
         raise ValueError(f"{label} routed down mismatch")
     if _projection_contract(block.shared_expert.down_proj) not in _SHARED_DOWN_CONTRACTS:
         raise ValueError(f"{label} shared down mismatch")
@@ -838,9 +870,72 @@ def _install_validated_plans(
             block.__class__ = _M4Stage3SparseMoeBlock
 
 
+def _routed_group_size(text: Any) -> int:
+    """The affine group the pack quantized the routed experts to (32 or 64)."""
+
+    return int(text.model.layers[0].mlp.switch_mlp.down_proj.group_size)
+
+
 def install_qwen4_m4_stage3(
     runtime: Any,
     *,
+    routed_down_reduce_enabled: bool,
+    routed_down_residual_tail_enabled: bool,
+    routed_glu_enabled: bool = False,
+) -> dict[str, Any]:
+    """Install the M=4 stage-3 combine, selecting the routed kernels by the
+    pack's group size.
+
+    The Q4/g64 routed kernels (Bare-Speed) are validated by the same
+    construction-time parity self-check as the Q4/g32 ones. Until the GPU
+    parity probe has signed them off, the g64 path is fail-closed only when
+    explicitly required (MTPLX_STRICT_CLAIMS=1): under default arming a
+    self-check miss or a build failure declines the whole combine to the stock
+    MoE forward and prints a verdict line, so the pack still serves. The g32
+    path keeps its raise-always contract.
+    """
+
+    text = _text_model(runtime)
+    routed_group_size = _routed_group_size(text)
+    if routed_group_size == 64 and not strict_claims():
+        try:
+            return _install_qwen4_m4_stage3_impl(
+                runtime,
+                routed_group_size=routed_group_size,
+                routed_down_reduce_enabled=routed_down_reduce_enabled,
+                routed_down_residual_tail_enabled=routed_down_residual_tail_enabled,
+                routed_glu_enabled=routed_glu_enabled,
+            )
+        except Exception as exc:  # noqa: BLE001 -- rounding-class decline
+            report = {
+                "installed": False,
+                "reason": "q4_g64_declined_to_stock",
+                "group_size": 64,
+                "detail": str(exc),
+            }
+            runtime.qwen4_m4_stage3_report = report
+            print(
+                "[mtplx] MTPLX_QWEN4_M4_STAGE3 declined to stock: the Q4/g64 "
+                "routed combine did not pass its construction-time self-check "
+                f"in this environment ({exc}); serving the stock MoE forward. "
+                "Export MTPLX_STRICT_CLAIMS=1 to require it (fails closed).",
+                file=sys.stderr,
+                flush=True,
+            )
+            return report
+    return _install_qwen4_m4_stage3_impl(
+        runtime,
+        routed_group_size=routed_group_size,
+        routed_down_reduce_enabled=routed_down_reduce_enabled,
+        routed_down_residual_tail_enabled=routed_down_residual_tail_enabled,
+        routed_glu_enabled=routed_glu_enabled,
+    )
+
+
+def _install_qwen4_m4_stage3_impl(
+    runtime: Any,
+    *,
+    routed_group_size: int,
     routed_down_reduce_enabled: bool,
     routed_down_residual_tail_enabled: bool,
     routed_glu_enabled: bool = False,
@@ -876,13 +971,15 @@ def install_qwen4_m4_stage3(
             _route_kernel.check_contract(block, index=index)
     stage3 = bind()
     routed_down_reduce = (
-        bind_residual_tail()
+        bind_residual_tail(routed_group_size)
         if routed_down_residual_tail_enabled
-        else bind_routed_down_reduce()
+        else bind_routed_down_reduce(routed_group_size)
         if routed_down_reduce_enabled
         else None
     )
-    routed_glu = bind_routed_glu() if routed_glu_enabled else None
+    routed_glu = (
+        bind_routed_glu(routed_group_size) if routed_glu_enabled else None
+    )
     route = (
         _route_kernel.bind(vec_lanes=route_kernel_vec_lanes)
         if route_kernel_enabled
