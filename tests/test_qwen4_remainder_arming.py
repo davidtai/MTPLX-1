@@ -111,3 +111,81 @@ def test_remainder_lanes_arm_when_served_not_frozen_at_import(tmp_path, monkeypa
         assert "MTPLX_QSA_SPARSE_DECODE" not in overrides
         assert "MTPLX_QSA_SPARSE_DECODE declined to stock" in log
         assert ro.qsa_sparse_decode_enabled() is False
+
+
+def test_upstream_verify_lanes_read_at_use_not_frozen_at_import(monkeypatch):
+    """The four upstream fixed-M4 verify lanes the arming audit found dead when
+    served must resolve the environment at USE too.
+
+    ``mtplx.generation`` was imported at module load above (before any stamp),
+    so an import-frozen reader would return its default forever. Each lane's
+    reader must see a stamp applied after that import -- the served order.
+    """
+
+    import mtplx.generation as generation
+    import mtplx.qwen4_block_verify as block_verify
+    import mtplx.qwen4_draft_k20_prescatter as prescatter
+
+    cases = [
+        # (set-unforced, reader, env key)
+        (
+            lambda: monkeypatch.setattr(ro, "_QWEN4_OPDIET", None),
+            ro.qwen4_opdiet_enabled,
+            "MTPLX_QWEN4_OPDIET",
+        ),
+        (
+            lambda: monkeypatch.setattr(ro, "_QWEN4_VERIFY_GLUE", None),
+            ro.qwen4_verify_glue_enabled,
+            "MTPLX_QWEN4_VERIFY_GLUE",
+        ),
+        (
+            lambda: monkeypatch.setattr(prescatter, "_ENABLED", None),
+            generation._qwen4_draft_k20_prescatter_enabled,
+            "MTPLX_QWEN4_DRAFT_K20_PRESCATTER",
+        ),
+        (
+            lambda: monkeypatch.setattr(block_verify, "_ENABLED", None),
+            generation._qwen4_block_verify_enabled,
+            "MTPLX_QWEN4_BLOCK_VERIFY",
+        ),
+    ]
+    for unforce, reader, env_key in cases:
+        unforce()
+        monkeypatch.delenv(env_key, raising=False)
+        assert reader() is False, env_key
+        monkeypatch.setenv(env_key, "1")
+        assert reader() is True, env_key  # the stamp lands AFTER import -> seen
+        monkeypatch.delenv(env_key, raising=False)
+
+
+def test_the_fixed_m4_auto_arm_stamps_the_upstream_verify_lanes(tmp_path, monkeypatch):
+    """The fixed-M4 auto-arm stamps OPDIET, BLOCK_VERIFY and VERIFY_GLUE, and
+    the readers (read at use, after the stamp is applied) arm.
+
+    (DRAFT_K20_PRESCATTER is stamped only on a q8/g64 lm_head pack, gated by the
+    FR-Spec draft; its read-at-use is covered above.)
+    """
+
+    for name in ("_QWEN4_OPDIET", "_QWEN4_OPDIET_SELECTED", "_QWEN4_VERIFY_GLUE",
+                 "_QWEN4_VERIFY_GLUE_SELECTED"):
+        monkeypatch.setattr(ro, name, None)
+    for key in ("MTPLX_QWEN4_OPDIET", "MTPLX_QWEN4_VERIFY_GLUE",
+                "MTPLX_QWEN4_VERIFY_GLUE_ITEMS"):
+        monkeypatch.delenv(key, raising=False)
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp"}), encoding="utf-8"
+    )
+    args = SimpleNamespace(
+        generation_mode="mtp", verify_strategy="capture_commit", model=str(tmp_path)
+    )
+    monkeypatch.setattr(openai, "_served_model_is_qwen4_fixed_m4", lambda a: True)
+    overrides = openai._server_runtime_env_overrides(args, {})
+    assert normalize_runtime_env_overrides(overrides) == overrides
+    assert overrides.get("MTPLX_QWEN4_OPDIET") == "1"
+    assert overrides.get("MTPLX_QWEN4_BLOCK_VERIFY") == "1"
+    assert overrides.get("MTPLX_QWEN4_VERIFY_GLUE") == "1"
+    for key, value in overrides.items():
+        monkeypatch.setenv(key, value)
+    assert ro.qwen4_opdiet_enabled() is True
+    assert ro.qwen4_verify_glue_enabled() is True

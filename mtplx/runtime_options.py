@@ -58,7 +58,14 @@ def env_bool(
 #: with it on the rewritten sites are value-identical by construction (see
 #: tests/test_qwen4_opdiet.py, which proves each rewrite against its original
 #: on random inputs).
-_QWEN4_OPDIET = env_bool("MTPLX_QWEN4_OPDIET", default=False)
+#: ``None`` = resolve from the environment on each read; a test may force a
+#: bool. Read at USE, not frozen at import: the server's fixed-M4 auto-arm
+#: stamps MTPLX_QWEN4_OPDIET into the environment AFTER this module is imported
+#: (via the generation import), so an import-time read froze the default and
+#: the served compiled verifier ran without the op diet (arming audit
+#: 2026-09-07). The env is frozen once serving starts, so two traces of the
+#: same graph still read the same value.
+_QWEN4_OPDIET = None
 
 #: The independently selectable rewrites behind the master switch.
 #:
@@ -105,25 +112,37 @@ def parse_opdiet_items(
     return frozenset(tokens)
 
 
-_QWEN4_OPDIET_SELECTED = parse_opdiet_items(
-    os.environ.get("MTPLX_QWEN4_OPDIET_ITEMS")
-)
+#: ``None`` = resolve from the environment on each read; a test may force a
+#: frozenset. Read at use, not frozen at import (same server-arming reason).
+_QWEN4_OPDIET_SELECTED = None
 
 
 def qwen4_opdiet_enabled(item: str | None = None) -> bool:
     """True when the op diet is armed, and this item is selected.
 
     ``item=None`` answers only the master switch. Every gated call site names
-    its item so ``MTPLX_QWEN4_OPDIET_ITEMS`` can isolate one rewrite.
+    its item so ``MTPLX_QWEN4_OPDIET_ITEMS`` can isolate one rewrite. Read at
+    use, not frozen at import; a test may set :data:`_QWEN4_OPDIET` /
+    :data:`_QWEN4_OPDIET_SELECTED` to force the answer.
     """
 
-    if not _QWEN4_OPDIET:
+    master = (
+        _QWEN4_OPDIET
+        if _QWEN4_OPDIET is not None
+        else env_bool("MTPLX_QWEN4_OPDIET", default=False)
+    )
+    if not master:
         return False
     if item is None:
         return True
     if item not in QWEN4_OPDIET_ITEMS:
         raise ValueError(f"unknown op-diet item {item!r}")
-    return item in _QWEN4_OPDIET_SELECTED
+    selected = (
+        _QWEN4_OPDIET_SELECTED
+        if _QWEN4_OPDIET_SELECTED is not None
+        else parse_opdiet_items(os.environ.get("MTPLX_QWEN4_OPDIET_ITEMS"))
+    )
+    return item in selected
 
 
 #: W70 -- fused glue inside the compiled fixed-M4 verify body.
@@ -156,7 +175,13 @@ def qwen4_opdiet_enabled(item: str | None = None) -> bool:
 #: ``kernels/qwen4_m4_hyper_read`` already measured at 13.2 tok/s against 67.8.
 QWEN4_VERIFY_GLUE_ITEMS = ("qsa_rope", "qsa_rope_idx")
 
-_QWEN4_VERIFY_GLUE = env_bool("MTPLX_QWEN4_VERIFY_GLUE", default=False)
+#: ``None`` = resolve from the environment on each read; a test may force a
+#: bool (directly or via :func:`reset_qwen4_verify_glue_cache`). Read at USE,
+#: not frozen at import: the server's fixed-M4 auto-arm stamps
+#: MTPLX_QWEN4_VERIFY_GLUE into the environment AFTER this module is imported,
+#: so an import-time read froze the default and the served verify body ran
+#: without the fused glue (arming audit 2026-09-07).
+_QWEN4_VERIFY_GLUE = None
 
 
 def parse_verify_glue_items(
@@ -188,29 +213,46 @@ def parse_verify_glue_items(
     return frozenset(tokens)
 
 
-_QWEN4_VERIFY_GLUE_SELECTED = parse_verify_glue_items(
-    os.environ.get("MTPLX_QWEN4_VERIFY_GLUE_ITEMS")
-)
+#: ``None`` = resolve from the environment on each read; a test may force a
+#: frozenset. Read at use, not frozen at import (same server-arming reason).
+_QWEN4_VERIFY_GLUE_SELECTED = None
 
 
 def qwen4_verify_glue_enabled(item: str | None = None) -> bool:
-    """True when the verify-glue flag is armed, and this item is selected."""
+    """True when the verify-glue flag is armed, and this item is selected.
 
-    if not _QWEN4_VERIFY_GLUE:
+    Read at use, not frozen at import; a test may set :data:`_QWEN4_VERIFY_GLUE`
+    / :data:`_QWEN4_VERIFY_GLUE_SELECTED` (directly or via
+    :func:`reset_qwen4_verify_glue_cache`) to force the answer.
+    """
+
+    master = (
+        _QWEN4_VERIFY_GLUE
+        if _QWEN4_VERIFY_GLUE is not None
+        else env_bool("MTPLX_QWEN4_VERIFY_GLUE", default=False)
+    )
+    if not master:
         return False
     if item is None:
         return True
     if item not in QWEN4_VERIFY_GLUE_ITEMS:
         raise ValueError(f"unknown verify-glue item {item!r}")
-    return item in _QWEN4_VERIFY_GLUE_SELECTED
+    selected = (
+        _QWEN4_VERIFY_GLUE_SELECTED
+        if _QWEN4_VERIFY_GLUE_SELECTED is not None
+        else parse_verify_glue_items(
+            os.environ.get("MTPLX_QWEN4_VERIFY_GLUE_ITEMS")
+        )
+    )
+    return item in selected
 
 
 def reset_qwen4_verify_glue_cache(env: Mapping[str, str] | None = None) -> None:
-    """Re-read the verify-glue gates from the environment.  Tests only.
+    """Force the verify-glue gates from a given environment.  Tests only.
 
-    The hot path reads these once at import on purpose; this exists so a test
-    can arm one item without a subprocess, and it is never called by the
-    runtime.
+    The runtime reads these at use and never calls this; it exists so a test
+    can arm one item without a subprocess by FORCING the module globals (which
+    then win over the environment until reset again).
     """
 
     global _QWEN4_VERIFY_GLUE, _QWEN4_VERIFY_GLUE_SELECTED

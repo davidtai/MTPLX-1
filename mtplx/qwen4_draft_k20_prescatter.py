@@ -196,14 +196,25 @@ def _env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-#: Read exactly once, at import.
-_ENABLED = _env_truthy(_ENV_VAR)
+#: ``None`` = resolve from the environment on each read; a test may force a
+#: bool via :func:`_configure_for_test`. Read at USE, never at import: the
+#: server's fixed-M4 auto-arm stamps MTPLX_QWEN4_DRAFT_K20_PRESCATTER into the
+#: environment AFTER this module is imported (via mtplx.server.openai's
+#: generation import), so an import-time read froze the default (off) and the
+#: served lane never engaged -- the arming audit, 2026-09-07. The env is frozen
+#: once serving starts, so a per-call read returns the same value every time.
+_ENABLED = None
 
 
 def is_enabled() -> bool:
-    """True when ``MTPLX_QWEN4_DRAFT_K20_PRESCATTER`` was set at import."""
+    """True when ``MTPLX_QWEN4_DRAFT_K20_PRESCATTER`` is set for this process.
 
-    return _ENABLED
+    Read at use, not frozen at import (a test may force :data:`_ENABLED`).
+    """
+
+    if _ENABLED is not None:
+        return bool(_ENABLED)
+    return _env_truthy(_ENV_VAR)
 
 
 def _configure_for_test(enabled: bool) -> None:
