@@ -223,6 +223,34 @@ def reset_qwen4_verify_glue_cache(env: Mapping[str, str] | None = None) -> None:
     )
 
 
+#: Verify-width fused hyper-connection read (mtplx/kernels/qwen4_m4_hyper_read).
+#:
+#: Read ONCE at import so the hot verify path never touches ``os.environ`` and
+#: two traces of the same compiled graph cannot disagree about which chain they
+#: carry. ``MTPLX_QWEN4_HC_M4`` is the key; the old ``MTPLX_FABLE_HC_M4`` name
+#: is honoured as an alias only when the new key is unset (the new key wins for
+#: any non-empty value, including ``0`` for the per-key opt-out). The kernel
+#: RAISES on a family-contract miss rather than falling back, so an
+#: armed-but-inert lane is unreachable.
+def _qwen4_hc_m4_import_default() -> bool:
+    raw = os.environ.get("MTPLX_QWEN4_HC_M4")
+    if raw is None or not str(raw).strip():
+        return env_bool("MTPLX_FABLE_HC_M4", default=False)
+    return env_bool("MTPLX_QWEN4_HC_M4", default=False)
+
+
+_QWEN4_HC_M4 = _qwen4_hc_m4_import_default()
+
+
+def qwen4_hc_m4_enabled() -> bool:
+    """True when the HC_M4 flag armed this process at import.
+
+    Armed by ``MTPLX_QWEN4_HC_M4`` (or the old ``MTPLX_FABLE_HC_M4`` alias).
+    """
+
+    return _QWEN4_HC_M4
+
+
 @dataclass(frozen=True)
 class ResolvedAPIKey:
     value: str | None

@@ -430,6 +430,13 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         "MTPLX_QWEN4_PLE_FIRST_GATHER_EARLY",
         "MTPLX_SESSION_BANK_SHED_BOUNDARIES",
         "MTPLX_SESSION_BANK_PROTECTED_TERMINAL",
+        # PR #391 remainder ports (davidtai), stamped by the Flash-Next lane
+        # defaults on the fixed-M4 geometry; registered so operator A/B
+        # launches and pack contracts pass the boot-time runtime-env
+        # validator. All rounding-class, quality-gated.
+        "MTPLX_QWEN4_HC_M4",
+        "MTPLX_QWEN4_PREFILL_MASK_FUSE",
+        "MTPLX_QSA_PREFILL_QUERY_TILE",
         "MTPLX_NGRAM_PREWARM_ORDER",
         "MTPLX_STRICT_CLAIMS",
         "MTPLX_QWEN4_COMPILED_MTP_PREPARE",

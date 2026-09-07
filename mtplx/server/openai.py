@@ -927,6 +927,16 @@ def _server_runtime_env_overrides(
                 "MTPLX_QWEN4_PLE_FIRST_GATHER_EARLY",
                 "MTPLX_SESSION_BANK_SHED_BOUNDARIES",
                 "MTPLX_SESSION_BANK_PROTECTED_TERMINAL",
+                # PR #391 remainder ports (davidtai), same fixed-M4 geometry.
+                # Decode: the verify-width fused hyper-connection read
+                # (mtplx/kernels/qwen4_m4_hyper_read; rounding-class, RAISES on
+                # a family-contract miss rather than falling back).
+                "MTPLX_QWEN4_HC_M4",
+                # Prefill: the causal-mask fuse routes the dense QSA prefill
+                # chunk through MLX's fused SDPA (rounding-class, exact visible
+                # set; per-shape-class capability cache, so a verify step MLX
+                # refuses never disarms a wide chunk).
+                "MTPLX_QWEN4_PREFILL_MASK_FUSE",
             ]
             if _qwen4_port_opt_in(
                 overrides, "MTPLX_FUSED_GATE_UP"
@@ -942,6 +952,14 @@ def _server_runtime_env_overrides(
             # leaves them inert.
             if os.environ.get("MTPLX_NGRAM_PREWARM") is None:
                 overrides.setdefault("MTPLX_NGRAM_PREWARM", "auto")
+            # PR #391 remainder port (davidtai): the QSA prefill query tile.
+            # Caps the dense QSA attention peak to 2,048 rows so a wider
+            # prefill chunk keeps the 8x2,048 attention peak AND cost. Inert
+            # at the production 2,048 chunk width (tile >= chunk == no-op), so
+            # it only bites a 4,096-row chunk experiment; an explicit export
+            # (including 0 for whole-chunk) wins via the pop loop below.
+            if os.environ.get("MTPLX_QSA_PREFILL_QUERY_TILE") is None:
+                overrides.setdefault("MTPLX_QSA_PREFILL_QUERY_TILE", "2048")
             # The stage-3 child routes are consumed at model load and raise
             # unless stage 3 itself resolves on, so they are derived from the
             # resolved parent, never stamped alone: the routed-down reduction,
@@ -1097,6 +1115,10 @@ _QWEN4_PORT_KEYS = (
     "MTPLX_QWEN4_PLE_FIRST_GATHER_EARLY",
     "MTPLX_SESSION_BANK_SHED_BOUNDARIES",
     "MTPLX_SESSION_BANK_PROTECTED_TERMINAL",
+    # PR #391 remainder ports (davidtai): each is its own kill switch through
+    # the pop loop below.
+    "MTPLX_QWEN4_HC_M4",
+    "MTPLX_QWEN4_PREFILL_MASK_FUSE",
     "MTPLX_NGRAM_PREWARM",
 )
 # Every key the fixed-M4 lane defaults may stamp; an explicit operator
@@ -1105,6 +1127,8 @@ _QWEN4_LANE_KEYS = _QWEN4_PORT_KEYS + (
     "MTPLX_FRSPEC_DRAFT",
     "MTPLX_FRSPEC_VOCAB",
     "MTPLX_QSA_GATHER_MAX_ROWS",
+    # PR #391 remainder port (davidtai): the QSA prefill query-tile value.
+    "MTPLX_QSA_PREFILL_QUERY_TILE",
 )
 
 
@@ -18625,6 +18649,9 @@ def _qwen4_install_reports(state: Any) -> dict[str, Any]:
     stage3 = getattr(runtime, "qwen4_m4_stage3_report", None)
     if isinstance(stage3, dict):
         out["m4_stage3"] = stage3
+    hc_m4 = getattr(runtime, "qwen4_hc_m4_report", None)
+    if isinstance(hc_m4, dict):
+        out["hc_m4"] = hc_m4
     glue = getattr(runtime, "_mtplx_qwen4_verify_glue", None)
     if isinstance(glue, dict):
         out["verify_glue"] = glue
