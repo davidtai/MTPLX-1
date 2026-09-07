@@ -1021,8 +1021,14 @@ def _server_runtime_env_overrides(
                 ):
                     if os.environ.get(key) is None:
                         overrides.setdefault(key, "1")
+                # The two-kernel routing head has a Q8/g64 shared-expert-gate
+                # GEMV arm only, so it stamps on the Optimized-Speed shape and
+                # NOT on Bare-Speed (Q4/g64 shared gate). Bare runs the stock
+                # routing head (route=None); a Q4/g64 route-head GEMV is a
+                # separate, later optimization.
                 if (
                     _qwen4_port_opt_in(overrides, "MTPLX_QWEN4_M4_ROUTED_GLU")
+                    and _served_model_shared_gate_is_q8_g64(args)
                     and os.environ.get("MTPLX_QWEN4_ROUTE_KERNEL") is None
                 ):
                     overrides.setdefault("MTPLX_QWEN4_ROUTE_KERNEL", "1")
@@ -1052,7 +1058,7 @@ def _server_runtime_env_overrides(
             # rows-gather engage floor and under MTPLX_QSA_GATHER=0.
             if os.environ.get("MTPLX_QSA_GATHER_MAX_ROWS") is None:
                 overrides.setdefault("MTPLX_QSA_GATHER_MAX_ROWS", "32")
-            if _served_model_lm_head_is_q8_g64(args):
+            if _served_model_lm_head_is_frspec_capable(args):
                 if os.environ.get("MTPLX_FRSPEC_DRAFT") is None:
                     overrides.setdefault("MTPLX_FRSPEC_DRAFT", "1")
                 if (
@@ -1255,14 +1261,16 @@ def _served_module_quantization(
     return bits, group_size, str(entry.get("mode") or "affine")
 
 
-def _served_model_lm_head_is_q8_g64(args: argparse.Namespace) -> bool:
+def _served_model_lm_head_is_frspec_capable(args: argparse.Namespace) -> bool:
     """FR-Spec pack predicate.
 
-    The builtin ranked table prunes the native Q8/g64 affine lm_head
-    (frspec_draft.install_frspec_draft_head) and any other head layout
-    fails the model LOAD (draft_lm_head raises), so the default only stamps
-    the lever on packs carrying that head. Catalog receipt 2026-09-02:
-    Optimized-Speed ships lm_head Q8/g64, Bare-Speed ships Q4/g64.
+    The builtin ranked table prunes the native affine g64 lm_head
+    (frspec_draft.install_frspec_draft_head). The pruning is quant-generic --
+    it carries the head's own bits/group_size -- so an affine g64 head installs
+    at either 8-bit or 4-bit, and any other head layout fails the model LOAD
+    (draft_lm_head raises). The default only stamps the optimization on packs
+    carrying such a head. Catalog receipt 2026-09-02: Optimized-Speed ships
+    lm_head Q8/g64, Bare-Speed ships Q4/g64; both are FR-Spec-capable.
     """
     config = _served_model_config(args)
     if config is None:
@@ -1270,25 +1278,43 @@ def _served_model_lm_head_is_q8_g64(args: argparse.Namespace) -> bool:
     text = config.get("text_config")
     if isinstance(text, Mapping) and text.get("tie_word_embeddings"):
         return False
-    return _served_module_quantization(config, "language_model.lm_head") == (
-        8,
-        64,
-        "affine",
+    return _served_module_quantization(config, "language_model.lm_head") in (
+        (8, 64, "affine"),
+        (4, 64, "affine"),
     )
 
 
-# Per-module quantization the M=4 stage-3 combine tail pins for every MoE
-# layer (qwen4_m4_stage3 contracts: router and shared expert Q8/g64, routed
-# experts Q4/g32); the installer raises on any other geometry at model load.
+def _served_model_shared_gate_is_q8_g64(args: argparse.Namespace) -> bool:
+    """Route-head pack predicate.
+
+    The two-kernel routing head (MTPLX_QWEN4_ROUTE_KERNEL) has a Q8/g64
+    shared-expert-gate GEMV arm only. Optimized-Speed ships that gate Q8/g64;
+    Bare-Speed ships it Q4/g64. The auto-arm stamps the route head only on the
+    Q8 shape, so Bare-Speed runs the stock routing head. A Q4/g64 route-head
+    GEMV is a separate, later optimization.
+    """
+    config = _served_model_config(args)
+    if config is None:
+        return False
+    return _served_module_quantization(
+        config, "language_model.model.layers.0.mlp.shared_expert_gate"
+    ) == (8, 64, "affine")
+
+
+# Per-module quantization the M=4 stage-3 combine tail accepts for every MoE
+# layer. Two shipped geometries are recognized: Optimized-Speed (router and
+# shared expert Q8/g64, routed experts Q4/g32) and Bare-Speed (router Q8/g64,
+# shared expert and routed experts Q4/g64). The installer raises on any other
+# geometry at model load.
 _QWEN4_STAGE3_MODULE_CONTRACT = (
-    ("mlp.gate", (8, 64, "affine")),
-    ("mlp.shared_expert_gate", (8, 64, "affine")),
-    ("mlp.shared_expert.gate_proj", (8, 64, "affine")),
-    ("mlp.shared_expert.up_proj", (8, 64, "affine")),
-    ("mlp.shared_expert.down_proj", (8, 64, "affine")),
-    ("mlp.switch_mlp.gate_proj", (4, 32, "affine")),
-    ("mlp.switch_mlp.up_proj", (4, 32, "affine")),
-    ("mlp.switch_mlp.down_proj", (4, 32, "affine")),
+    ("mlp.gate", ((8, 64, "affine"),)),
+    ("mlp.shared_expert_gate", ((8, 64, "affine"), (4, 64, "affine"))),
+    ("mlp.shared_expert.gate_proj", ((8, 64, "affine"), (4, 64, "affine"))),
+    ("mlp.shared_expert.up_proj", ((8, 64, "affine"), (4, 64, "affine"))),
+    ("mlp.shared_expert.down_proj", ((8, 64, "affine"), (4, 64, "affine"))),
+    ("mlp.switch_mlp.gate_proj", ((4, 32, "affine"), (4, 64, "affine"))),
+    ("mlp.switch_mlp.up_proj", ((4, 32, "affine"), (4, 64, "affine"))),
+    ("mlp.switch_mlp.down_proj", ((4, 32, "affine"), (4, 64, "affine"))),
 )
 
 
@@ -1305,9 +1331,9 @@ def _served_model_pack_is_stage3_geometry(args: argparse.Namespace) -> bool:
         _served_module_quantization(
             config, f"language_model.model.layers.{index}.{module}"
         )
-        == expected
+        in allowed
         for index in range(layers)
-        for module, expected in _QWEN4_STAGE3_MODULE_CONTRACT
+        for module, allowed in _QWEN4_STAGE3_MODULE_CONTRACT
     )
 
 

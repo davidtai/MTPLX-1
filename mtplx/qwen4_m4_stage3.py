@@ -558,16 +558,34 @@ _ROUTER_CONTRACT = (
     (512, 40),
     (512, 40),
 )
-_SHARED_GATE_CONTRACT = (
-    8,
-    64,
-    "affine",
-    mx.uint32,
-    mx.bfloat16,
-    mx.bfloat16,
-    (1, 640),
-    (1, 40),
-    (1, 40),
+# Shared-expert projections: Optimized-Speed ships them Q8/g64, Bare-Speed
+# ships them Q4/g64. Both are accepted -- the combine reads the owner's own
+# bits/group_size dynamically, so the shapes below are the only difference
+# (a Q4 packed weight has half the uint32 columns; g64 keeps the scale/bias
+# group count). Any other geometry still raises at model load.
+_SHARED_GATE_CONTRACTS = (
+    (
+        8,
+        64,
+        "affine",
+        mx.uint32,
+        mx.bfloat16,
+        mx.bfloat16,
+        (1, 640),
+        (1, 40),
+        (1, 40),
+    ),
+    (
+        4,
+        64,
+        "affine",
+        mx.uint32,
+        mx.bfloat16,
+        mx.bfloat16,
+        (1, 320),
+        (1, 40),
+        (1, 40),
+    ),
 )
 _ROUTED_GU_CONTRACT = (
     4,
@@ -580,16 +598,29 @@ _ROUTED_GU_CONTRACT = (
     (512, 1280, 80),
     (512, 1280, 80),
 )
-_SHARED_GU_CONTRACT = (
-    8,
-    64,
-    "affine",
-    mx.uint32,
-    mx.bfloat16,
-    mx.bfloat16,
-    (1280, 640),
-    (1280, 40),
-    (1280, 40),
+_SHARED_GU_CONTRACTS = (
+    (
+        8,
+        64,
+        "affine",
+        mx.uint32,
+        mx.bfloat16,
+        mx.bfloat16,
+        (1280, 640),
+        (1280, 40),
+        (1280, 40),
+    ),
+    (
+        4,
+        64,
+        "affine",
+        mx.uint32,
+        mx.bfloat16,
+        mx.bfloat16,
+        (1280, 320),
+        (1280, 40),
+        (1280, 40),
+    ),
 )
 _ROUTED_DOWN_CONTRACT = (
     4,
@@ -602,16 +633,29 @@ _ROUTED_DOWN_CONTRACT = (
     (512, 2560, 20),
     (512, 2560, 20),
 )
-_SHARED_DOWN_CONTRACT = (
-    8,
-    64,
-    "affine",
-    mx.uint32,
-    mx.bfloat16,
-    mx.bfloat16,
-    (2560, 160),
-    (2560, 10),
-    (2560, 10),
+_SHARED_DOWN_CONTRACTS = (
+    (
+        8,
+        64,
+        "affine",
+        mx.uint32,
+        mx.bfloat16,
+        mx.bfloat16,
+        (2560, 160),
+        (2560, 10),
+        (2560, 10),
+    ),
+    (
+        4,
+        64,
+        "affine",
+        mx.uint32,
+        mx.bfloat16,
+        mx.bfloat16,
+        (2560, 80),
+        (2560, 10),
+        (2560, 10),
+    ),
 )
 
 
@@ -638,15 +682,15 @@ def _validate_block_contract(block: Any, *, index: int) -> None:
         raise ValueError(f"{label} lacks exact shared fused GU owner")
     if _projection_contract(block.gate) != _ROUTER_CONTRACT:
         raise ValueError(f"{label} router mismatch")
-    if _projection_contract(block.shared_expert_gate) != _SHARED_GATE_CONTRACT:
+    if _projection_contract(block.shared_expert_gate) not in _SHARED_GATE_CONTRACTS:
         raise ValueError(f"{label} shared gate mismatch")
     if _fused_gu_contract(block.switch_mlp) != _ROUTED_GU_CONTRACT:
         raise ValueError(f"{label} routed fused GU mismatch")
-    if _fused_gu_contract(block.shared_expert) != _SHARED_GU_CONTRACT:
+    if _fused_gu_contract(block.shared_expert) not in _SHARED_GU_CONTRACTS:
         raise ValueError(f"{label} shared fused GU mismatch")
     if _projection_contract(block.switch_mlp.down_proj) != _ROUTED_DOWN_CONTRACT:
         raise ValueError(f"{label} routed down mismatch")
-    if _projection_contract(block.shared_expert.down_proj) != _SHARED_DOWN_CONTRACT:
+    if _projection_contract(block.shared_expert.down_proj) not in _SHARED_DOWN_CONTRACTS:
         raise ValueError(f"{label} shared down mismatch")
 
 

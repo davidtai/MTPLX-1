@@ -241,3 +241,116 @@ def test_health_surfaces_the_three_no_observable_verify_lanes(monkeypatch):
     assert "opdiet" not in rep
     assert "block_verify" not in rep
     assert "draft_k20_prescatter" not in rep
+
+
+def _bare_speed_config(tmp_path) -> str:
+    """A Bare-Speed-shaped config.json: lm_head/shared/routed all Q4/g64,
+    router Q8/g64, 48 layers. Geometry matches Optimized-Speed; only the quant
+    recipe differs, so the FR-Spec and stage-3 pack predicates read real quant.
+    """
+
+    def entry(bits, group):
+        return {"bits": bits, "group_size": group, "mode": "affine"}
+
+    quant = {"bits": 4, "group_size": 64}
+    quant["language_model.lm_head"] = entry(4, 64)
+    per_module = {
+        "mlp.gate": (8, 64),
+        "mlp.shared_expert_gate": (4, 64),
+        "mlp.shared_expert.gate_proj": (4, 64),
+        "mlp.shared_expert.up_proj": (4, 64),
+        "mlp.shared_expert.down_proj": (4, 64),
+        "mlp.switch_mlp.gate_proj": (4, 64),
+        "mlp.switch_mlp.up_proj": (4, 64),
+        "mlp.switch_mlp.down_proj": (4, 64),
+    }
+    for index in range(48):
+        prefix = f"language_model.model.layers.{index}."
+        for module, (bits, group) in per_module.items():
+            quant[prefix + module] = entry(bits, group)
+    cfg = {
+        "model_type": "qwen4_exp",
+        "text_config": {
+            "model_type": "qwen4_exp_text",
+            "num_hidden_layers": 48,
+            "tie_word_embeddings": False,
+        },
+        "quantization": quant,
+    }
+    (tmp_path / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+    return str(tmp_path)
+
+
+def test_bare_speed_arms_frspec_and_stage3(tmp_path, monkeypatch):
+    # The Bare-Speed pack (lm_head Q4/g64, shared + routed experts Q4/g64) must
+    # arm FR-Spec and the M=4 stage-3 optimization, exactly as Optimized-Speed's
+    # Q8-shared / Q4-g32-routed geometry does. The fixed-M4 predicate is pure
+    # geometry (both packs share it); the FR-Spec and stage-3 pack predicates
+    # read the real per-module quantization from config.json below.
+    import mtplx.qwen4_block_verify as block_verify
+    import mtplx.qwen4_draft_k20_prescatter as prescatter
+
+    for key in _LANE_ENV_KEYS + (
+        "MTPLX_FRSPEC_DRAFT",
+        "MTPLX_FRSPEC_VOCAB",
+        "MTPLX_QWEN4_DRAFT_K20_PRESCATTER",
+        "MTPLX_QWEN4_BLOCK_VERIFY",
+        "MTPLX_QWEN4_OPDIET",
+        "MTPLX_FUSED_GATE_UP",
+        "MTPLX_QWEN4_M4_STAGE3",
+        "MTPLX_QWEN4_M4_ROUTED_GLU",
+        "MTPLX_QWEN4_M4_ROUTED_DOWN_REDUCE",
+        "MTPLX_QWEN4_M4_ROUTED_DOWN_RESIDUAL_TAIL",
+        "MTPLX_QWEN4_PLE_CACHED_AUX",
+        "MTPLX_QSA_POOLED_ROWSEL",
+        "MTPLX_FABLE_PLE_CACHED_AUX",
+        "MTPLX_FABLE_QSA_POOLED_ROWSEL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    # Unforced readers + cleared first-use latches: the served import-time state.
+    monkeypatch.setattr(ro, "_QWEN4_OPDIET", None)
+    monkeypatch.setattr(ro, "_QWEN4_OPDIET_SELECTED", None)
+    monkeypatch.setattr(block_verify, "_ENABLED", None)
+    monkeypatch.setattr(prescatter, "_ENABLED", None)
+    ro.reset_qwen4_opdiet_applied_for_test()
+    block_verify.reset_engagement_for_test()
+    prescatter.reset_engagement_for_test()
+
+    model = _bare_speed_config(tmp_path)
+    args = SimpleNamespace(
+        generation_mode="mtp",
+        verify_strategy="capture_commit",
+        model=model,
+    )
+    monkeypatch.setattr(openai, "_served_model_is_qwen4_fixed_m4", lambda a: True)
+    overrides = openai._server_runtime_env_overrides(args, {})
+
+    # FR-Spec + K20 arm on the Q4/g64 head.
+    assert openai._served_model_lm_head_is_frspec_capable(args) is True
+    assert overrides.get("MTPLX_FRSPEC_DRAFT") == "1"
+    assert overrides.get("MTPLX_FRSPEC_VOCAB", "").startswith("builtin:")
+    assert overrides.get("MTPLX_QWEN4_DRAFT_K20_PRESCATTER") == "1"
+
+    # The M=4 stage-3 optimization + its children arm on the Q4/g64 experts.
+    assert openai._served_model_pack_is_stage3_geometry(args) is True
+    assert overrides.get("MTPLX_QWEN4_M4_STAGE3") == "1"
+    assert overrides.get("MTPLX_QWEN4_M4_ROUTED_GLU") == "1"
+    assert overrides.get("MTPLX_QWEN4_M4_ROUTED_DOWN_REDUCE") == "1"
+    assert overrides.get("MTPLX_QWEN4_M4_ROUTED_DOWN_RESIDUAL_TAIL") == "1"
+
+    # The two #475 aux optimizations arm on the Bare config as well.
+    assert overrides.get("MTPLX_QWEN4_PLE_CACHED_AUX") == "1"
+    assert overrides.get("MTPLX_QSA_POOLED_ROWSEL") == "1"
+
+    # Applied as the server does, the three no-observable verify lanes and the
+    # two #475 aux optimizations surface in /health qwen4_install_reports with
+    # armed True for the Bare-Speed config.
+    for key, value in overrides.items():
+        monkeypatch.setenv(key, value)
+    state = SimpleNamespace(runtime=SimpleNamespace(model=None))
+    rep = openai._qwen4_install_reports(state)
+    assert rep["opdiet"]["armed"] is True
+    assert rep["block_verify"]["armed"] is True
+    assert rep["draft_k20_prescatter"]["armed"] is True
+    assert rep["ple_cached_aux"]["armed"] is True
+    assert rep["qsa_pooled_rowsel"]["armed"] is True
