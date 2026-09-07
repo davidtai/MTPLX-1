@@ -769,3 +769,98 @@ def test_reset_clears_the_route_state_too():
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# Regression: the served-launch arming ordering (battery, 2026-09-07)
+# ---------------------------------------------------------------------------
+def test_the_reader_resolves_lazily_not_at_import(monkeypatch):
+    """A stamp applied AFTER runtime_options is imported must still arm.
+
+    The served bug: qsa_sparse_decode_enabled() froze the env at IMPORT
+    (default False), so openai.py's fixed-M4 auto-arm setdefault -- which runs
+    later and stamps MTPLX_QSA_SPARSE_DECODE=1 when the native ext is built --
+    landed after the cache and the lane never engaged. The reader must read at
+    first USE (install time), which is after the overrides are applied.
+    """
+
+    from mtplx import runtime_options as ro
+
+    monkeypatch.delenv("MTPLX_QSA_SPARSE_DECODE", raising=False)
+    monkeypatch.delenv("MTPLX_FABLE_QSA_SPARSE_DECODE", raising=False)
+    # As at a fresh import, with nothing stamped yet.
+    monkeypatch.setattr(ro, "_QSA_SPARSE_DECODE", None)
+    assert ro.qsa_sparse_decode_enabled() is False
+    # The auto-arm stamps the key AFTER import; a lazily-resolved reader that
+    # has not yet been forced to a value must pick it up.
+    monkeypatch.setattr(ro, "_QSA_SPARSE_DECODE", None)
+    monkeypatch.setenv("MTPLX_QSA_SPARSE_DECODE", "1")
+    assert ro.qsa_sparse_decode_enabled() is True
+    # The old FABLE name is honoured only when the new key is unset.
+    monkeypatch.setattr(ro, "_QSA_SPARSE_DECODE", None)
+    monkeypatch.delenv("MTPLX_QSA_SPARSE_DECODE", raising=False)
+    monkeypatch.setenv("MTPLX_FABLE_QSA_SPARSE_DECODE", "1")
+    assert ro.qsa_sparse_decode_enabled() is True
+
+
+def test_the_fixed_m4_auto_arm_stamps_or_declines_the_sparse_decode_lane(
+    tmp_path, monkeypatch
+):
+    """Apply the fixed-M4 auto-arm block; the sparse-decode install must be
+    ATTEMPTED -- stamped (native ext built) or declined-to-stock (not built) --
+    and never silently absent, which is exactly what the served launch showed.
+    """
+
+    import io
+    import contextlib
+    import json as _json
+    from types import SimpleNamespace as _NS
+
+    import mtplx.server.openai as openai
+    from mtplx import runtime_options as ro
+    from mtplx.native import native_qsa_available
+    from mtplx.profiles import (
+        MODEL_RUNTIME_ENV_OVERRIDE_KEYS,
+        normalize_runtime_env_overrides,
+    )
+
+    (tmp_path / "config.json").write_text(
+        _json.dumps({"model_type": "qwen4_exp"}), encoding="utf-8"
+    )
+    args = _NS(
+        generation_mode="mtp",
+        verify_strategy="capture_commit",
+        model=str(tmp_path),
+    )
+    # Force the fixed-M4 predicate on rather than crafting a full fixed-verify
+    # config; the sparse-decode default gates only on that predicate + the
+    # built native extension.
+    monkeypatch.setattr(openai, "_served_model_is_qwen4_fixed_m4", lambda a: True)
+    for key in ("MTPLX_QSA_SPARSE_DECODE", "MTPLX_FABLE_QSA_SPARSE_DECODE"):
+        monkeypatch.delenv(key, raising=False)
+
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        overrides = openai._server_runtime_env_overrides(args, {})
+    log = err.getvalue()
+
+    # The key is registered, so a stamped value survives the boot-time
+    # validator (the check that only runs inside apply_profile_env).
+    assert "MTPLX_QSA_SPARSE_DECODE" in MODEL_RUNTIME_ENV_OVERRIDE_KEYS
+    assert normalize_runtime_env_overrides(overrides) == overrides
+
+    if native_qsa_available():
+        # Ext built: the lane is armed by default -> install attempted.
+        assert overrides.get("MTPLX_QSA_SPARSE_DECODE") == "1"
+        # And the reader, resolved at install time AFTER the stamp is applied
+        # to the environment, arms (the bug returned False here).
+        monkeypatch.setattr(ro, "_QSA_SPARSE_DECODE", None)
+        monkeypatch.setenv(
+            "MTPLX_QSA_SPARSE_DECODE", overrides["MTPLX_QSA_SPARSE_DECODE"]
+        )
+        assert ro.qsa_sparse_decode_enabled() is True
+    else:
+        # No ext: decline-to-stock, key NOT stamped, a verdict line printed so
+        # a wheel without the extension still serves and says so.
+        assert "MTPLX_QSA_SPARSE_DECODE" not in overrides
+        assert "MTPLX_QSA_SPARSE_DECODE declined to stock" in log

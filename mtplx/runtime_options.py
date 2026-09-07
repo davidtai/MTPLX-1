@@ -268,27 +268,44 @@ def qwen4_hc_m4_enabled() -> bool:
 #: failure at install: this kernel is rounding-class, so a parity miss is a
 #: numerical verdict, and the lane disables itself for the process and
 #: reports the measured deltas.
-def _qsa_sparse_decode_import_default() -> bool:
+def _resolve_qsa_sparse_decode() -> bool:
     # New key wins for any non-empty value (including "0" for the per-key
     # opt-out); the old MTPLX_FABLE_QSA_SPARSE_DECODE name is honoured as an
-    # alias only when the new key is unset. Read once at import.
+    # alias only when the new key is unset.
     raw = os.environ.get("MTPLX_QSA_SPARSE_DECODE")
     if raw is None or not str(raw).strip():
         return env_bool("MTPLX_FABLE_QSA_SPARSE_DECODE", default=False)
     return env_bool("MTPLX_QSA_SPARSE_DECODE", default=False)
 
 
-_QSA_SPARSE_DECODE = _qsa_sparse_decode_import_default()
+#: ``None`` = resolve from the environment on every read; a test may force a
+#: bool (the fixtures set this directly to arm/disarm the lane).
+#:
+#: The flag is read at USE, never frozen at import. The server's fixed-M4
+#: auto-arm stamps ``MTPLX_QSA_SPARSE_DECODE`` into the environment AFTER this
+#: module is imported (``openai.py:_server_runtime_env_overrides``, gated on
+#: the built native extension). An import-time read (or a first-use read that
+#: happened to fire before the stamp) froze the default (False) before the
+#: stamp landed, so the served lane never engaged even with the extension
+#: built -- the bug the battery caught 2026-09-07. Reading the environment on
+#: each call means the graphbank cache install (after the overrides are
+#: applied) always sees the resolved value; the read is a dict lookup and the
+#: env is frozen once serving starts.
+_QSA_SPARSE_DECODE = None
 
 
 def qsa_sparse_decode_enabled() -> bool:
-    """True when the QSA split-K decode flag armed this process at import.
+    """True when the QSA split-K decode flag is armed for this process.
 
     Armed by ``MTPLX_QSA_SPARSE_DECODE`` (or the old
-    ``MTPLX_FABLE_QSA_SPARSE_DECODE`` alias).
+    ``MTPLX_FABLE_QSA_SPARSE_DECODE`` alias). Read at use, not frozen at
+    import -- see the note on :data:`_QSA_SPARSE_DECODE`. A test may set that
+    global to a bool to force the answer.
     """
 
-    return _QSA_SPARSE_DECODE
+    if _QSA_SPARSE_DECODE is not None:
+        return bool(_QSA_SPARSE_DECODE)
+    return _resolve_qsa_sparse_decode()
 
 
 def _parse_sparse_decode_tile(raw: str | None) -> tuple[int, int]:
