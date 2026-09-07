@@ -251,6 +251,141 @@ def qwen4_hc_m4_enabled() -> bool:
     return _QWEN4_HC_M4
 
 
+
+#: Split-K (KV-split) native sparse-GQA attention for the DECODE geometries
+#: (native_extensions/qsa_sparse_gqa, mtplx/kernels/qsa_sparse_decode.py).
+#:
+#: ``MTPLX_QSA_SPARSE_DECODE`` serves the M=4 fixed verify, all 12 QSA
+#: layers, once per verify cycle.  This is where the bytes are: the shipped
+#: lane materialises a [1, 2, 4, 2052, 256] gathered K/V pair per layer
+#: (16.8 MB written, then re-read by the score and P@V GEMMs), plus MLX's own
+#: 8.4 MB contiguous copy of the transposed key view.  The kernel reads the
+#: cache rows once and never writes them.
+#:
+#: Off by default.  It RAISES on a contract failure rather than silently
+#: reverting -- a silently inert flag is how MTPLX_FUSED_HC_V3 came to be
+#: armed-but-dead at M=4.  The one thing that does NOT raise is a PARITY
+#: failure at install: this kernel is rounding-class, so a parity miss is a
+#: numerical verdict, and the lane disables itself for the process and
+#: reports the measured deltas.
+def _qsa_sparse_decode_import_default() -> bool:
+    # New key wins for any non-empty value (including "0" for the per-key
+    # opt-out); the old MTPLX_FABLE_QSA_SPARSE_DECODE name is honoured as an
+    # alias only when the new key is unset. Read once at import.
+    raw = os.environ.get("MTPLX_QSA_SPARSE_DECODE")
+    if raw is None or not str(raw).strip():
+        return env_bool("MTPLX_FABLE_QSA_SPARSE_DECODE", default=False)
+    return env_bool("MTPLX_QSA_SPARSE_DECODE", default=False)
+
+
+_QSA_SPARSE_DECODE = _qsa_sparse_decode_import_default()
+
+
+def qsa_sparse_decode_enabled() -> bool:
+    """True when the QSA split-K decode flag armed this process at import.
+
+    Armed by ``MTPLX_QSA_SPARSE_DECODE`` (or the old
+    ``MTPLX_FABLE_QSA_SPARSE_DECODE`` alias).
+    """
+
+    return _QSA_SPARSE_DECODE
+
+
+def _parse_sparse_decode_tile(raw: str | None) -> tuple[int, int]:
+    """``"BK:DC"`` -> the compiled tile pair; unset means the default."""
+
+    if raw is None or not str(raw).strip():
+        return (128, 32)
+    token = str(raw).strip()
+    parts = token.split(":")
+    if len(parts) != 2:
+        raise ValueError(
+            f"MTPLX_QSA_SPARSE_DECODE_TILE={raw!r} must be 'BK:DC'"
+        )
+    try:
+        tile = (int(parts[0]), int(parts[1]))
+    except ValueError as exc:
+        raise ValueError(
+            f"MTPLX_QSA_SPARSE_DECODE_TILE={raw!r} must be 'BK:DC'"
+        ) from exc
+    if tile not in QSA_SPARSE_DECODE_TILES:
+        accepted = ", ".join(f"{a}:{b}" for a, b in QSA_SPARSE_DECODE_TILES)
+        raise ValueError(
+            f"MTPLX_QSA_SPARSE_DECODE_TILE={raw!r} is not instantiated; "
+            f"expected one of: {accepted}"
+        )
+    return tile
+
+
+#: The (BK, DC) pairs the metallib instantiates.  Anything else raises rather
+#: than falling back, so a typo in a sweep cannot quietly measure the default.
+QSA_SPARSE_DECODE_TILES = ((128, 32), (256, 32), (64, 64), (128, 64))
+QSA_SPARSE_DECODE_MAX_SPLITS = 64
+
+_QSA_SPARSE_DECODE_TILE = _parse_sparse_decode_tile(
+    os.environ.get("MTPLX_QSA_SPARSE_DECODE_TILE")
+    or os.environ.get("MTPLX_FABLE_QSA_SPARSE_DECODE_TILE")
+)
+
+
+#: MEASURED default (2026-09-02, guarded micro, M=4, 16K, 12 layers).  The
+#: kernel is occupancy-bound, and at the shipped tile (BK=128) there are 17
+#: BK-tiles over the 2,051 selected keys, so 17 is the smallest split target
+#: that reaches one tile per threadgroup -- a 4 x 2 x 17 = 136-threadgroup
+#: grid on a 40-core M5 Max.  Everything below it leaves cores idle:
+#:
+#:     splits   n_splits   threadgroups   ms/layer   x baseline
+#:          4          4             32      0.325         0.70
+#:          8          6             48      0.210         1.08
+#:         16          9             72      0.149         1.52
+#:         17         17            136      0.094-0.099   2.3-2.4
+#:
+#: Larger values clamp to the same 17 at BK=128, so 17 is also the point past
+#: which the knob stops doing anything -- which is why the first sweep's s17
+#: and s32 rows are the SAME configuration measured twice, and their 5.3%
+#: spread is the bench's noise floor rather than a result.
+#:
+#: The previous default of 8 was a placeholder, and it measured 2.2x slower.
+QSA_SPARSE_DECODE_DEFAULT_SPLITS = 17
+
+
+def _parse_sparse_decode_splits(raw: str | None) -> int:
+    """``MTPLX_QSA_SPARSE_DECODE_SPLITS`` -- the KV-split target."""
+
+    if raw is None or not str(raw).strip():
+        return QSA_SPARSE_DECODE_DEFAULT_SPLITS
+    try:
+        value = int(str(raw).strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"MTPLX_QSA_SPARSE_DECODE_SPLITS={raw!r} must be an integer"
+        ) from exc
+    if not 1 <= value <= QSA_SPARSE_DECODE_MAX_SPLITS:
+        raise ValueError(
+            f"MTPLX_QSA_SPARSE_DECODE_SPLITS={raw!r} must be in "
+            f"[1, {QSA_SPARSE_DECODE_MAX_SPLITS}]"
+        )
+    return value
+
+
+_QSA_SPARSE_DECODE_SPLITS = _parse_sparse_decode_splits(
+    os.environ.get("MTPLX_QSA_SPARSE_DECODE_SPLITS")
+    or os.environ.get("MTPLX_FABLE_QSA_SPARSE_DECODE_SPLITS")
+)
+
+
+def qsa_sparse_decode_tile() -> tuple[int, int]:
+    """The armed ``(key_tile, dimension_tile)`` for the decode kernel."""
+
+    return _QSA_SPARSE_DECODE_TILE
+
+
+def qsa_sparse_decode_splits() -> int:
+    """The armed KV-split target for the decode kernel."""
+
+    return _QSA_SPARSE_DECODE_SPLITS
+
+
 @dataclass(frozen=True)
 class ResolvedAPIKey:
     value: str | None

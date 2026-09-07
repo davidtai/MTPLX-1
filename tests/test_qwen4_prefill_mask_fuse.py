@@ -513,7 +513,14 @@ def test_refusal_is_native_on_a_build_without_fused_kernels(monkeypatch):
             q, kv, kv, mask=_lane_mask(total - rows, rows, total), scale=1.0
         )
     message = err.getvalue()
-    assert "require a GPU (Metal) stream" in message
+    # The refusal is NATIVE: MLX declined force_fused (a CPU stream has no
+    # fused kernel), the lane caught it and logged one per-class line with
+    # MLX's own message appended. The exact native wording differs by MLX
+    # build (0.32.0 said one thing, 0.32.2's CPU stream says "require a GPU
+    # (Metal) stream"), so assert the version-independent lane line rather
+    # than any one build's native string.
+    assert "has no fused SDPA for shape class" in message
+    assert "MTPLX_QWEN4_PREFILL_MASK_FUSE" in message
     # Two classes learned -- one per mask kind at this one geometry -- and
     # nothing said about any other shape.
     assert set(qwen4_exp._PREFILL_MASK_FUSE_UNAVAILABLE) == {

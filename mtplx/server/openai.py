@@ -960,6 +960,36 @@ def _server_runtime_env_overrides(
             # (including 0 for whole-chunk) wins via the pop loop below.
             if os.environ.get("MTPLX_QSA_PREFILL_QUERY_TILE") is None:
                 overrides.setdefault("MTPLX_QSA_PREFILL_QUERY_TILE", "2048")
+            # PR #391 remainder port (davidtai): the native split-K QSA decode
+            # lane. Default ON for the fixed-M4 pack, but ONLY when the native
+            # mtplx_native_qsa extension is built -- a wheel without it declines
+            # to stock and serves the shipped QSA decode path, so a release
+            # without the Apple-Silicon native wheel still boots. An explicit
+            # operator export of MTPLX_QSA_SPARSE_DECODE=1 bypasses this check
+            # and reaches the fail-closed install (armed + unbuilt -> RAISE),
+            # which is the measured-arm contract. Its measured companions (the
+            # 128:32 tile and 17 KV-splits) are the runtime_options defaults,
+            # so they need no stamp; an explicit export of either still wins.
+            if os.environ.get("MTPLX_QSA_SPARSE_DECODE") is None:
+                try:
+                    from mtplx.native import native_qsa_available
+
+                    _qsa_decode_ext_ok = bool(native_qsa_available())
+                except Exception:
+                    _qsa_decode_ext_ok = False
+                if _qsa_decode_ext_ok:
+                    overrides.setdefault("MTPLX_QSA_SPARSE_DECODE", "1")
+                else:
+                    print(
+                        "[mtplx] MTPLX_QSA_SPARSE_DECODE declined to stock: the "
+                        "native mtplx_native_qsa split-K extension is not built "
+                        "in this environment; serving the stock QSA decode "
+                        "path. Build native_extensions/qsa_sparse_gqa to arm "
+                        "the lane, or export MTPLX_QSA_SPARSE_DECODE=1 to "
+                        "require it (armed + unbuilt fails closed at load).",
+                        file=sys.stderr,
+                        flush=True,
+                    )
             # The stage-3 child routes are consumed at model load and raise
             # unless stage 3 itself resolves on, so they are derived from the
             # resolved parent, never stamped alone: the routed-down reduction,
@@ -1119,6 +1149,7 @@ _QWEN4_PORT_KEYS = (
     # the pop loop below.
     "MTPLX_QWEN4_HC_M4",
     "MTPLX_QWEN4_PREFILL_MASK_FUSE",
+    "MTPLX_QSA_SPARSE_DECODE",
     "MTPLX_NGRAM_PREWARM",
 )
 # Every key the fixed-M4 lane defaults may stamp; an explicit operator
@@ -1127,8 +1158,11 @@ _QWEN4_LANE_KEYS = _QWEN4_PORT_KEYS + (
     "MTPLX_FRSPEC_DRAFT",
     "MTPLX_FRSPEC_VOCAB",
     "MTPLX_QSA_GATHER_MAX_ROWS",
-    # PR #391 remainder port (davidtai): the QSA prefill query-tile value.
+    # PR #391 remainder ports (davidtai): the QSA prefill query-tile value and
+    # the split-K decode lane's tile/splits companions.
     "MTPLX_QSA_PREFILL_QUERY_TILE",
+    "MTPLX_QSA_SPARSE_DECODE_TILE",
+    "MTPLX_QSA_SPARSE_DECODE_SPLITS",
 )
 
 
@@ -18652,6 +18686,15 @@ def _qwen4_install_reports(state: Any) -> dict[str, Any]:
     hc_m4 = getattr(runtime, "qwen4_hc_m4_report", None)
     if isinstance(hc_m4, dict):
         out["hc_m4"] = hc_m4
+    try:
+        from mtplx.runtime_options import qsa_sparse_decode_enabled
+
+        if qsa_sparse_decode_enabled():
+            from mtplx.kernels import qsa_sparse_decode as _qsd
+
+            out["qsa_sparse_decode"] = _qsd.receipt()
+    except Exception:
+        pass
     glue = getattr(runtime, "_mtplx_qwen4_verify_glue", None)
     if isinstance(glue, dict):
         out["verify_glue"] = glue
