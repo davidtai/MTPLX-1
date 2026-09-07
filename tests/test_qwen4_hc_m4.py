@@ -347,16 +347,28 @@ def test_armed_wrong_down_rows_raise(armed):
         mod._hc_m4_applies(mx.zeros((1, 4, HCD), dtype=mx.bfloat16))
 
 
-def test_env_flag_is_read_once(monkeypatch):
-    """A mid-run env change must not reach the hot path: two traces of the
-    same compiled verify graph would then disagree about which read they
-    contain."""
+def test_env_flag_is_read_at_use_not_frozen_at_import(monkeypatch):
+    """The reader must resolve the environment at USE, not freeze at import.
 
-    before = runtime_options.qwen4_hc_m4_enabled()
-    monkeypatch.setenv("MTPLX_QWEN4_HC_M4", "1")
-    assert runtime_options.qwen4_hc_m4_enabled() is before
+    The server's fixed-M4 auto-arm stamps MTPLX_QWEN4_HC_M4 AFTER
+    runtime_options is imported; an import-time freeze left the served lane
+    OFF (the battery's 2026-09-07 arming failure). A stamp applied after the
+    module exists must be seen. ``_QWEN4_HC_M4`` is left None (unforced) so
+    the reader consults the environment.
+    """
+
+    monkeypatch.setattr(runtime_options, "_QWEN4_HC_M4", None)
     monkeypatch.delenv("MTPLX_QWEN4_HC_M4", raising=False)
-    assert runtime_options.qwen4_hc_m4_enabled() is before
+    monkeypatch.delenv("MTPLX_FABLE_HC_M4", raising=False)
+    assert runtime_options.qwen4_hc_m4_enabled() is False
+    monkeypatch.setenv("MTPLX_QWEN4_HC_M4", "1")
+    assert runtime_options.qwen4_hc_m4_enabled() is True
+    monkeypatch.delenv("MTPLX_QWEN4_HC_M4", raising=False)
+    assert runtime_options.qwen4_hc_m4_enabled() is False
+    # A test/A-B may still force a value by setting the module global.
+    monkeypatch.setattr(runtime_options, "_QWEN4_HC_M4", True)
+    monkeypatch.delenv("MTPLX_QWEN4_HC_M4", raising=False)
+    assert runtime_options.qwen4_hc_m4_enabled() is True
 
 
 def test_env_flag_defaults_off():

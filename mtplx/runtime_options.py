@@ -225,30 +225,40 @@ def reset_qwen4_verify_glue_cache(env: Mapping[str, str] | None = None) -> None:
 
 #: Verify-width fused hyper-connection read (mtplx/kernels/qwen4_m4_hyper_read).
 #:
-#: Read ONCE at import so the hot verify path never touches ``os.environ`` and
-#: two traces of the same compiled graph cannot disagree about which chain they
-#: carry. ``MTPLX_QWEN4_HC_M4`` is the key; the old ``MTPLX_FABLE_HC_M4`` name
-#: is honoured as an alias only when the new key is unset (the new key wins for
-#: any non-empty value, including ``0`` for the per-key opt-out). The kernel
-#: RAISES on a family-contract miss rather than falling back, so an
-#: armed-but-inert lane is unreachable.
-def _qwen4_hc_m4_import_default() -> bool:
+#: Read at USE, never frozen at import. ``MTPLX_QWEN4_HC_M4`` is the key; the
+#: old ``MTPLX_FABLE_HC_M4`` name is honoured as an alias only when the new key
+#: is unset (the new key wins for any non-empty value, including ``0`` for the
+#: per-key opt-out). The kernel RAISES on a family-contract miss rather than
+#: falling back, so an armed-but-inert lane is unreachable.
+#:
+#: ``None`` = resolve from the environment on each read; a test may force a
+#: bool. This must NOT freeze at import: the server's fixed-M4 auto-arm stamps
+#: ``MTPLX_QWEN4_HC_M4`` into the environment AFTER this module is imported, so
+#: an import-time read froze the default (False) and the served lane never
+#: armed -- the second arming failure the battery caught 2026-09-07 (the first
+#: was the sibling QSA sparse-decode reader). The install check runs after the
+#: overrides are applied, so reading the environment there sees the stamp.
+_QWEN4_HC_M4 = None
+
+
+def _resolve_qwen4_hc_m4() -> bool:
     raw = os.environ.get("MTPLX_QWEN4_HC_M4")
     if raw is None or not str(raw).strip():
         return env_bool("MTPLX_FABLE_HC_M4", default=False)
     return env_bool("MTPLX_QWEN4_HC_M4", default=False)
 
 
-_QWEN4_HC_M4 = _qwen4_hc_m4_import_default()
-
-
 def qwen4_hc_m4_enabled() -> bool:
-    """True when the HC_M4 flag armed this process at import.
+    """True when the HC_M4 flag is armed for this process.
 
     Armed by ``MTPLX_QWEN4_HC_M4`` (or the old ``MTPLX_FABLE_HC_M4`` alias).
+    Read at use, not frozen at import; a test may set :data:`_QWEN4_HC_M4` to
+    a bool to force the answer.
     """
 
-    return _QWEN4_HC_M4
+    if _QWEN4_HC_M4 is not None:
+        return bool(_QWEN4_HC_M4)
+    return _resolve_qwen4_hc_m4()
 
 
 
@@ -339,10 +349,10 @@ def _parse_sparse_decode_tile(raw: str | None) -> tuple[int, int]:
 QSA_SPARSE_DECODE_TILES = ((128, 32), (256, 32), (64, 64), (128, 64))
 QSA_SPARSE_DECODE_MAX_SPLITS = 64
 
-_QSA_SPARSE_DECODE_TILE = _parse_sparse_decode_tile(
-    os.environ.get("MTPLX_QSA_SPARSE_DECODE_TILE")
-    or os.environ.get("MTPLX_FABLE_QSA_SPARSE_DECODE_TILE")
-)
+#: ``None`` = resolve from the environment on each read; a test may force a
+#: (key_tile, dim_tile) tuple. Read at use, not frozen at import (same
+#: server-arming ordering as the master flag above).
+_QSA_SPARSE_DECODE_TILE = None
 
 
 #: MEASURED default (2026-09-02, guarded micro, M=4, 16K, 12 layers).  The
@@ -385,22 +395,39 @@ def _parse_sparse_decode_splits(raw: str | None) -> int:
     return value
 
 
-_QSA_SPARSE_DECODE_SPLITS = _parse_sparse_decode_splits(
-    os.environ.get("MTPLX_QSA_SPARSE_DECODE_SPLITS")
-    or os.environ.get("MTPLX_FABLE_QSA_SPARSE_DECODE_SPLITS")
-)
+#: ``None`` = resolve from the environment on each read; a test may force an
+#: int. Read at use, not frozen at import.
+_QSA_SPARSE_DECODE_SPLITS = None
 
 
 def qsa_sparse_decode_tile() -> tuple[int, int]:
-    """The armed ``(key_tile, dimension_tile)`` for the decode kernel."""
+    """The armed ``(key_tile, dimension_tile)`` for the decode kernel.
 
-    return _QSA_SPARSE_DECODE_TILE
+    Read at use, not frozen at import; a test may set
+    :data:`_QSA_SPARSE_DECODE_TILE` to force the answer.
+    """
+
+    if _QSA_SPARSE_DECODE_TILE is not None:
+        return _QSA_SPARSE_DECODE_TILE
+    return _parse_sparse_decode_tile(
+        os.environ.get("MTPLX_QSA_SPARSE_DECODE_TILE")
+        or os.environ.get("MTPLX_FABLE_QSA_SPARSE_DECODE_TILE")
+    )
 
 
 def qsa_sparse_decode_splits() -> int:
-    """The armed KV-split target for the decode kernel."""
+    """The armed KV-split target for the decode kernel.
 
-    return _QSA_SPARSE_DECODE_SPLITS
+    Read at use, not frozen at import; a test may set
+    :data:`_QSA_SPARSE_DECODE_SPLITS` to force the answer.
+    """
+
+    if _QSA_SPARSE_DECODE_SPLITS is not None:
+        return _QSA_SPARSE_DECODE_SPLITS
+    return _parse_sparse_decode_splits(
+        os.environ.get("MTPLX_QSA_SPARSE_DECODE_SPLITS")
+        or os.environ.get("MTPLX_FABLE_QSA_SPARSE_DECODE_SPLITS")
+    )
 
 
 @dataclass(frozen=True)

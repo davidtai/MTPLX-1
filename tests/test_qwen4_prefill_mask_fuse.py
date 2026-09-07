@@ -71,7 +71,6 @@ def _clean_lane_state(monkeypatch):
 
     monkeypatch.delenv(MASK_FUSE_ENV, raising=False)
     monkeypatch.delenv(QUERY_TILE_ENV, raising=False)
-    qwen4_exp._prefill_mask_fuse_enabled.cache_clear()
     saved_counts = dict(qwen4_exp._QSA_PREFILL_COUNTS)
     saved_unavailable = dict(qwen4_exp._PREFILL_MASK_FUSE_UNAVAILABLE)
     saved_printed = qwen4_exp._MASK_FUSE_REFUSALS_PRINTED[0]
@@ -83,7 +82,6 @@ def _clean_lane_state(monkeypatch):
     try:
         yield
     finally:
-        qwen4_exp._prefill_mask_fuse_enabled.cache_clear()
         qwen4_exp._QSA_PREFILL_COUNTS.clear()
         qwen4_exp._QSA_PREFILL_COUNTS.update(saved_counts)
         qwen4_exp._PREFILL_MASK_FUSE_UNAVAILABLE.clear()
@@ -94,7 +92,6 @@ def _clean_lane_state(monkeypatch):
 
 def _arm(monkeypatch, value: str = "1") -> None:
     monkeypatch.setenv(MASK_FUSE_ENV, value)
-    qwen4_exp._prefill_mask_fuse_enabled.cache_clear()
 
 
 def _lane_mask(pos_start: int, rows: int, total: int) -> mx.array:
@@ -717,7 +714,6 @@ def test_armed_flag_on_an_unavailable_build_still_returns_the_dense_answer(
         armed = qwen4_exp._qsa_dense_attention(
             q, kv, kv, mask=_lane_mask(pos_start, rows, total), scale=0.25
         )
-    qwen4_exp._prefill_mask_fuse_enabled.cache_clear()
     monkeypatch.delenv(MASK_FUSE_ENV, raising=False)
     stock = qwen4_exp._qsa_dense_attention(
         q, kv, kv, mask=_lane_mask(pos_start, rows, total), scale=0.25

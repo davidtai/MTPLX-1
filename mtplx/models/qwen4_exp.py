@@ -44,7 +44,6 @@ import re
 import struct
 import time
 from dataclasses import dataclass, field
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -1921,7 +1920,6 @@ def _qsa_prefill_gather_tile_rows() -> int:
         return 64
 
 
-@lru_cache(maxsize=1)
 def _prefill_mask_fuse_enabled() -> bool:
     """MTPLX_QWEN4_PREFILL_MASK_FUSE: ask MLX for the fused masked SDPA.
 
@@ -1980,12 +1978,14 @@ def _prefill_mask_fuse_enabled() -> bool:
     ``engaged:`` line -- the absence of a refusal is not a receipt.
     """
 
-    # Cached (maxsize=1) so the hot lane does not touch os.environ every
-    # call; ``cache_clear()`` is the escape hatch a test or an in-process A/B
-    # uses to re-read. The renamed key wins when set to any non-empty value
+    # Read at USE, never frozen at import: the server's fixed-M4 auto-arm
+    # stamps this key into the environment after the module is imported, so an
+    # import-time freeze would miss the stamp (the arming-ordering class the
+    # battery caught). The read is one dict lookup, and it is only reached on
+    # the prefill path. The renamed key wins when set to any non-empty value
     # (including "0" for the per-key opt-out); the old
-    # MTPLX_FABLE_PREFILL_MASK_FUSE name is honoured as an alias only when
-    # the new key is unset.
+    # MTPLX_FABLE_PREFILL_MASK_FUSE name is honoured as an alias only when the
+    # new key is unset.
     raw = os.environ.get("MTPLX_QWEN4_PREFILL_MASK_FUSE")
     if raw is None or not str(raw).strip():
         raw = os.environ.get("MTPLX_FABLE_PREFILL_MASK_FUSE")
