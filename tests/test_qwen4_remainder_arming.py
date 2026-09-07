@@ -189,3 +189,55 @@ def test_the_fixed_m4_auto_arm_stamps_the_upstream_verify_lanes(tmp_path, monkey
         monkeypatch.setenv(key, value)
     assert ro.qwen4_opdiet_enabled() is True
     assert ro.qwen4_verify_glue_enabled() is True
+
+
+def test_health_surfaces_the_three_no_observable_verify_lanes(monkeypatch):
+    """The three verify lanes with no per-window observable appear in
+    /health qwen4_install_reports with an at-use ``armed`` the battery can gate
+    on (True under a served stamp, False when the key is =0).
+    """
+
+    import mtplx.qwen4_block_verify as block_verify
+    import mtplx.qwen4_draft_k20_prescatter as prescatter
+
+    state = SimpleNamespace(runtime=SimpleNamespace(model=None))
+    # Unforced globals + cleared first-use latches (the served import-time
+    # state); the modules were imported at the top of this file, before any stamp.
+    monkeypatch.setattr(ro, "_QWEN4_OPDIET", None)
+    monkeypatch.setattr(ro, "_QWEN4_OPDIET_SELECTED", None)
+    monkeypatch.setattr(block_verify, "_ENABLED", None)
+    monkeypatch.setattr(prescatter, "_ENABLED", None)
+    ro.reset_qwen4_opdiet_applied_for_test()
+    block_verify.reset_engagement_for_test()
+    prescatter.reset_engagement_for_test()
+    keys = (
+        "MTPLX_QWEN4_OPDIET",
+        "MTPLX_QWEN4_BLOCK_VERIFY",
+        "MTPLX_QWEN4_DRAFT_K20_PRESCATTER",
+    )
+    for k in keys:
+        monkeypatch.delenv(k, raising=False)
+
+    # Off -> absent (== off), so an unarmed lane never claims a verdict.
+    rep = openai._qwen4_install_reports(state)
+    assert "opdiet" not in rep
+    assert "block_verify" not in rep
+    assert "draft_k20_prescatter" not in rep
+
+    # Served stamp applied AFTER import -> present with armed True at /health
+    # (the fix: gate-able from the install verdict, not the env).
+    for k in keys:
+        monkeypatch.setenv(k, "1")
+    rep = openai._qwen4_install_reports(state)
+    assert rep["opdiet"]["armed"] is True
+    assert rep["block_verify"] == {"armed": True, "engaged": False}
+    assert rep["draft_k20_prescatter"]["armed"] is True
+    assert rep["draft_k20_prescatter"]["engaged"] is False
+
+    # Per-key opt-out (=0) -> absent again.
+    for k in keys:
+        monkeypatch.setenv(k, "0")
+    rep = openai._qwen4_install_reports(state)
+    assert "opdiet" not in rep
+    assert "block_verify" not in rep
+    assert "draft_k20_prescatter" not in rep

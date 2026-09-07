@@ -116,6 +116,12 @@ def parse_opdiet_items(
 #: frozenset. Read at use, not frozen at import (same server-arming reason).
 _QWEN4_OPDIET_SELECTED = None
 
+#: First-use latch: the op-diet items actually applied at a gated site in the
+#: compiled fixed-M4 verify graph. The graph has no other per-window observable,
+#: so /health surfaces this so the battery can confirm which rewrites ran
+#: instead of trusting the env. Read-only reporting.
+_QWEN4_OPDIET_APPLIED: set[str] = set()
+
 
 def qwen4_opdiet_enabled(item: str | None = None) -> bool:
     """True when the op diet is armed, and this item is selected.
@@ -142,7 +148,38 @@ def qwen4_opdiet_enabled(item: str | None = None) -> bool:
         if _QWEN4_OPDIET_SELECTED is not None
         else parse_opdiet_items(os.environ.get("MTPLX_QWEN4_OPDIET_ITEMS"))
     )
-    return item in selected
+    applied = item in selected
+    if applied:
+        _QWEN4_OPDIET_APPLIED.add(item)
+    return applied
+
+
+def qwen4_opdiet_report() -> dict:
+    """Install/first-use verdict for ``/health qwen4_install_reports.opdiet``.
+
+    ``armed`` is read at use (reflects the served auto-arm stamp, gate-able
+    without a request); ``items`` is the configured selection; ``applied`` is
+    the first-use latch of items that actually ran at a gated site.
+    """
+
+    if not qwen4_opdiet_enabled():
+        return {"armed": False, "items": [], "applied": sorted(_QWEN4_OPDIET_APPLIED)}
+    selected = (
+        _QWEN4_OPDIET_SELECTED
+        if _QWEN4_OPDIET_SELECTED is not None
+        else parse_opdiet_items(os.environ.get("MTPLX_QWEN4_OPDIET_ITEMS"))
+    )
+    return {
+        "armed": True,
+        "items": sorted(selected),
+        "applied": sorted(_QWEN4_OPDIET_APPLIED),
+    }
+
+
+def reset_qwen4_opdiet_applied_for_test() -> None:
+    """Clear the applied-items latch (tests only)."""
+
+    _QWEN4_OPDIET_APPLIED.clear()
 
 
 #: W70 -- fused glue inside the compiled fixed-M4 verify body.

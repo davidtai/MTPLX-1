@@ -18698,6 +18698,36 @@ def _qwen4_install_reports(state: Any) -> dict[str, Any]:
     glue = getattr(runtime, "_mtplx_qwen4_verify_glue", None)
     if isinstance(glue, dict):
         out["verify_glue"] = glue
+    # PR #391 remainder / arming audit: three decode-verify lanes with no
+    # per-window observable. Read-only {armed (read at use, gate-able without a
+    # request) + first-use engaged/applied latch}, so the battery gates on the
+    # install verdict instead of trusting the env. Present only when ARMED, so an
+    # unarmed lane stays absent (== off) like the others; the engaged/applied
+    # latch rides inside the armed report.
+    try:
+        from mtplx import qwen4_draft_k20_prescatter as _k20
+
+        report = _k20.engagement_report()
+        if report.get("armed"):
+            out["draft_k20_prescatter"] = report
+    except Exception:
+        pass
+    try:
+        from mtplx import qwen4_block_verify as _bv
+
+        report = _bv.engagement_report()
+        if report.get("armed"):
+            out["block_verify"] = report
+    except Exception:
+        pass
+    try:
+        from mtplx.runtime_options import qwen4_opdiet_report
+
+        report = qwen4_opdiet_report()
+        if report.get("armed"):
+            out["opdiet"] = report
+    except Exception:
+        pass
     try:
         model = getattr(runtime, "model", None)
         text = getattr(model, "language_model", model)

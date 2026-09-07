@@ -224,6 +224,45 @@ def _configure_for_test(enabled: bool) -> None:
     _ENABLED = bool(enabled)
 
 
+#: First-use engagement latch + the last install receipt, surfaced at /health
+#: so the battery can gate on the install verdict instead of the env. The
+#: receipt (``{installed, rows, ...}``) is per-request in generation.py; this
+#: latches the last one a claim installed. Read-only reporting.
+_ENGAGED = [False]
+_LAST_RECEIPT: dict[str, object] = {}
+
+
+def _note_engaged(receipt: dict[str, object] | None = None) -> None:
+    """Latch first-use for /health (called by ``claim_draft_route`` on install)."""
+
+    _ENGAGED[0] = True
+    if receipt:
+        _LAST_RECEIPT.clear()
+        _LAST_RECEIPT.update(receipt)
+
+
+def engagement_report() -> dict:
+    """Install/first-use verdict for ``/health qwen4_install_reports.draft_k20_prescatter``.
+
+    ``armed`` is read at use (reflects the served auto-arm stamp, gate-able
+    without a request); ``engaged`` latches True the first time a claim installs
+    the pre-scatter route, and the last install receipt rides along.
+    """
+
+    return {
+        "armed": is_enabled(),
+        "engaged": bool(_ENGAGED[0]),
+        "receipt": dict(_LAST_RECEIPT),
+    }
+
+
+def reset_engagement_for_test() -> None:
+    """Clear the first-use latch and receipt (tests only)."""
+
+    _ENGAGED[0] = False
+    _LAST_RECEIPT.clear()
+
+
 class DraftK20PrescatterIneligible(RuntimeError):
     """The armed flag cannot work in THIS PROCESS at all.
 
@@ -416,7 +455,7 @@ def claim_draft_route(
     if not _ENABLED:
         return None
     try:
-        return _claim_draft_route(
+        plan = _claim_draft_route(
             rt,
             draft_sampler=draft_sampler,
             draft_core=draft_core,
@@ -446,6 +485,12 @@ def claim_draft_route(
             receipt.clear()
             receipt.update(stamped)
         return None
+    if plan is not None:
+        try:
+            _note_engaged(plan.to_dict())
+        except Exception:
+            _note_engaged()
+    return plan
 
 
 def _claim_draft_route(

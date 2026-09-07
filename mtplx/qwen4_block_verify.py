@@ -154,6 +154,29 @@ def _configure_for_test(enabled: bool) -> None:
     _ENABLED = bool(enabled)
 
 
+#: First-use engagement latch: the accept loop has no other per-window
+#: observable, so /health surfaces this so the battery can confirm the block
+#: law actually ran instead of trusting the env. Read-only reporting.
+_ENGAGED = [False]
+
+
+def engagement_report() -> dict:
+    """Install/first-use verdict for ``/health qwen4_install_reports.block_verify``.
+
+    ``armed`` is read at use (reflects the served auto-arm stamp, gate-able
+    without a request); ``engaged`` latches True the first window a block
+    verifier is actually built for the accept loop.
+    """
+
+    return {"armed": is_enabled(), "engaged": bool(_ENGAGED[0])}
+
+
+def reset_engagement_for_test() -> None:
+    """Clear the first-use latch (tests only)."""
+
+    _ENGAGED[0] = False
+
+
 # ---------------------------------------------------------------------------
 # Row preparation -- mirrors offline_block_verification.prepared_row exactly.
 # ---------------------------------------------------------------------------
@@ -499,6 +522,16 @@ def build_verifier(
         # hands back; the widest id in play is a safe, exact one.
         vocab_size = 1 + int(
             max(int(ids.max()) for ids, _ in (*draft_rows, *target_rows))
+        )
+    if not _ENGAGED[0]:
+        _ENGAGED[0] = True
+        import sys as _sys
+
+        print(
+            "[mtplx] MTPLX_QWEN4_BLOCK_VERIFY armed: block verification engaged "
+            f"in the accept loop (depth={depth})",
+            file=_sys.stderr,
+            flush=True,
         )
     return BlockVerifier(
         draft_tokens=draft_tokens,
