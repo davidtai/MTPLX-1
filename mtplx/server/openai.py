@@ -16506,7 +16506,7 @@ def _cascade_acceptance_health_payload() -> dict[str, Any]:
     whenever ``max_v q(v) >= max_v p(v) - alpha*D_TV(p,q)`` and otherwise defers
     to the exact ``min(1, p/q)`` coin + residual. Mutually exclusive with the
     typical lane (both set is a fail-loud misconfiguration). See
-    docs/perf/pr478-cascade-acceptance.md.
+    docs/perf/qwen38-cascade-acceptance.md.
     """
     raw = os.environ.get("MTPLX_FABLE_CASCADE_THRESHOLD")
     enabled = raw is not None and str(raw).strip() != ""
@@ -36381,7 +36381,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "distribution-exact; engages only at temperature > 0. Mutually "
             "exclusive with --typical-threshold (setting both is an error). "
             "Environment: MTPLX_FABLE_CASCADE_THRESHOLD, which this flag "
-            "overrides. See docs/perf/pr478-cascade-acceptance.md."
+            "overrides. See docs/perf/qwen38-cascade-acceptance.md."
         ),
     )
     parser.add_argument(
