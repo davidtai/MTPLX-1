@@ -3,9 +3,11 @@
 `mtplx serve` OOM'd on the pack's advertised 262,144-token context on a 128 GB
 M5 Max under turbo / server defaults. The full source + log diagnosis is in
 `.benchmark-artifacts/over100-reports/oom255k/report.md`; this note records the
-optimization it produced.
+two optimizations it produced. The OOM is in the speculative-verify decode step,
+not the prefill: the prefill completes (TTFT ~240 s) and the request fails a few
+decode tokens later. Two separate ~6.4 GB verify transients had to go.
 
-## Optimization — head-chunk the small-q_len verify SDPA
+## Optimization 1 — head-chunk the small-q_len verify SDPA
 
 ### Problem
 
@@ -82,3 +84,57 @@ the same class as the mask-fuse lane.
   heads_per_chunk=H chunks=N`.
 - `/health` → `qwen4_install_reports.verify_sdpa_head_chunk`:
   `{engaged, q_len, heads_per_chunk, chunks, n_kv_heads}` once it has fired.
+
+## Optimization 2 — write the fixed-M4 verify KV in place
+
+### Problem
+
+With Optimization 1 in place the small-q_len score plane is gone, yet the
+261,120-token request still OOMs at the same ~100.8 GB peak, a few decode tokens
+in. The remaining ~6.4 GB (100.82 GB with MTP on and the verify running, vs
+94.19 GB for the same prompt with MTP off at S=1) is the verify's KV-cache
+update. The fixed-M4 verify uses `TensorOffsetKVCache` (graphbank.py), whose
+`update_and_fetch` writes the new rows with the functional `mx.slice_update`.
+That op reallocates the whole `[1, 2, capacity, 256]` buffer per key and per
+value tensor (267 MB each at the 262K capacity, measured on CPU), and across the
+12 full-attention layers that is 6.4 GB, matching the gap exactly. An S=1 AR
+decode (MTP off) rides the stock `KVCache`, which writes in place and returns a
+view, so it never pays it. The bank's own machinery demotes long generations to
+the eager verify (graphbank: "longer generations demote to eager"), so the served
+261K verify runs this eager path with a concrete offset.
+
+### Change
+
+`TensorOffsetKVCache.update_and_fetch` (and the `trim` rollback restore) now take
+an in-place path when the offset is a concrete host value: the S new rows are
+written with a slice assignment into the existing buffer (0 allocation, measured),
+after materializing an independent copy of the pre-write rows for rollback. When
+the offset is a tracer (inside an `mx.compile` trace) the compile-visible
+functional `mx.slice_update` path is kept unchanged, so the compiled replay's
+donation contract is untouched.
+
+### Effect
+
+The eager verify's KV update no longer reallocates the full buffer, removing the
+~6.4 GB verify transient. Combined with Optimization 1, the 261,120-token verify's
+working set no longer scales the way that overflows the 100 GiB knob.
+
+### Exactness
+
+Byte-identical. The in-place write lands the same bytes at the same positions as
+the functional `slice_update` (verified equal on random tensors), and the
+rollback snapshot is an independent copy so `trim` restores exactly the pre-write
+rows.
+
+### Files
+
+- `mtplx/graphbank.py` — `TensorOffsetKVCache.update_and_fetch`, `trim`,
+  `_concrete_offset`.
+- `tests/test_tensoroffset_kv_inplace.py` — CPU tests (no full-buffer alloc,
+  correctness, rollback independence, numerical equivalence, tracer detection).
+
+### Switch / observability
+
+No new knob; the in-place path is the eager verify's KV update. A GPU probe that
+isolates the transient is at
+`.benchmark-artifacts/over100-reports/oom255k/verify_kv_peak_probe.py`.

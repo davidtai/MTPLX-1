@@ -496,8 +496,45 @@ class TensorOffsetKVCache:
         )
         self._granted = True
 
+    def _concrete_offset(self):
+        """The host-int offset when it is a materialized value, else None.
+
+        During an ``mx.compile`` trace ``cache[2]`` is a tracer and ``.item()``
+        raises; on the eager (demoted) verify path it is a concrete scalar.
+        """
+        try:
+            return int(self.cache[2].item())
+        except Exception:
+            return None
+
     def update_and_fetch(self, keys, values):
         steps = int(keys.shape[2])
+        off_i = self._concrete_offset()
+        if off_i is not None:
+            # Eager (demoted) verify: write the S new rows in place. The
+            # functional ``mx.slice_update`` below reallocates the WHOLE
+            # [1, 2, capacity, 256] buffer per key and value tensor when the
+            # compiled graph cannot donate it (267 MB each at 262K, 6.4 GB
+            # across the 12 full-attention layers) -- the transient that OOMs a
+            # 261,120-token verify while an S=1 AR decode on the stock KVCache,
+            # which writes in place, fits. Mirror the stock in-place write on
+            # this path. The rollback snapshot is a materialized independent
+            # copy of the pre-write rows, so the in-place write cannot corrupt
+            # it and a later ``trim`` restores exactly the same bytes.
+            end = off_i + steps
+            snap_k = mx.contiguous(self.cache[0][:, :, off_i:end, :])
+            snap_v = mx.contiguous(self.cache[1][:, :, off_i:end, :])
+            mx.eval(snap_k, snap_v)
+            self.rollback_state[0] = self.cache[2]
+            self.rollback_state[1] = snap_k
+            self.rollback_state[2] = snap_v
+            self.cache[0][:, :, off_i:end, :] = keys
+            self.cache[1][:, :, off_i:end, :] = values
+            self.cache[2] = self.cache[2] + steps
+            return self.cache[0], self.cache[1]
+        # Compiled trace: keep the compile-visible functional path so
+        # mx.compile(inputs=..., outputs=...) can donate the buffers in the
+        # replayed graph.
         self.rollback_state[0] = self.cache[2]
         self.rollback_state[1] = mx.slice(
             self.cache[0],
@@ -554,19 +591,31 @@ class TensorOffsetKVCache:
             and self.rollback_state[2] is not None
             and int(self.rollback_state[1].shape[2]) == n
         ):
-            self.cache[0] = mx.slice_update(
-                self.cache[0],
-                self.rollback_state[1],
-                self.rollback_state[0],
-                axes=(2,),
-            )
-            self.cache[1] = mx.slice_update(
-                self.cache[1],
-                self.rollback_state[2],
-                self.rollback_state[0],
-                axes=(2,),
-            )
-            self.cache[2] = self.rollback_state[0]
+            try:
+                back_i = int(self.rollback_state[0].item())
+            except Exception:
+                back_i = None
+            if back_i is not None:
+                # Eager restore: put the saved rows back in place instead of
+                # reallocating the full buffer (same 6.4 GB avoidance as
+                # update_and_fetch's eager write).
+                self.cache[0][:, :, back_i:back_i + n, :] = self.rollback_state[1]
+                self.cache[1][:, :, back_i:back_i + n, :] = self.rollback_state[2]
+                self.cache[2] = self.rollback_state[0]
+            else:
+                self.cache[0] = mx.slice_update(
+                    self.cache[0],
+                    self.rollback_state[1],
+                    self.rollback_state[0],
+                    axes=(2,),
+                )
+                self.cache[1] = mx.slice_update(
+                    self.cache[1],
+                    self.rollback_state[2],
+                    self.rollback_state[0],
+                    axes=(2,),
+                )
+                self.cache[2] = self.rollback_state[0]
         else:
             self.cache[2] = mx.maximum(
                 self.cache[2] - n,
