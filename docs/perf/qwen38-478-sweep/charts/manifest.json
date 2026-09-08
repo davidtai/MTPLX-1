@@ -1,7 +1,7 @@
 [
   {
     "alt": "Pass rate against completion tokens in log-spaced bins, one line per typical threshold plus the release arm, with a task-count table under the axis and a cap-hit column",
-    "bytes": 129274,
+    "bytes": 129288,
     "caption": "_Pass rate against how long the completion ran, per typical threshold. Every bin is joined and the y-range comes from the data, so no point falls off the axis and breaks a line. Series carry a small constant downward offset so lines that share a value can be told apart; the offset never changes the values or the counts. Cap hits are off the axis, with their counts in the right-hand column. Scored from the re-scored HumanEval rows._",
     "engines": [
       "sweep off",
@@ -15,9 +15,9 @@
     "label": "HumanEval pass rate by completion length"
   },
   {
-    "alt": "Grouped bars of pass rate against per-request decode speed in fixed log-spaced tok/s bins, one bar per typical threshold plus the release arm, each labelled failed over total",
-    "bytes": 154994,
-    "caption": "_Pass rate against per-request decode speed, in fixed log-spaced bins, as grouped bars: several series share the same rate, which lines draw on top of each other. Each bar is labelled failed/total. The eval ran 4 concurrent requests, so this speed is relative to that concurrency, not the single-stream 16K figure. Cap hits are excluded from the bins, with their counts in the right-hand column. Scored from the re-scored HumanEval rows._",
+    "alt": "Grouped bars of the percentage of tasks passed against per-request decode speed in fixed log-spaced tok/s bins, one bar per typical threshold plus the release arm, each labelled with its percentage",
+    "bytes": 155604,
+    "caption": "_Percentage of tasks passed against per-request decode speed, in fixed log-spaced bins, as grouped bars: several thresholds share the same rate, which lines draw on top of each other. Each bar is labelled with its percentage above the bar; the task count per bin is in the table under the axis. The eval ran 4 concurrent requests, so this speed is relative to that concurrency, not the single-stream 16K figure. Cap hits are excluded from the bins, with their counts in the right-hand column. Scored from the re-scored HumanEval rows._",
     "engines": [
       "sweep off",
       "sweep delta0.09",
@@ -27,7 +27,7 @@
     ],
     "file": "acc_vs_speed.svg",
     "key": "acc_vs_speed",
-    "label": "HumanEval pass rate by per-request decode speed"
+    "label": "HumanEval tasks passed by per-request decode speed"
   },
   {
     "alt": "Decode tok/s for the twelve interleaved 16K windows in run order plus the typical sweep's own windows past a separator, fastest seed as the point with a min-max band, one colour per arm or threshold",
