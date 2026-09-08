@@ -1,0 +1,18 @@
+[
+  {
+    "alt": "Decode tok/s by cascade alpha, fastest of three with a min-max band, and two reference lines for the exact law and typical acceptance at 0.09",
+    "bytes": 60773,
+    "caption": "_Decode tok/s by cascade alpha, fastest of three seeds with a min-max band. The dashed line is the exact law (82.80) and the dotted line typical acceptance at 0.09 (104.65), both from the pooled 16K windows in #478. Alpha >= 1.0 saturates at accept 1.0 and the two highest alphas coincide._",
+    "file": "cascade_decode_vs_alpha.svg",
+    "key": "cascade_decode_vs_alpha",
+    "label": "cascade decode by alpha"
+  },
+  {
+    "alt": "Cascade accept rate and tokens per cycle by alpha on two y-axes",
+    "bytes": 61850,
+    "caption": "_Cascade accept rate (left axis) and tokens per cycle (right axis) by alpha, from the run's cascade-accept metrics rather than the receipts. Higher alpha accepts more drafted tokens per verify._",
+    "file": "cascade_accept_vs_alpha.svg",
+    "key": "cascade_accept_vs_alpha",
+    "label": "cascade acceptance and tokens/cycle by alpha"
+  }
+]
