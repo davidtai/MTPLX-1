@@ -1,8 +1,8 @@
 [
   {
-    "alt": "Pass rate against completion tokens in log-spaced bins on a 0.70 to 1.00 axis, one line per typical threshold plus the release arm, task-count table under the axis and a cap-hit count column at the right",
-    "bytes": 123698,
-    "caption": "_Pass rate against how long the completion ran, per typical threshold, on a [0.70, 1.00] axis so the differences are visible. Cap hits are off the axis (their rate is 0 by construction) with their counts in the right-hand column; a bin below the axis floor is marked with a down-triangle and its value. Bins with fewer than three tasks are hollow and left out of the line. Scored from the re-scored HumanEval rows._",
+    "alt": "Pass rate against completion tokens in log-spaced bins, one line per typical threshold plus the release arm, with a task-count table under the axis and a cap-hit column",
+    "bytes": 129274,
+    "caption": "_Pass rate against how long the completion ran, per typical threshold. Every bin is joined and the y-range comes from the data, so no point falls off the axis and breaks a line. Series carry a small constant downward offset so lines that share a value can be told apart; the offset never changes the values or the counts. Cap hits are off the axis, with their counts in the right-hand column. Scored from the re-scored HumanEval rows._",
     "engines": [
       "sweep off",
       "sweep delta0.09",
@@ -15,9 +15,9 @@
     "label": "HumanEval pass rate by completion length"
   },
   {
-    "alt": "Pass rate against per-request decode speed in fixed log-spaced tok/s bins, one line per typical threshold plus the release arm, cap hits excluded and counted separately",
-    "bytes": 127215,
-    "caption": "_Pass rate against per-request decode speed in fixed log-spaced bins. The eval ran 4 concurrent requests, so this speed is a relative measure under that concurrency, not the single-stream 16K figure. Cap hits are excluded from the bins entirely, since they generate the full 32,768 tokens at high throughput and would make a length effect look like a speed one; their counts are in the right-hand column. Scored from the re-scored HumanEval rows._",
+    "alt": "Grouped bars of pass rate against per-request decode speed in fixed log-spaced tok/s bins, one bar per typical threshold plus the release arm, each labelled failed over total",
+    "bytes": 154994,
+    "caption": "_Pass rate against per-request decode speed, in fixed log-spaced bins, as grouped bars: several series share the same rate, which lines draw on top of each other. Each bar is labelled failed/total. The eval ran 4 concurrent requests, so this speed is relative to that concurrency, not the single-stream 16K figure. Cap hits are excluded from the bins, with their counts in the right-hand column. Scored from the re-scored HumanEval rows._",
     "engines": [
       "sweep off",
       "sweep delta0.09",
