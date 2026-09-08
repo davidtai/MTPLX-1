@@ -798,16 +798,19 @@ def _installation_report(
     routed_glu_enabled: bool = False,
     route_kernel_enabled: bool = False,
     route_kernel_vec_lanes: int | None = None,
+    routed_group_size: int = 32,
+    routed_bits: int = 4,
 ) -> dict[str, Any]:
+    routed_tag = f"q{int(routed_bits)}g{int(routed_group_size)}"
     return {
         "installed": True,
         "layers": layer_count,
         "rows": 4,
         "max_abs_diff": max_delta,
         "boundary": (
-            "paired_routed_q4g32_glu_reduce_shared_add_mlp_residual"
+            f"paired_routed_{routed_tag}_glu_reduce_shared_add_mlp_residual"
             if routed_glu_enabled
-            else "routed_q4g32_reduce_shared_add_mlp_residual"
+            else f"routed_{routed_tag}_reduce_shared_add_mlp_residual"
             if routed_down_residual_tail_enabled
             else "stock_qmm_combine_tail"
         ),
@@ -816,7 +819,7 @@ def _installation_report(
             if routed_down_residual_tail_enabled
             else "stock_sparse_moe_block"
         ),
-        "routed": "stock_q4/g32",
+        "routed": f"stock_q{int(routed_bits)}/g{int(routed_group_size)}",
         "shared": "stock_q8/g64",
         "routed_down_reduce": routed_down_reduce_enabled,
         "routed_down_residual_tail": routed_down_residual_tail_enabled,
@@ -874,6 +877,12 @@ def _routed_group_size(text: Any) -> int:
     """The affine group the pack quantized the routed experts to (32 or 64)."""
 
     return int(text.model.layers[0].mlp.switch_mlp.down_proj.group_size)
+
+
+def _routed_bits(text: Any) -> int:
+    """The bit width the pack quantized the routed experts to (e.g. 4)."""
+
+    return int(text.model.layers[0].mlp.switch_mlp.down_proj.bits)
 
 
 def install_qwen4_m4_stage3(
@@ -1095,6 +1104,8 @@ def _install_qwen4_m4_stage3_impl(
         routed_glu_enabled=routed_glu_enabled,
         route_kernel_enabled=route_kernel_enabled,
         route_kernel_vec_lanes=route_kernel_vec_lanes,
+        routed_group_size=routed_group_size,
+        routed_bits=_routed_bits(text),
     )
     runtime.qwen4_m4_stage3_report = report
     return report
