@@ -16495,6 +16495,52 @@ def _int_env(name: str) -> int | None:
         return None
 
 
+def _cascade_acceptance_health_payload() -> dict[str, Any]:
+    """Resolved speculative-cascade acceptance lane state, for ``/health``.
+
+    A SECOND lossy verify rule beside typical acceptance (Narasimhan et al.
+    2024, arXiv:2405.19261, "Faster Cascades via Speculative Decoding", Eq.
+    (10)). OFF unless the operator sets MTPLX_FABLE_CASCADE_THRESHOLD (server
+    flag ``--cascade-threshold``); unset leaves the exact speculative law
+    unchanged. When on it is NOT distribution-exact: it accepts the draft token
+    whenever ``max_v q(v) >= max_v p(v) - alpha*D_TV(p,q)`` and otherwise defers
+    to the exact ``min(1, p/q)`` coin + residual. Mutually exclusive with the
+    typical lane (both set is a fail-loud misconfiguration). See
+    docs/perf/pr478-cascade-acceptance.md.
+    """
+    raw = os.environ.get("MTPLX_FABLE_CASCADE_THRESHOLD")
+    enabled = raw is not None and str(raw).strip() != ""
+    alpha: float | None = None
+    if enabled:
+        try:
+            alpha = float(raw)
+        except ValueError:
+            alpha = None
+            enabled = False
+    typical_on = False
+    tv = os.environ.get("MTPLX_FABLE_TYPICAL_THRESHOLD")
+    try:
+        typical_on = tv is not None and float(tv) > 0.0
+    except ValueError:
+        typical_on = False
+    return {
+        "enabled": enabled,
+        "alpha": alpha,
+        "threshold": alpha,
+        "rule": "defer iff max_q < max_p - alpha*D_TV(p,q); else accept draft",
+        "divergence": "D_TV(p,q) = sum_v max(0, p(v)-q(v)) over scored top-k",
+        "distribution_exact": not enabled,
+        "mutually_exclusive_with_typical": True,
+        "conflict": bool(enabled and typical_on),
+        "citation": "arXiv:2405.19261 Eq. (10)",
+        "note": (
+            "OFF unless --cascade-threshold (MTPLX_FABLE_CASCADE_THRESHOLD) is "
+            "set; when on it is NOT distribution-exact and engages only at "
+            "temperature > 0; mutually exclusive with --typical-threshold"
+        ),
+    }
+
+
 def _startup_health_payload(state: "ServerState") -> dict[str, Any]:
     chat_template_report = getattr(state, "chat_template_report", {}) or {}
     tool_prompt_mode = _tool_prompt_mode_from_args(state.args)
@@ -29074,6 +29120,7 @@ def create_app(state: ServerState) -> FastAPI:
                 "actual_ramp_latency_s"
             ),
             "startup": _startup_health_payload(state),
+            "cascade_acceptance": _cascade_acceptance_health_payload(),
             "thermal": _thermal_health_payload(
                 fan_mode=fan_mode,
                 smart_status=smart_status,
@@ -36320,6 +36367,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Load and inject the native MTP sidecar. Disable only for stock AR diagnostics.",
     )
     parser.add_argument(
+        "--cascade-threshold",
+        type=float,
+        default=None,
+        metavar="ALPHA",
+        help=(
+            "Enable speculative-cascade acceptance (arXiv:2405.19261 Eq. (10)) "
+            "at this deferral cost alpha: accept the draft token when "
+            "max_q >= max_p - alpha*D_TV(p,q), else defer to the exact "
+            "min(1,p/q) coin + residual. Unset = OFF = exact speculative "
+            "sampling (the default); any set value (including 0) turns it on. "
+            "Higher alpha widens the accept band (fewer defers). NOT "
+            "distribution-exact; engages only at temperature > 0. Mutually "
+            "exclusive with --typical-threshold (setting both is an error). "
+            "Environment: MTPLX_FABLE_CASCADE_THRESHOLD, which this flag "
+            "overrides. See docs/perf/pr478-cascade-acceptance.md."
+        ),
+    )
+    parser.add_argument(
         "--ngram-prewarm",
         metavar="auto|all|off|GiB",
         # Not a boolean, and default=None rather than "auto": the flag has an
@@ -36853,6 +36918,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "off" if args.strip_assistant_reasoning_history else args.preserve_thinking
     )
     args.strip_assistant_reasoning_history = not _preserve_thinking_effective(args)
+    if getattr(args, "cascade_threshold", None) is not None:
+        # Same flag-beats-env contract; generation.py reads the env per request.
+        # Unlike the typical delta, any set value (including 0) turns the lane
+        # on, so only pass --cascade-threshold to enable it.
+        os.environ["MTPLX_FABLE_CASCADE_THRESHOLD"] = str(float(args.cascade_threshold))
+    # Fail loud on the mutually exclusive lossy verify rules, whether they were
+    # set by flag (stamped just above) or already present in the environment.
+    _typ_env = os.environ.get("MTPLX_FABLE_TYPICAL_THRESHOLD")
+    _cas_env = os.environ.get("MTPLX_FABLE_CASCADE_THRESHOLD")
+    _typ_on = False
+    try:
+        _typ_on = _typ_env is not None and float(_typ_env) > 0.0
+    except ValueError:
+        _typ_on = False
+    _cas_on = _cas_env is not None and str(_cas_env).strip() != ""
+    if _typ_on and _cas_on:
+        raise SystemExit(
+            "error: --typical-threshold and --cascade-threshold are mutually "
+            "exclusive lossy verify rules; set at most one "
+            f"(typical={_typ_env!r}, cascade={_cas_env!r})."
+        )
     return args
 
 

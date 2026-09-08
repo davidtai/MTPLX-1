@@ -288,6 +288,86 @@ def residual_distribution(target_p: Distribution, draft_q: Distribution) -> Dist
     return residual / total
 
 
+def _peak_probability(distribution: Distribution) -> float:
+    """The largest single-token mass in ``distribution`` (``max_v P(v)``)."""
+    if isinstance(distribution, SparseDistribution):
+        probs = np.asarray(distribution.probs, dtype=np.float64)
+    else:
+        probs = np.asarray(distribution, dtype=np.float64)
+    probs = probs[np.isfinite(probs)]
+    if probs.size == 0:
+        return 0.0
+    return float(probs.max())
+
+
+def total_variation(target_p: Distribution, draft_q: Distribution) -> float:
+    """``D_TV(p, q) = sum_v max(0, p(v) - q(v))`` over the scored top-k support.
+
+    This is the total-variation divergence in the one-sided form the cascade
+    paper writes it (Narasimhan et al. 2024, arXiv:2405.19261, Eq. (8)); it is
+    the same unnormalized mass ``residual_distribution`` renormalizes. Taken
+    over the UNION of the two supports (the truncated target row and the draft
+    head's sparse rows), so tokens the draft scores but the target truncated
+    away, and vice versa, both count. Bounded in [0, 1].
+    """
+    if isinstance(target_p, SparseDistribution) or isinstance(draft_q, SparseDistribution):
+        if isinstance(target_p, SparseDistribution) and isinstance(draft_q, SparseDistribution):
+            token_ids = np.union1d(target_p.token_ids, draft_q.token_ids)
+            tv = 0.0
+            for token in token_ids:
+                diff = target_p.probability(int(token)) - draft_q.probability(int(token))
+                if diff > 0:
+                    tv += diff
+            return float(tv)
+        dense_target = _as_dense(target_p)
+        dense_draft = _as_dense(draft_q)
+    else:
+        dense_target = np.asarray(target_p, dtype=np.float64)
+        dense_draft = np.asarray(draft_q, dtype=np.float64)
+    diff = dense_target - dense_draft
+    return float(np.sum(diff[np.isfinite(diff) & (diff > 0.0)]))
+
+
+def cascade_defer_decision(
+    target_p: Distribution,
+    draft_q: Distribution,
+    *,
+    alpha: float,
+    tv_value: float | None = None,
+) -> tuple[bool, float]:
+    """Speculative-cascade plug-in deferral rule.
+
+    Narasimhan, Mreddy, Jitkrittum, Rawat, Kumar, "Faster Cascades via
+    Speculative Decoding", ICLR 2025 / arXiv:2405.19261 v2, Eq. (10) (the
+    plug-in approximation to the optimal deferral rule of Eq. (8)):
+
+        r_OPT(x_<t) = 1  <=>  max_v q(v) < max_v p(v) - alpha * D_TV(p, q)
+
+    ``r = 1`` DEFERS to the large (target) model; ``r = 0`` accepts the small
+    (draft) model's token. Returns ``(defer, tv)``.
+
+    The draft is 'good enough' (do NOT defer) when its peak confidence
+    ``max_v q(v)`` is within ``alpha * D_TV(p, q)`` of the target's peak
+    ``max_v p(v)``. Not deferring means the effective speculative-cascade target
+    is ``pi = q`` (Sec. 4.1), so Algorithm 4's speculative-execution accept
+    probability ``min(1, pi(x)/q(x)) = 1`` and the draft token is accepted with
+    no coin. Deferring sets ``pi = p``, which is exactly the lossless
+    speculative-decoding law: accept with ``min(1, p(x)/q(x))`` and, on
+    rejection, resample the residual ``norm(max(0, p - q))``.
+
+    ``alpha`` (the operator knob) is the Eq. (8) deferral cost. Higher ``alpha``
+    lowers the RHS, so the accept band widens and FEWER positions defer (faster,
+    lossier); ``alpha = 0`` defers whenever the target is strictly more
+    confident than the draft. The decision is DETERMINISTIC (consumes no
+    uniform) -- the coin only appears on the deferred exact path.
+    """
+    tv = total_variation(target_p, draft_q) if tv_value is None else float(tv_value)
+    peak_p = _peak_probability(target_p)
+    peak_q = _peak_probability(draft_q)
+    defer = peak_q < (peak_p - float(alpha) * tv)
+    return (defer, tv)
+
+
 def sample_from_distribution(probs: Distribution, rng: np.random.Generator | None = None) -> int:
     rng = rng or np.random.default_rng()
     if isinstance(probs, SparseDistribution):

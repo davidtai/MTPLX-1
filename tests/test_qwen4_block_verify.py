@@ -322,9 +322,16 @@ def test_the_shipped_law_survives_verbatim_in_the_accept_loop():
     assert "residual_distribution(\n" in loop
     assert "else target_distribution_batch.to_distribution(depth_index)," in loop
     # The accept coin is still drawn once per depth and compared with `<=`,
-    # so arming block verification cannot shift the PCG64 stream.
-    assert loop.count("accepted_now = float(rng.random()) <= accept_prob") == 2
-    assert loop.count("rng.random()") == 2
+    # so arming block verification cannot shift the PCG64 stream. The exact law
+    # appears in four places now: the two shipped exact branches (batched +
+    # lazy) plus the two speculative-cascade DEFER paths (batched + lazy), which
+    # reuse the identical coin verbatim. The cascade paths are gated behind
+    # `_cascade_active` (MTPLX_FABLE_CASCADE_THRESHOLD, off by default and
+    # mutually exclusive with block verification's own lane), so with the
+    # cascade lane off the coin still fires exactly once per depth and the
+    # block-verification RNG guarantee is unchanged.
+    assert loop.count("accepted_now = float(rng.random()) <= accept_prob") == 4
+    assert loop.count("rng.random()") == 4
 
 
 def test_every_block_verification_read_is_guarded():

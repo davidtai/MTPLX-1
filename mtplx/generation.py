@@ -100,6 +100,7 @@ from .sampling import (
     SamplerConfig,
     SparseDistribution,
     acceptance_probability as compute_acceptance_probability,
+    cascade_defer_decision,
     distribution_from_logits as dense_distribution_from_logits,
     residual_distribution,
     sample_from_distribution,
@@ -606,6 +607,57 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, str(default)))
     except (TypeError, ValueError):
         return int(default)
+
+
+def _cascade_accept_alpha() -> float | None:
+    """MTPLX_FABLE_CASCADE_THRESHOLD (server flag --cascade-threshold): the
+    speculative-cascade deferral cost alpha, or None when the lane is OFF.
+
+    A SECOND lossy verify rule beside typical acceptance (Narasimhan et al.
+    2024, arXiv:2405.19261, Eq. (10)). UNSET (or blank) leaves the lane off and
+    the exact speculative law runs byte-for-byte. Any set value -- including an
+    explicit 0.0 -- turns the lane on with that alpha, so the off-switch is
+    UNSETTING the key, not setting it to 0 (alpha=0 still defers whenever the
+    target is strictly more confident). Higher alpha widens the accept band, so
+    fewer positions defer. Mutually exclusive with the typical lane
+    (MTPLX_FABLE_TYPICAL_THRESHOLD); the verify setup fails loud if both are on.
+    Resolved at use, per request.
+    """
+    raw = os.environ.get("MTPLX_FABLE_CASCADE_THRESHOLD")
+    if raw is None or str(raw).strip() == "":
+        return None
+    return float(raw)  # a malformed value fails loud, never silently disables
+
+
+def _cascade_accept_enabled() -> bool:
+    """The speculative-cascade lane is ON iff the alpha knob is set (any value)."""
+    return _cascade_accept_alpha() is not None
+
+
+def _assert_lossy_verify_rules_exclusive() -> None:
+    """Fail loud when both lossy verify rules are armed at once.
+
+    Typical acceptance and speculative-cascade acceptance are two different
+    lossy replacements for the exact speculative law; running both would make
+    one silently mask the other. This is the cascade-only PEER of #478 (typical):
+    the two are alternative modes and were never intended to be armed together,
+    and the typical lane's code is not present on this branch, so the guard is
+    inert here and retained defensively. It reads MTPLX_FABLE_TYPICAL_THRESHOLD
+    from the environment directly (resolved at use), so it still fires if a
+    typical threshold is ever exported alongside the cascade knob.
+    """
+    alpha = _cascade_accept_alpha()
+    raw_typical = os.environ.get("MTPLX_FABLE_TYPICAL_THRESHOLD")
+    try:
+        typical = float(raw_typical) if raw_typical not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        typical = 0.0
+    if alpha is not None and typical > 0.0:
+        raise ValueError(
+            "MTPLX_FABLE_CASCADE_THRESHOLD and MTPLX_FABLE_TYPICAL_THRESHOLD are "
+            "mutually exclusive lossy verify rules; set at most one "
+            f"(cascade alpha={alpha}, typical delta={typical})."
+        )
 
 
 def _generation_rate_fields(
@@ -2676,6 +2728,17 @@ class GenerationStats:
     drafted_by_depth: list[int] = field(default_factory=list)
     accept_probability_sum_by_depth: list[float] = field(default_factory=list)
     mean_accept_probability_by_depth: list[float | None] = field(default_factory=list)
+    # Speculative-cascade acceptance (MTPLX_FABLE_CASCADE_THRESHOLD set;
+    # arXiv:2405.19261). All zero/false on the exact-rule and typical paths.
+    # cascade_positions is every draft position the cascade rule decided;
+    # cascade_accepted / cascade_resamples split it; cascade_mean_divergence is
+    # the mean total-variation D_TV(p,q); cascade_alpha carries the knob.
+    cascade_accept_enabled: bool = False
+    cascade_alpha: float = 0.0
+    cascade_positions: int = 0
+    cascade_accepted: int = 0
+    cascade_resamples: int = 0
+    cascade_mean_divergence: float = 0.0
     # Which commit path produced the stop token when finish_reason == "stop"
     # (#414 telemetry): accepted_draft | residual_correction | bonus |
     # primary | context_copy | repetition_stop | grammar_terminal | unknown.
@@ -8691,6 +8754,16 @@ def generate_mtpk(
     # vLLM-exact). Counts are rebuilt from `tokens` at each sample point — simple
     # and drift-proof; an incremental counter is a documented perf follow-up.
     _penalties_active = bool(sampler.presence_penalty) or bool(sampler.frequency_penalty)
+    # Speculative-cascade acceptance (arXiv:2405.19261, Eq. (10)): a SECOND
+    # lossy verify rule beside typical acceptance, mutually exclusive with it.
+    # OFF unless MTPLX_FABLE_CASCADE_THRESHOLD is set (server flag
+    # --cascade-threshold), and, like typical, engages only at temperature > 0
+    # (at <= 0 the primary is the argmax and greedy acceptance already
+    # coincides). alpha is the deferral cost; the decision is deterministic and
+    # the deferred path is the exact min(1, p/q) coin + residual.
+    _assert_lossy_verify_rules_exclusive()
+    _cascade_alpha = _cascade_accept_alpha()
+    _cascade_active = _cascade_alpha is not None and sampler.temperature > 0
     # Loop Guard: loop-armed DRY-style steering (see mtplx/loop_guard.py).
     # Disarmed = zero distribution impact (identity transform, fast paths kept).
     # Armed = target distributions get sparse anti-cycle penalties per position;
@@ -8732,6 +8805,14 @@ def generate_mtpk(
     append_event = events.append if record_events else (lambda _event: None)
     accepted = rejected = drafted = 0
     bonus_tokens = correction_tokens = verify_calls = 0
+    # Speculative-cascade per-request counters (only move when _cascade_active).
+    # cascade_positions is every draft position the cascade rule decided;
+    # cascade_accepted / cascade_resamples split it (an accepted draft on either
+    # the non-defer shortcut or the deferred coin, vs a deferred coin-reject
+    # resampled from the exact residual); cascade_divergence_sum feeds the mean
+    # total-variation divergence on the verdict line.
+    cascade_positions = cascade_accepted = cascade_resamples = 0
+    cascade_divergence_sum = 0.0
     stop_origin: str | None = None
     accepted_by_depth = [0 for _ in range(speculative_depth)]
     drafted_by_depth = [0 for _ in range(speculative_depth)]
@@ -12286,6 +12367,51 @@ def generate_mtpk(
                 accepted_now = int(draft_token) == target_token
                 accept_prob = 1.0 if accepted_now else 0.0
                 correction = target_token
+            elif _cascade_active and target_distribution_batch is not None:
+                # Speculative-cascade acceptance, batched-target rows
+                # (arXiv:2405.19261, Eq. (10) + Algorithm 4). The deferral
+                # decision is deterministic (no coin): accept the draft when
+                # max_q >= max_p - alpha*D_TV(p,q). Deferring falls back to the
+                # EXACT law -- min(1, p/q) coin + residual -- so this branch is a
+                # superset of the exact rule with a draft-accept shortcut.
+                draft_q = draft_probs[depth_index]
+                if draft_q is None:
+                    raise RuntimeError("non-greedy MTP requires draft distributions")
+                target_p_for_cache = target_distribution_batch.to_distribution(
+                    depth_index
+                )
+                _defer, _cas_tv = cascade_defer_decision(
+                    target_p_for_cache, draft_q, alpha=_cascade_alpha
+                )
+                cascade_positions += 1
+                cascade_divergence_sum += _cas_tv
+                if not _defer:
+                    # Draft good enough (pi = q): accept, no coin.
+                    accepted_now = True
+                    accept_prob = 1.0
+                    correction = draft_token
+                    cascade_accepted += 1
+                else:
+                    # Defer (pi = p): exact speculative law, same as the exact
+                    # branch below.
+                    p = target_distribution_batch.probability(depth_index, draft_token)
+                    q = (
+                        draft_q.probability(draft_token)
+                        if isinstance(draft_q, SparseDistribution)
+                        else float(draft_q[draft_token])
+                    )
+                    accept_prob = (
+                        1.0 if q <= 0 and p > 0 else (0.0 if q <= 0 else min(1.0, p / q))
+                    )
+                    accepted_now = float(rng.random()) <= accept_prob
+                    if accepted_now:
+                        correction = draft_token
+                        cascade_accepted += 1
+                    else:
+                        correction = sample_from_distribution(
+                            residual_distribution(target_p_for_cache, draft_q), rng
+                        )
+                        cascade_resamples += 1
             elif target_distribution_batch is not None:
                 draft_q = draft_probs[depth_index]
                 if draft_q is None:
@@ -12362,27 +12488,56 @@ def generate_mtpk(
                 draft_q = draft_probs[depth_index]
                 if draft_q is None:
                     raise RuntimeError("non-greedy MTP requires draft distributions")
-                accept_prob = compute_acceptance_probability(
-                    target_p, draft_q, draft_token
-                )
-                if _bv is not None:
-                    # Block verification: see the batched branch above. `_bv`
-                    # is only ever built when every target row was already
-                    # materialised, so it is None on the lazy path that just
-                    # built `target_p` here.
-                    accept_prob = _bv.accept_probability[depth_index]
-                accepted_now = float(rng.random()) <= accept_prob
                 target_p_for_cache = target_p
-                if accepted_now:
-                    correction = draft_token
-                elif _bv is not None:
-                    correction = sample_from_distribution(
-                        _bv.scaled_residual(depth_index), rng
+                if _cascade_active:
+                    # Speculative-cascade acceptance, lazy/per-row target. Same
+                    # law as the batched branch: deterministic Eq.(10) deferral,
+                    # accept the draft when it is good enough, otherwise the
+                    # exact min(1, p/q) coin + residual.
+                    _defer, _cas_tv = cascade_defer_decision(
+                        target_p, draft_q, alpha=_cascade_alpha
                     )
+                    cascade_positions += 1
+                    cascade_divergence_sum += _cas_tv
+                    if not _defer:
+                        accepted_now = True
+                        accept_prob = 1.0
+                        correction = draft_token
+                        cascade_accepted += 1
+                    else:
+                        accept_prob = compute_acceptance_probability(
+                            target_p, draft_q, draft_token
+                        )
+                        accepted_now = float(rng.random()) <= accept_prob
+                        if accepted_now:
+                            correction = draft_token
+                            cascade_accepted += 1
+                        else:
+                            correction = sample_from_distribution(
+                                residual_distribution(target_p, draft_q), rng
+                            )
+                            cascade_resamples += 1
                 else:
-                    correction = sample_from_distribution(
-                        residual_distribution(target_p, draft_q), rng
+                    accept_prob = compute_acceptance_probability(
+                        target_p, draft_q, draft_token
                     )
+                    if _bv is not None:
+                        # Block verification: see the batched branch above. `_bv`
+                        # is only ever built when every target row was already
+                        # materialised, so it is None on the lazy path that just
+                        # built `target_p` here.
+                        accept_prob = _bv.accept_probability[depth_index]
+                    accepted_now = float(rng.random()) <= accept_prob
+                    if accepted_now:
+                        correction = draft_token
+                    elif _bv is not None:
+                        correction = sample_from_distribution(
+                            _bv.scaled_residual(depth_index), rng
+                        )
+                    else:
+                        correction = sample_from_distribution(
+                            residual_distribution(target_p, draft_q), rng
+                        )
                 if not accepted_now and _env_truthy("MTPLX_DELTA_TELEMETRY"):
                     # Tree Stage-0 pricing (2026-08-25): would a sibling branch
                     # have caught this rejection? Record the rank of the
@@ -13564,6 +13719,16 @@ def generate_mtpk(
             accept_probability_sum_by_depth,
             drafted_by_depth,
         ),
+        cascade_accept_enabled=bool(_cascade_active),
+        cascade_alpha=float(_cascade_alpha) if _cascade_active else 0.0,
+        cascade_positions=int(cascade_positions),
+        cascade_accepted=int(cascade_accepted),
+        cascade_resamples=int(cascade_resamples),
+        cascade_mean_divergence=(
+            float(cascade_divergence_sum / cascade_positions)
+            if cascade_positions
+            else 0.0
+        ),
         bonus_tokens=bonus_tokens,
         correction_tokens=correction_tokens,
         verify_calls=verify_calls,
@@ -13949,6 +14114,22 @@ def generate_mtpa(
         stop_token_ids=stop_token_ids,
         max_tokens=max_tokens,
     )
+    if _cascade_active:
+        _cas_denom = cascade_accepted + cascade_resamples
+        _cas_rate = (cascade_accepted / _cas_denom) if _cas_denom else 0.0
+        _cas_cycles = max(1, verify_calls)
+        print(
+            "[cascade-accept] NOT distribution-exact; "
+            f"threshold={_cascade_alpha:.4g} alpha={_cascade_alpha:.4g} "
+            f"positions={cascade_positions} accepted={cascade_accepted} "
+            f"resamples={cascade_resamples} accept_rate={_cas_rate:.4f} "
+            f"mean_divergence={stats.cascade_mean_divergence:.4f} "
+            f"tokens_per_cycle={len(tokens) / _cas_cycles:.3f} "
+            f"accepted_by_depth={accepted_by_depth} "
+            f"generated={len(tokens)} verify_calls={verify_calls}",
+            file=sys.stderr,
+            flush=True,
+        )
     return GenerationOutput(
         tokens=tokens,
         text=_decode(rt.tokenizer, _strip_terminal_stop(tokens, stop_token_ids)),
