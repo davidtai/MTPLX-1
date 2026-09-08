@@ -15,9 +15,9 @@
     "label": "HumanEval pass rate by completion length"
   },
   {
-    "alt": "Grouped bars of the percentage of tasks passed against per-request decode speed in fixed log-spaced tok/s bins, one bar per typical threshold plus the release arm, each labelled with its percentage",
-    "bytes": 155604,
-    "caption": "_Percentage of tasks passed against per-request decode speed, in fixed log-spaced bins, as grouped bars: several thresholds share the same rate, which lines draw on top of each other. Each bar is labelled with its percentage above the bar; the task count per bin is in the table under the axis. The eval ran 4 concurrent requests, so this speed is relative to that concurrency, not the single-stream 16K figure. Cap hits are excluded from the bins, with their counts in the right-hand column. Scored from the re-scored HumanEval rows._",
+    "alt": "Grouped bars of the percentage of tasks passed against per-request decode speed in fixed linear tok/s bins, one bar per typical threshold plus the release arm, each labelled with its percentage",
+    "bytes": 143690,
+    "caption": "_Percentage of tasks passed against per-request decode speed, in fixed linear bins, as grouped bars: several thresholds share the same rate, which lines draw on top of each other. Each bar is labelled with its percentage above the bar; the task count per bin is in the table under the axis. The eval ran 4 concurrent requests, so this speed is relative to that concurrency, not the single-stream 16K figure. Cap hits are excluded from the bins, with their counts in the right-hand column. Scored from the re-scored HumanEval rows._",
     "engines": [
       "sweep off",
       "sweep delta0.09",
