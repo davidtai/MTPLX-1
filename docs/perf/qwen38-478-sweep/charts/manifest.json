@@ -1,0 +1,31 @@
+[
+  {
+    "alt": "Decode tok/s for the twelve interleaved 16K windows in run order plus the typical sweep's own windows past a separator, fastest seed as the point with a min-max band, one colour per arm or threshold",
+    "bytes": 126328,
+    "caption": "_The twelve interleaved 16K windows (A C D E x three rounds) in run order, then the typical sweep's own windows past the dotted separator. Each point is the window's fastest seed; the band is min-max over its three seeds. The dashed line is each arm's fastest window. A drift (first vs last) = +0.17 tok/s (+0.24%)._",
+    "engines": [
+      "arm-A-release",
+      "arm-C-aux475",
+      "arm-D-t478-020",
+      "arm-E-t478-009"
+    ],
+    "file": "decode_16k_windows.svg",
+    "key": "decode_16k_windows",
+    "label": "16K ABAB decode by window"
+  },
+  {
+    "alt": "Decode tok/s against HumanEval pass@1, one labelled point per typical threshold plus the release arm, filled marker strict and hollow marker completed-task pass@1, horizontal band the pooled min-max decode",
+    "bytes": 93551,
+    "caption": "_Decode rate against task quality, one point per operating point. The filled marker is strict pass@1, the hollow marker the completed-task value at the same decode rate; the horizontal band is the pooled min-max over that point's windows, with n in the label. Quality is one seed at the cell's own sampler._",
+    "engines": [
+      "arm-A-release",
+      "sweep-perf-off",
+      "sweep-perf-delta0.09",
+      "sweep-perf-delta0.2",
+      "sweep-perf-delta0.4"
+    ],
+    "file": "tok_s_vs_passk.svg",
+    "key": "tok_s_vs_passk",
+    "label": "decode tok/s against HumanEval pass@1"
+  }
+]
