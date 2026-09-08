@@ -154,3 +154,50 @@ where the target clearly leads, which is the "gain speed while holding quality"
 operating point the sweep should confirm. If HumanEval drops, fall back toward
 alpha = 0 (more deferral); if quality holds, push toward alpha = 1.0 for more
 speed.
+
+## Provenance and rule-diff proof (arm G)
+
+The arm G 16K sweep and the pending HumanEval cell were measured on served code
+`2eac2fee` (cascade stacked on the #478 typical head). This branch re-parents the
+cascade mode onto the #475 served base `27d5ff6b`, the same base #478 is built on,
+so #478 (typical) and this PR (cascade) are alternative-mode PEERS on one base
+rather than a stack. This is the same provenance bridge #475 uses (docs commits
+over the served base); the measurements transfer because the cascade RULE is
+byte-identical on the new base.
+
+Per-function sha256 (first 16 hex) of the cascade computation, this branch vs the
+measured `2eac2fee`:
+
+| symbol | sha256 | vs 2eac2fee |
+| --- | --- | --- |
+| `mtplx/sampling.py::_peak_probability` | `f3bba8b637a1ff9e` | identical |
+| `mtplx/sampling.py::total_variation` | `1b960bfacfb37ce9` | identical |
+| `mtplx/sampling.py::cascade_defer_decision` | `3ba053b7097fa91e` | identical |
+| `mtplx/generation.py::_cascade_accept_alpha` | `b81b13739d2166b7` | identical |
+| `mtplx/generation.py::_cascade_accept_enabled` | `1c5fae48d7f81e85` | identical |
+| batched-target cascade verify branch | `6d2749c7d09e8cbb` | identical |
+| lazy-target cascade verify body | `1ab16b485087dce2` | identical |
+| `[cascade-accept]` verdict block | `78d7c3e84c84f6c1` | identical |
+| `/health` `_cascade_acceptance_health_payload` (feature commit) | `7a9006f74a187d70` | identical |
+| `--cascade-threshold` argparse block | (identical) | identical |
+
+The accept/defer/coin/residual, the total-variation and peak-probability
+computations, the RNG draws, and the `[cascade-accept]` telemetry are therefore
+byte-identical to the measured code. Three forced glue deltas remain, none of
+which changes what a cascade run computes (so arm G stands):
+
+1. Lazy-target dispatch keyword: `elif _cascade_active:` on `2eac2fee` (it chained
+   off typical's `if _typical_active:`) becomes `if _cascade_active:` here, because
+   typical is dropped. The branch body is byte-identical.
+2. The exact-path lazy block is re-indented one level under the new `else:` and
+   `target_p_for_cache = target_p` is hoisted above the dispatch (both idempotent
+   / non-behavioral; the cascade-off output is unchanged).
+3. `_assert_lossy_verify_rules_exclusive` reads `MTPLX_FABLE_TYPICAL_THRESHOLD`
+   from the environment directly instead of calling the (now-absent)
+   `_typical_accept_threshold()`.
+
+Mutual exclusion (option a): the guard reads the typical env name defensively. It
+is INERT on this branch, retained defensively; #478 and cascade are alternative
+modes and were never intended to be armed together, so nothing here arms a typical
+threshold, but the guard still fails loud (ValueError in the verify setup,
+SystemExit at serve start) if an operator ever exports both keys.
