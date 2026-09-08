@@ -1,8 +1,8 @@
 [
   {
-    "alt": "Pass rate against completion tokens in log-spaced bins, one line per typical threshold plus the release arm, with a task-count table under the axis",
-    "bytes": 120173,
-    "caption": "_Pass rate against how long the completion ran, per typical threshold. Cap hits are their own rightmost bin and count as failures. Bins with fewer than three tasks are drawn hollow and left out of the line; the table under the axis gives the task count per bin per series. Scored from the re-scored HumanEval rows: the live gate dropped the prompt's helper definitions, so HumanEval/38 and /50 failed as NameErrors in every cell. Solution = the last fenced block defining the entry point._",
+    "alt": "Pass rate against completion tokens in log-spaced bins on a 0.70 to 1.00 axis, one line per typical threshold plus the release arm, task-count table under the axis and a cap-hit count column at the right",
+    "bytes": 123698,
+    "caption": "_Pass rate against how long the completion ran, per typical threshold, on a [0.70, 1.00] axis so the differences are visible. Cap hits are off the axis (their rate is 0 by construction) with their counts in the right-hand column; a bin below the axis floor is marked with a down-triangle and its value. Bins with fewer than three tasks are hollow and left out of the line. Scored from the re-scored HumanEval rows._",
     "engines": [
       "sweep off",
       "sweep delta0.09",
@@ -15,9 +15,9 @@
     "label": "HumanEval pass rate by completion length"
   },
   {
-    "alt": "Pass rate against per-request completion tokens per request second in equal-count bins, one line per typical threshold plus the release arm, with a task-count table under the axis",
-    "bytes": 129535,
-    "caption": "_Pass rate against per-request decode speed, in equal-count bins over the pooled distribution. The eval ran 4 concurrent requests, so this speed is a relative measure under that concurrency, not the single-stream 16K figure. Every cap hit lands in the fastest bin and scores 0, so that bin's dip is a length effect. Scored from the re-scored HumanEval rows: the live gate dropped the prompt's helper definitions, so HumanEval/38 and /50 failed as NameErrors in every cell. Solution = the last fenced block defining the entry point._",
+    "alt": "Pass rate against per-request decode speed in fixed log-spaced tok/s bins, one line per typical threshold plus the release arm, cap hits excluded and counted separately",
+    "bytes": 127215,
+    "caption": "_Pass rate against per-request decode speed in fixed log-spaced bins. The eval ran 4 concurrent requests, so this speed is a relative measure under that concurrency, not the single-stream 16K figure. Cap hits are excluded from the bins entirely, since they generate the full 32,768 tokens at high throughput and would make a length effect look like a speed one; their counts are in the right-hand column. Scored from the re-scored HumanEval rows._",
     "engines": [
       "sweep off",
       "sweep delta0.09",
