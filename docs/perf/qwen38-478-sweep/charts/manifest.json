@@ -1,5 +1,35 @@
 [
   {
+    "alt": "Pass rate against completion tokens in log-spaced bins, one line per typical threshold plus the release arm, with a task-count table under the axis",
+    "bytes": 114956,
+    "caption": "_Pass rate against how long the completion ran, per typical threshold. Cap hits are their own rightmost bin and count as failures. Bins with fewer than three tasks are drawn hollow and left out of the line; the table under the axis gives the task count per bin per series._",
+    "engines": [
+      "sweep off",
+      "sweep delta0.09",
+      "sweep delta0.2",
+      "sweep delta0.4",
+      "arm-A-release"
+    ],
+    "file": "acc_vs_length.svg",
+    "key": "acc_vs_length",
+    "label": "HumanEval pass rate by completion length"
+  },
+  {
+    "alt": "Pass rate against per-request completion tokens per request second in equal-count bins, one line per typical threshold plus the release arm, with a task-count table under the axis",
+    "bytes": 124338,
+    "caption": "_Pass rate against per-request decode speed, in equal-count bins over the pooled distribution. The eval ran 4 concurrent requests, so this speed is a relative measure under that concurrency, not the single-stream 16K figure. Every cap hit lands in the fastest bin and scores 0, so that bin's dip is a length effect._",
+    "engines": [
+      "sweep off",
+      "sweep delta0.09",
+      "sweep delta0.2",
+      "sweep delta0.4",
+      "arm-A-release"
+    ],
+    "file": "acc_vs_speed.svg",
+    "key": "acc_vs_speed",
+    "label": "HumanEval pass rate by per-request decode speed"
+  },
+  {
     "alt": "Decode tok/s for the twelve interleaved 16K windows in run order plus the typical sweep's own windows past a separator, fastest seed as the point with a min-max band, one colour per arm or threshold",
     "bytes": 126328,
     "caption": "_The twelve interleaved 16K windows (A C D E x three rounds) in run order, then the typical sweep's own windows past the dotted separator. Each point is the window's fastest seed; the band is min-max over its three seeds. The dashed line is each arm's fastest window. A drift (first vs last) = +0.17 tok/s (+0.24%)._",
