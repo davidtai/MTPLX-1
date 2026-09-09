@@ -14130,22 +14130,6 @@ def generate_mtpa(
         stop_token_ids=stop_token_ids,
         max_tokens=max_tokens,
     )
-    if _cascade_active:
-        _cas_denom = cascade_accepted + cascade_resamples
-        _cas_rate = (cascade_accepted / _cas_denom) if _cas_denom else 0.0
-        _cas_cycles = max(1, verify_calls)
-        print(
-            "[cascade-accept] NOT distribution-exact; "
-            f"threshold={_cascade_alpha:.4g} alpha={_cascade_alpha:.4g} "
-            f"positions={cascade_positions} accepted={cascade_accepted} "
-            f"resamples={cascade_resamples} accept_rate={_cas_rate:.4f} "
-            f"mean_divergence={stats.cascade_mean_divergence:.4f} "
-            f"tokens_per_cycle={len(tokens) / _cas_cycles:.3f} "
-            f"accepted_by_depth={accepted_by_depth} "
-            f"generated={len(tokens)} verify_calls={verify_calls}",
-            file=sys.stderr,
-            flush=True,
-        )
     return GenerationOutput(
         tokens=tokens,
         text=_decode(rt.tokenizer, _strip_terminal_stop(tokens, stop_token_ids)),
