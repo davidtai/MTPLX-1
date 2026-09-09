@@ -472,3 +472,106 @@ def test_rule_selector_reads_env_at_use(monkeypatch):
     monkeypatch.setenv("MTPLX_FABLE_CASCADE_RULE", "bogus")
     with _pytest.raises(ValueError):
         _cascade_accept_rule()
+
+
+# ===========================================================================
+# defer_rate / accept_rate / resample_rate counters (David 2026-09-09: "accept
+# rate is never defined for speculative cascade"). cascade_deferred counts
+# positions the rule deferred (the paper's r); accept_rate is the kept-draft
+# rate. Invariants: accepted + resamples == positions; resamples <= deferred
+# <= positions; defer_rate == deferred / positions.
+# ===========================================================================
+class _DivergentMTPModel(_VerdictAcceptingMTPModel):
+    """Draft favours token 3, trunk target favours token 1, so under TokenV3 the
+    drafted token has small p(v) and the rule DEFERS (exercises cascade_deferred)."""
+
+    def mtp_forward(self, hidden_states, next_token_ids, *, mtp_cache=None,
+                    concat_order=None, return_hidden=False,
+                    mtp_hidden_variant=None, position_offset=None):
+        length = int(next_token_ids.shape[1])
+        hidden = _mx.zeros((1, length, 2), dtype=_mx.float32)
+        logits = _mx.zeros((1, length, 4), dtype=_mx.float32) + _mx.array(
+            [0.0, 0.0, 0.0, 6.0], dtype=_mx.float32)  # draft -> token 3
+        return (logits, hidden) if return_hidden else logits
+
+    def __call__(self, input_ids, *, cache=None, return_hidden=False,
+                 hidden_variant=None, emit_logits=True, logits_keep=None):
+        self.calls.append(int(input_ids.shape[1]))
+        length = int(input_ids.shape[1])
+        hidden = _mx.zeros((1, length, 2), dtype=_mx.float32)
+        if not emit_logits:
+            return (None, hidden) if return_hidden else None
+        keep = length if logits_keep is None else min(length, max(1, int(logits_keep)))
+        logits = _mx.zeros((1, keep, 4), dtype=_mx.float32) + _mx.array(
+            [0.0, 6.0, 0.0, 0.0], dtype=_mx.float32)  # target -> token 1
+        return (logits, hidden) if return_hidden else logits
+
+
+def _run_cascade(model, rule, alpha, monkeypatch, seed=0):
+    monkeypatch.setenv("MTPLX_FABLE_CASCADE_THRESHOLD", str(alpha))
+    monkeypatch.setenv("MTPLX_FABLE_CASCADE_RULE", rule)
+    monkeypatch.setenv("MTPLX_BATCH_TARGET_ARRAYS", "1")
+    monkeypatch.delenv("MTPLX_FABLE_TYPICAL_THRESHOLD", raising=False)
+    previous = _mx.default_device()
+    _mx.set_default_device(_mx.cpu)
+    try:
+        return _generate_mtpk(
+            _verdict_runtime(model), [0], max_tokens=6,
+            sampler=_SamplerConfig(temperature=0.6, top_p=1.0, top_k=1),
+            speculative_depth=3, mtp_history_policy="committed",
+            verify_strategy="batched", stop_token_ids=set(), seed=seed,
+        )
+    finally:
+        _mx.set_default_device(previous)
+
+
+def test_defer_accept_resample_counters_are_consistent(monkeypatch):
+    out = _run_cascade(_DivergentMTPModel(), "tokenv3", 0.5, monkeypatch, seed=7)
+    st = out.stats
+    assert st.cascade_positions > 0
+    # kept-draft identity: accepted + resamples == positions
+    assert st.cascade_accepted + st.cascade_resamples == st.cascade_positions
+    # deferred = coin-accepted-after-defer + resamples, so resamples <= deferred <= positions
+    assert st.cascade_resamples <= st.cascade_deferred <= st.cascade_positions
+    # no-defer accepts = positions - deferred, all kept, so accepted >= positions - deferred
+    assert st.cascade_accepted >= st.cascade_positions - st.cascade_deferred
+    # defer_rate is deferred / positions
+    assert st.cascade_defer_rate == _pytest.approx(
+        st.cascade_deferred / st.cascade_positions)
+    # the divergent draft is outside Top_alpha under TokenV3, so some positions defer
+    assert st.cascade_deferred > 0
+
+
+def test_served_order_emits_defer_rate(capsys, monkeypatch):
+    out = _run_cascade(_DivergentMTPModel(), "tokenv3", 0.5, monkeypatch, seed=7)
+    err = capsys.readouterr().err
+    lines = [ln for ln in err.splitlines() if "[cascade-accept]" in ln]
+    assert len(lines) == 1, lines
+    m_def = _re.search(r"defer_rate=([0-9.]+)", lines[0])
+    m_pos = _re.search(r"positions=(\d+)", lines[0])
+    m_dfd = _re.search(r"deferred=(\d+)", lines[0])
+    assert m_def and m_pos and m_dfd, lines[0]
+    assert int(m_dfd.group(1)) == out.stats.cascade_deferred
+    assert float(m_def.group(1)) == _pytest.approx(
+        out.stats.cascade_deferred / out.stats.cascade_positions, abs=1e-4)
+
+
+def test_exact_off_leaves_cascade_counters_zero(monkeypatch):
+    monkeypatch.delenv("MTPLX_FABLE_CASCADE_THRESHOLD", raising=False)
+    monkeypatch.delenv("MTPLX_FABLE_TYPICAL_THRESHOLD", raising=False)
+    monkeypatch.setenv("MTPLX_BATCH_TARGET_ARRAYS", "1")
+    previous = _mx.default_device()
+    _mx.set_default_device(_mx.cpu)
+    try:
+        out = _generate_mtpk(
+            _verdict_runtime(_VerdictAcceptingMTPModel()), [0], max_tokens=5,
+            sampler=_SamplerConfig(temperature=0.6, top_p=1.0, top_k=1),
+            speculative_depth=3, mtp_history_policy="committed",
+            verify_strategy="batched", stop_token_ids=set(),
+        )
+    finally:
+        _mx.set_default_device(previous)
+    assert out.stats.cascade_accept_enabled is False
+    assert out.stats.cascade_positions == 0
+    assert out.stats.cascade_deferred == 0
+    assert out.stats.cascade_defer_rate == 0.0

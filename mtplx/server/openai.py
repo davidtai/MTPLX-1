@@ -16538,6 +16538,11 @@ def _cascade_acceptance_health_payload() -> dict[str, Any]:
         "rule_name": rule_name,
         "rule": rule_text,
         "divergence": "D_TV(p,q) = sum_v max(0, p(v)-q(v)) over scored top-k",
+        "rates": {
+            "defer_rate": "cascade_deferred / cascade_positions -- the paper's deferral rate r (fraction of cascade-decided positions the rule deferred to the target); per-request value in VerifyStats.cascade_defer_rate and the [cascade-accept] verdict line",
+            "accept_rate": "cascade_accepted / cascade_positions -- kept-draft rate over cascade-decided positions (no-defer accepts + coin-accepted deferred tokens); NOT the deferral rate",
+            "resample_rate": "cascade_resamples / cascade_positions -- deferred tokens that lost the exact coin; accept_rate + resample_rate == 1 over cascade-decided positions",
+        },
         "distribution_exact": not enabled,
         "mutually_exclusive_with_typical": True,
         "conflict": bool(enabled and typical_on),

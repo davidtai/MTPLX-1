@@ -104,6 +104,36 @@ runs.
   `cascade_acceptance` install report.
 - `tests/test_cascade_acceptance.py`, `tests/test_cascade_threshold_cli_health_cpu.py`.
 
+## Definitions: deferral, accept, and resample rates
+
+Speculative cascade has no single "accept rate": the paper's quantity is the
+DEFERRAL rate, and the served verdict's `accept_rate` is a different, kept-draft
+quantity. Over the positions the cascade rule actually decided
+(`cascade_positions`, one per drafted position in a cascade window), the three
+rates are:
+
+| quantity | formula | meaning | artifact |
+| --- | --- | --- | --- |
+| defer_rate | `cascade_deferred / cascade_positions` | the paper's deferral rate r: the fraction of decided positions where the rule deferred to the target (before the coin) | `[cascade-accept]` verdict line `defer_rate=`; `VerifyStats.cascade_defer_rate` |
+| accept_rate | `cascade_accepted / cascade_positions` | kept-draft rate: no-defer accepts plus deferred tokens the exact coin then kept; NOT the deferral rate | `[cascade-accept]` verdict line `accept_rate=`; `VerifyStats.cascade_accepted` |
+| resample_rate | `cascade_resamples / cascade_positions` | deferred tokens that lost the exact coin and were resampled from the residual | `VerifyStats.cascade_resamples` |
+
+Counter definitions: `cascade_positions` counts every draft position the rule
+decided; `cascade_deferred` counts positions where the rule deferred (`r = 1`,
+incremented before the coin); `cascade_accepted` counts kept drafts (no-defer
+accepts plus coin-accepted deferred tokens); `cascade_resamples` counts deferred
+tokens that lost the coin. Two identities always hold:
+`cascade_accepted + cascade_resamples == cascade_positions` and
+`cascade_deferred == (coin-accepted deferred tokens) + cascade_resamples`, so
+`accept_rate + resample_rate == 1` over decided positions, while `defer_rate` is
+independent of them.
+
+Note on the receipt: the perf harness records a separate `mtp_accept_rate` (the
+fraction of drafted tokens accepted across the whole request, the throughput
+lever). That is a decode-throughput measure over all MTP positions and is not
+the cascade `defer_rate`; read `defer_rate` from the `[cascade-accept]` verdict
+line or `VerifyStats.cascade_defer_rate`, not from `mtp_accept_rate`.
+
 ## Switch
 
 - `--cascade-threshold ALPHA` (env `MTPLX_FABLE_CASCADE_THRESHOLD`): the deferral

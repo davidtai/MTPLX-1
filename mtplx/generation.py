@@ -2770,6 +2770,8 @@ class GenerationStats:
     cascade_positions: int = 0
     cascade_accepted: int = 0
     cascade_resamples: int = 0
+    cascade_deferred: int = 0
+    cascade_defer_rate: float = 0.0
     cascade_mean_divergence: float = 0.0
     # Which commit path produced the stop token when finish_reason == "stop"
     # (#414 telemetry): accepted_draft | residual_correction | bonus |
@@ -8845,6 +8847,7 @@ def generate_mtpk(
     # resampled from the exact residual); cascade_divergence_sum feeds the mean
     # total-variation divergence on the verdict line.
     cascade_positions = cascade_accepted = cascade_resamples = 0
+    cascade_deferred = 0  # positions where the rule DEFERRED (paper's r)
     cascade_divergence_sum = 0.0
     stop_origin: str | None = None
     accepted_by_depth = [0 for _ in range(speculative_depth)]
@@ -12428,6 +12431,7 @@ def generate_mtpk(
                     correction = draft_token
                     cascade_accepted += 1
                 else:
+                    cascade_deferred += 1
                     _pi_token = cascade_token_target_distribution(
                         target_p_for_cache, draft_q,
                         alpha=_cascade_alpha, rule=_cascade_rule,
@@ -12469,6 +12473,7 @@ def generate_mtpk(
                     correction = draft_token
                     cascade_accepted += 1
                 else:
+                    cascade_deferred += 1
                     # Defer (pi = p): exact speculative law, same as the exact
                     # branch below.
                     p = target_distribution_batch.probability(depth_index, draft_token)
@@ -12581,6 +12586,7 @@ def generate_mtpk(
                         correction = draft_token
                         cascade_accepted += 1
                     else:
+                        cascade_deferred += 1
                         _pi_token = cascade_token_target_distribution(
                             target_p, draft_q,
                             alpha=_cascade_alpha, rule=_cascade_rule,
@@ -12613,6 +12619,7 @@ def generate_mtpk(
                         correction = draft_token
                         cascade_accepted += 1
                     else:
+                        cascade_deferred += 1
                         accept_prob = compute_acceptance_probability(
                             target_p, draft_q, draft_token
                         )
@@ -13832,6 +13839,12 @@ def generate_mtpk(
         cascade_positions=int(cascade_positions),
         cascade_accepted=int(cascade_accepted),
         cascade_resamples=int(cascade_resamples),
+        cascade_deferred=int(cascade_deferred),
+        cascade_defer_rate=(
+            float(cascade_deferred / cascade_positions)
+            if cascade_positions
+            else 0.0
+        ),
         cascade_mean_divergence=(
             float(cascade_divergence_sum / cascade_positions)
             if cascade_positions
@@ -13941,13 +13954,17 @@ def generate_mtpk(
     if _cascade_active:
         _cas_denom = cascade_accepted + cascade_resamples
         _cas_rate = (cascade_accepted / _cas_denom) if _cas_denom else 0.0
+        _cas_defer_rate = (
+            (cascade_deferred / cascade_positions) if cascade_positions else 0.0
+        )
         _cas_cycles = max(1, verify_calls)
         print(
             "[cascade-accept] NOT distribution-exact; "
             f"rule={_cascade_rule} "
             f"threshold={_cascade_alpha:.4g} alpha={_cascade_alpha:.4g} "
             f"positions={cascade_positions} accepted={cascade_accepted} "
-            f"resamples={cascade_resamples} accept_rate={_cas_rate:.4f} "
+            f"resamples={cascade_resamples} deferred={cascade_deferred} "
+            f"accept_rate={_cas_rate:.4f} defer_rate={_cas_defer_rate:.4f} "
             f"mean_divergence={stats.cascade_mean_divergence:.4f} "
             f"tokens_per_cycle={len(tokens) / _cas_cycles:.3f} "
             f"accepted_by_depth={accepted_by_depth} "
