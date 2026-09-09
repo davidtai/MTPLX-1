@@ -1,5 +1,5 @@
 {
-  "generated_by": "battery475/scripts/render_bare_16k.py + render_bare_ladder.py",
+  "generated_by": "battery475/scripts/render_bare_16k.py + render_bare_ladder.py + render_comparison.py",
   "generator": "server_cell_charts (min-max variance bands, fastest-of-seeds)",
   "parent": "perf/qwen38-bare-speed-main @ 548e568c (docs commit adds these)",
   "charts": [
@@ -37,6 +37,22 @@
       "file": "ttft_s.svg",
       "bytes": 92012,
       "sha256": "ee18cd5b124b2ec580401b2d858875305e3fcc517a78e19900757f079c91cc5b"
+    },
+    {
+      "file": "bare_vs_475_478_16k.svg",
+      "label": "Bare-Speed against #475 and #478 at 16K",
+      "alt": "Grouped bars of decode tok/s at 16,384 tokens, the Optimized-Speed pack beside the Bare-Speed pack, one colour family each",
+      "caption": "_Decode tok/s at 16,384 tokens. The two colour families are the two model packs: blues are Optimized-Speed (release 2.11.2 exact 71.97, #475 exact 82.84, #478 typical 0.09 104.65) and the warm bars are Bare-Speed (release exact 67.80, #475 exact 78.39, #478 typical 0.09 97.12, this PR exact 79.84, typical 0.09 106.67, cascade OPT alpha 0.5 121.48, cascade TokenV3 alpha 0.95 103.98). Bar height is the fastest seed and the whisker is the min-max band. HumanEval strict pass@1 is annotated on the two arms measured on this pack, both at the exact law._",
+      "bytes": 165598,
+      "sha256": "c0f31d8c5ea5386cafd8badcad9677e6e3e25d32d9d96a24321cccb9512e3616"
+    },
+    {
+      "file": "bare_vs_475_478_ladder.svg",
+      "label": "Bare-Speed against #475 and #478 by context",
+      "alt": "Decode tok/s against context size from 1,024 to 261,120 tokens for #475 and #478 on both packs and this pull request on Bare-Speed",
+      "caption": "_Decode tok/s against context size for #475 and #478 on the Optimized-Speed pack, the same two on the Bare-Speed pack, and this pull request on Bare-Speed at typical acceptance 0.09. Each point is the fastest seed and the band is the min-max range. At 261,120 the three Bare-Speed arms carry a point and the two Optimized-Speed arms do not: they exceed the memory knob on the #475 base without #482._",
+      "bytes": 143905,
+      "sha256": "464833f817f926bbabc0c34f4f8396535c1101aee80acd7ec791e82b02d4b45c"
     }
   ]
 }
