@@ -25,7 +25,7 @@
 <rect x="551.67" y="102.36" width="120" height="277.64" fill="#2563eb"/>
 <text x="611.67" y="94" text-anchor="middle" font-size="14" font-weight="600" fill="#111827">97.99</text>
 <text x="611.67" y="80" text-anchor="middle" font-size="11" fill="#2563eb">+19.8%</text>
-<text x="178.33" y="398" text-anchor="middle" font-size="12" fill="#374151">exact (lane off)</text>
+<text x="178.33" y="398" text-anchor="middle" font-size="12" fill="#374151">typical off</text>
 <text x="178.33" y="414" text-anchor="middle" font-size="11" fill="#6b7280">threshold 0</text>
 <text x="178.33" y="429" text-anchor="middle" font-size="11" fill="#6b7280">2.54 tok/cycle</text>
 <text x="395" y="398" text-anchor="middle" font-size="12" fill="#374151">typical, threshold 0.09</text>
@@ -34,5 +34,5 @@
 <text x="611.67" y="398" text-anchor="middle" font-size="12" fill="#374151">typical, threshold 0.20</text>
 <text x="611.67" y="414" text-anchor="middle" font-size="11" fill="#6b7280">3.31 tok/cycle</text>
 <text x="611.67" y="429" text-anchor="middle" font-size="11" fill="#6b7280">accept 0.80</text>
-<text x="70" y="452" font-size="10.5" fill="#6b7280">Higher threshold = stricter (fewer typical positions). Both typical arms hold HumanEval-sampling within +/-1 task of exact (153/164); greedy and MBPP byte-identical. NOT distribution-exact.</text>
+<text x="70" y="452" font-size="10.5" fill="#6b7280">Higher threshold = stricter (fewer typical positions). Both typical arms hold HumanEval-sampling within +/-1 task of typical off (153/164); greedy and MBPP byte-identical. NOT distribution-exact.</text>
 </svg>

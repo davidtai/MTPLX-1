@@ -1,7 +1,7 @@
 [
   {
     "alt": "Pass rate against completion tokens in log-spaced bins, one line per typical threshold plus the release arm, with a task-count table under the axis and a cap-hit column",
-    "bytes": 129288,
+    "bytes": 117628,
     "caption": "_Pass rate against how long the completion ran, per typical threshold. Every bin is joined and the y-range comes from the data, so no point falls off the axis and breaks a line. Series carry a small constant downward offset so lines that share a value can be told apart; the offset never changes the values or the counts. Cap hits are off the axis, with their counts in the right-hand column. Scored from the re-scored HumanEval rows._",
     "engines": [
       "sweep off",
@@ -15,9 +15,9 @@
     "label": "HumanEval pass rate by completion length"
   },
   {
-    "alt": "Pass rate against completion tokens in log-spaced bins for the exact arm, task-count table under the axis and a cap-hit count column at the right",
-    "bytes": 93783,
-    "caption": "_MBPP pass rate against how long the completion ran. Only the exact arm was run: the sweep was cut after it, so this figure carries one series. Cap hits are off the axis with their counts in the right-hand column._",
+    "alt": "Pass rate against completion tokens in log-spaced bins for the typical-off arm, task-count table under the axis and a cap-hit count column at the right",
+    "bytes": 91833,
+    "caption": "_MBPP pass rate against how long the completion ran. Only the typical-off arm was run: the sweep was cut after it, so this figure carries one series. Cap hits are off the axis with their counts in the right-hand column._",
     "engines": [
       "sweep off"
     ],
@@ -27,7 +27,7 @@
   },
   {
     "alt": "Grouped bars of the percentage of tasks passed against per-request decode speed in fixed linear tok/s bins, one bar per typical threshold plus the release arm, each labelled with its percentage",
-    "bytes": 156699,
+    "bytes": 156748,
     "caption": "_Percentage of tasks passed against per-request decode speed, in fixed linear bins, as grouped bars: several thresholds share the same rate, which lines draw on top of each other. Each bar is labelled with its percentage above the bar; the task count per bin is in the table under the axis. The eval ran 4 concurrent requests, so this speed is relative to that concurrency, not the single-stream 16K figure. Cap hits are excluded from the bins, with their counts in the right-hand column. Scored from the re-scored HumanEval rows._",
     "engines": [
       "sweep off",
@@ -41,9 +41,9 @@
     "label": "HumanEval tasks passed by per-request decode speed"
   },
   {
-    "alt": "Bars of the percentage of MBPP tasks passed against per-request decode speed in fixed linear tok/s bins, exact arm only, each labelled with its percentage",
-    "bytes": 129276,
-    "caption": "_MBPP percentage of tasks passed against per-request decode speed, in fixed linear bins. Only the exact arm was run. The eval ran 4 concurrent requests, so this speed is relative to that concurrency. Cap hits are excluded from the bins, with their counts in the right-hand column._",
+    "alt": "Bars of the percentage of MBPP tasks passed against per-request decode speed in fixed linear tok/s bins, typical-off arm only, each labelled with its percentage",
+    "bytes": 129390,
+    "caption": "_MBPP percentage of tasks passed against per-request decode speed, in fixed linear bins. Only the typical-off arm was run. The eval ran 4 concurrent requests, so this speed is relative to that concurrency. Cap hits are excluded from the bins, with their counts in the right-hand column._",
     "engines": [
       "sweep off"
     ],
@@ -67,7 +67,7 @@
   },
   {
     "alt": "Decode tok/s against HumanEval pass@1, one labelled point per typical threshold plus the release arm, filled marker strict and hollow marker completed-task pass@1, horizontal band the pooled min-max decode",
-    "bytes": 93551,
+    "bytes": 94388,
     "caption": "_Decode rate against task quality, one point per operating point. The filled marker is strict pass@1, the hollow marker the completed-task value at the same decode rate; the horizontal band is the pooled min-max over that point's windows, with n in the label. Quality is one seed at the cell's own sampler._",
     "engines": [
       "arm-A-release",
