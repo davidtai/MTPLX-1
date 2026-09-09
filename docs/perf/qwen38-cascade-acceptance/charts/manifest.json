@@ -1,21 +1,21 @@
 [
   {
     "alt": "Decode tok/s by cascade alpha, fastest of three with a min-max band, and two reference lines for the exact law and typical acceptance at 0.09",
-    "bytes": 64678,
-    "caption": "_Decode tok/s by cascade alpha, fastest of three seeds with a min-max band. The dashed line is the exact law (82.80) and the dotted line typical acceptance at 0.09 (104.65), both from the pooled 16K windows in #478. Alpha >= 1.0 saturates at accept 1.0 and the two highest alphas coincide._",
+    "bytes": 94167,
+    "caption": "_Decode by alpha for BOTH cascade rules: OPT (Equation 10) and TokenV3 (Equation 15), each fastest of three seeds with a min-max band. Reference lines are the exact law (82.80) and typical acceptance at 0.09 (104.65) from the pooled 16K windows in #478. The two rules' alphas are different quantities and are NOT comparable at equal alpha; compare at equal decode speed._",
     "file": "cascade_decode_vs_alpha.svg",
     "key": "cascade_decode_vs_alpha",
     "label": "cascade decode by alpha",
-    "sha256": "224d8ac00e5beeb7347be25d2d9bb07c41a250dcaf1e68fc81f423f1528f5b41"
+    "sha256": "f191004d8dc77f46079ac5ba7123ccde2377a743be69cbdcdba649344fdb1f5f"
   },
   {
     "alt": "Cascade accept rate and tokens per cycle by alpha on two y-axes",
-    "bytes": 66171,
-    "caption": "_Cascade accept rate (left axis) and tokens per cycle (right axis) by alpha, from the run's cascade-accept metrics rather than the receipts. Higher alpha accepts more drafted tokens per verify._",
+    "bytes": 86003,
+    "caption": "_Cascade accept rate (left) and tokens per cycle (right) by alpha for BOTH rules, OPT (Equation 10) and TokenV3 (Equation 15), from each run's cascade-accept metrics rather than the receipts. Equal alphas are NOT comparable across the two rules._",
     "file": "cascade_accept_vs_alpha.svg",
     "key": "cascade_accept_vs_alpha",
     "label": "cascade acceptance and tokens/cycle by alpha",
-    "sha256": "1c63ea4c8e0b459b9d10eedfe533e4fcdcbbead7ddc3a9a832ee2332a563a047"
+    "sha256": "47531a838091993d3c928b4d9cf4f3b292fbfc1fed0081edeef86bcb84eba860"
   },
   {
     "alt": "Decode tok/s by context size (1K-128K) for the exact pairing and cascade alpha 0.0/0.5/1.0/2.0, fastest of seeds with min-max variance bands",
