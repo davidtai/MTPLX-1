@@ -16523,11 +16523,20 @@ def _cascade_acceptance_health_payload() -> dict[str, Any]:
         typical_on = tv is not None and float(tv) > 0.0
     except ValueError:
         typical_on = False
+    rule_raw = os.environ.get("MTPLX_FABLE_CASCADE_RULE")
+    rule_name = str(rule_raw).strip().lower() if rule_raw not in (None, "") else "opt"
+    rule_text = {
+        "opt": "defer iff max_q < max_p - alpha*D_TV(p,q); else accept draft (Eq. 10)",
+        "tokenv1": "defer token v iff q(v) < max_p - alpha; else accept (Eq. 13)",
+        "tokenv2": "defer token v iff p(v) < max_p - alpha; else accept (Eq. 14)",
+        "tokenv3": "defer token v iff p(v) < max_p*(1-alpha); else accept (Eq. 15)",
+    }.get(rule_name, rule_name)
     return {
         "enabled": enabled,
         "alpha": alpha,
         "threshold": alpha,
-        "rule": "defer iff max_q < max_p - alpha*D_TV(p,q); else accept draft",
+        "rule_name": rule_name,
+        "rule": rule_text,
         "divergence": "D_TV(p,q) = sum_v max(0, p(v)-q(v)) over scored top-k",
         "distribution_exact": not enabled,
         "mutually_exclusive_with_typical": True,
@@ -36385,6 +36394,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--cascade-rule",
+        choices=("opt", "tokenv1", "tokenv2", "tokenv3"),
+        default=None,
+        help=(
+            "Which speculative-cascade deferral rule --cascade-threshold "
+            "applies (arXiv:2405.19261 v2). opt (default) = the position-level "
+            "peak rule (Eq. 10); tokenv1/tokenv2/tokenv3 = the token-specific "
+            "rules (Eq. 13/14/15, Sec. 4.4) that judge the drafted token and "
+            "defer to the exact coin with target pi_Token (Eq. 11). Ignored "
+            "unless --cascade-threshold is set. Environment: "
+            "MTPLX_FABLE_CASCADE_RULE, which this flag overrides."
+        ),
+    )
+    parser.add_argument(
         "--ngram-prewarm",
         metavar="auto|all|off|GiB",
         # Not a boolean, and default=None rather than "auto": the flag has an
@@ -36923,6 +36946,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         # Unlike the typical delta, any set value (including 0) turns the lane
         # on, so only pass --cascade-threshold to enable it.
         os.environ["MTPLX_FABLE_CASCADE_THRESHOLD"] = str(float(args.cascade_threshold))
+    if getattr(args, "cascade_rule", None) is not None:
+        # Flag beats env; generation.py resolves the rule per request. Only the
+        # deferral rule -- inert unless --cascade-threshold turns the lane on.
+        os.environ["MTPLX_FABLE_CASCADE_RULE"] = str(args.cascade_rule)
     # Fail loud on the mutually exclusive lossy verify rules, whether they were
     # set by flag (stamped just above) or already present in the environment.
     _typ_env = os.environ.get("MTPLX_FABLE_TYPICAL_THRESHOLD")

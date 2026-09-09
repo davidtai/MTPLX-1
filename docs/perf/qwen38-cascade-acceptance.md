@@ -205,3 +205,78 @@ is INERT on this branch, retained defensively; #478 and cascade are alternative
 modes and were never intended to be armed together, so nothing here arms a typical
 threshold, but the guard still fails loud (ValueError in the verify setup,
 SystemExit at serve start) if an operator ever exports both keys.
+
+## Token-specific deferral rules (TokenV1 / TokenV3)
+
+`r_OPT` (Eq. 10) decides between q and p by comparing only their peaks. Sec. 4.4
+of the paper names the failure that costs us HumanEval at every alpha: the draft
+token `x_t ~ q_t(.)` may not maximise `q_t`, so "even when `x_t` is of poor
+quality, we may end up accepting it because `q_t` happens to be more peaked than
+`p_t`." Their fix is a token-specific rule `r(x_<t, v)` that judges the specific
+candidate token, with target distribution (Eq. 11)
+
+    pi_Token(v) = q(v) * (1 - r(x_<t, v)) + p(v) * eta,
+    eta = sum_{v'} r(x_<t, v') * q(v').
+
+We implement two plug-ins behind `--cascade-rule` / `MTPLX_FABLE_CASCADE_RULE`
+(`opt` default; `tokenv1`, `tokenv2`, `tokenv3`):
+
+| rule | defer r(x_<t, v) = 1 iff | eq |
+| --- | --- | --- |
+| `opt` (default) | `max_v q(v) < max_v p(v) - alpha * D_TV(p,q)` (position-level) | 10 |
+| `tokenv1` | `q(v) < max_v' p(v') - alpha` | 13 |
+| `tokenv2` | `p(v) < max_v' p(v') - alpha` | 14 |
+| `tokenv3` | `p(v) < max_v' p(v') * (1 - alpha)` | 15 |
+
+For TokenV3 this yields the intuitive target (Sec. 4.4)
+
+    pi_TokenV3(v) = q(v) * 1[v in Top_alpha] + p(v) * sum_{v' not in Top_alpha} q(v'),
+    Top_alpha = { v : p(v) >= max_v' p(v') * (1 - alpha) }.
+
+The `p(v)*eta` term is present for every v, so a token in `Top_alpha`
+(`r = 0`) has `pi(v) = q(v) + p(v)*eta >= q(v)` and the generic speculative coin
+accepts it with probability 1 (accept, no coin drawn); a deferred token
+(`r = 1`) has `pi(v) = p(v)*eta` and takes the exact `min(1, pi/q)` coin plus
+`norm(max(0, pi - q))` residual -- Algorithm 6 (Appendix D) is
+`GenSpecSample(q, p, pi_Token)`, i.e. the shipped exact path with `pi_Token` as
+the target instead of `p`. `sum_v pi_Token(v) = 1` by construction. A
+confidently-wrong drafted token (`p(v)` small) is now DEFERRED even when
+`max q > max p` -- exactly the case `r_OPT` accepts.
+
+`r_OPT` stays the default and its executed code is unchanged; the token-specific
+branches are added as a new `elif ... _cascade_rule != "opt" ...` above the OPT
+branch at both verify sites, so with `--cascade-rule opt` (or unset) the OPT
+path is byte-for-byte what it was.
+
+### Provenance after the citation fix
+
+The TokenV3 commit also corrects the stale citation in
+`cascade_defer_decision`'s docstring (it read "Mreddy" / "ICLR 2025"; corrected
+to "Narasimhan, Jitkrittum, Rawat, Kim, Gupta, Menon, Kumar, arXiv:2405.19261 v2
+(2024)"). That edit is inside the sha256-hashed function body #485 cited as
+byte-identical to `2eac2fee`, so the whole-function TEXT hash of
+`cascade_defer_decision` necessarily changes. We therefore restate the proof two
+ways -- whole-function text (docstring included) AND AST of the function body
+with the docstring node stripped (its executable code):
+
+Whole-function TEXT sha256 (first 16 hex; docstring included):
+
+| function | 2eac2fee | d8efc3f5 | this branch |
+| --- | --- | --- | --- |
+| `cascade_defer_decision` | `1f5061f6caa3838d` | `1f5061f6caa3838d` | `895a81bd203accc5` (docstring changed) |
+| `total_variation` | `804fe67757c30ea3` | `804fe67757c30ea3` | `804fe67757c30ea3` (same) |
+| `_peak_probability` | `3eb10a6b9e83045a` | `3eb10a6b9e83045a` | `3eb10a6b9e83045a` (same) |
+
+AST CODE sha256 (first 16 hex; docstring node removed):
+
+| function | 2eac2fee | d8efc3f5 | this branch |
+| --- | --- | --- | --- |
+| `cascade_defer_decision` | `1e08468afd459849` | `1e08468afd459849` | `1e08468afd459849` (same) |
+| `total_variation` | `d4832efa65b6a0e2` | `d4832efa65b6a0e2` | `d4832efa65b6a0e2` (same) |
+| `_peak_probability` | `9c62b65e7dd51f9c` | `9c62b65e7dd51f9c` | `9c62b65e7dd51f9c` (same) |
+
+The OPT rule's *code* is thus byte-identical to `2eac2fee`/`d8efc3f5`; only the
+docstring text changed. The measured arm-G OPT numbers stand. (The whole-file
+text hashes in the earlier table above use a different extractor and are
+unaffected; the two tables here are self-consistent, produced by one
+docstring-stripping AST script.)

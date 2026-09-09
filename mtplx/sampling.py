@@ -337,8 +337,8 @@ def cascade_defer_decision(
 ) -> tuple[bool, float]:
     """Speculative-cascade plug-in deferral rule.
 
-    Narasimhan, Mreddy, Jitkrittum, Rawat, Kumar, "Faster Cascades via
-    Speculative Decoding", ICLR 2025 / arXiv:2405.19261 v2, Eq. (10) (the
+    Narasimhan, Jitkrittum, Rawat, Kim, Gupta, Menon, Kumar, "Faster Cascades
+    via Speculative Decoding", arXiv:2405.19261 v2 (2024), Eq. (10) (the
     plug-in approximation to the optimal deferral rule of Eq. (8)):
 
         r_OPT(x_<t) = 1  <=>  max_v q(v) < max_v p(v) - alpha * D_TV(p, q)
@@ -367,6 +367,103 @@ def cascade_defer_decision(
     defer = peak_q < (peak_p - float(alpha) * tv)
     return (defer, tv)
 
+
+def cascade_token_deferral(
+    target_p: Distribution,
+    draft_q: Distribution,
+    token_id: int,
+    *,
+    alpha: float,
+    rule: str,
+) -> bool:
+    """Token-specific speculative-cascade deferral r(x_<t, v) for ONE token v.
+
+    Narasimhan, Jitkrittum, Rawat, Kim, Gupta, Menon, Kumar, "Faster Cascades
+    via Speculative Decoding", arXiv:2405.19261 v2 (2024), Sec. 4.4. The OPT
+    rule (Eq. 10) compares only the peaks ``max_v q(v)`` vs ``max_v p(v)``, so a
+    drafted token ``x_t ~ q`` that does not maximise ``q`` can be accepted
+    "because q happens to be more peaked than p" even when the token is poor
+    (Sec. 4.4). The token-specific rules judge the specific candidate ``v``:
+
+        r_TokenV1(x_<t, v) = 1  <=>  q(v) < max_v' p(v') - alpha        (Eq. 13)
+        r_TokenV3(x_<t, v) = 1  <=>  p(v) < max_v' p(v') * (1 - alpha)  (Eq. 15)
+
+    ``r = 1`` DEFERS (``v`` judged poor); ``r = 0`` ACCEPTS ``v`` (it is in
+    ``Top_alpha``). Higher ``alpha`` grows ``Top_alpha`` and defers fewer
+    tokens. (Eq. 14 / TokenV2 -- ``p(v) < max p - alpha`` -- is available via
+    ``rule="tokenv2"`` for completeness.)
+    """
+    max_p = _peak_probability(target_p)
+    a = float(alpha)
+    if rule == "tokenv3":
+        return _probability(target_p, token_id) < max_p * (1.0 - a)
+    if rule == "tokenv1":
+        return _probability(draft_q, token_id) < max_p - a
+    if rule == "tokenv2":
+        return _probability(target_p, token_id) < max_p - a
+    raise ValueError(f"unknown token-specific cascade rule: {rule!r}")
+
+
+def cascade_token_target_distribution(
+    target_p: Distribution,
+    draft_q: Distribution,
+    *,
+    alpha: float,
+    rule: str,
+) -> Distribution:
+    """``pi_Token`` (Eq. 11) for the token-specific rule ``r_TokenV{1,2,3}``.
+
+    arXiv:2405.19261 v2, Eq. (11) and Appendix D (Algorithm 6, TokenSpecCascade):
+
+        pi_Token(v) = q(v) * (1 - r(x_<t, v)) + p(v) * eta,
+        eta = sum_{v'} r(x_<t, v') * q(v')
+
+    For V3 this is the intuitive form (Sec. 4.4):
+
+        pi_TokenV3(v) = q(v) * 1[v in Top_alpha] + p(v) * sum_{v' not in Top_alpha} q(v'),
+        Top_alpha = { v : p(v) >= max_v' p(v') * (1 - alpha) }.
+
+    The ``p(v)*eta`` term is present for EVERY ``v``: an accepted token
+    ``v in Top_alpha`` has ``pi(v) = q(v) + p(v)*eta >= q(v)``, so the generic
+    speculative coin (Algorithm 4) accepts it with probability 1; a deferred
+    token has ``pi(v) = p(v)*eta``. ``sum_v pi(v) = 1`` by construction. The
+    deferred exact coin/residual then runs with this ``pi`` as the target,
+    exactly the shipped ``min(1, pi/q)`` accept + ``norm(max(0, pi - q))``
+    residual (Algorithm 6 = GenSpecSample(q, p, pi_Token)).
+    """
+    max_p = _peak_probability(target_p)
+    a = float(alpha)
+    sparse = isinstance(target_p, SparseDistribution) or isinstance(draft_q, SparseDistribution)
+    if sparse and isinstance(target_p, SparseDistribution) and isinstance(draft_q, SparseDistribution):
+        token_ids = np.union1d(target_p.token_ids, draft_q.token_ids).astype(np.int64)
+        p = np.array([target_p.probability(int(t)) for t in token_ids], dtype=np.float64)
+        q = np.array([draft_q.probability(int(t)) for t in token_ids], dtype=np.float64)
+        vocab = _vocab_size(target_p)
+    else:
+        p = _as_dense(target_p)
+        q = _as_dense(draft_q)
+        token_ids = np.arange(p.shape[0], dtype=np.int64)
+        vocab = int(p.shape[0])
+    if rule == "tokenv3":
+        defer = p < max_p * (1.0 - a)
+    elif rule == "tokenv1":
+        defer = q < max_p - a
+    elif rule == "tokenv2":
+        defer = p < max_p - a
+    else:
+        raise ValueError(f"unknown token-specific cascade rule: {rule!r}")
+    eta = float(q[defer].sum())
+    # pi(v) = q(v)*(1 - r(v)) + p(v)*eta  for every v.
+    pi = np.where(defer, 0.0, q) + p * eta
+    pi = np.where(np.isfinite(pi) & (pi > 0), pi, 0.0)
+    total = pi.sum()
+    if not np.isfinite(total) or total <= 0:
+        return target_p  # degenerate; keep the coin well-defined
+    pi = pi / total
+    if sparse:
+        keep = pi > 0
+        return SparseDistribution(token_ids[keep], pi[keep], vocab)
+    return pi
 
 def sample_from_distribution(probs: Distribution, rng: np.random.Generator | None = None) -> int:
     rng = rng or np.random.default_rng()

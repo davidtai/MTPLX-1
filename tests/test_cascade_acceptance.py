@@ -345,3 +345,120 @@ def test_served_path_emits_cascade_verdict_with_threshold_and_positions(
     assert float(m_thr.group(1)) == float(m_alpha.group(1))  # threshold == alpha
     assert int(m_pos.group(1)) > 0
     assert int(m_pos.group(1)) == out.stats.cascade_positions
+
+
+# ===========================================================================
+# Token-specific speculative-cascade rules (arXiv:2405.19261 v2, Sec. 4.4;
+# Eq. 11/13/14/15; Appendix D Algorithm 6). r_OPT (Eq. 10) compares only the
+# peaks, so it accepts a poor drafted token when q is more peaked than p; the
+# token-specific rules judge the drafted token itself.
+# ===========================================================================
+import numpy as _np
+
+from mtplx.sampling import (
+    SparseDistribution as _SD,
+    cascade_defer_decision as _opt_defer,
+    cascade_token_deferral as _tok_defer,
+    cascade_token_target_distribution as _tok_pi,
+)
+
+
+def _p_dist():
+    # max_p = 0.5 at token 1; token 3 is confidently-wrong under p (p=0.05).
+    return _SD(_np.array([1, 2, 3, 4]), _np.array([0.5, 0.3, 0.05, 0.15]), 5)
+
+
+def _q_dist():
+    # q is MORE peaked than p (max_q = 0.9 at token 3), the OPT failure case.
+    return _SD(_np.array([3, 1]), _np.array([0.9, 0.1]), 5)
+
+
+def test_tokenv3_defers_confident_wrong_draft_that_opt_accepts():
+    p, q = _p_dist(), _q_dist()
+    alpha = 0.2
+    drafted = 3  # x_t ~ q, the peak of q, but poor under p
+    # OPT (Eq. 10): max_q=0.9 >= max_p=0.5 - alpha*D_TV -> does NOT defer -> accepts.
+    opt_defer, _ = _opt_defer(p, q, alpha=alpha)
+    assert opt_defer is False
+    # TokenV3 (Eq. 15): p(3)=0.05 < max_p*(1-alpha)=0.5*0.8=0.4 -> DEFERS.
+    assert _tok_defer(p, q, drafted, alpha=alpha, rule="tokenv3") is True
+
+
+def test_tokenv3_accepts_token_in_top_alpha():
+    p, q = _p_dist(), _q_dist()
+    alpha = 0.2
+    # token 1: p(1)=0.5 >= 0.4 -> in Top_alpha -> r=0 -> accept (no defer).
+    assert _tok_defer(p, q, 1, alpha=alpha, rule="tokenv3") is False
+    # token 2: p(2)=0.3 < 0.4 -> deferred.
+    assert _tok_defer(p, q, 2, alpha=alpha, rule="tokenv3") is True
+
+
+def test_tokenv3_target_distribution_matches_eq11():
+    p, q = _p_dist(), _q_dist()
+    alpha = 0.2  # Top_alpha = {1}; eta = sum_{v not in Top} q(v) = q(3) = 0.9
+    pi = _tok_pi(p, q, alpha=alpha, rule="tokenv3")
+    # pi(v) = q(v)*1[v in Top] + p(v)*eta
+    assert pi.probability(1) == _pytest.approx(0.1 + 0.5 * 0.9)   # 0.55
+    assert pi.probability(2) == _pytest.approx(0.3 * 0.9)          # 0.27
+    assert pi.probability(3) == _pytest.approx(0.05 * 0.9)         # 0.045
+    assert pi.probability(4) == _pytest.approx(0.15 * 0.9)         # 0.135
+    assert sum(pi.probability(v) for v in (1, 2, 3, 4)) == _pytest.approx(1.0)
+
+
+def test_tokenv1_rule_uses_q_against_additive_band():
+    p, q = _p_dist(), _q_dist()
+    alpha = 0.2  # Eq. 13: defer iff q(v) < max_p - alpha = 0.5 - 0.2 = 0.3
+    assert _tok_defer(p, q, 3, alpha=alpha, rule="tokenv1") is False  # q(3)=0.9 >= 0.3
+    assert _tok_defer(p, q, 1, alpha=alpha, rule="tokenv1") is True   # q(1)=0.1 < 0.3
+
+
+def test_unknown_rule_fails_loud():
+    p, q = _p_dist(), _q_dist()
+    with _pytest.raises(ValueError):
+        _tok_defer(p, q, 1, alpha=0.2, rule="bogus")
+
+
+def test_served_order_tokenv3_names_rule_and_defers(capsys, monkeypatch):
+    previous = _mx.default_device()
+    _mx.set_default_device(_mx.cpu)
+    try:
+        monkeypatch.setenv("MTPLX_FABLE_CASCADE_THRESHOLD", "0.5")
+        monkeypatch.setenv("MTPLX_FABLE_CASCADE_RULE", "tokenv3")
+        monkeypatch.setenv("MTPLX_BATCH_TARGET_ARRAYS", "1")
+        monkeypatch.delenv("MTPLX_FABLE_TYPICAL_THRESHOLD", raising=False)
+        model = _VerdictAcceptingMTPModel()
+        out = _generate_mtpk(
+            _verdict_runtime(model),
+            [0],
+            max_tokens=5,
+            sampler=_SamplerConfig(temperature=0.6, top_p=1.0, top_k=1),
+            speculative_depth=3,
+            mtp_history_policy="committed",
+            verify_strategy="batched",
+            stop_token_ids=set(),
+        )
+    finally:
+        _mx.set_default_device(previous)
+    assert out.stats.cascade_accept_enabled is True
+    assert out.stats.cascade_positions > 0
+    err = capsys.readouterr().err
+    lines = [ln for ln in err.splitlines() if "[cascade-accept]" in ln]
+    assert len(lines) == 1, lines
+    assert "rule=tokenv3" in lines[0]
+
+
+def test_default_rule_is_opt(monkeypatch):
+    monkeypatch.delenv("MTPLX_FABLE_CASCADE_RULE", raising=False)
+    from mtplx.generation import _cascade_accept_rule
+    assert _cascade_accept_rule() == "opt"
+
+
+def test_rule_selector_reads_env_at_use(monkeypatch):
+    from mtplx.generation import _cascade_accept_rule
+    monkeypatch.setenv("MTPLX_FABLE_CASCADE_RULE", "tokenv1")
+    assert _cascade_accept_rule() == "tokenv1"
+    monkeypatch.setenv("MTPLX_FABLE_CASCADE_RULE", "TokenV3")
+    assert _cascade_accept_rule() == "tokenv3"  # normalised
+    monkeypatch.setenv("MTPLX_FABLE_CASCADE_RULE", "bogus")
+    with _pytest.raises(ValueError):
+        _cascade_accept_rule()

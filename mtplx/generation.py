@@ -101,9 +101,12 @@ from .sampling import (
     SparseDistribution,
     acceptance_probability as compute_acceptance_probability,
     cascade_defer_decision,
+    cascade_token_deferral,
+    cascade_token_target_distribution,
     distribution_from_logits as dense_distribution_from_logits,
     residual_distribution,
     sample_from_distribution,
+    total_variation,
 )
 from .session_bank import _boundary_true_restore_enabled
 from .runtime_options import (
@@ -632,6 +635,33 @@ def _cascade_accept_alpha() -> float | None:
 def _cascade_accept_enabled() -> bool:
     """The speculative-cascade lane is ON iff the alpha knob is set (any value)."""
     return _cascade_accept_alpha() is not None
+
+
+def _cascade_accept_rule() -> str:
+    """MTPLX_FABLE_CASCADE_RULE (server flag --cascade-rule): which cascade
+    deferral rule to apply. Default "opt" for backward compatibility.
+
+      opt      -- r_OPT (arXiv:2405.19261 v2, Eq. 10): defer iff
+                  max_v q(v) < max_v p(v) - alpha*D_TV(p,q); position-level.
+      tokenv1  -- r_TokenV1 (Eq. 13): defer iff q(v) < max_v' p(v') - alpha.
+      tokenv2  -- r_TokenV2 (Eq. 14): defer iff p(v) < max_v' p(v') - alpha.
+      tokenv3  -- r_TokenV3 (Eq. 15): defer iff p(v) < max_v' p(v')*(1-alpha).
+
+    The token-specific rules (Sec. 4.4) judge the drafted token v rather than
+    only the peaks, and on a deferred token run the exact coin/residual with the
+    token-specific target pi_Token (Eq. 11, Algorithm 6). Resolved at use, per
+    request; a malformed value fails loud.
+    """
+    raw = os.environ.get("MTPLX_FABLE_CASCADE_RULE")
+    if raw is None or str(raw).strip() == "":
+        return "opt"
+    rule = str(raw).strip().lower()
+    if rule not in ("opt", "tokenv1", "tokenv2", "tokenv3"):
+        raise ValueError(
+            f"unknown MTPLX_FABLE_CASCADE_RULE={raw!r}; "
+            "expected one of opt|tokenv1|tokenv2|tokenv3"
+        )
+    return rule
 
 
 def _assert_lossy_verify_rules_exclusive() -> None:
@@ -8764,6 +8794,7 @@ def generate_mtpk(
     _assert_lossy_verify_rules_exclusive()
     _cascade_alpha = _cascade_accept_alpha()
     _cascade_active = _cascade_alpha is not None and sampler.temperature > 0
+    _cascade_rule = _cascade_accept_rule()
     # Loop Guard: loop-armed DRY-style steering (see mtplx/loop_guard.py).
     # Disarmed = zero distribution impact (identity transform, fast paths kept).
     # Armed = target distributions get sparse anti-cycle penalties per position;
@@ -12367,6 +12398,50 @@ def generate_mtpk(
                 accepted_now = int(draft_token) == target_token
                 accept_prob = 1.0 if accepted_now else 0.0
                 correction = target_token
+            elif _cascade_active and _cascade_rule != "opt" and target_distribution_batch is not None:
+                # Token-specific speculative-cascade acceptance (arXiv:2405.19261
+                # v2, Sec. 4.4 / Eq. 11,13-15; Appendix D Algorithm 6). Unlike
+                # OPT (Eq. 10) which compares only the peaks, r_TokenV{1,3} judge
+                # the drafted token v: accept (r=0) when v is in Top_alpha, else
+                # DEFER (r=1) and run the exact coin/residual with target
+                # pi_Token (Eq. 11) instead of p. pi_Token(v)=q(v) for v in
+                # Top_alpha gives an accept probability of 1, so Top_alpha tokens
+                # accept with no coin.
+                draft_q = draft_probs[depth_index]
+                if draft_q is None:
+                    raise RuntimeError("non-greedy MTP requires draft distributions")
+                target_p_for_cache = target_distribution_batch.to_distribution(
+                    depth_index
+                )
+                _cas_tv = total_variation(target_p_for_cache, draft_q)
+                cascade_positions += 1
+                cascade_divergence_sum += _cas_tv
+                _defer = cascade_token_deferral(
+                    target_p_for_cache, draft_q, draft_token,
+                    alpha=_cascade_alpha, rule=_cascade_rule,
+                )
+                if not _defer:
+                    accepted_now = True
+                    accept_prob = 1.0
+                    correction = draft_token
+                    cascade_accepted += 1
+                else:
+                    _pi_token = cascade_token_target_distribution(
+                        target_p_for_cache, draft_q,
+                        alpha=_cascade_alpha, rule=_cascade_rule,
+                    )
+                    accept_prob = compute_acceptance_probability(
+                        _pi_token, draft_q, draft_token
+                    )
+                    accepted_now = float(rng.random()) <= accept_prob
+                    if accepted_now:
+                        correction = draft_token
+                        cascade_accepted += 1
+                    else:
+                        correction = sample_from_distribution(
+                            residual_distribution(_pi_token, draft_q), rng
+                        )
+                        cascade_resamples += 1
             elif _cascade_active and target_distribution_batch is not None:
                 # Speculative-cascade acceptance, batched-target rows
                 # (arXiv:2405.19261, Eq. (10) + Algorithm 4). The deferral
@@ -12489,7 +12564,38 @@ def generate_mtpk(
                 if draft_q is None:
                     raise RuntimeError("non-greedy MTP requires draft distributions")
                 target_p_for_cache = target_p
-                if _cascade_active:
+                if _cascade_active and _cascade_rule != "opt":
+                    # Token-specific cascade (Sec. 4.4), lazy/per-row target.
+                    _cas_tv = total_variation(target_p, draft_q)
+                    cascade_positions += 1
+                    cascade_divergence_sum += _cas_tv
+                    _defer = cascade_token_deferral(
+                        target_p, draft_q, draft_token,
+                        alpha=_cascade_alpha, rule=_cascade_rule,
+                    )
+                    if not _defer:
+                        accepted_now = True
+                        accept_prob = 1.0
+                        correction = draft_token
+                        cascade_accepted += 1
+                    else:
+                        _pi_token = cascade_token_target_distribution(
+                            target_p, draft_q,
+                            alpha=_cascade_alpha, rule=_cascade_rule,
+                        )
+                        accept_prob = compute_acceptance_probability(
+                            _pi_token, draft_q, draft_token
+                        )
+                        accepted_now = float(rng.random()) <= accept_prob
+                        if accepted_now:
+                            correction = draft_token
+                            cascade_accepted += 1
+                        else:
+                            correction = sample_from_distribution(
+                                residual_distribution(_pi_token, draft_q), rng
+                            )
+                            cascade_resamples += 1
+                elif _cascade_active:
                     # Speculative-cascade acceptance, lazy/per-row target. Same
                     # law as the batched branch: deterministic Eq.(10) deferral,
                     # accept the draft when it is good enough, otherwise the
@@ -13836,6 +13942,7 @@ def generate_mtpk(
         _cas_cycles = max(1, verify_calls)
         print(
             "[cascade-accept] NOT distribution-exact; "
+            f"rule={_cascade_rule} "
             f"threshold={_cascade_alpha:.4g} alpha={_cascade_alpha:.4g} "
             f"positions={cascade_positions} accepted={cascade_accepted} "
             f"resamples={cascade_resamples} accept_rate={_cas_rate:.4f} "
