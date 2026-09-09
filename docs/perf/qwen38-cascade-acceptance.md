@@ -112,14 +112,26 @@ runs.
   UNSETTING the key, not setting it to 0 (alpha = 0 still defers whenever the
   target is strictly more confident than the draft). Higher alpha widens the
   accept band, so fewer positions defer. Resolved at use, per request.
+- `--cascade-rule opt|tokenv1|tokenv2|tokenv3` (env `MTPLX_FABLE_CASCADE_RULE`):
+  which deferral rule `--cascade-threshold` applies. Default `opt` for backward
+  compatibility -- the position-level peak rule (Eq. 10). `tokenv1`/`tokenv2`/
+  `tokenv3` are the token-specific rules (Eq. 13/14/15) that judge the drafted
+  token. For `tokenv3`, alpha is a FRACTION of the target peak
+  (`Top_alpha = {v : p(v) >= max_p * (1 - alpha)}`), so its useful range is
+  alpha >= 0.9; a small alpha collapses `Top_alpha` toward the argmax and defers
+  almost everything (near-exact, slow). Ignored unless `--cascade-threshold` is
+  set; resolved at use, per request.
 - Mutually exclusive with `--typical-threshold` (`MTPLX_FABLE_TYPICAL_THRESHOLD`
   > 0). Setting both fails loud at serve startup (SystemExit) and in the verify
   setup (ValueError).
-- Observability: `/health` -> `cascade_acceptance` (`enabled`, `alpha`, the rule
-  and divergence definitions, `conflict`); and a per-request verdict line
-  `[cascade-accept] NOT distribution-exact; threshold=A alpha=A positions=N
-  accepted=N resamples=N accept_rate=R mean_divergence=D ...` in the same format
-  as `[typical-accept]`.
+- Observability: `/health` -> `cascade_acceptance` reports `enabled`, `alpha`
+  (= `threshold`), `rule_name` (the resolved rule, e.g. `tokenv3`), `rule` (its
+  one-line definition), the divergence definition, and `conflict`. Each
+  generation prints a per-request verdict line that names the rule:
+  `[cascade-accept] NOT distribution-exact; rule=RULE threshold=A alpha=A
+  positions=N accepted=N resamples=N accept_rate=R mean_divergence=D
+  tokens_per_cycle=T accepted_by_depth=... generated=N verify_calls=N` (the same
+  format as `[typical-accept]`, with the added `rule=` field).
 
 ## Recommended alpha grid for the 16K sweep
 
@@ -280,3 +292,62 @@ docstring text changed. The measured arm-G OPT numbers stand. (The whole-file
 text hashes in the earlier table above use a different extractor and are
 unaffected; the two tables here are self-consistent, produced by one
 docstring-stripping AST script.)
+
+## Measured results (16K HumanEval)
+
+Optimized-Speed pack, 16,384-token context, HumanEval (164), temperature 1.0,
+reasoning xhigh, sampled decode; decode tok/s is the fastest of the seeds.
+"strict" pass@1 is the evalplus-sanitized score over all problems; "completed"
+excludes output-cap truncations; "trunc" is the truncation rate.
+
+Baselines:
+
+- Exact speculative sampling (cascade off): HumanEval 0.9634 strict at 82.85 tok/s.
+- Typical-0.09 (the #478 lane): 0.9634 strict at 104.65 tok/s.
+
+OPT rule (`r_OPT`, Eq. 10) -- HumanEval strict pass@1 by alpha:
+
+| alpha | 0.0 | 0.25 | 0.5 | 0.75 | 1.0 | 2.0 |
+| --- | --- | --- | --- | --- | --- | --- |
+| HE strict | 0.9024 | 0.8537 | 0.7805 | 0.7073 | dnf | not run |
+
+OPT alpha 0.25 ran at 104.78 tok/s (equal speed to typical-0.09) at 0.8537 strict.
+
+TokenV3 rule (`r_TokenV3`, Eq. 15) -- decode tok/s by alpha:
+
+| alpha | 0.0 | 0.25 | 0.5 | 0.75 | 0.95 |
+| --- | --- | --- | --- | --- | --- |
+| decode tok/s | 84.09 | 88.70 | 95.30 | 96.52 | 107.10 |
+
+(TokenV3 alpha 0.0 sits at 84.09 tok/s, next to exact's 82.85, because
+`Top_alpha` is then the argmax alone and almost every token defers; higher alpha
+widens `Top_alpha` and accepts more, up to 107.10 tok/s at alpha 0.95.)
+
+TokenV3 quality:
+
+- alpha 0.95: HumanEval 0.9695 strict / 1.000 completed / 3.05% truncation, at
+  107.10 tok/s.
+- alpha 0.75: {{tokenv3_a0p75_quality}}  <!-- placeholder: TokenV3 alpha 0.75 quality point pending -->
+
+Equal-speed comparison (~105 tok/s): TokenV3 alpha 0.95 = 0.9695 strict at
+107.10 tok/s; typical-0.09 = 0.9634 strict at 104.65 tok/s; OPT alpha 0.25 =
+0.8537 strict at 104.78 tok/s. Exact speculative sampling reaches 0.9634 strict
+but at 82.85 tok/s.
+
+### Why the peak rule loses and the token-specific rule does not (Sec. 4.4)
+
+`r_OPT` (Eq. 10) decides between the draft `q` and the target `p` by comparing
+only their maximum token probabilities. As Sec. 4.4 of the paper states, the
+drafted token `x_t ~ q_t(.)` may not maximise `q_t`, so "even when `x_t` is of
+poor quality, we may end up accepting it because `q_t` happens to be more peaked
+than `p_t`." That is the mechanism behind the OPT grid above: as alpha rises the
+accept band widens and more of these poor tokens are admitted, and strict pass@1
+falls monotonically. The token-specific rules judge the drafted token `v`
+itself: `r_TokenV3` defers `v` iff `p(v) < max_v' p(v') * (1 - alpha)`, i.e. iff
+`v` is outside the target's top band `Top_alpha`. A confidently-wrong drafted
+token has small `p(v)`, so it is deferred and re-drawn from the exact target
+`pi_Token` (Eq. 11) even when `q` is more peaked than `p` -- exactly the case
+`r_OPT` accepts. This is why TokenV3 holds strict pass@1 at exact's level
+(0.9695 vs 0.9634) while still admitting the high-`p(v)` tokens that give the
+speed-up.
+
