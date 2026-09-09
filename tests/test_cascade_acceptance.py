@@ -447,10 +447,20 @@ def test_served_order_tokenv3_names_rule_and_defers(capsys, monkeypatch):
     assert "rule=tokenv3" in lines[0]
 
 
-def test_default_rule_is_opt(monkeypatch):
+def test_default_rule_is_tokenv3(monkeypatch):
+    # David 2026-09-09: TokenV3 is the default rule (exact-level accuracy).
     monkeypatch.delenv("MTPLX_FABLE_CASCADE_RULE", raising=False)
     from mtplx.generation import _cascade_accept_rule
+    assert _cascade_accept_rule() == "tokenv3"
+
+
+def test_env_opt_still_selects_opt(monkeypatch):
+    # Backward compatibility: the OPT peak rule stays selectable by env.
+    from mtplx.generation import _cascade_accept_rule
+    monkeypatch.setenv("MTPLX_FABLE_CASCADE_RULE", "opt")
     assert _cascade_accept_rule() == "opt"
+    monkeypatch.setenv("MTPLX_FABLE_CASCADE_RULE", "OPT")
+    assert _cascade_accept_rule() == "opt"  # normalised
 
 
 def test_rule_selector_reads_env_at_use(monkeypatch):

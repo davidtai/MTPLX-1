@@ -113,14 +113,20 @@ runs.
   target is strictly more confident than the draft). Higher alpha widens the
   accept band, so fewer positions defer. Resolved at use, per request.
 - `--cascade-rule opt|tokenv1|tokenv2|tokenv3` (env `MTPLX_FABLE_CASCADE_RULE`):
-  which deferral rule `--cascade-threshold` applies. Default `opt` for backward
-  compatibility -- the position-level peak rule (Eq. 10). `tokenv1`/`tokenv2`/
-  `tokenv3` are the token-specific rules (Eq. 13/14/15) that judge the drafted
-  token. For `tokenv3`, alpha is a FRACTION of the target peak
-  (`Top_alpha = {v : p(v) >= max_p * (1 - alpha)}`), so its useful range is
-  alpha >= 0.9; a small alpha collapses `Top_alpha` toward the argmax and defers
-  almost everything (near-exact, slow). Ignored unless `--cascade-threshold` is
-  set; resolved at use, per request.
+  which deferral rule `--cascade-threshold` applies. Default `tokenv3` (the
+  token-specific multiplicative rule, Eq. 15). It is the default because it is
+  the only rule measured at exact-level accuracy: at alpha 0.95 it holds
+  HumanEval 0.9695 strict (equal to exact) while OPT loses quality at every alpha
+  (0.9024 at alpha 0.0 down to 0.7073 at alpha 0.75). To use the original
+  position-level peak rule, select `opt` (env `MTPLX_FABLE_CASCADE_RULE=opt` or
+  `--cascade-rule opt`); `tokenv1`/`tokenv2` are the additive token-specific
+  rules (Eq. 13/14). The default change does not turn the mode on: the lane is
+  still OFF unless `--cascade-threshold` is set, in which case the exact
+  speculative law runs unchanged. For `tokenv3`, alpha is a FRACTION of the
+  target peak (`Top_alpha = {v : p(v) >= max_p * (1 - alpha)}`), so its useful
+  range is alpha >= 0.9; a small alpha collapses `Top_alpha` toward the argmax
+  and defers almost everything (near-exact, slow). All rules are resolved at use,
+  per request.
 - Mutually exclusive with `--typical-threshold` (`MTPLX_FABLE_TYPICAL_THRESHOLD`
   > 0). Setting both fails loud at serve startup (SystemExit) and in the verify
   setup (ValueError).

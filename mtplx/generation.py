@@ -639,7 +639,9 @@ def _cascade_accept_enabled() -> bool:
 
 def _cascade_accept_rule() -> str:
     """MTPLX_FABLE_CASCADE_RULE (server flag --cascade-rule): which cascade
-    deferral rule to apply. Default "opt" for backward compatibility.
+    deferral rule to apply. Default "tokenv3" (David 2026-09-09: the only
+    rule with exact-level accuracy); "opt" stays selectable for backward
+    compatibility. The mode itself is still OFF unless the alpha knob is set.
 
       opt      -- r_OPT (arXiv:2405.19261 v2, Eq. 10): defer iff
                   max_v q(v) < max_v p(v) - alpha*D_TV(p,q); position-level.
@@ -654,7 +656,7 @@ def _cascade_accept_rule() -> str:
     """
     raw = os.environ.get("MTPLX_FABLE_CASCADE_RULE")
     if raw is None or str(raw).strip() == "":
-        return "opt"
+        return "tokenv3"
     rule = str(raw).strip().lower()
     if rule not in ("opt", "tokenv1", "tokenv2", "tokenv3"):
         raise ValueError(

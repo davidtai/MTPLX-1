@@ -16524,7 +16524,7 @@ def _cascade_acceptance_health_payload() -> dict[str, Any]:
     except ValueError:
         typical_on = False
     rule_raw = os.environ.get("MTPLX_FABLE_CASCADE_RULE")
-    rule_name = str(rule_raw).strip().lower() if rule_raw not in (None, "") else "opt"
+    rule_name = str(rule_raw).strip().lower() if rule_raw not in (None, "") else "tokenv3"
     rule_text = {
         "opt": "defer iff max_q < max_p - alpha*D_TV(p,q); else accept draft (Eq. 10)",
         "tokenv1": "defer token v iff q(v) < max_p - alpha; else accept (Eq. 13)",
@@ -36396,14 +36396,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--cascade-rule",
         choices=("opt", "tokenv1", "tokenv2", "tokenv3"),
+        # default=None (sentinel) so an unset flag does not override a
+        # shell-set MTPLX_FABLE_CASCADE_RULE; the effective default resolves in
+        # generation._cascade_accept_rule() (tokenv3).
         default=None,
         help=(
             "Which speculative-cascade deferral rule --cascade-threshold "
-            "applies (arXiv:2405.19261 v2). opt (default) = the position-level "
-            "peak rule (Eq. 10); tokenv1/tokenv2/tokenv3 = the token-specific "
-            "rules (Eq. 13/14/15, Sec. 4.4) that judge the drafted token and "
-            "defer to the exact coin with target pi_Token (Eq. 11). Ignored "
-            "unless --cascade-threshold is set. Environment: "
+            "applies (arXiv:2405.19261 v2). tokenv3 (default) = the "
+            "token-specific multiplicative rule (Eq. 15, Sec. 4.4), the only "
+            "rule with exact-level accuracy; opt = the position-level peak "
+            "rule (Eq. 10); tokenv1/tokenv2 = the additive token-specific "
+            "rules (Eq. 13/14). The token-specific rules judge the drafted "
+            "token and defer to the exact coin with target pi_Token (Eq. 11). "
+            "Ignored unless --cascade-threshold is set. Environment: "
             "MTPLX_FABLE_CASCADE_RULE, which this flag overrides."
         ),
     )
