@@ -5,11 +5,15 @@ beside typical acceptance. Per draft position it decides whether the draft token
 is good enough to keep, or whether to defer to the exact target law. It is OFF by
 default, mutually exclusive with typical acceptance, and NOT distribution-exact.
 
-Citation: Narasimhan, Mreddy, Jitkrittum, Rawat, Kumar, "Faster Cascades via
-Speculative Decoding," ICLR 2025 / arXiv:2405.19261 v2. This implements the
-plug-in deferral rule of Section 4.3, Equation (10) (the plug-in approximation
-to the optimal rule of Equation (8)), executed with the speculative decoding of
-Algorithm 4.
+Citation: Narasimhan, Jitkrittum, Rawat, Kim, Gupta, Menon, and Kumar, "Faster Cascades via
+Speculative Decoding," arXiv:2405.19261 v2 (2024). This implements the
+r-hat_OPT deferral rule of Section 4.3, Equation (10): the plug-in ESTIMATOR of
+the optimal speculative-cascade deferral rule (Lemma 4, Equation (9)), replacing
+that rule's ground-truth expected 0-1 losses with one minus each model's max
+probability. It is not the optimal rule and not an oracle. The separate Diff rule
+(Equation (5), max q < max p - alpha, no total-variation term) is the
+SEQUENTIAL-cascade oracle and is not implemented here. Executed with the
+speculative decoding of Algorithm 4.
 
 Terms:
 
@@ -63,7 +67,7 @@ is SUBTRACTED from the target's confidence. So more disagreement between the
 draft and the target LOWERS the bar for accepting the draft, which means the rule
 defers LESS when they disagree, not more. The paper's reason (their Lemma 3) is
 that a large disagreement makes the verification step itself expensive, so the
-optimal rule only pays that cost when the target is clearly better; it accepts a
+rule only pays that cost when the target is clearly better; it accepts a
 draft that is confident, even on a token the target would not have picked. The
 intuitive "reject when the draft diverges" behaviour still holds for the common
 case, a diverging draft that has also lost its peak confidence, which defers; a

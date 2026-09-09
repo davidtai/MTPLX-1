@@ -1,7 +1,7 @@
 """CPU tests for speculative-cascade acceptance (a second lossy verify rule).
 
-Rule implemented: Narasimhan, Mreddy, Jitkrittum, Rawat, Kumar, "Faster
-Cascades via Speculative Decoding" (arXiv:2405.19261 v2), Section 4.3
+Rule implemented: Narasimhan, Jitkrittum, Rawat, Kim, Gupta, Menon, and Kumar, "Faster
+Cascades via Speculative Decoding" (arXiv:2405.19261 v2, 2024), Section 4.3
 Equation (10), the plug-in approximation to the optimal deferral rule of
 Equation (8):
 
