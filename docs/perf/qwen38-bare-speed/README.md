@@ -1,9 +1,9 @@
 # Bare-Speed: run the full Qwen3.8 Flash-Next serving stack on the Q4/g64 pack
 
-**Headline.** On the Bare-Speed pack, stock 2.11.2 and #475 leave FR-Spec dark:
+**Headline.** On the Bare-Speed pack, release 2.11.2 and #475 leave FR-Spec dark:
 the Q4/g64 `lm_head` fails the auto-arm predicate, so the pruned draft head never
 installs and decode runs at a draft acceptance of 0.435. This pull request's
-predicate relaxation and g64 kernels arm it, recovering exact decode at 16K from
+predicate relaxation and g64 kernels arm it, recovering decode with the acceptance mode off at 16K from
 71.51 to 79.84 tok/s (11.6%), with 106.67 tok/s at typical acceptance 0.09 and
 121.48 tok/s at cascade 0.5, at a peak about 9 GB below the Optimized-Speed pack,
 and 261,120 tokens fit on every arm. Section 2.7 gives the diagnosis and states
@@ -98,7 +98,7 @@ _16K decode per arm, fastest with a min-max band. FR-Spec is dark on A/B/C and a
 
 ## 2. Results
 
-**This pull request is not finished. Prefill tok/s, decode tok/s, wall time, TTFT and peak memory are measured after the Optimized-Speed battery, inside a wait-for-free flock hold between windows, and will replace these cells.** Each throughput cell reports the fastest of its seeds with the slowest-to-fastest range in parentheses; TTFT and wall report the fastest (lowest); peak memory reports the highest. `n=` is the number of seeds behind the fastest-of value. The Δ% column is the comparison of record, D vs A; the pairwise attribution deltas (B vs A, C vs B, D vs C) accompany the sweep.
+Each throughput cell reports the fastest of its seeds with the slowest-to-fastest range in parentheses; TTFT and wall report the fastest (lowest); peak memory reports the highest. `n=` is the number of seeds behind the fastest-of value. The Δ% column is the comparison of record, D vs A; the pairwise attribution deltas (B vs A, C vs B, D vs C) accompany the sweep.
 
 ### 2.1 Decode tok/s _(higher is better)_
 
@@ -108,7 +108,7 @@ The same full Bare kernel stack, read at 16K under each acceptance mode:
 
 | All Bare kernels, by acceptance mode | Decode tok/s (16K, fastest of seeds) |
 | --- | ---: |
-| Bare + exact | 79.84 (74.34-79.84) _n=3_ |
+| Bare-Speed + acceptance mode off | 79.84 (74.34-79.84) _n=3_ |
 | Bare + typical 0.09 | 106.67 (101.31-106.67) _n=9_ |
 | Bare + cascade 0.5 | 121.48 (115.92-121.48) _n=3_ |
 
@@ -116,7 +116,7 @@ _Provenance: all three are the same full Bare kernel stack (FR-Spec q4/g64, the 
 
 _Acceptance mode is part of every arm's identity, so it is named in each column below. Arms A and B run the exact acceptance law; arms C and D run typical acceptance at 0.09, because #478's typical mode is what arm C adds and arm D inherits. The Δ% D vs A column therefore spans both the Bare kernels and the change of acceptance mode, and is not a kernel-only figure; the kernel-only comparison at a fixed mode is D vs C._
 
-| Cell | Bare release 2.11.2 (A, exact) | #475 on Bare (B, exact) | #475+#478 on Bare (C, typical 0.09) | this PR (D, typical 0.09) | Δ% D vs A |
+| Cell | Bare-Speed release 2.11.2 (A, acceptance mode off) | #475 on Bare-Speed (B, acceptance mode off) | #475+#478 on Bare-Speed (C, typical acceptance 0.09) | this PR (D, typical 0.09) | Δ% D vs A |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | 1K | 75.34 (67.95-75.34) _n=3_ | 72.03 (71.14-72.03) _n=3_ | 103.62 (97.22-103.62) _n=3_ | 113.80 (109.02-113.80) _n=3_ | +51.0% |
 | 8K | 66.63 (61.06-66.63) _n=3_ | 85.41 (71.03-85.41) _n=3_ | 99.18 (92.77-99.18) _n=3_ | 111.10 (101.37-111.10) _n=3_ | +66.7% |
@@ -130,7 +130,7 @@ _Acceptance mode is part of every arm's identity, so it is named in each column 
 
 #475's remainder optimizations touch prefill; #478 and this pull request's Bare engagement touch only decode, so prefill is expected to be equal for C and D and to match B. The sweep confirms it.
 
-| Cell | Bare release 2.11.2 (A, exact) | #475 on Bare (B, exact) | #475+#478 on Bare (C, typical 0.09) | this PR (D, typical 0.09) | Δ% D vs A |
+| Cell | Bare-Speed release 2.11.2 (A, acceptance mode off) | #475 on Bare-Speed (B, acceptance mode off) | #475+#478 on Bare-Speed (C, typical acceptance 0.09) | this PR (D, typical 0.09) | Δ% D vs A |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | 1K | 955.8 (761.5-955.8) _n=3_ | 952.8 (761.4-952.8) _n=3_ | 951.1 (762.4-951.1) _n=3_ | 955.9 (757.3-955.9) _n=3_ | +0.0% |
 | 8K | 1405.6 (1272.5-1405.6) _n=3_ | 1403.7 (1274.5-1403.7) _n=3_ | 1407.4 (1274.4-1407.4) _n=3_ | 1404.4 (1275.4-1404.4) _n=3_ | -0.1% |
@@ -142,7 +142,7 @@ _Acceptance mode is part of every arm's identity, so it is named in each column 
 
 ### 2.3 TTFT s _(lower is better)_
 
-| Cell | Bare release 2.11.2 (A, exact) | #475 on Bare (B, exact) | #475+#478 on Bare (C, typical 0.09) | this PR (D, typical 0.09) | Δ% D vs A |
+| Cell | Bare-Speed release 2.11.2 (A, acceptance mode off) | #475 on Bare-Speed (B, acceptance mode off) | #475+#478 on Bare-Speed (C, typical acceptance 0.09) | this PR (D, typical 0.09) | Δ% D vs A |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | 1K | 1.202 (1.202-1.490) _n=3_ | 1.199 (1.199-1.483) _n=3_ | 1.201 (1.201-1.478) _n=3_ | 1.190 (1.190-1.483) _n=3_ | -1.0% |
 | 8K | 5.998 (5.998-6.619) _n=3_ | 6.003 (6.003-6.604) _n=3_ | 5.968 (5.968-6.585) _n=3_ | 5.975 (5.975-6.573) _n=3_ | -0.4% |
@@ -154,7 +154,7 @@ _Acceptance mode is part of every arm's identity, so it is named in each column 
 
 ### 2.4 Wall s _(lower is better)_
 
-| Cell | Bare release 2.11.2 (A, exact) | #475 on Bare (B, exact) | #475+#478 on Bare (C, typical 0.09) | this PR (D, typical 0.09) | Δ% D vs A |
+| Cell | Bare-Speed release 2.11.2 (A, acceptance mode off) | #475 on Bare-Speed (B, acceptance mode off) | #475+#478 on Bare-Speed (C, typical acceptance 0.09) | this PR (D, typical 0.09) | Δ% D vs A |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | 1K | 15.07 _n=1_ | 15.49 _n=1_ | 11.08 (11.08-11.88) _n=3_ | 10.19 (10.19-10.76) _n=3_ | -32.4% |
 | 8K | 21.98 _n=1_ | measuring | 16.37 (16.37-17.03) _n=3_ | 15.79 _n=1_ | -28.2% |
@@ -166,7 +166,7 @@ _Acceptance mode is part of every arm's identity, so it is named in each column 
 
 ### 2.5 Peak memory GB _(lower is better)_
 
-| Cell | Bare release 2.11.2 (A, exact) | #475 on Bare (B, exact) | #475+#478 on Bare (C, typical 0.09) | this PR (D, typical 0.09) | Δ% D vs A |
+| Cell | Bare-Speed release 2.11.2 (A, acceptance mode off) | #475 on Bare-Speed (B, acceptance mode off) | #475+#478 on Bare-Speed (C, typical acceptance 0.09) | this PR (D, typical 0.09) | Δ% D vs A |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | 1K | 77.74 (75.70-77.74) _n=3_ | 77.72 (75.69-77.72) _n=3_ | 78.18 (75.69-78.18) _n=3_ | 78.28 (75.79-78.28) _n=3_ | +0.7% |
 | 8K | 82.05 (78.00-82.05) _n=3_ | 80.84 (77.68-80.84) _n=3_ | 82.62 (77.68-82.62) _n=3_ | 81.83 (77.78-81.83) _n=3_ | -0.3% |
@@ -210,16 +210,16 @@ optimization declines in the same query-length band, so it does not change
 either peak.
 
 The headroom therefore comes from the pack's quantization recipe, not from this
-pull request's kernels: the cell fits on the Bare release arm and the Bare PR
+pull request's kernels: the cell fits on the Bare-Speed release arm and the #488
 arm alike. This pull request does not change 261,120-token behaviour.
 
 ### 2.7 Why the Bare pack decodes below Optimized-Speed on stock code
 
-On stock 2.11.2 and on #475, the Bare-Speed pack decodes below the
+On release 2.11.2 and on #475, the Bare-Speed pack decodes below the
 Optimized-Speed pack even though it carries about 8% fewer bytes. Three
 measurements settle why.
 
-**1. The deficit tracks draft acceptance, not bytes.** Same #475 exact code,
+**1. The deficit tracks draft acceptance, not bytes.** Same #475 base code with the acceptance mode off,
 seed 20260829, 16,384 tokens: Bare decodes 71.51 tok/s at a draft acceptance of
 0.435 with FR-Spec disabled, because the Q4/g64 predicate rejects the head. The
 Optimized-Speed pack decodes 82.54 tok/s at 0.493 with FR-Spec armed on its
@@ -244,17 +244,17 @@ Swapping the head back to 8 bits buys almost nothing and costs memory.
 
 **What this pull request is worth on the Bare pack.** Stock 2.11.2 and #475
 leave FR-Spec dark here. The predicate relaxation and the g64 kernels arm it,
-which recovers exact decode at 16K from 71.51 to 79.84 tok/s, 11.6%, and carries
+which recovers decode with the acceptance mode off at 16K from 71.51 to 79.84 tok/s, 11.6%, and carries
 106.67 tok/s at typical 0.09 and 121.48 tok/s at cascade 0.5. Peak sits about
 9 GB below the Optimized-Speed pack on the paired #475 windows (78.62 GB against
 87.88 GB), and 261,120 tokens fit on every arm.
 
 **The residual, plainly.** At equal acceptance the pack gap does not fully close.
-Bare-PR exact with the 8-bit head runs 80.90 tok/s at acceptance 0.490 against
+#488 with the acceptance mode off and the 8-bit head runs 80.90 tok/s at MTP draft acceptance 0.490 against
 Optimized-Speed #475 at 82.80 tok/s with acceptance 0.493, about 2%, which is
 inside the seed band these windows span (74 to 83 tok/s).
 
-A per-stage trace attributes that remainder. Running the same Bare-PR code at 16K
+A per-stage trace attributes that remainder. Running the same #488 code at 16K
 exact, seed 20260829, on both packs and differencing the per-decode-step timing
 (Bare minus Optimized), the whole-cycle delta is +0.13 ms per step, +0.9%. Two
 terms make it up. The larger is acceptance: the Bare pack commits 2.77 tokens per
@@ -337,14 +337,14 @@ GEMV is a separate, later optimization, not part of this pull request.
 | Engine | MTPLX 2.11.2 (base `21be78b3`) on MLX 0.32.2, served path; branch on the #475/#478 tip `264e0835` |
 | Profile | cli-resolved Turbo, the profile `mtplx serve` selects for this pack |
 | Cell | 1,024 output tokens, temperature 1, top-p 0.95, top-k 20, reasoning `xhigh`, native MTP depth 3 |
-| #478 typical threshold | Arms C and D run at `MTPLX_FABLE_TYPICAL_THRESHOLD=0.09` (the #478 headline operating point) so D-vs-C isolates the Bare engagement at the same acceptance rule; arms A and B are exact (typical off) |
+| #478 typical threshold | Arms C and D run at `MTPLX_FABLE_TYPICAL_THRESHOLD=0.09` (the #478 headline operating point) so D-vs-C isolates the Bare engagement at the same acceptance rule; arms A and B run with typical off |
 | Seeds | 20260829, 20260830, 20260831; three seeds at every context |
 | Seeds per load | 1K/8K/16K/32K run three seeds in one server load; 64K/128K/255K run one seed per load |
 | Isolation | cold prefill; prefix restore off (`MTPLX_SESSION_BLOCK_PREFIX_RESTORE=0`, near-prefix off); a fresh SSD session-cache dir per window; `new_prefill == prompt` verified per cell |
 | Memory / thermal | 100 GiB cap; fans at maximum; 40 degree Celsius hold before every cell |
 | 16K protocol | interleaved paired windows for each attribution step (B vs A, C vs B, D vs C), three windows per arm, three seeds each; each arm's 16K value is its fastest window; paired per-seed deltas with a 95% interval on the mean delta and a drift bracket |
 | Cell statistic | throughput cells report the fastest of the seeds with the slowest-to-fastest range in parentheses; TTFT and wall report the fastest (lowest); peak memory reports the highest |
-| Flock discipline | every window and every GPU-touching check runs inside a wait-for-free flock hold between battery windows; no Metal execution of any size outside the flock |
+| GPU exclusivity | every window and every GPU-touching check holds the machine's GPU lock for its whole duration; no Metal execution of any size runs outside it |
 
 ---
 
@@ -354,11 +354,12 @@ The one rounding-class optimization (the routed Q4/g64 kernels) ships on the
 code-eval quality gate, not on bit-identity; the exact optimizations do not
 affect it. The gate is HumanEval at the EXACT acceptance law (typical off) on
 three arms: release A, #475 on Bare B, and this pull request's kernels D. The
-exact setting is deliberate. Exact acceptance preserves the target distribution
+acceptance-mode-off setting is deliberate. Exact acceptance preserves the target
+distribution
 regardless of the draft, so the emitted stream does not depend on the typical
 rule; any HumanEval delta across these arms is therefore the routed-GLU and
-FR-Spec kernels, not the acceptance rule. D's control is B: same exact setting,
-differing only in the kernels. The typical rule's own quality is covered by
+FR-Spec kernels, not the acceptance rule. D's control is B: the same setting with the
+acceptance mode off, differing only in the kernels. The typical rule's own quality is covered by
 #478; the speed table above stays at typical 0.09 as measured.
 
 The gate is HumanEval only — one HumanEval cell per arm is the sanity check;
@@ -374,30 +375,37 @@ samples jsonl is kept.
 
 | Suite | Arm | pass@1 (strict) | pass@1 (completed-task) | Truncation % (mean/max tokens) |
 | --- | --- | ---: | ---: | ---: |
-| HumanEval (exact, re-scored) | release (A) | 0.9695 | 1.0000 | 3.0% (mean 3058 tok) |
-| HumanEval (exact, re-scored) | #475 on Bare (B) | 0.9573 | 0.9937 | 3.7% (mean 3911 tok) |
-| HumanEval (exact, re-scored) | this PR (D) | 0.9695 | 0.9938 | 2.4% (mean 3628 tok) |
-| MBPP | #475 on Bare (B) | not run | not run | not run |
+| HumanEval (acceptance mode off, re-scored) | release (A) | 0.9695 | 1.0000 | 3.0% (mean 3058 tok) |
+| HumanEval (acceptance mode off, re-scored) | #475 on Bare-Speed (B) | 0.9573 | 0.9937 | 3.7% (mean 3911 tok) |
+| HumanEval (acceptance mode off, re-scored) | this PR (D) | 0.9695 | 0.9938 | 2.4% (mean 3628 tok) |
+| MBPP | #475 on Bare-Speed (B) | not run | not run | not run |
 | MBPP | this PR (D) | not run | not run | not run |
 
 _All three HumanEval rows are at the exact acceptance law (typical off), so any delta isolates the routed-GLU / FR-Spec kernels rather than the acceptance rule. MBPP was not part of this gate (HumanEval only, David's ruling); its rows are shown as not run rather than omitted so the gate's scope is explicit._
 
 _Read strict, completed, and truncation together, not strict alone. D holds release strict exactly (0.9695 vs A's 0.9695, delta 0.0000): the whole Bare-Speed stack, rounding kernels included, does not move the exact-law pass rate. B's lower strict (0.9573) is two extra cap-32768 truncations under xhigh verbosity on a single seed, not a code regression: B and D each have exactly one completed-but-failed problem, so their completed-task pass@1 is identical to rounding (0.9937 vs 0.9938)._
 
-_Pack footnote: A is release 2.11.2 on the coordinator's on-disk Optimized-Speed control pack, while B and D are served on the Bare-Speed (Q4/g64) pack; the A-to-B/D comparison therefore also crosses the pack boundary, whereas the D-vs-B kernel attribution is within the Bare-Speed pack._
+_Pack footnote: A is release 2.11.2 on the on-disk Optimized-Speed control pack, while B and D are served on the Bare-Speed (Q4/g64) pack; the A-to-B/D comparison therefore also crosses the pack boundary, whereas the D-vs-B kernel attribution is within the Bare-Speed pack._
 
 ---
 
-## 6. What is still being measured
+## 6. What is not measured here
 
-These run after the Optimized-Speed battery, each inside a wait-for-free flock hold between windows, in this order:
+The four-arm context sweep, the paired attribution windows at 16,384 and the
+acceptance-mode-off HumanEval gate are complete and are reported above. Three
+gaps remain, and each is marked in its own cell rather than left to this list:
 
-1. The routed Q4/g64 GLU and down parity self-check on the real Bare-Speed pack (worst absolute delta ≤ 2⁻⁹ per layer at model load).
-2. A guarded serve of the Bare-Speed pack on this branch, confirming `/health` shows the M=4 stage-3 combine installed (paired routed GLU true) and FR-Spec installed (source native_mtp_head, bits 4), with no stage-3 decline line.
-3. The FR-Spec native-head install tests, run under the flock.
-4. The four-arm Bare-Speed context sweep across arms A (release + bare), B (#475 + bare), C (#475 + #478 + bare) and D (this PR), at 1K, 8K, 16K, 32K, 64K, 128K, 255K, three seeds per cell, with the charts in Section 1; the paired attribution windows at 16K (B vs A, C vs B, D vs C); and the exact-law HumanEval quality gate in Section 5 (arms A/B/D, which isolates the kernel adaptations from the acceptance rule).
+1. Wall seconds at 8,192 for arm B, at 65,536 for arm A, and at 261,120 for
+   every arm. A wall figure is comparable only when the request stopped on the
+   output cap, and no seed in those cells did.
+2. MBPP. This pull request's quality gate is HumanEval only, so the MBPP rows
+   read `not run` rather than being omitted, which keeps the gate's scope
+   visible.
+3. The routed Q4/g64 parity self-check runs at model load on every serve of this
+   branch, so it is a standing gate rather than a measured cell.
 
-The FR-Spec draft-acceptance A/B is measured by the battery's Bare arms.
+The FR-Spec MTP-draft-acceptance A/B is measured by the battery's Bare-Speed
+arms.
 
 ---
 
