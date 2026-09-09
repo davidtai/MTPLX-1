@@ -19,12 +19,12 @@
   },
   {
     "alt": "Decode tok/s by context size for the exact pairing, cascade OPT alphas 0.0-2.0 and TokenV3 alpha 0.95",
-    "bytes": 88972,
-    "caption": "_Decode tok/s by context size, one line per arm: the exact pairing, the OPT rule at alpha 0.0/0.25/0.5/0.75/1.0/2.0, and the TokenV3 rule at alpha 0.95. Each point is the fastest seed with a min-max band; 16,384 is the arm-G/arm-T sweep merged in; 261,120 is absent because every arm exceeds the memory knob on the #475 base without #482._",
+    "bytes": 88853,
+    "caption": "_Decode tok/s by context size, one line per arm: the exact pairing, the OPT rule at alpha 0.0/0.25/0.5/0.75/1.0/2.0, and the TokenV3 rule at alpha 0.95. Each point is the fastest seed with a min-max band; the 16,384 rung is merged in from the 16K sweeps, the OPT arms from battery475/g and the TokenV3 arm from battery475/t; 261,120 is absent because every arm exceeds the memory knob on the #475 base without #482._",
     "file": "cascade_decode_by_context.svg",
     "key": "cascade_decode_by_context",
     "label": "cascade decode by context",
-    "sha256": "2391b851be197e57ab1b3f9746c61624340fc65d10b8742ca75463df02404fa0"
+    "sha256": "aaa4aeff255fc437d48b6f897b86252f5790676e7ead2662fbca3a0232d3da15"
   },
   {
     "alt": "Grouped bars of decode tok/s at 16,384 tokens for release 2.11.2, #475, #478 and four #485 cascade operating points, each annotated with its HumanEval strict pass@1",
