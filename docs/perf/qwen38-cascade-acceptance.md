@@ -327,12 +327,17 @@ TokenV3 quality:
 
 - alpha 0.95: HumanEval 0.9695 strict / 1.000 completed / 3.05% truncation, at
   107.10 tok/s.
-- alpha 0.75: {{tokenv3_a0p75_quality}}  <!-- placeholder: TokenV3 alpha 0.75 quality point pending -->
+- alpha 0.75: HumanEval 0.9695 strict (159/164) / 0.9876 completed / 1.83%
+  truncation (mean 2,652 tokens), cascade acceptance 0.820, at 95.30 tok/s
+  (+15.1% vs exact 82.85); wall 1 h 19 m.
 
 Equal-speed comparison (~105 tok/s): TokenV3 alpha 0.95 = 0.9695 strict at
 107.10 tok/s; typical-0.09 = 0.9634 strict at 104.65 tok/s; OPT alpha 0.25 =
 0.8537 strict at 104.78 tok/s. Exact speculative sampling reaches 0.9634 strict
 but at 82.85 tok/s.
+
+TokenV3 held 0.9695 strict at both alpha 0.75 and alpha 0.95; OPT ran 0.9024 ->
+0.7073 across alpha 0.0 -> 0.75.
 
 ### Why the peak rule loses and the token-specific rule does not (Sec. 4.4)
 
