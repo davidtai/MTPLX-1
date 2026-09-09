@@ -1,0 +1,42 @@
+{
+  "generated_by": "battery475/scripts/render_bare_16k.py + render_bare_ladder.py",
+  "generator": "server_cell_charts (min-max variance bands, fastest-of-seeds)",
+  "parent": "perf/qwen38-bare-speed-main @ 548e568c (docs commit adds these)",
+  "charts": [
+    {
+      "file": "bare_16k_bars.svg",
+      "bytes": 47982,
+      "sha256": "af25b76d7dfe7e85c655efa8496e52991dce26b8ec0dffee2f54696ee35c866c"
+    },
+    {
+      "file": "bare_decode_16k_windows.svg",
+      "bytes": 64536,
+      "sha256": "74c483909ce3cc89677c12e28bdb6d40bb2f18462476678ed3777ab99afc8798"
+    },
+    {
+      "file": "decode_tok_s.svg",
+      "bytes": 87071,
+      "sha256": "2e51cd9528050460ccd8e223d2102f9e935f761c34ae8413697c4411daf0737e"
+    },
+    {
+      "file": "peak_memory_gb.svg",
+      "bytes": 86115,
+      "sha256": "5b928b7979ac31e54eb76e9b449459e5a477129cada50f3ffddc841a62ba755c"
+    },
+    {
+      "file": "prefill_tok_s.svg",
+      "bytes": 85510,
+      "sha256": "3eb21e3e03b3577e2f8261732658f8c6216d437533bb55a798c49ab2995a9d9a"
+    },
+    {
+      "file": "summary.svg",
+      "bytes": 172308,
+      "sha256": "7331d22dc8d86a56f10fff6def3be27e767e64f3888204adddd9468e3d5966f2"
+    },
+    {
+      "file": "ttft_s.svg",
+      "bytes": 92012,
+      "sha256": "ee18cd5b124b2ec580401b2d858875305e3fcc517a78e19900757f079c91cc5b"
+    }
+  ]
+}
