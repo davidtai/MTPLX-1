@@ -9,13 +9,22 @@
     "sha256": "f191004d8dc77f46079ac5ba7123ccde2377a743be69cbdcdba649344fdb1f5f"
   },
   {
-    "alt": "Cascade accept rate and tokens per cycle by alpha on two y-axes",
-    "bytes": 86003,
-    "caption": "_Cascade accept rate (left) and tokens per cycle (right) by alpha for BOTH rules, OPT (Equation 10) and TokenV3 (Equation 15), from each run's cascade-accept metrics rather than the receipts. Equal alphas are NOT comparable across the two rules._",
-    "file": "cascade_accept_vs_alpha.svg",
-    "key": "cascade_accept_vs_alpha",
-    "label": "cascade acceptance and tokens/cycle by alpha",
-    "sha256": "47531a838091993d3c928b4d9cf4f3b292fbfc1fed0081edeef86bcb84eba860"
+    "alt": "Cascade kept-draft rate by alpha for the OPT and TokenV3 rules",
+    "bytes": 84026,
+    "caption": "_Cascade kept-draft rate, Definitions (c), by alpha for BOTH rules, OPT (Equation 10) and TokenV3 (Equation 15), from each run's `[cascade-accept]` verdict line rather than the receipts. Equal alphas are NOT comparable across the two rules._",
+    "file": "cascade_kept_draft_vs_alpha.svg",
+    "key": "cascade_kept_draft_vs_alpha",
+    "label": "cascade kept-draft rate by alpha",
+    "sha256": "cf90fc510da90ab94cceb5a4e511fc18601dd8ce4af047680903e606463ffa89"
+  },
+  {
+    "alt": "Tokens per verify cycle by alpha for the OPT and TokenV3 rules",
+    "bytes": 74232,
+    "caption": "_Tokens per verify cycle by alpha for BOTH rules, OPT (Equation 10) and TokenV3 (Equation 15), from each run's `[cascade-accept]` verdict line rather than the receipts. Equal alphas are NOT comparable across the two rules._",
+    "file": "cascade_tokens_per_cycle_vs_alpha.svg",
+    "key": "cascade_tokens_per_cycle_vs_alpha",
+    "label": "tokens per verify cycle by alpha",
+    "sha256": "9a36a010ec9ee5d7bf86c3efb5ff15fceb157658bb38bd7f3ea2ff8655ecb2fe"
   },
   {
     "alt": "Decode tok/s by context size for the exact pairing, cascade OPT alphas 0.0-2.0 and TokenV3 alpha 0.95",
