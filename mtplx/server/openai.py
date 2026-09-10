@@ -16673,6 +16673,42 @@ def _int_env(name: str) -> int | None:
         return None
 
 
+def _typical_acceptance_health_payload() -> dict[str, Any]:
+    """Resolved Medusa-2 typical-acceptance lane state, for ``/health``.
+
+    The lane is OFF unless the operator sets MTPLX_FABLE_TYPICAL_THRESHOLD > 0
+    (server flag ``--typical-threshold``); at 0 the exact speculative-sampling
+    law runs unchanged. When on it is NOT distribution-exact: it accepts the
+    longest prefix of draft positions that are "typical" under the target row,
+    ``p(x) > min(eps, delta*exp(-H))`` (delta == the threshold), and resamples
+    the first non-typical position from the target row itself. See
+    docs/perf/pr391-typical-acceptance.md.
+    """
+
+    def _f(name: str, default: float) -> float:
+        try:
+            return float(os.environ.get(name, "") or default)
+        except ValueError:
+            return default
+
+    threshold = _f("MTPLX_FABLE_TYPICAL_THRESHOLD", 0.0)
+    eps = _f("MTPLX_FABLE_TYPICAL_EPS", 1.0)
+    enabled = threshold > 0.0
+    return {
+        "enabled": enabled,
+        "threshold": threshold,
+        "delta": threshold,
+        "eps": eps,
+        "floor": "min(eps, delta*exp(-H))",
+        "distribution_exact": not enabled,
+        "note": (
+            "OFF unless --typical-threshold (MTPLX_FABLE_TYPICAL_THRESHOLD) > 0; "
+            "when on, trades distribution-exactness for tokens/cycle and is NOT "
+            "distribution-exact (engages only at temperature > 0)"
+        ),
+    }
+
+
 def _startup_health_payload(state: "ServerState") -> dict[str, Any]:
     chat_template_report = getattr(state, "chat_template_report", {}) or {}
     tool_prompt_mode = _tool_prompt_mode_from_args(state.args)
@@ -29287,6 +29323,7 @@ def create_app(state: ServerState) -> FastAPI:
                 "actual_ramp_latency_s"
             ),
             "startup": _startup_health_payload(state),
+            "typical_acceptance": _typical_acceptance_health_payload(),
             "thermal": _thermal_health_payload(
                 fan_mode=fan_mode,
                 smart_status=smart_status,
@@ -36569,6 +36606,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Load and inject the native MTP sidecar. Disable only for stock AR diagnostics.",
     )
     parser.add_argument(
+        "--typical-threshold",
+        type=float,
+        default=None,
+        metavar="DELTA",
+        help=(
+            "Enable Medusa-2 typical acceptance at this threshold, which maps to "
+            "delta in the floor min(eps, delta*exp(-H)) (higher = stricter). "
+            "Unset or 0 = OFF = exact speculative sampling (the default). When > 0 "
+            "this lane is NOT distribution-exact and engages only at "
+            "temperature > 0. Environment: MTPLX_FABLE_TYPICAL_THRESHOLD, which "
+            "this flag overrides. See docs/perf/pr391-typical-acceptance.md."
+        ),
+    )
+    parser.add_argument(
         "--ngram-prewarm",
         metavar="auto|all|off|GiB",
         # Not a boolean, and default=None rather than "auto": the flag has an
@@ -37102,6 +37153,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "off" if args.strip_assistant_reasoning_history else args.preserve_thinking
     )
     args.strip_assistant_reasoning_history = not _preserve_thinking_effective(args)
+    if getattr(args, "typical_threshold", None) is not None:
+        # The flag overrides any shell-set MTPLX_FABLE_TYPICAL_THRESHOLD -- the
+        # same "flag beats env" contract as --ngram-prewarm. generation.py reads
+        # this env per request, so setting it here (before serving) is what the
+        # flag means. 0 (or unset) leaves the exact law in place.
+        os.environ["MTPLX_FABLE_TYPICAL_THRESHOLD"] = str(float(args.typical_threshold))
     return args
 
 
