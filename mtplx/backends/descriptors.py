@@ -9,7 +9,11 @@ without inheriting Qwen-specific assumptions.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+import re
+from dataclasses import dataclass, field, replace
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 
@@ -82,8 +86,22 @@ class ReasoningCodec:
     supported: bool = True
     modes: tuple[str, ...] = ("auto", "on", "off")
     history_policy: str = "preserve_when_enabled"
+    # Drawn from mtplx.reasoning_effort.REASONING_EFFORT_LEVELS: the app
+    # renders these verbatim, so a level outside that vocabulary is one the
+    # user can pick and no writing surface will accept
+    # (test_reasoning_effort_vocabulary_covers_every_family pins it).
     effort_levels: tuple[str, ...] = ()
     default_effort: str | None = None
+    # Agent-lane default (OpenCode/Pi config writers): coding wall clock is
+    # dominated by thinking-token burn, so a family whose chat default is
+    # xhigh can pin a cheaper effort for tool-driven lanes. None -> the
+    # plain default_effort. Receipt 2026-08-28: identical multifile task,
+    # xhigh 150.2s vs medium 44.2s wall clock, same correct output.
+    default_agent_effort: str | None = None
+
+    @property
+    def agent_effort(self) -> str | None:
+        return self.default_agent_effort or self.default_effort
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -104,7 +122,7 @@ class TunePolicy:
     supported: bool
     control_field: str = "depth"
     candidates: tuple[str, ...] = ("AR", "D1", "D2", "D3")
-    supported_families: tuple[str, ...] = ("qwen3_5", "qwen3_6", "gemma4")
+    supported_families: tuple[str, ...] = ("qwen3_5", "qwen3_6", "qwen3_8", "gemma4")
     unsupported_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -161,7 +179,7 @@ class ContextWindowPolicy:
         if value is None:
             return self
         resolved = int(value)
-        if resolved <= 0 or resolved > 1_000_000:
+        if resolved <= 0 or resolved > 1_048_576:
             return self
         maximum = max(int(self.minimum), resolved)
         default = min(maximum, max(int(self.minimum), int(self.default)))
@@ -270,6 +288,11 @@ class BackendDescriptor:
     context_window_policy: ContextWindowPolicy = field(
         default_factory=ContextWindowPolicy
     )
+    default_max_response_tokens: int | None = None
+    default_tool_prompt_mode: str = "hybrid"
+    required_tool_prompt_mode: str | None = None
+    required_chat_template_profile: str | None = None
+    allows_chat_template_path: bool = True
     validation_status: str = "qa_verified"
     app_ui_policy: str = "descriptor_owned"
     status: str = "qa_verified"
@@ -310,6 +333,11 @@ class BackendDescriptor:
             "tune_policy": self.tune_policy.to_dict(),
             "kv_quant_policy": self.kv_quant_policy.to_dict(),
             "context_window_policy": self.context_window_policy.to_dict(),
+            "default_max_response_tokens": self.default_max_response_tokens,
+            "default_tool_prompt_mode": self.default_tool_prompt_mode,
+            "required_tool_prompt_mode": self.required_tool_prompt_mode,
+            "required_chat_template_profile": self.required_chat_template_profile,
+            "allows_chat_template_path": self.allows_chat_template_path,
             "validation_status": self.validation_status,
             "app_ui_policy": self.app_ui_policy,
             "status": self.status,
@@ -368,6 +396,318 @@ QWEN3_NEXT_DESCRIPTOR = BackendDescriptor(
 )
 
 
+# Qwen3.8 family overrides. Qwen3.8-27B shares the Qwen3.6 trunk geometry and
+# therefore the qwen3_next backend, but ships its own inference contract: the
+# official thinking-mode sampler (temperature 1.0, top_p 0.95, top_k 20),
+# official reasoning_effort levels (xhigh / medium / low), preserve_thinking
+# retained-history rendering, and a multi-step-trained MTP head. Upstream's
+# generic default is xhigh; MTPLX defaults coding sessions to medium after a
+# strict max-fan live A/B completed the same correct uncapped Aphanes task in
+# 51.52s versus 314.91s at xhigh (2026-08-14). Users can still select xhigh.
+QWEN3_8_SAMPLER_DEFAULTS = SamplerDefaults(temperature=1.0, top_p=0.95, top_k=20)
+# Strict max-fan A/B on drop day (2026-08-14, Bare-Speed Q4, alternating
+# 2,000-token xhigh arms) kept the official target sampler for the draft:
+# draft 1.0 averaged 46.05 tok/s versus 42.79 at 0.6, with higher D2/D3
+# acceptance. The earlier 0.6 result was thermally uncontrolled and is not a
+# product receipt.
+QWEN3_8_DRAFT_TEMPERATURE = 1.0
+# Per-family dynamic draft-temperature curves: (target_temperature,
+# draft_temperature) points, piecewise-linear, flat extrapolation
+# (draft_sampling.resolve_draft_temperature). An absent family means the
+# identity policy — the static per-family draft temperature above. Curves
+# are stamped ONLY from a measured max-fan ABBA calibration campaign (see
+# MEASUREMENTS.md); never invent offsets. Target temp 0 is handled by
+# greedy draft coupling in the server resolver, not by these curves.
+DRAFT_TEMPERATURE_CURVES: dict[str, tuple[tuple[float, float], ...]] = {}
+
+
+def draft_temperature_curve_for_model(
+    model_ref: str | None = None,
+    inspection: dict[str, Any] | None = None,
+    descriptor: "BackendDescriptor | None" = None,
+) -> tuple[tuple[float, float], ...] | None:
+    """The measured draft-temperature curve for the model's family, or None
+    (identity) when no calibration has been stamped."""
+
+    family = model_family_from_inspection(
+        inspection,
+        model_ref=model_ref,
+        descriptor=descriptor,
+    )
+    return DRAFT_TEMPERATURE_CURVES.get(family)
+# Qwen3.8-Flash-Next model-card best practices (thinking mode): temp 1.0,
+# top_p 0.95, top_k 20, min_p 0, presence/repetition neutral. Own constant so
+# later Flash-Next calibration never drifts the dense-27B contract.
+QWEN4_EXP_SAMPLER_DEFAULTS = SamplerDefaults(temperature=1.0, top_p=0.95, top_k=20)
+QWEN4_EXP_DRAFT_SEMANTICS = DraftSemantics(
+    request_field="depth",
+    display_label="Draft depth",
+    # Family law (founder, 2026-08-26): Flash-Next follows the 27B contract —
+    # ceiling 3 with the adaptive expected_value depth policy owning the
+    # effective per-step depth (the serving descriptor declares
+    # native_adaptive_depth_policy, so the CLI keeps adaptive_policy
+    # "expected_value"; depth here is the ceiling, not a static pin).
+    # Static-depth reference receipts (Bare pack, flight recorder, target
+    # 1.0): fixed D1 56.9 vs fixed D2 52.0 tok/s — those measured FIXED
+    # depth, not the adaptive policy. Adaptive-vs-static receipt owed in
+    # the serve battery before any further tune.
+    default=3,
+    minimum=1,
+    # Ceiling 5, default 3: this head's depth-3 CONDITIONAL acceptance
+    # measured 86% (serve battery 2026-08-27), unlike the 27B head whose
+    # D4-8 cells were falsified (acceptance could not fill the window) —
+    # that family keeps its own cap. Deeper DEFAULTS stay founder-gated;
+    # this only lets clients and the depth battery request D4/D5.
+    maximum=5,
+    unit="depth",
+)
+# Flash-Next KV-quant stance (2026-08-28): the paged KV-quant lane (memo +
+# 2-pass q8 kernel, F29 routing, graphbank promotion) is wired to the
+# qwen3_next SDPA call sites. This family's 12 QSA layers run hand-rolled
+# attention (pooled-score indexer + dense mask / rows-gather) over a plain
+# KVCache the paged installer never converts, so a q8/q4 request would be
+# silently inert — the boot gate downgrades it to off. The hybrid design
+# also keeps KV small by construction: 12 of 48 layers x 2 KV heads x 256
+# head_dim = ~24 KB/token (~2.4 GB bf16 at 100k). A quantized QSA lane
+# (gather-then-dequant over the rows-gather path) is a post-release
+# candidate; until it carries parity + memory receipts the policy stays
+# unsupported with an architecture-truth reason instead of the generic one.
+QWEN4_EXP_KV_QUANT_POLICY = KVQuantPolicy(
+    supported=False,
+    disabled_reason=(
+        "Flash-Next keeps KV on 12 of 48 layers (~24 KB/token), and its QSA "
+        "attention has no validated quantized-cache lane yet."
+    ),
+)
+QWEN3_8_REASONING_CODEC = ReasoningCodec(
+    parser="qwen3",
+    display_name="Qwen think tags",
+    default_mode="auto",
+    effort_levels=("xhigh", "medium", "low"),
+    default_effort="medium",
+)
+# Families whose reasoning codec overrides a shared/generic lane
+# descriptor, keyed to the ONLY lanes they ride. Both conditions must
+# hold — family AND active backend — because the family sniff falls back
+# to a default family for empty/unrecognized refs (the daemon's default
+# --model is the 27B HF id), and a ref-only override stamped qwen3 onto
+# an explicitly chosen Laguna lane (caught 2026-08-28).
+REASONING_FAMILY_OVERRIDE_LANES: dict[str, frozenset[str]] = {
+    "qwen3_8": frozenset({"qwen3_next"}),
+    "qwen4_exp": frozenset({"qwen4_exp", "native_mtp"}),
+    "lfm2": frozenset({"mlx_lm_ar"}),
+}
+
+
+def reasoning_family_override_applies(
+    family: str | None, backend_id: str | None
+) -> bool:
+    lanes = REASONING_FAMILY_OVERRIDE_LANES.get(str(family or ""))
+    return lanes is not None and str(backend_id or "") in lanes
+
+# Flash-Next ships a byte-identical Qwen think-tag chat template to the dense
+# 27B (diff-verified 2026-08-28), including the template-enforced effort
+# triple (it raise_exceptions outside xhigh/medium/low — "high" would crash
+# the render). Default xhigh is the founder call for this family
+# (2026-08-28) and matches the template's own fallback; the 27B's medium
+# default keeps its separate wall-clock receipt above.
+QWEN4_EXP_REASONING_CODEC = ReasoningCodec(
+    parser="qwen3",
+    display_name="Qwen think tags",
+    default_mode="auto",
+    effort_levels=("xhigh", "medium", "low"),
+    default_effort="xhigh",
+    # Coding-agent lanes (OpenCode/Pi config writers) default to medium:
+    # 2026-08-28 wall-clock A/B on the identical multifile coding task
+    # measured xhigh 150.2s vs medium 44.2s with the same correct output —
+    # the xhigh think burn is chat-grade depth, not agent throughput. The
+    # in-client effort picker still offers xhigh per request.
+    default_agent_effort="medium",
+)
+QWEN3_8_DRAFT_SEMANTICS = DraftSemantics(
+    request_field="depth",
+    display_label="Draft depth",
+    default=3,
+    minimum=1,
+    # The multi-step head trains for deeper drafts, but the live depth-4 serve
+    # lane killed the daemon on drop day (silent death mid-request, no crash
+    # report — memory-kill signature; receipt: scratchpad serve-d4-t0.6.log,
+    # warmup healthy at 88-92 tok/s then nothing). Cap at 3 until the deep
+    # lane is root-caused; reopen with the QL5-7 packed-verify extension.
+    # 2026-08-25 flat-decode branch temporarily raised this to 8 for the
+    # depth-ladder cells, gated on "NOT for release until the D4-8 cells
+    # pass". The cells ran 2026-08-26 and FALSIFIED deep depth: verify is
+    # flat to D8 but acceptance cannot fill the window — D6 measured -27%
+    # vs D3 at 88.4k and flat-to-down at 16k (MEASUREMENTS 2026-08-26; the
+    # head is the binder, distillation is the reopen condition now). The
+    # drop-day memory-kill also remains unexplained, so the release cap
+    # stays 3.
+    maximum=3,
+    unit="depth",
+)
+
+
+def sampler_defaults_for_model(
+    model_ref: str | None = None,
+    inspection: dict[str, Any] | None = None,
+    descriptor: BackendDescriptor | None = None,
+) -> SamplerDefaults:
+    resolved = descriptor or descriptor_from_inspection(inspection)
+    family = model_family_from_inspection(
+        inspection,
+        model_ref=model_ref,
+        descriptor=resolved,
+    )
+    if family == "qwen3_8":
+        return QWEN3_8_SAMPLER_DEFAULTS
+    if family == "qwen4_exp":
+        return QWEN4_EXP_SAMPLER_DEFAULTS
+    return resolved.sampler_defaults
+
+
+def draft_semantics_for_model(
+    model_ref: str | None = None,
+    inspection: dict[str, Any] | None = None,
+    descriptor: BackendDescriptor | None = None,
+) -> DraftSemantics:
+    resolved = descriptor or descriptor_from_inspection(inspection)
+    family = model_family_from_inspection(
+        inspection,
+        model_ref=model_ref,
+        descriptor=resolved,
+    )
+    if family == "qwen3_8":
+        return QWEN3_8_DRAFT_SEMANTICS
+    if family == "qwen4_exp":
+        return QWEN4_EXP_DRAFT_SEMANTICS
+    return resolved.draft_semantics
+
+
+LAGUNA_AR_DESCRIPTOR = BackendDescriptor(
+    backend_id="laguna_ar",
+    architecture_id="laguna-s-2.1-ar",
+    model_family="laguna",
+    display_name="Laguna-S-2.1 target-only AR",
+    artifact_layout="single_mlx_folder_target_only_ar",
+    runtime_capabilities=("target_logits", "target_only_ar"),
+    sampler_defaults=SamplerDefaults(temperature=1.0, top_p=1.0, top_k=20),
+    reasoning_codec=ReasoningCodec(
+        parser="poolside_v1",
+        display_name="Poolside v1 think tags",
+        default_mode="on",
+        supported=True,
+        modes=("auto", "on", "off"),
+        history_policy="preserve_when_enabled",
+    ),
+    draft_semantics=DraftSemantics(
+        request_field="depth",
+        display_label="Draft depth",
+        default=1,
+        minimum=1,
+        maximum=1,
+        unit="depth",
+    ),
+    uses_external_assistant=False,
+    uses_draft_lm_head=False,
+    tune_policy=TunePolicy(
+        supported=False,
+        supported_families=(),
+        unsupported_reason="Laguna-S-2.1 is installed as target-only AR.",
+    ),
+    kv_quant_policy=KVQuantPolicy(supported=False),
+    context_window_policy=ContextWindowPolicy(
+        maximum=1_048_576,
+        default=32_768,
+        source="laguna_s_2_1_config",
+    ),
+    default_max_response_tokens=32_768,
+    default_tool_prompt_mode="native",
+    required_tool_prompt_mode="native",
+    required_chat_template_profile="tokenizer",
+    allows_chat_template_path=False,
+    validation_status="target_exact_ar",
+    status="target_exact_ar",
+    notes=(
+        "The checkpoint has no native MTP head.",
+        "The bundled loader and native MLX cache path are pinned to Laguna-S-2.1 4-bit geometry.",
+    ),
+)
+
+
+MLX_LM_AR_DESCRIPTOR = BackendDescriptor(
+    backend_id="mlx_lm_ar",
+    architecture_id="mlx-lm-ar-family",
+    model_family="mlx-lm",
+    display_name="mlx-lm target-only AR",
+    artifact_layout="single_mlx_folder_target_only_ar",
+    runtime_capabilities=("target_logits", "target_only_ar"),
+    sampler_defaults=SamplerDefaults(temperature=0.6, top_p=0.95, top_k=20),
+    reasoning_codec=ReasoningCodec(
+        parser="none",
+        display_name="No verified reasoning parser",
+        default_mode="off",
+        supported=False,
+        modes=(),
+        history_policy="visible_content_only",
+    ),
+    draft_semantics=DraftSemantics(
+        request_field="depth",
+        display_label="Draft depth",
+        default=1,
+        minimum=1,
+        maximum=1,
+        unit="depth",
+    ),
+    uses_external_assistant=False,
+    uses_draft_lm_head=False,
+    tune_policy=TunePolicy(
+        supported=False,
+        supported_families=(),
+        unsupported_reason=(
+            "mlx-lm AR-only checkpoints have no MTPLX tune path."
+        ),
+    ),
+    kv_quant_policy=KVQuantPolicy(supported=False),
+    context_window_policy=ContextWindowPolicy(
+        maximum=1_048_576,
+        default=131_072,
+        source="model_config",
+    ),
+    default_max_response_tokens=32_768,
+    default_tool_prompt_mode="native",
+    required_chat_template_profile="tokenizer",
+    validation_status="experimental_mlx_lm_ar",
+    status="experimental_mlx_lm_ar",
+    notes=(
+        "Recognized no-MTP architectures served through the bundled mlx-lm "
+        "loader in target-only AR mode.",
+        "No exactness baseline: runs report as unverified until a "
+        "per-artifact contract is recorded.",
+    ),
+)
+
+
+# Same lane and backend_id as MLX_LM_AR_DESCRIPTOR, but with the LFM wire
+# format verified: literal <think> tags without a prefilled open tag, and
+# pythonic <|tool_call_start|> envelopes. Deliberately NOT registered in
+# DESCRIPTORS_BY_BACKEND_ID (the generic entry owns the backend_id); only
+# descriptor_from_runtime returns it, after sniffing the loaded model family.
+MLX_LM_AR_LFM2_DESCRIPTOR = replace(
+    MLX_LM_AR_DESCRIPTOR,
+    display_name="mlx-lm target-only AR (LFM grammar)",
+    reasoning_codec=ReasoningCodec(
+        parser="lfm2",
+        display_name="LFM think tags",
+        default_mode="auto",
+    ),
+    # The LFM chat template owns tool formatting (List of tools + pythonic
+    # <|tool_call_start|> envelope). The hybrid launch default would inject the
+    # legacy <tool_call> XML contract on top and the model obeys the injected
+    # format over its native one — with malformed results.
+    required_tool_prompt_mode="native",
+)
+
+
 NATIVE_CONTRACT_DESCRIPTOR = BackendDescriptor(
     backend_id="native_mtp",
     architecture_id="native-contract-mtp",
@@ -408,6 +748,28 @@ NATIVE_CONTRACT_DESCRIPTOR = BackendDescriptor(
     ),
     kv_quant_policy=KVQuantPolicy(supported=False),
     status="experimental_contract_gated",
+)
+
+
+# Nemotron-H and MiMo run the one-step MTP contract: their mtp_forward
+# rejects mtp_depth > 1 outright (mtplx/nemotron_h_mtp_patch.py,
+# mtplx/mimo_mtp_patch.py). The depth control every surface renders from
+# draft_semantics must not offer D2/D3 the backend will refuse, and the
+# server default must not resolve to a depth that raises (issue #341).
+# Distinct backend_id: serve startup rewrites args.backend_id to the
+# resolved descriptor's id, and that id must round-trip through
+# descriptor_for_backend_id without laundering the cap away.
+NATIVE_CONTRACT_SINGLE_STEP_DESCRIPTOR = replace(
+    NATIVE_CONTRACT_DESCRIPTOR,
+    backend_id="native_mtp_single_step",
+    draft_semantics=DraftSemantics(
+        request_field="depth",
+        display_label="Draft depth",
+        default=1,
+        minimum=1,
+        maximum=1,
+        unit="depth",
+    ),
 )
 
 
@@ -506,6 +868,48 @@ GLM_MTP_DESCRIPTOR = BackendDescriptor(
     ),
     validation_status="native_contract_gated",
     status="experimental_contract_gated",
+)
+
+
+HY_V3_MTP_DESCRIPTOR = BackendDescriptor(
+    backend_id="hy_v3_mtp",
+    architecture_id="hy-v3-mtp",
+    model_family="hy",
+    display_name="Hy3 native MTP",
+    artifact_layout="single_mlx_folder_native_mtp",
+    runtime_capabilities=NATIVE_CONTRACT_DESCRIPTOR.runtime_capabilities,
+    # Official Tencent inference settings (tencent/Hy3 generation_config.json):
+    # temperature 0.9, top_p 1.0, top_k disabled. Do NOT inherit the Qwen
+    # 0.6/0.95/20 coding sampler; Hy3's CoT measurably degrades at greedy/cold
+    # settings (community reports on the release thread).
+    sampler_defaults=SamplerDefaults(temperature=0.9, top_p=1.0, top_k=0),
+    # Hy3 emits <think:opensource>...</think:opensource> (suffixed single
+    # tokens). The qwen3-style splitter handles suffixed spellings.
+    reasoning_codec=ReasoningCodec(
+        parser="qwen3",
+        display_name="Hy3 think tags",
+        default_mode="auto",
+    ),
+    draft_semantics=NATIVE_CONTRACT_DESCRIPTOR.draft_semantics,
+    uses_external_assistant=False,
+    uses_draft_lm_head=True,
+    hidden_variant="pre_norm",
+    tune_policy=TunePolicy(
+        supported=False,
+        unsupported_reason="Tune is supported for Qwen 3.5, Qwen 3.6, and Gemma 4 MTPLX models only.",
+    ),
+    kv_quant_policy=KVQuantPolicy(
+        supported=False,
+        disabled_reason="KV quantization is not supported for Hy3.",
+    ),
+    validation_status="experimental_contract_gated",
+    status="experimental_contract_gated",
+    notes=(
+        "Single appended NextN MoE layer (depth 1); 192-expert sigmoid top-8 "
+        "routing with expert bias; draft input eh_proj(concat[enorm(embedding), "
+        "hnorm(pre-final-norm hidden)]).",
+        "Official sampler: temperature 0.9, top_p 1.0, top_k off.",
+    ),
 )
 
 
@@ -628,13 +1032,19 @@ GEMMA4_ASSISTANT_DESCRIPTOR = BackendDescriptor(
 
 DESCRIPTORS_BY_BACKEND_ID: dict[str, BackendDescriptor] = {
     QWEN3_NEXT_DESCRIPTOR.backend_id: QWEN3_NEXT_DESCRIPTOR,
+    LAGUNA_AR_DESCRIPTOR.backend_id: LAGUNA_AR_DESCRIPTOR,
+    MLX_LM_AR_DESCRIPTOR.backend_id: MLX_LM_AR_DESCRIPTOR,
     NATIVE_CONTRACT_DESCRIPTOR.backend_id: NATIVE_CONTRACT_DESCRIPTOR,
     GEMMA4_ASSISTANT_DESCRIPTOR.backend_id: GEMMA4_ASSISTANT_DESCRIPTOR,
     STEP3P5_MTP_DESCRIPTOR.backend_id: STEP3P5_MTP_DESCRIPTOR,
     DEEPSEEK_MTP_DESCRIPTOR.backend_id: DEEPSEEK_MTP_DESCRIPTOR,
     GLM_MTP_DESCRIPTOR.backend_id: GLM_MTP_DESCRIPTOR,
-    "mimo_mtp": NATIVE_CONTRACT_DESCRIPTOR,
-    "nemotron_h_mtp": NATIVE_CONTRACT_DESCRIPTOR,
+    HY_V3_MTP_DESCRIPTOR.backend_id: HY_V3_MTP_DESCRIPTOR,
+    NATIVE_CONTRACT_SINGLE_STEP_DESCRIPTOR.backend_id: (
+        NATIVE_CONTRACT_SINGLE_STEP_DESCRIPTOR
+    ),
+    "mimo_mtp": NATIVE_CONTRACT_SINGLE_STEP_DESCRIPTOR,
+    "nemotron_h_mtp": NATIVE_CONTRACT_SINGLE_STEP_DESCRIPTOR,
 }
 
 
@@ -690,12 +1100,77 @@ def _text_markers(model_ref: str | None, inspection: dict[str, Any] | None) -> s
     return " ".join(str(part or "") for part in parts).lower()
 
 
+# Stock Qwen3 sizes collide with the 3.8 version token: in "qwen3-8b" or
+# "qwen3-80b" the digit-run ending in "b" right after the token is a
+# parameter count, not a version, and must not claim the qwen3_8 family.
+_QWEN3_8_MARKER = re.compile(r"qwen3[._-]?8(?!\d*b)")
+
+# Qwen4-generation previews carry "3.8" in their public names
+# (Qwen3.8-Flash-Next) but are a different architecture generation with
+# their own sampler/reasoning contract; the dense-27B qwen3_8 behavior
+# contract must not claim them by name. They resolve to the generic default
+# descriptor until a dedicated qwen4 contract exists.
+_QWEN4_PREVIEW_MARKER = re.compile(r"flash[._-]?next|qwen[._-]?4")
+
+
 def _explicit_qwen_family_marker(text: str) -> str | None:
-    if "qwen3.6" in text or "qwen3_6" in text or "qwen36" in text:
+    if _QWEN4_PREVIEW_MARKER.search(text):
+        return None
+    if _QWEN3_8_MARKER.search(text):
+        return "qwen3_8"
+    if "qwen3.6" in text or "qwen3_6" in text or "qwen36" in text or "qwen3-6" in text:
         return "qwen3_6"
     if "qwen3.5" in text or "qwen3_5" in text or "qwen3-5" in text:
         return "qwen3_5"
     return None
+
+
+@lru_cache(maxsize=64)
+def _artifact_family_texts(model_ref: str) -> tuple[str, str]:
+    """Family markers the artifact carries about itself (issue #268).
+
+    A model served from a renamed or symlinked directory has no family
+    marker in its ref, and the shared qwen3_next descriptor cannot split
+    3.5/3.6/3.8 — config.json says qwen3_5 for all of them. The artifact
+    still knows what it is: the forge provenance in mtplx_runtime.json
+    (source trunk, published repo) and the symlink-resolved path name the
+    family, returned as ``(provenance, resolved_path)`` in that order of
+    authority — what the artifact says outranks what the folder is called.
+    Family is a behavior contract, not a first-party identity claim, so
+    provenance matching is safe here — unlike the served-model-id lane,
+    where fuzzy inference was deliberately removed (July 2026, issue #57).
+    """
+    resolved = ""
+    parts: list[str] = []
+    try:
+        path = Path(model_ref).expanduser()
+        if not path.exists():
+            return "", ""
+        resolved = str(path.resolve())
+        runtime_json = path / "mtplx_runtime.json"
+        if runtime_json.is_file():
+            data = json.loads(runtime_json.read_text())
+            if isinstance(data, dict):
+                provenance = data.get("forge_provenance")
+                provenance = provenance if isinstance(provenance, dict) else {}
+                inputs = provenance.get("forge_inputs")
+                inputs = inputs if isinstance(inputs, dict) else {}
+                parts.extend(
+                    str(value or "")
+                    for value in (
+                        data.get("public_model_id"),
+                        data.get("served_model_id"),
+                        data.get("model_id"),
+                        data.get("published_to_hf"),
+                        data.get("base_trunk"),
+                        data.get("artifact_role"),
+                        inputs.get("trunk_path"),
+                        inputs.get("mtp_source_path"),
+                    )
+                )
+    except Exception:
+        pass
+    return " ".join(part for part in parts if part).lower(), resolved.lower()
 
 
 def model_family_from_inspection(
@@ -705,14 +1180,29 @@ def model_family_from_inspection(
     descriptor: BackendDescriptor | None = None,
 ) -> str:
     text = _text_markers(model_ref, inspection)
+    if model_ref:
+        # The artifact outranks its folder name: forge provenance first,
+        # then the symlink-resolved location, then the ref as spelled.
+        provenance_text, resolved_path = _artifact_family_texts(str(model_ref))
+        artifact_family = _explicit_qwen_family_marker(
+            provenance_text
+        ) or _explicit_qwen_family_marker(resolved_path)
+        if artifact_family is not None:
+            return artifact_family
     ref_family = _explicit_qwen_family_marker(str(model_ref or "").lower())
     if ref_family is not None:
         return ref_family
     backend_id = (
-        str(descriptor.backend_id)
+        str(getattr(descriptor, "backend_id", "") or "")
         if descriptor is not None
         else backend_id_from_inspection(inspection)
     )
+    if backend_id == "qwen4_exp" or _QWEN4_PREVIEW_MARKER.search(text):
+        # Qwen4-generation preview (Qwen3.8-Flash-Next). Own family key so
+        # sampler/draft/reasoning policy never rides the dense-27B qwen3_8
+        # contract (#268 kept them apart by exclusion; this is the positive
+        # identity).
+        return "qwen4_exp"
     if backend_id == GEMMA4_ASSISTANT_DESCRIPTOR.backend_id or "gemma4" in text or "gemma-4" in text:
         return "gemma4"
     if backend_id == STEP3P5_MTP_DESCRIPTOR.backend_id or "step3p5" in text or "step3p7" in text or "step-3.7" in text:
@@ -721,13 +1211,24 @@ def model_family_from_inspection(
         return "deepseek"
     if backend_id == GLM_MTP_DESCRIPTOR.backend_id or "glm" in text:
         return "glm"
+    if "mimo" in text:
+        # mimo-mtp has shipped a native backend with can_run_verified since
+        # before this function existed, but no branch here ever returned its
+        # family, so every MiMo artifact resolved to "unknown" and forge build
+        # exited 1 at the tune gate after a successful convert and calibrate.
+        # The marker text carries model_type and arch_id, not just the folder
+        # name, so this reads the artifact rather than guessing from a path.
+        return "mimo"
+    if "lfm2" in text:
+        return "lfm2"
     family = _explicit_qwen_family_marker(text)
     if family is not None:
         return family
-    if descriptor is not None and descriptor.model_family == "qwen":
+    descriptor_family = getattr(descriptor, "model_family", None)
+    if descriptor_family == "qwen":
         return "qwen3_6"
-    if descriptor is not None and descriptor.model_family not in {"native-mtp", "qwen"}:
-        return descriptor.model_family
+    if descriptor_family is not None and descriptor_family not in {"native-mtp", "qwen"}:
+        return str(descriptor_family)
     return "unknown"
 
 
@@ -744,13 +1245,35 @@ def tune_policy_for_model(
     )
     if family in {"qwen3_5", "qwen3_6"}:
         return TunePolicy(supported=True)
+    if family == "qwen3_8":
+        # Multi-step-trained MTP head wants deeper candidates, but the live
+        # depth-4 lane killed the daemon on drop day (see
+        # QWEN3_8_DRAFT_SEMANTICS). Cap tune at D3 so an app Tune run cannot
+        # crash the daemon; restore AR..D6 with the deep-lane fix.
+        return TunePolicy(
+            supported=True,
+            candidates=("AR", "D1", "D2", "D3"),
+        )
     if family == "gemma4":
         return GEMMA4_ASSISTANT_DESCRIPTOR.tune_policy
     if family == "step":
         return STEP3P5_MTP_DESCRIPTOR.tune_policy
+    if family == "qwen4_exp":
+        # Qwen 3.8 Flash-Next: backend qwen4_exp, can_run_verified=True, packs
+        # record mtp_depth_max 3. The allowlist stopped at qwen3_8, so tune
+        # called the model unsupported.
+        return TunePolicy(
+            supported=True,
+            candidates=("AR", "D1", "D2", "D3"),
+        )
+    if family == "mimo":
+        # D1 only: mimo_mtp_patch.mtp_forward raises on mtp_depth > 1, and
+        # vLLM's proposer is single-token too, so offering D2+ would advertise
+        # depths the backend refuses.
+        return TunePolicy(supported=True, candidates=("AR", "D1"))
     return TunePolicy(
         supported=False,
-        unsupported_reason="Tune is supported for Qwen 3.5, Qwen 3.6, and Gemma 4 MTPLX models only.",
+        unsupported_reason="Tune is supported for Qwen 3.5, Qwen 3.6, Qwen 3.8, and Gemma 4 MTPLX models only.",
     )
 
 
@@ -765,7 +1288,7 @@ def kv_quant_policy_for_model(
         model_ref=model_ref,
         descriptor=descriptor,
     )
-    if family in {"qwen3_5", "qwen3_6"}:
+    if family in {"qwen3_5", "qwen3_6", "qwen3_8"}:
         return QWEN3_NEXT_DESCRIPTOR.kv_quant_policy
     if family == "gemma4":
         return GEMMA4_ASSISTANT_DESCRIPTOR.kv_quant_policy
@@ -775,6 +1298,8 @@ def kv_quant_policy_for_model(
         return GLM_MTP_DESCRIPTOR.kv_quant_policy
     if family == "deepseek":
         return DEEPSEEK_MTP_DESCRIPTOR.kv_quant_policy
+    if family == "qwen4_exp":
+        return QWEN4_EXP_KV_QUANT_POLICY
     return KVQuantPolicy(supported=False)
 
 
@@ -794,7 +1319,7 @@ def _context_window_from_inspection(inspection: dict[str, Any] | None) -> int | 
             value = source.get(key)
             if isinstance(value, int):
                 candidates.append(value)
-    sane = [value for value in candidates if 0 < value <= 1_000_000]
+    sane = [value for value in candidates if 0 < value <= 1_048_576]
     return max(sane) if sane else None
 
 
@@ -809,7 +1334,7 @@ def context_window_policy_for_model(
         model_ref=model_ref,
         descriptor=descriptor,
     )
-    if family in {"qwen3_5", "qwen3_6"}:
+    if family in {"qwen3_5", "qwen3_6", "qwen3_8"}:
         base = QWEN3_NEXT_DESCRIPTOR.context_window_policy
     elif family == "gemma4":
         base = GEMMA4_ASSISTANT_DESCRIPTOR.context_window_policy
@@ -835,6 +1360,10 @@ def reasoning_policy_for_model(
         model_ref=model_ref,
         descriptor=descriptor,
     )
+    if family == "qwen3_8":
+        return QWEN3_8_REASONING_CODEC
+    if family == "qwen4_exp":
+        return QWEN4_EXP_REASONING_CODEC
     if family in {"qwen3_5", "qwen3_6"}:
         return QWEN3_NEXT_DESCRIPTOR.reasoning_codec
     if family == "gemma4":
@@ -845,6 +1374,10 @@ def reasoning_policy_for_model(
         return GLM_MTP_DESCRIPTOR.reasoning_codec
     if family == "deepseek":
         return DEEPSEEK_MTP_DESCRIPTOR.reasoning_codec
+    if family == "laguna":
+        return LAGUNA_AR_DESCRIPTOR.reasoning_codec
+    if family == "lfm2":
+        return MLX_LM_AR_LFM2_DESCRIPTOR.reasoning_codec
     return ReasoningCodec(
         parser="none",
         display_name="No verified reasoning parser",
@@ -870,7 +1403,7 @@ def model_controls_for_descriptor(
     kv_policy = kv_quant_policy_for_model(model_ref, inspection, descriptor)
     reasoning_policy = reasoning_policy_for_model(model_ref, inspection, descriptor)
     context_policy = context_window_policy_for_model(model_ref, inspection, descriptor)
-    sampler = descriptor.sampler_defaults.to_dict()
+    sampler = sampler_defaults_for_model(model_ref, inspection, descriptor).to_dict()
     return {
         "schema_version": 1,
         "model_ref": model_ref,
@@ -879,16 +1412,22 @@ def model_controls_for_descriptor(
         "architecture_id": descriptor.architecture_id,
         "support_level": descriptor.status,
         "display_name": descriptor.display_name,
-        "draft_control": descriptor.draft_semantics.to_dict(),
+        "draft_control": draft_semantics_for_model(
+            model_ref, inspection, descriptor
+        ).to_dict(),
         "sampling": {
             **sampler,
             "family_default_reason": (
                 "Gemma assistant sampler"
                 if family == "gemma4"
                 else (
-                    "Qwen coding sampler"
-                    if family in {"qwen3_5", "qwen3_6"}
-                    else f"{descriptor.display_name} sampler"
+                    "Qwen3.8 official thinking sampler"
+                    if family == "qwen3_8"
+                    else (
+                        "Qwen coding sampler"
+                        if family in {"qwen3_5", "qwen3_6"}
+                        else f"{descriptor.display_name} sampler"
+                    )
                 )
             ),
         },
@@ -897,6 +1436,42 @@ def model_controls_for_descriptor(
         "kv_quant": kv_policy.to_dict(),
         "context_window": context_policy.to_dict(),
     }
+
+
+def descriptor_for_model(
+    descriptor: BackendDescriptor,
+    *,
+    model_ref: str | None = None,
+    inspection: dict[str, Any] | None = None,
+) -> BackendDescriptor:
+    """Resolve family policy for a model sharing a backend lane.
+
+    Qwen3.8 deliberately reuses the qwen3_next runtime, but its official
+    sampler, reasoning controls, and multi-step MTP range differ from the
+    Qwen3.5/3.6 lane defaults.  Returning a descriptor view keeps server
+    validation and health telemetry on the same contract as model_controls.
+    """
+
+    family = model_family_from_inspection(
+        inspection,
+        model_ref=model_ref,
+        descriptor=descriptor,
+    )
+    if family not in {"qwen3_8", "qwen4_exp"}:
+        return descriptor
+    return replace(
+        descriptor,
+        sampler_defaults=sampler_defaults_for_model(
+            model_ref, inspection, descriptor
+        ),
+        reasoning_codec=reasoning_policy_for_model(
+            model_ref, inspection, descriptor
+        ),
+        draft_semantics=draft_semantics_for_model(
+            model_ref, inspection, descriptor
+        ),
+        tune_policy=tune_policy_for_model(model_ref, inspection, descriptor),
+    )
 
 
 def assistant_target_distribution_choices() -> tuple[str, ...]:
@@ -998,14 +1573,66 @@ def descriptor_from_inspection(inspection: dict[str, Any] | None) -> BackendDesc
     return descriptor_for_backend_id(backend_id_from_inspection(inspection))
 
 
+def _runtime_is_lfm2(runtime: Any) -> bool:
+    model_args = getattr(getattr(runtime, "model", None), "args", None)
+    model_type = str(getattr(model_args, "model_type", "") or "").lower()
+    if model_type.startswith("lfm2"):
+        return True
+    return "lfm2" in str(getattr(runtime, "model_path", "") or "").lower()
+
+
 def descriptor_from_runtime(runtime: Any, args: Any | None = None) -> BackendDescriptor:
     runtime_backend = getattr(runtime, "backend_id", None)
     if runtime_backend:
-        return descriptor_for_backend_id(str(runtime_backend))
-    if bool(getattr(runtime, "gemma4_external_assistant", False)):
+        descriptor = descriptor_for_backend_id(str(runtime_backend))
+    elif bool(getattr(runtime, "gemma4_external_assistant", False)):
         return GEMMA4_ASSISTANT_DESCRIPTOR
-    backend_id = getattr(args, "backend_id", None) if args is not None else None
-    return descriptor_for_backend_id(str(backend_id) if backend_id else None)
+    else:
+        backend_id = getattr(args, "backend_id", None) if args is not None else None
+        descriptor = descriptor_for_backend_id(str(backend_id) if backend_id else None)
+    if (
+        descriptor.backend_id == MLX_LM_AR_DESCRIPTOR.backend_id
+        and _runtime_is_lfm2(runtime)
+    ):
+        return MLX_LM_AR_LFM2_DESCRIPTOR
+    # The server validates request depth and reports sampler defaults from
+    # THIS descriptor, but the family contracts (qwen3_8 / qwen4_exp draft
+    # semantics + sampler law) were only resolved on the CLI launch path —
+    # so a family whose ceiling or sampler differs from the generic
+    # native-contract descriptor was silently mis-served (found 2026-08-27:
+    # qwen4_exp depth-4 requests 400'd against the generic max=3 while the
+    # family ceiling says 5, and /health reported temperature 0.6 against
+    # the family law 1.0). Rebind the family truth once, at resolution.
+    model_ref = getattr(args, "model", None) if args is not None else None
+    if model_ref is None:
+        model_ref = getattr(runtime, "model_path", None)
+    ref_text = str(model_ref or "")
+    family_semantics = draft_semantics_for_model(ref_text, None, descriptor)
+    family_sampler = sampler_defaults_for_model(ref_text, None, descriptor)
+    # Reasoning follows the same rebind, but only when family AND lane
+    # agree (see REASONING_FAMILY_OVERRIDE_LANES): the family sniff's
+    # default-fallback must never strip or replace a lane's own codec
+    # (Laguna, custom models).
+    ref_family = model_family_from_inspection(
+        model_ref=ref_text, descriptor=descriptor
+    )
+    family_reasoning = (
+        reasoning_policy_for_model(ref_text, None, descriptor)
+        if reasoning_family_override_applies(ref_family, descriptor.backend_id)
+        else descriptor.reasoning_codec
+    )
+    if (
+        family_semantics != descriptor.draft_semantics
+        or family_sampler != descriptor.sampler_defaults
+        or family_reasoning != descriptor.reasoning_codec
+    ):
+        descriptor = replace(
+            descriptor,
+            draft_semantics=family_semantics,
+            sampler_defaults=family_sampler,
+            reasoning_codec=family_reasoning,
+        )
+    return descriptor
 
 
 def _arg_value(args: Any, names: tuple[str, ...], default: Any = None) -> Any:

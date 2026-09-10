@@ -84,7 +84,7 @@ def main() -> int:
     )
 
     # Seed: cold prefill of q1 with store-on-prefill -> entry with boundaries.
-    restore_or_prefill_prompt_state(
+    seed_state = restore_or_prefill_prompt_state(
         rt,
         q1_ids,
         session_bank=bank,

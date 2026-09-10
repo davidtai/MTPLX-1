@@ -8,8 +8,6 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
-from mtplx import generation as generation_module
-from mtplx.cache_state import CacheSnapshot
 from mtplx.generation import (
     _clear_cache_every,
     _defer_verify_hidden_eval_enabled,
@@ -20,6 +18,7 @@ from mtplx.generation import (
     _prefill_chunk_size,
     _prefill_committed_mtp_history_streaming,
     _sustained_prefill_layout,
+    _trim_cache_to_offset,
     generate_ar,
     generate_mtpk,
     restore_or_prefill_prompt_state,
@@ -28,15 +27,6 @@ from mtplx.mtp_patch import MTPContract
 from mtplx.profiles import DEFAULT_HF_MODEL_ID
 from mtplx.runtime import MTPLXRuntime
 from mtplx.sampling import SamplerConfig
-
-
-def _bind_sustained_prefill_policy(monkeypatch, *, enabled: bool) -> None:
-    environ = {"MTPLX_SUSTAINED_PREFILL": "1"} if enabled else {}
-    monkeypatch.setattr(
-        generation_module,
-        "_GENERATION_FEATURE_POLICY",
-        generation_module.bind_generation_feature_policy(environ),
-    )
 
 
 class TinyTokenizer:
@@ -156,6 +146,39 @@ class OffsetCache:
         return n
 
 
+def test_trim_cache_to_offset_preflights_all_bounded_entries_atomically():
+    from mtplx.models.deepseek_v4 import DeepseekV4Cache
+
+    first = DeepseekV4Cache(
+        window_size=16,
+        compress_ratio=0,
+        head_dim=8,
+        rollback_capacity=10,
+    )
+    second = DeepseekV4Cache(
+        window_size=16,
+        compress_ratio=0,
+        head_dim=8,
+        rollback_capacity=2,
+    )
+    first.offset = second.offset = 10
+    assert first.max_rollback == 10
+    assert second.max_rollback == 2
+
+    assert _trim_cache_to_offset([first, second], 5) is False
+    assert [first.offset, second.offset] == [10, 10]
+
+
+def test_trim_cache_to_offset_rejects_zero_delta_entry_without_trim_atomically():
+    first = OffsetCache()
+    first.offset = 10
+    second = SimpleNamespace(offset=5, trim=None)
+
+    assert _trim_cache_to_offset([first, second], 5) is False
+    assert first.offset == 10
+    assert first.trimmed == []
+
+
 class RejectingTinyMTPModel(AcceptingTinyMTPModel):
     def __init__(self):
         super().__init__()
@@ -185,6 +208,53 @@ class RejectingTinyMTPModel(AcceptingTinyMTPModel):
         )
 
 
+class TargetOnlyRuntime:
+    """A runtime with no MTP head, returning logits ONLY — like Laguna's.
+
+    Mirrors ``_TargetOnlyRuntime`` in test_laguna_fused.py: asking it for hidden
+    states is the bug itself, so it says so loudly rather than quietly handing
+    back something unpackable.
+    """
+
+    def __init__(self, model: TinyModel):
+        self.model = model
+        self.mtp_enabled = False
+        self.model_path = Path("tiny-target-only")
+        self.contract = MTPContract()
+        self.diagnostic_counters: dict[str, int] = {}
+
+    def forward_ar(
+        self,
+        input_ids,
+        cache=None,
+        return_hidden: bool = False,
+        hidden_variant: str | None = None,
+        emit_logits: bool = True,
+        logits_keep: int | None = None,
+        input_embeddings=None,
+    ):
+        assert not return_hidden, (
+            "the warm-restore prefill must not ask a target-only runtime for "
+            "hidden states; its forward_ar returns logits alone"
+        )
+        assert hidden_variant is None, (
+            "hidden_variant must not travel to a target-only runtime: the "
+            "generic runtime forwards it to a model that cannot accept it"
+        )
+        return self.model(
+            input_ids,
+            cache=cache,
+            emit_logits=emit_logits,
+            logits_keep=logits_keep,
+        )
+
+    def make_cache(self):
+        return self.model.make_cache()
+
+    def repage_target_prefill_cache(self, _cache):
+        return False
+
+
 def _runtime(model: TinyModel, *, mtp_enabled: bool = True) -> MTPLXRuntime:
     return MTPLXRuntime(
         model=model,
@@ -204,6 +274,10 @@ def test_contiguous_then_repage_cache_layout_restores_paged_env(monkeypatch):
             events.append(("make_cache", os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN")))
             return cache
 
+        def repage_target_prefill_cache(self, received_cache):
+            configure(received_cache)
+            return True
+
     def configure(received_cache):
         events.append(("repage", os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN")))
         assert received_cache is cache
@@ -218,8 +292,9 @@ def test_contiguous_then_repage_cache_layout_restores_paged_env(monkeypatch):
         configure,
     )
 
-    made_cache = _make_target_prefill_cache(Runtime())
-    elapsed = _maybe_repage_target_prefill_cache(made_cache)
+    runtime = Runtime()
+    made_cache = _make_target_prefill_cache(runtime)
+    elapsed = _maybe_repage_target_prefill_cache(runtime, made_cache)
 
     assert elapsed >= 0.0
     assert events == [("make_cache", "0"), ("repage", "1")]
@@ -237,6 +312,10 @@ def test_contiguous_dense_decode_cache_layout_does_not_repage(monkeypatch):
             events.append(("make_cache", os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN")))
             return cache
 
+        def repage_target_prefill_cache(self, received_cache):
+            configure(received_cache)
+            return True
+
     def configure(_received_cache):
         raise AssertionError("dense decode layout must not repage after prefill")
 
@@ -249,8 +328,9 @@ def test_contiguous_dense_decode_cache_layout_does_not_repage(monkeypatch):
         configure,
     )
 
-    made_cache = _make_target_prefill_cache(Runtime())
-    elapsed = _maybe_repage_target_prefill_cache(made_cache)
+    runtime = Runtime()
+    made_cache = _make_target_prefill_cache(runtime)
+    elapsed = _maybe_repage_target_prefill_cache(runtime, made_cache)
 
     assert elapsed == 0.0
     assert events == [("make_cache", "0")]
@@ -260,7 +340,7 @@ def test_contiguous_dense_decode_cache_layout_does_not_repage(monkeypatch):
 
 
 def test_session_restore_uses_prefill_layout_cache_factory(monkeypatch):
-    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "contiguous_dense_decode")
     monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN", "1")
     model = TinyModel()
@@ -300,207 +380,8 @@ def test_session_restore_uses_prefill_layout_cache_factory(monkeypatch):
     assert prompt_state.restore_mode == "clone"
 
 
-@pytest.mark.parametrize(
-    ("prefix_len", "expected_suffix_tokens"),
-    [
-        (5, 0),
-        (3, 2),
-    ],
-)
-def test_target_only_exact_restore_keeps_none_identity_without_hidden_capture(
-    monkeypatch,
-    prefix_len,
-    expected_suffix_tokens,
-):
-    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
-    monkeypatch.setattr(
-        generation_module,
-        "_resolve_runtime_mtp_position_mode",
-        lambda _rt: (_ for _ in ()).throw(
-            AssertionError("target-only restore must not resolve MTP position mode")
-        ),
-    )
-    model = TinyModel()
-    rt = _runtime(model, mtp_enabled=False)
-    restore_kwargs: list[dict[str, object]] = []
-
-    class Bank:
-        last_miss_reason = None
-
-        def longest_prefix(self, _prompt_ids):
-            return SimpleNamespace(prefix_len=prefix_len)
-
-        def near_prefix_candidates(self, _prompt_ids, **kwargs):
-            assert kwargs["hidden_variant"] is None
-            assert kwargs["mtp_history_policy"] == "none"
-            return []
-
-        def restore(self, _rt, _prompt_ids, **kwargs):
-            restore_kwargs.append(kwargs)
-            return SimpleNamespace(
-                entry=SimpleNamespace(prefix_len=prefix_len),
-                cache=[],
-                logits=mx.zeros((1, 4), dtype=mx.float32),
-                # A target-only restore must fail closed against stale
-                # auxiliary state even if a duck-typed bank returns it.
-                hidden=mx.zeros((1, 1, 2), dtype=mx.float32),
-                mtp_history_cache=["unexpected-mtp-cache"],
-                restore_mode="clone",
-            )
-
-    prompt_state = restore_or_prefill_prompt_state(
-        rt,
-        [0, 1, 2, 3, 4],
-        mtp_history_policy="none",
-        session_bank=Bank(),
-        target_only=True,
-    )
-
-    assert restore_kwargs[-1]["hidden_variant"] is None
-    assert restore_kwargs[-1]["mtp_history_policy"] == "none"
-    assert prompt_state.mtp_history_policy == "none"
-    assert prompt_state.hidden is None
-    assert prompt_state.committed_mtp_cache is None
-    assert prompt_state.suffix_tokens == expected_suffix_tokens
-    assert all(call["return_hidden"] is False for call in model.calls)
-
-
-def test_target_only_near_prefix_restore_without_suffix_keeps_hidden_none(
-    monkeypatch,
-):
-    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
-    model = TinyModel()
-    rt = _runtime(model, mtp_enabled=False)
-    entry = SimpleNamespace(
-        prefix_len=6,
-        token_ids=tuple(range(6)),
-        model_path=str(rt.model_path),
-        hidden_variant=None,
-        template_hash=None,
-        mtp_history_policy="none",
-        draft_head_identity=None,
-        policy_fingerprint=None,
-        snapshot_epoch=6,
-        mtp_snapshot_epoch=None,
-        mtp_history_snapshot=None,
-        mtp_history_cache_ref=None,
-        hits=0,
-        last_access_s=0.0,
-    )
-
-    class Bank:
-        last_miss_reason = "prefix_divergence_at_token"
-
-        def longest_prefix(self, _prompt_ids):
-            return None
-
-        def near_prefix_candidates(self, _prompt_ids, **kwargs):
-            assert kwargs["hidden_variant"] is None
-            assert kwargs["mtp_history_policy"] == "none"
-            return [(entry, 5)]
-
-        def restore_entry_prefix_cache(
-            self,
-            _rt,
-            _entry,
-            prefix_len,
-            *,
-            mode,
-            cache_factory=None,
-        ):
-            assert prefix_len == 5
-            assert mode == "clone"
-            assert cache_factory is None or callable(cache_factory)
-            return [], None, "clone"
-
-        def restore(self, *_args, **_kwargs):
-            raise AssertionError("near-prefix hit must bypass exact restore")
-
-    prompt_state = restore_or_prefill_prompt_state(
-        rt,
-        [0, 1, 2, 3, 4],
-        mtp_history_policy="none",
-        session_bank=Bank(),
-        target_only=True,
-    )
-
-    assert prompt_state.cache_hit is True
-    assert prompt_state.restore_mode == "near_prefix_clone"
-    assert prompt_state.mtp_history_policy == "none"
-    assert prompt_state.hidden is None
-    assert prompt_state.committed_mtp_cache is None
-    assert prompt_state.suffix_tokens == 0
-    assert [call["return_hidden"] for call in model.calls] == [False]
-
-
-def test_target_only_duck_near_prefix_ignores_stale_mtp_snapshot(monkeypatch):
-    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
-
-    class DuckFallbackModel(TinyModel):
-        def make_cache(self):
-            cache = OffsetCache()
-            cache.offset = 5
-            return [cache]
-
-    model = DuckFallbackModel()
-    rt = _runtime(model, mtp_enabled=False)
-    make_mtp_cache_calls: list[bool] = []
-    original_make_mtp_cache = rt.make_mtp_cache
-
-    def recording_make_mtp_cache():
-        make_mtp_cache_calls.append(True)
-        return original_make_mtp_cache()
-
-    rt.make_mtp_cache = recording_make_mtp_cache
-    entry = SimpleNamespace(
-        prefix_len=6,
-        token_ids=tuple(range(6)),
-        model_path=str(rt.model_path),
-        hidden_variant=None,
-        template_hash=None,
-        mtp_history_policy="none",
-        draft_head_identity=None,
-        policy_fingerprint=None,
-        snapshot_epoch=6,
-        mtp_snapshot_epoch=6,
-        cache_snapshot=CacheSnapshot(states=(), meta_states=()),
-        mtp_history_snapshot=CacheSnapshot(states=(), meta_states=()),
-        mtp_history_cache_ref=None,
-        live_ref_only=False,
-        has_recurrent=False,
-        hits=0,
-        last_access_s=0.0,
-    )
-
-    class DuckBank:
-        last_miss_reason = "prefix_divergence_at_token"
-
-        def longest_prefix(self, _prompt_ids):
-            return None
-
-        def near_prefix_candidates(self, _prompt_ids, **kwargs):
-            assert kwargs["mtp_history_policy"] == "none"
-            return [(entry, 5)]
-
-        def restore(self, *_args, **_kwargs):
-            raise AssertionError("duck near-prefix hit must bypass exact restore")
-
-    prompt_state = restore_or_prefill_prompt_state(
-        rt,
-        [0, 1, 2, 3, 4],
-        mtp_history_policy="none",
-        session_bank=DuckBank(),
-        target_only=True,
-    )
-
-    assert prompt_state.cache_hit is True
-    assert prompt_state.hidden is None
-    assert prompt_state.committed_mtp_cache is None
-    assert make_mtp_cache_calls == []
-
-
 def test_live_frontier_reference_restore_survives_prefill_layout_factory(monkeypatch):
-    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "contiguous_dense_decode")
     monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN", "1")
     monkeypatch.setenv("MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE", "1")
@@ -593,7 +474,7 @@ def test_auto_sustained_prefill_policy_repages_when_paged_kv_quant_is_enabled(mo
 def test_non_sustained_long_context_prefill_is_blocked_before_full_hidden_eval(
     monkeypatch,
 ):
-    _bind_sustained_prefill_policy(monkeypatch, enabled=False)
+    monkeypatch.delenv("MTPLX_SUSTAINED_PREFILL", raising=False)
     monkeypatch.delenv("MTPLX_ALLOW_UNSAFE_LONG_CONTEXT_PREFILL", raising=False)
     monkeypatch.setenv("MTPLX_UNSAFE_LONG_CONTEXT_PREFILL_GUARD_TOKENS", "8")
     model = TinyModel()
@@ -613,7 +494,7 @@ def test_non_sustained_long_context_prefill_is_blocked_before_full_hidden_eval(
 def test_non_sustained_long_context_prefill_guard_has_explicit_escape_hatch(
     monkeypatch,
 ):
-    _bind_sustained_prefill_policy(monkeypatch, enabled=False)
+    monkeypatch.delenv("MTPLX_SUSTAINED_PREFILL", raising=False)
     monkeypatch.setenv("MTPLX_ALLOW_UNSAFE_LONG_CONTEXT_PREFILL", "1")
     monkeypatch.setenv("MTPLX_UNSAFE_LONG_CONTEXT_PREFILL_GUARD_TOKENS", "8")
     model = TinyModel()
@@ -647,11 +528,148 @@ def test_generate_ar_does_not_request_hidden_by_default(monkeypatch):
     assert out.stats.prompt_mtp_history_time_s == 0.0
     assert out.stats.prompt_target_prefill_tok_s > 0.0
     assert out.stats.tok_s == out.stats.decode_tok_s
+    # Decode attribution truth (2026-08-30): the prompt-state span's
+    # restore machinery outside measured prefill compute
+    # (prompt_state_unattributed_time_s) is non-decode time too — it used
+    # to be silently charged into decode_elapsed_s.
+    assert out.stats.prompt_state_total_time_s >= out.stats.prompt_eval_time_s
+    assert out.stats.prompt_state_unattributed_time_s >= 0.0
     assert out.stats.decode_elapsed_s == pytest.approx(
-        out.stats.elapsed_s - out.stats.prompt_eval_time_s
+        out.stats.elapsed_s
+        - out.stats.prompt_eval_time_s
+        - out.stats.cache_restore_time_s
+        - out.stats.prompt_state_unattributed_time_s
     )
     assert out.stats.end_to_end_tok_s <= out.stats.decode_tok_s
     assert all(call["return_hidden"] is False for call in model.calls)
+
+
+def test_score_prompt_logprobs_alignment_and_normalization():
+    """Prompt scoring: position i predicts token i+1; per-row logprobs are a
+    valid distribution slice (sorted descending, <= 0); token_logprobs match
+    the target token's entry when it appears in the top-K."""
+
+    from mtplx.generation import score_prompt_logprobs
+
+    rt = _runtime(TinyModel(), mtp_enabled=True)
+    prompt = [0, 1, 2, 3]
+
+    scored = score_prompt_logprobs(rt, prompt, top_k=4, chunk_size=2)
+
+    assert scored["prompt_tokens"] == 4
+    assert len(scored["positions"]) == 3
+    assert len(scored["token_logprobs"]) == 3
+    for index, entries in enumerate(scored["positions"]):
+        values = [logprob for _token, logprob in entries]
+        assert values == sorted(values, reverse=True)
+        assert all(value <= 1e-6 for value in values)
+        # top_k == vocab here, so the target token must be present and its
+        # entry must equal the reported token logprob.
+        target = prompt[index + 1]
+        by_token = dict(entries)
+        assert target in by_token
+        assert by_token[target] == pytest.approx(
+            scored["token_logprobs"][index], abs=1e-5
+        )
+
+
+def test_generate_ar_restores_warm_prefix_from_session_bank():
+    """#246: the AR lane used to full-prefill unconditionally and hardcode
+    cached_tokens 0 / cache_hit false. With a bank hit it must restore the
+    prefix and report real numbers."""
+
+    model = TinyModel()
+    rt = _runtime(model, mtp_enabled=True)
+
+    class Bank:
+        last_miss_reason = None
+
+        def longest_prefix(self, _prompt_ids):
+            return SimpleNamespace(prefix_len=3)
+
+        def restore(self, _rt, _prompt_ids, **kwargs):
+            cache_factory = kwargs.get("cache_factory")
+            cache = cache_factory() if callable(cache_factory) else _rt.make_cache()
+            return SimpleNamespace(
+                entry=SimpleNamespace(prefix_len=3),
+                cache=cache,
+                logits=mx.zeros((1, 4), dtype=mx.float32),
+                hidden=None,
+                mtp_history_cache=None,
+                restore_mode="clone",
+            )
+
+    out = generate_ar(
+        rt,
+        [0, 1, 2, 3, 4],
+        max_tokens=2,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        stop_token_ids=set(),
+        session_bank=Bank(),
+        session_id="ar-warm-session",
+    )
+
+    assert out.stats.session_cache_hit is True
+    assert out.stats.cached_tokens > 0
+    assert out.stats.new_prefill_tokens < 5
+    assert len(out.tokens) == 2
+
+
+def test_generate_ar_cold_output_identical_with_and_without_bank():
+    """Empty-bank receipt: routing AR through restore_or_prefill must not
+    change cold-path outputs."""
+
+    class EmptyBank:
+        last_miss_reason = None
+
+        def longest_prefix(self, _prompt_ids):
+            return None
+
+        def restore(self, _rt, _prompt_ids, **kwargs):
+            return None
+
+    prompt = [0, 1, 2, 3]
+    sampler = SamplerConfig(temperature=0.0, top_p=1.0, top_k=4)
+    out_no_bank = generate_ar(
+        _runtime(TinyModel(), mtp_enabled=True),
+        list(prompt),
+        max_tokens=3,
+        sampler=sampler,
+        stop_token_ids=set(),
+    )
+    out_empty_bank = generate_ar(
+        _runtime(TinyModel(), mtp_enabled=True),
+        list(prompt),
+        max_tokens=3,
+        sampler=sampler,
+        stop_token_ids=set(),
+        session_bank=EmptyBank(),
+        session_id="ar-cold-session",
+    )
+
+    assert out_no_bank.tokens == out_empty_bank.tokens
+    assert out_empty_bank.stats.cached_tokens == 0
+    assert out_empty_bank.stats.session_cache_hit is False
+
+
+def test_generate_ar_captures_final_state_for_bank_commit():
+    """capture_final_state must produce a committable state whose token ids
+    match the generated tokens exactly (the committer refuses mismatches)."""
+
+    out = generate_ar(
+        _runtime(TinyModel(), mtp_enabled=True),
+        [0, 1, 2],
+        max_tokens=2,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        stop_token_ids=set(),
+        capture_final_state=True,
+    )
+
+    assert out.final_state is not None
+    assert out.final_state.safe_to_commit is True
+    assert out.final_state.generated_token_ids == tuple(out.tokens)
+    assert out.final_state.final_committed_mtp_cache is None
+    assert out.final_state.mtp_history_policy == "cycle"
 
 
 def test_default_qwen27b_ar_decode_trace_does_not_crash(tmp_path, monkeypatch):
@@ -686,7 +704,7 @@ def test_lazy_bonus_verify_shortens_full_accept_verify_input(monkeypatch):
         _runtime(model, mtp_enabled=True),
         [0],
         max_tokens=5,
-        sampler=SamplerConfig(temperature=0.6, top_p=0.95, top_k=20),
+        sampler=SamplerConfig(temperature=0.6, top_p=1.0, top_k=1),
         speculative_depth=3,
         mtp_history_policy="committed",
         verify_strategy="batched",
@@ -881,8 +899,50 @@ def test_trim_commit_keeps_rejected_verify_prefix_without_reforward(monkeypatch)
     assert "repair_forward" not in out.stats.events[0].get("timing_s", {})
 
 
+def test_mtpk_draft_time_is_decode_only_and_excludes_prompt_mtp_history(monkeypatch):
+    """draft_time_s must be a decode-window bucket.
+
+    Prefill MTP-history time is already reported separately in
+    prompt_mtp_history_time_s (and subtracted from prompt_target_prefill).
+    Folding it into draft_time_s as well made exported stats look impossible
+    at long context (256k Ivan-ladder row: draft 83s inside a 19s decode
+    window) and disagreed with generate_mtp1/generate_mtpa, which both report
+    decode-only draft time.
+    """
+    import mtplx.generation as generation_mod
+
+    real_restore = generation_mod.restore_or_prefill_prompt_state
+
+    def fake_restore(*args, **kwargs):
+        state = real_restore(*args, **kwargs)
+        state.prompt_mtp_history_time_s = 123.0
+        return state
+
+    monkeypatch.setattr(
+        generation_mod, "restore_or_prefill_prompt_state", fake_restore
+    )
+
+    out = generate_mtpk(
+        _runtime(AcceptingTinyMTPModel(), mtp_enabled=True),
+        [0],
+        max_tokens=5,
+        sampler=SamplerConfig(temperature=0.6, top_p=1.0, top_k=1),
+        speculative_depth=3,
+        mtp_history_policy="committed",
+        verify_strategy="batched",
+        stop_token_ids=set(),
+    )
+
+    # The prompt-side bucket carries the injected time untouched...
+    assert out.stats.prompt_mtp_history_time_s == 123.0
+    # ...and the decode-side draft bucket does not absorb it.
+    assert out.stats.draft_time_s < 60.0
+    # prompt_eval here is tiny, so the target-prefill share clamps to zero.
+    assert out.stats.prompt_target_prefill_time_s == 0.0
+
+
 def test_sustained_prefill_chunks_without_full_prompt_logits(monkeypatch):
-    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     model = TinyModel()
@@ -902,7 +962,7 @@ def test_warm_restored_suffix_prefill_is_chunked_and_typed_for_abort(monkeypatch
     # kvcache-v2: suffixes <= MTPLX_SMALL_SUFFIX_FUSED_MAX fuse into one
     # forward; this test guards the chunked lane used above that threshold.
     monkeypatch.setenv("MTPLX_SMALL_SUFFIX_FUSED_MAX", "0")
-    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     model = TinyModel()
@@ -929,11 +989,13 @@ def test_warm_restored_suffix_prefill_is_chunked_and_typed_for_abort(monkeypatch
         hidden_states,
         token_ids,
         *,
+        phase,
         mtp_hidden_variant,
         position_offset=None,
         force_eval=False,
         input_embeddings=None,
     ):
+        assert phase == "prefill"
         assert hidden_states.shape[1] == len(token_ids)
         assert force_eval is True
         appended.append(list(token_ids))
@@ -965,8 +1027,67 @@ def test_warm_restored_suffix_prefill_is_chunked_and_typed_for_abort(monkeypatch
     assert chunk_events[-1]["live_prefill_tok_s"] is not None
 
 
+@pytest.mark.parametrize(
+    ("lane", "fused_max", "suffix_len"),
+    [("fused", 64, 2), ("chunked", 0, 4)],
+)
+def test_warm_restore_never_asks_a_target_only_runtime_for_hidden(
+    monkeypatch, lane, fused_max, suffix_len
+):
+    """Regression for the live serving crash at _prefill_restored_prompt_suffix.
+
+    Every warm restore asked the runtime for hidden states unconditionally, on
+    both lanes. A target-only runtime returns logits alone, so unpacking that
+    into ``(logits, hidden)`` raised ``ValueError: not enough values to unpack
+    (expected 2, got 1)``. The double asserts the request is never made at all
+    — including hidden_variant, which the generic runtime would forward to a
+    model that cannot accept it.
+    """
+
+    monkeypatch.setenv("MTPLX_SMALL_SUFFIX_FUSED_MAX", str(fused_max))
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
+    model = TinyModel()
+    rt = TargetOnlyRuntime(model)
+
+    class Bank:
+        last_miss_reason = None
+
+        def restore(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                entry=SimpleNamespace(prefix_len=3),
+                cache=[],
+                logits=mx.zeros((1, 4), dtype=mx.float32),
+                # An AR turn banks the trunk cache only: no hidden was stored.
+                hidden=None,
+                mtp_history_cache=None,
+                restore_mode="clone",
+            )
+
+    prompt_state = restore_or_prefill_prompt_state(
+        rt,
+        list(range(3 + suffix_len)),
+        # The server hands AR runtimes the committed policy; the chokepoint
+        # guard downgrades it to cycle, and the suffix prefill must honor that.
+        mtp_history_policy="committed",
+        session_bank=Bank(),
+    )
+
+    assert prompt_state.cache_hit is True
+    assert prompt_state.mtp_history_policy == "cycle"
+    assert prompt_state.cached_tokens == 3
+    assert prompt_state.suffix_tokens == suffix_len
+    assert prompt_state.hidden is None
+    assert prompt_state.logits is not None
+    assert not any(call["return_hidden"] for call in model.calls)
+    if lane == "fused":
+        assert rt.diagnostic_counters["restored_suffix_prefill_fused"] == 1
+    else:
+        assert rt.diagnostic_counters["restored_suffix_prefill_chunks"] >= 1
+
+
 def test_restore_prefers_larger_near_gap_over_shorter_exact_prefix(monkeypatch):
-    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     model = TinyModel()
@@ -1040,11 +1161,13 @@ def test_restore_prefers_larger_near_gap_over_shorter_exact_prefix(monkeypatch):
         hidden_states,
         token_ids,
         *,
+        phase,
         mtp_hidden_variant,
         position_offset=None,
         force_eval=False,
         input_embeddings=None,
     ):
+        assert phase == "prefill"
         assert hidden_states.shape[1] == len(token_ids)
         assert force_eval is True
         appended.append(list(token_ids))
@@ -1078,7 +1201,7 @@ def test_restore_prefers_larger_near_gap_over_shorter_exact_prefix(monkeypatch):
 
 
 def test_opencode_compact_restore_prefers_block_prefix_over_short_exact(monkeypatch):
-    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     model = TinyModel()
@@ -1156,11 +1279,13 @@ def test_opencode_compact_restore_prefers_block_prefix_over_short_exact(monkeypa
         hidden_states,
         token_ids,
         *,
+        phase,
         mtp_hidden_variant,
         position_offset=None,
         force_eval=False,
         input_embeddings=None,
     ):
+        assert phase == "prefill"
         assert hidden_states.shape[1] == len(token_ids)
         assert force_eval is True
         appended.append(list(token_ids))
@@ -1266,11 +1391,13 @@ def _install_history_stub(monkeypatch):
         hidden_states,
         token_ids,
         *,
+        phase,
         mtp_hidden_variant,
         position_offset=None,
         force_eval=False,
         input_embeddings=None,
     ):
+        assert phase == "prefill"
         assert hidden_states.shape[1] == len(token_ids)
         return 0.0
 
@@ -1285,7 +1412,7 @@ def test_generic_client_escapes_stale_short_exact_prefix_via_block_restore(
     prefixes went unused, re-prefilling a growing suffix every turn. With
     boundary-true restore on (the v2 default), the block-prefix lane is safe
     and must engage for every client."""
-    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     model = TinyModel()
@@ -1318,7 +1445,7 @@ def test_generic_client_block_restore_respects_boundary_true_off_switch(
 ):
     """With MTPLX_SESSION_BOUNDARY_TRUE_RESTORE=0 the pre-v2 caution comes
     back for non-OpenCode clients: tiny-gap only, exact restore wins."""
-    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     monkeypatch.setenv("MTPLX_SESSION_BOUNDARY_TRUE_RESTORE", "0")
@@ -1349,7 +1476,7 @@ def test_generic_client_block_restore_respects_block_prefix_kill_switch(
 ):
     """MTPLX_SESSION_BLOCK_PREFIX_RESTORE=0 must still disable the block
     lane for generic clients even with boundary-true restore on."""
-    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     monkeypatch.setenv("MTPLX_SESSION_BLOCK_PREFIX_RESTORE", "0")
@@ -1377,7 +1504,7 @@ def test_generic_client_block_restore_respects_block_prefix_kill_switch(
 
 def test_ssd_near_prefix_restore_time_is_cache_time_not_decode_time(monkeypatch):
     monkeypatch.setenv("MTPLX_SESSION_BLOCK_PREFIX_RESTORE", "1")
-    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     model = TinyModel()
@@ -1436,11 +1563,13 @@ def test_ssd_near_prefix_restore_time_is_cache_time_not_decode_time(monkeypatch)
         hidden_states,
         token_ids,
         *,
+        phase,
         mtp_hidden_variant,
         position_offset=None,
         force_eval=False,
         input_embeddings=None,
     ):
+        assert phase == "prefill"
         assert hidden_states.shape[1] == len(token_ids)
         assert force_eval is True
         return 0.0
@@ -1462,7 +1591,7 @@ def test_ssd_near_prefix_restore_time_is_cache_time_not_decode_time(monkeypatch)
 
 def test_block_prefix_restore_matches_target_default(monkeypatch):
     monkeypatch.delenv("MTPLX_SESSION_BLOCK_PREFIX_RESTORE", raising=False)
-    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     model = TinyModel()
@@ -1499,7 +1628,7 @@ def test_block_prefix_restore_matches_target_default(monkeypatch):
 
 
 def test_sustained_prefill_chunk_cache_cleanup_is_explicit(monkeypatch):
-    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_CACHE_CLEANUP", "1")
@@ -1518,7 +1647,7 @@ def test_sustained_prefill_chunk_cache_cleanup_is_explicit(monkeypatch):
 
 
 def test_sustained_prefill_stock_cache_only_requires_unsafe_allow(monkeypatch):
-    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     monkeypatch.setenv("MTPLX_PREFILL_STOCK_CACHE_ONLY", "1")
@@ -1534,7 +1663,7 @@ def test_sustained_prefill_stock_cache_only_requires_unsafe_allow(monkeypatch):
 
 
 def test_sustained_prefill_stock_cache_only_is_explicit_unsafe(monkeypatch):
-    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     monkeypatch.setenv("MTPLX_PREFILL_STOCK_CACHE_ONLY", "1")
@@ -1552,7 +1681,7 @@ def test_sustained_prefill_stock_cache_only_is_explicit_unsafe(monkeypatch):
 
 
 def test_sustained_prefill_omlx_external_is_safe_profile_path(monkeypatch):
-    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     monkeypatch.setenv("MTPLX_PREFILL_OMLX_EXTERNAL", "1")
@@ -1572,7 +1701,7 @@ def test_sustained_prefill_omlx_external_is_safe_profile_path(monkeypatch):
 def test_sustained_prefill_forwards_logits_controls_through_patched_kwargs_wrapper(
     monkeypatch,
 ):
-    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     model = KwargsOnlyTinyModel()
@@ -1585,7 +1714,7 @@ def test_sustained_prefill_forwards_logits_controls_through_patched_kwargs_wrapp
 
 
 def test_last_window_mtp_history_skips_discarded_chunk_hidden(monkeypatch):
-    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     model = TinyModel()
@@ -1598,11 +1727,13 @@ def test_last_window_mtp_history_skips_discarded_chunk_hidden(monkeypatch):
         hidden_states,
         token_ids,
         *,
+        phase,
         mtp_hidden_variant,
         position_offset=None,
         force_eval=False,
         input_embeddings=None,
     ):
+        assert phase == "prefill"
         appended.append((list(token_ids), position_offset))
         return 0.0
 
@@ -1626,7 +1757,7 @@ def test_last_window_mtp_history_skips_discarded_chunk_hidden(monkeypatch):
     assert appended == [([6], 5), ([7, 8], 6)]
 
 
-def test_32k_prefill_peak_memory_bounded(monkeypatch):
+def test_32k_prefill_peak_memory_bounded():
     """
     Regression guard for the Ivan/Benchand 32K memory balloon.
     Run only on the Apple Silicon long-context QA machine.
@@ -1637,10 +1768,6 @@ def test_32k_prefill_peak_memory_bounded(monkeypatch):
     if not model_path:
         pytest.skip("set MTPLX_32K_QA_MODEL to a local runnable MTPLX model")
 
-    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
-    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2048")
-    monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
-
     from mtplx.runtime import load
 
     rt = load(model_path, mtp=True)
@@ -1650,6 +1777,9 @@ def test_32k_prefill_peak_memory_bounded(monkeypatch):
         pytest.skip("QA prompt did not tokenize to 32K tokens")
 
     mx.reset_peak_memory()
+    os.environ["MTPLX_SUSTAINED_PREFILL"] = "1"
+    os.environ["MTPLX_PREFILL_CHUNK_SIZE"] = "2048"
+    os.environ["MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS"] = "0"
     _prefill(rt, prompt_ids, return_hidden=True)
     peak_gb = mx.get_peak_memory() / (1024**3)
 

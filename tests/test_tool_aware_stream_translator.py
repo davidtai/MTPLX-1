@@ -361,7 +361,11 @@ def test_leading_whitespace_before_marker_still_dropped():
     assert any("tool_calls" in d for d in (out + finish_deltas))
 
 
-def test_unknown_tool_name_suppresses_raw_tool_markup():
+def test_unknown_tool_name_passes_through_as_tool_call():
+    # OpenAI-compatible contract: an unknown-named call is surfaced to the
+    # client, which owns the rejection (and answers the model so it can
+    # self-correct). Suppressing it degraded the whole turn to prose and cost
+    # agent clients (Cline) a consecutive-mistake strike per occurrence.
     t = _make()
     text = (
         "<tool_call>\n<function=Agent>\n"
@@ -369,9 +373,17 @@ def test_unknown_tool_name_suppresses_raw_tool_markup():
         "</function>\n</tool_call>"
     )
     out = t.feed("content", text)
-    assert t.finish() == []
-    assert t.has_tool_calls is False
-    assert t.fallback_reason == "unknown tool 'Agent'"
+    finish_deltas = t.finish()
+    assert t.has_tool_calls is True
+    assert t.fallback_reason is None
+    named = [
+        d for d in (out + finish_deltas)
+        if any(
+            (c.get("function") or {}).get("name") == "Agent"
+            for c in (d.get("tool_calls") or [])
+        )
+    ]
+    assert named, "unknown-named call should stream as a tool_call delta"
     assert _content_text(out) == ""
 
 
@@ -544,6 +556,60 @@ def test_qwen_xml_opening_marker_split_after_preamble_no_leak():
     assert t.tool_calls is not None
     assert len(t.tool_calls) == 1
     assert json.loads(t.tool_calls[0]["function"]["arguments"]) == {"q": "scene"}
+
+
+def test_hy3_suffixed_native_parallel_calls_stream_without_markup():
+    t = _make(tools=OPENCODE_READ_TOOL_SPECS + OPENCODE_SHELL_TOOL_SPECS)
+    text = (
+        "I'll inspect both. <tool_calls:opensource>\n"
+        "<tool_call:opensource>read<tool_sep:opensource>\n"
+        "<arg_key:opensource>filePath</arg_key:opensource>\n"
+        "<arg_value:opensource>/tmp/brief.md</arg_value:opensource>\n"
+        "</tool_call:opensource>\n"
+        "<tool_call:opensource>bash<tool_sep:opensource>\n"
+        "<arg_key:opensource>command</arg_key:opensource>\n"
+        "<arg_value:opensource>ls -la</arg_value:opensource>\n"
+        "<arg_key:opensource>description</arg_key:opensource>\n"
+        "<arg_value:opensource>List project files</arg_value:opensource>\n"
+        "</tool_call:opensource>\n"
+        "</tool_calls:opensource>"
+    )
+    out = _feed_in_chunks(t, text, [1] * len(text))
+
+    content = _content_text(out)
+    assert content == "I'll inspect both. "
+    _assert_no_tool_markup_leaked(content)
+    assert t.tool_parser_dialect == "suffixed_native"
+    assert t.tool_calls is not None
+    assert [call["function"]["name"] for call in t.tool_calls] == ["read", "bash"]
+    assert [
+        json.loads(call["function"]["arguments"]) for call in t.tool_calls
+    ] == [
+        {"filePath": "/tmp/brief.md"},
+        {"command": "ls -la", "description": "List project files"},
+    ]
+
+
+def test_hy3_suffixed_native_write_preserves_json_shaped_string():
+    t = _make(tools=OPENCODE_WRITE_TOOL_SPECS)
+    text = (
+        "<tool_calls:opensource>"
+        "<tool_call:opensource>write<tool_sep:opensource>"
+        "<arg_key:opensource>filePath</arg_key:opensource>"
+        "<arg_value:opensource>config.json</arg_value:opensource>"
+        "<arg_key:opensource>content</arg_key:opensource>"
+        '<arg_value:opensource>{"enabled":true}</arg_value:opensource>'
+        "</tool_call:opensource>"
+        "</tool_calls:opensource>"
+    )
+    out = _feed_in_chunks(t, text, [7] * ((len(text) // 7) + 1))
+
+    assert t.tool_calls is not None
+    assert json.loads(_argument_text(out)) == {
+        "filePath": "config.json",
+        "content": '{"enabled":true}',
+    }
+    assert _content_text(out) == ""
 
 
 def test_opencode_style_long_write_arguments_stream_without_raw_xml():
@@ -851,3 +917,60 @@ def test_schema_type_mismatch_suppresses_raw_tool_markup():
     assert t.has_tool_calls is False
     assert "timeout must be number" in (t.fallback_reason or "")
     assert _content_text(out) == ""
+
+
+def test_bracket_call_streams_as_tool_call_not_content():
+    # Live shape 2026-07-25: prose, then a complete [Calling tool: ...] block
+    # whose arguments contain `]` (task_progress checklist) and `})]` inside
+    # strings. The old start detector skipped the prefix on the early `]`,
+    # so the block streamed as content AND the finish-time rescue emitted the
+    # same call — a double delivery.
+    payload = {
+        "input": "*** Begin Patch\n+const f = (x) => ({y: x});\ncall(f(1))]\n*** End Patch",
+        "task_progress": "- [x] one\n- [ ] two",
+    }
+    text = (
+        "Let me start with the math utilities: [Calling tool: apply_patch("
+        + json.dumps(payload)
+        + ")]"
+    )
+    t = _make(
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "apply_patch",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"input": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+    )
+    out = []
+    for i in range(0, len(text), 7):  # simulate streaming in small chunks
+        out += t.feed("content", text[i : i + 7])
+    out += t.finish()
+    assert t.has_tool_calls is True, t.fallback_reason
+    contents = _content_text(out)
+    assert "[Calling tool:" not in contents
+    assert "Begin Patch" not in contents
+    args = _argument_text(out)
+    assert json.loads(args) == payload
+
+
+def test_unterminated_bracket_call_suppresses_like_unclosed_markup():
+    # Same contract as test_unclosed_tool_call_suppresses_raw_tool_markup:
+    # a never-completing block is suppressed with a recorded reason, keeping
+    # the drift dialect out of the visible transcript (and the model's
+    # conversation history).
+    text = 'And now: [Calling tool: apply_patch({"input": "never closed'
+    t = _make()
+    out = []
+    for i in range(0, len(text), 9):
+        out += t.feed("content", text[i : i + 9])
+    out += t.finish()
+    assert t.has_tool_calls is False
+    assert t.fallback_reason
+    assert _content_text(out) == "And now: "

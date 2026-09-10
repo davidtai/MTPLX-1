@@ -29,6 +29,7 @@ from mtplx.benchmarks.runners.aime import AIMEProblem
 from mtplx.server import openai
 from mtplx.server.dashboard_state import (
     InFlightHandle,
+    PrefillHistory,
     ProgressEventGate,
     RollingMetrics,
 )
@@ -37,9 +38,11 @@ from mtplx.server.openai import (
     DASHBOARD_READ_ONLY_SETTINGS_KEYS,
     DASHBOARD_RESTART_REQUIRED_KEYS,
     DASHBOARD_SNAPSHOT_INTERVAL_DEFAULT_MS,
+    DASHBOARD_SNAPSHOT_INTERVAL_IDLE_MIN_MS,
     DASHBOARD_SNAPSHOT_INTERVAL_MAX_MS,
     DASHBOARD_SNAPSHOT_INTERVAL_MIN_MS,
     PUBLIC_MTPLX_STATS_KEYS,
+    _dashboard_snapshot_interval_for_activity_s,
     _dashboard_snapshot_interval_s,
     create_app,
 )
@@ -125,6 +128,16 @@ def test_public_stats_keys_keep_previously_exposed_keys():
     }
     missing = must_keep - set(PUBLIC_MTPLX_STATS_KEYS)
     assert not missing, f"public stats keys regressed; lost: {sorted(missing)}"
+
+
+def test_public_stats_keys_expose_mtp_batch_execution_truth():
+    assert {
+        "mtp_batch_real_width",
+        "mtp_batch_fixed_width",
+        "mtp_batch_route_id",
+        "target_verify_cycles",
+        "mtp_batch_session_cache_bypass",
+    } <= set(PUBLIC_MTPLX_STATS_KEYS)
 
 
 def test_public_stats_keys_includes_verify_decomposition():
@@ -597,6 +610,7 @@ def test_app_capabilities_returns_stable_native_backend_contract():
         "serial",
         "cooperative",
         "ar_batch",
+        "mtp_batch",
         "mtp_cohort_experimental",
     ]
     assert body["scheduler"]["default_ux"] == "coding_agents"
@@ -604,6 +618,7 @@ def test_app_capabilities_returns_stable_native_backend_contract():
     assert body["snapshot_interval"]["default_ms"] == DASHBOARD_SNAPSHOT_INTERVAL_DEFAULT_MS
     assert body["snapshot_interval"]["min_ms"] == DASHBOARD_SNAPSHOT_INTERVAL_MIN_MS
     assert body["snapshot_interval"]["max_ms"] == DASHBOARD_SNAPSHOT_INTERVAL_MAX_MS
+    assert body["snapshot_interval"]["idle_min_ms"] == DASHBOARD_SNAPSHOT_INTERVAL_IDLE_MIN_MS
     assert body["snapshot_interval"]["native_default_ms"] == 500
     assert body["snapshot_interval"]["performance_lock_ms"] == 1000
 
@@ -646,6 +661,12 @@ def test_metrics_stream_accepts_bounded_snapshot_interval():
     assert _dashboard_snapshot_interval_s(1000) == 1.0
     assert _dashboard_snapshot_interval_s(1) == 0.1
     assert _dashboard_snapshot_interval_s(999_999) == 5.0
+
+
+def test_metrics_stream_relaxes_full_snapshots_only_while_idle():
+    assert _dashboard_snapshot_interval_for_activity_s(0.1, active_requests=1) == 0.1
+    assert _dashboard_snapshot_interval_for_activity_s(0.1, active_requests=0) == 1.0
+    assert _dashboard_snapshot_interval_for_activity_s(2.0, active_requests=0) == 2.0
 
 
 def test_metrics_bus_round_trips_completed_event():
@@ -956,6 +977,38 @@ def test_dashboard_prefill_chunk_exposes_live_and_cumulative_rates():
     assert handle.prefill_state["live_prefill_tok_s"] == 512.0
 
 
+def test_prefill_card_summarizes_live_work_without_polling_duplicates():
+    state = _fake_state()
+    state.dashboard.in_flight.register(InFlightHandle(
+        request_id="prefill-card", cancel_event=Event(), started_s=time.time(),
+    ))
+    for size, seconds in [(2048, 1.0), (4096, 3.0)]:
+        openai._dashboard_publish_prefill(
+            state, request_id="prefill-card", session_id="session",
+            payload={"phase": "chunk", "chunk_size": size,
+                     "chunk_elapsed_s": seconds, "tokens_done": 106144,
+                     "cached_tokens": 100000, "elapsed_s": 15.0},
+        )
+    # Non-compute phases and repeated reads cannot inflate work or dilute it
+    # with cache restoration, MTP history, queueing or the model's output.
+    openai._dashboard_publish_prefill(
+        state, request_id="prefill-card", session_id="session",
+        payload={"phase": "completed", "prefill_tok_s": 400, "elapsed_s": 20.0},
+    )
+    first = openai._mtplx_dashboard_snapshot(state)["prefill_rates"]
+    assert first == openai._mtplx_dashboard_snapshot(state)["prefill_rates"]
+    assert first == {"tokens": 6144, "compute_time_s": 4.0,
+                     "peak_tok_s": 2048.0, "samples": 2, "capacity": 100}
+
+
+def test_prefill_chunk_window_is_bounded_and_ignores_invalid_samples():
+    history = PrefillHistory(capacity=2)
+    for size, seconds in [(100, 1), (200, 1), (300, 1), (1, 0), (1, float("nan"))]:
+        history.record_chunk(size, seconds)
+    assert history.rates() == {"tokens": 500, "compute_time_s": 2,
+                              "peak_tok_s": 300, "samples": 2, "capacity": 2}
+
+
 def test_dashboard_prompt_preview_truncates_long_messages():
     long_text = "abcdefghij" * 20
     request = type(
@@ -985,3 +1038,22 @@ def test_rolling_metrics_per_session_map_is_lru_bounded():
     # Most-recent sessions survive; the oldest were evicted.
     assert "session-199" in per_session
     assert "session-0" not in per_session
+
+
+def test_settings_post_toggles_adaptive_depth_policy_live():
+    state = _fake_state()
+    client = TestClient(create_app(state))
+    supported = client.get("/v1/mtplx/settings").json()["adaptive_depth_supported"]
+    off = client.post("/v1/mtplx/settings", json={"adaptive_policy": "none"})
+    assert off.status_code == 200
+    assert off.json()["adaptive_policy"] == "none"
+    assert state.args.adaptive_policy == "none"
+    on = client.post("/v1/mtplx/settings", json={"adaptive_policy": "expected_value"})
+    if supported:
+        assert on.status_code == 200
+        assert state.args.adaptive_policy == "expected_value"
+        assert on.json()["adaptive_policy"] == "expected_value"
+    else:
+        assert on.status_code == 400
+        assert state.args.adaptive_policy == "none"
+    assert client.post("/v1/mtplx/settings", json={"adaptive_policy": "always"}).status_code == 400

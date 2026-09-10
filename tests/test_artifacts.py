@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 
 import numpy as np
@@ -94,10 +96,13 @@ def test_inspect_model_reads_qwen_mtp_config_without_weights(tmp_path):
     assert result.mtp.exists is False
     assert result.compatibility["tier"] == "architecture-compatible-but-unverified"
     assert result.compatibility["exit_code"] == 3
-    assert result.compatibility["runtime_compatibility"] == "missing-mtp-weights"
+    # Config-only dirs have no model at all — that stays a clean refusal
+    # (the mtp_off AR degradation applies only when trunk weights exist).
+    assert result.compatibility["runtime_compatibility"] == "missing-model-weights"
+    assert result.compatibility["can_run"] is False
     assert result.compatibility["unsafe_force_required"] is False
-    assert "mtplx_runtime.json is optional metadata" in result.compatibility["message"]
-    assert "missing MTP weights" in result.compatibility["message"]
+    assert "no model weights" in result.compatibility["message"]
+    assert "graft an MTP sidecar" not in result.compatibility["message"]
 
 
 def test_qwen3_5_text_subtype_can_pass_primary_gate_when_mtp_is_valid(monkeypatch, tmp_path):
@@ -903,7 +908,30 @@ def test_qwen3_next_architecture_without_mtp_sidecar_is_unverified(tmp_path):
 
     assert result.compatibility["tier"] == "architecture-compatible-but-unverified"
     assert result.compatibility["exit_code"] == 3
-    assert result.compatibility["runtime_compatibility"] == "missing-mtp-weights"
+    assert result.compatibility["runtime_compatibility"] == "missing-model-weights"
+    assert result.compatibility["can_run"] is False
+
+
+def test_qwen3_next_trunk_without_mtp_head_degrades_to_ar(tmp_path):
+    """mtp_heads missing on a real trunk -> mtp_off AR serving, not refusal."""
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3NextForCausalLM"],
+                "model_type": "qwen3_next",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "model.safetensors").write_bytes(b"\x00" * 8)
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "architecture-compatible-but-unverified"
+    assert result.compatibility["runtime_compatibility"] == "native-ar-only-missing-mtp"
+    assert result.compatibility["can_run"] is True
+    assert "mtp_heads not found -> mtp_off" in result.compatibility["message"]
+    assert "autoregressive" in result.compatibility["message"]
 
 
 def test_architecture_catalog_tracks_main_mtp_families():
@@ -1068,7 +1096,10 @@ def test_glm4_moe_mtp_with_family_layer_weights_is_runnable_without_contract(tmp
     assert result.compatibility["runtime_compatibility"] == "native-family-gated"
 
 
-def test_glm4_moe_mtp_with_unrelated_model_file_still_needs_contract(tmp_path):
+def test_glm4_moe_mtp_with_unrelated_model_file_serves_ar_mtp_off(tmp_path):
+    # 2026-08-26 (founder): an MTP head this build cannot attach is
+    # "MTP unavailable", never a refusal — the constructable trunk serves
+    # autoregressive with mtp_off.
     (tmp_path / "config.json").write_text(
         json.dumps(
             {
@@ -1085,8 +1116,12 @@ def test_glm4_moe_mtp_with_unrelated_model_file_still_needs_contract(tmp_path):
     result = inspect_model(tmp_path)
 
     assert result.compatibility["tier"] == "architecture-compatible-but-unverified"
-    assert result.compatibility["can_run"] is False
-    assert result.compatibility["runtime_compatibility"] == "needs-contract"
+    assert result.compatibility["can_run"] is True
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "native-ar-only-mtp-unsupported"
+    )
+    assert "MTP unavailable" in result.compatibility["message"]
 
 
 def test_glm4_moe_mtp_sidecar_layer_keys_are_family_runnable(tmp_path):
@@ -1235,7 +1270,9 @@ def test_mimo_mtp_with_family_layer_weights_is_runnable_without_contract(tmp_pat
     assert result.compatibility["runtime_compatibility"] == "native-family-gated"
 
 
-def test_mimo_mtp_with_unrelated_model_file_still_needs_contract(tmp_path):
+def test_mimo_mtp_with_unrelated_model_file_serves_ar_mtp_off(tmp_path):
+    # Same 2026-08-26 doctrine as the glm4_moe case above: MTP unavailable
+    # degrades to AR, it does not block a constructable trunk.
     (tmp_path / "config.json").write_text(
         json.dumps(
             {
@@ -1252,8 +1289,12 @@ def test_mimo_mtp_with_unrelated_model_file_still_needs_contract(tmp_path):
     result = inspect_model(tmp_path)
 
     assert result.compatibility["tier"] == "architecture-compatible-but-unverified"
-    assert result.compatibility["can_run"] is False
-    assert result.compatibility["runtime_compatibility"] == "needs-contract"
+    assert result.compatibility["can_run"] is True
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "native-ar-only-mtp-unsupported"
+    )
+    assert "MTP unavailable" in result.compatibility["message"]
 
 
 def test_minimax_m2_with_nextn_marker_is_recognized_backend_pending(tmp_path):
@@ -1382,6 +1423,48 @@ def test_nemotron_h_mtp_with_family_sidecar_is_runnable_without_contract(tmp_pat
 
     result = inspect_model(tmp_path)
 
+    assert result.compatibility["tier"] == "family-compatible-unverified"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["runtime_compatibility"] == "native-family-gated"
+
+
+def test_nemotron_h_mtp_official_block_type_list_config_is_runnable(tmp_path):
+    """Official NVIDIA configs carry mtp_layers_block_type, not
+    mtp_hybrid_override_pattern; the derived pattern must match the runtime
+    routing gate or inspect and serve disagree (issue #341)."""
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["NemotronHForCausalLM"],
+                "model_type": "nemotron_h",
+                "num_nextn_predict_layers": 1,
+                "num_hidden_layers": 52,
+                # Backbone pattern (M/- chars) must not shadow the MTP stack.
+                "hybrid_override_pattern": "M-M-M*-M-M-M*-E",
+                "mtp_layers_block_type": ["attention", "moe"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {
+            "mtp.layers.0.enorm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.hnorm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.eh_proj.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.norm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.mixer.q_proj.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.1.norm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.1.mixer.gate.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.1.final_layernorm.weight": np.ones((1,), dtype=np.float32),
+        },
+        tmp_path / "mtp.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.mtp_pattern == "*E"
+    assert result.compatibility["arch_id"] == "nemotron-h-mtp"
     assert result.compatibility["tier"] == "family-compatible-unverified"
     assert result.compatibility["can_run"] is True
     assert result.compatibility["runtime_compatibility"] == "native-family-gated"
@@ -1556,7 +1639,9 @@ def test_gemma4_pair_subfolder_reports_bundle_required(tmp_path):
     [
         ("DeepseekV32ForCausalLM", "deepseek_v32", "deepseek-v3-mtp"),
         ("GlmMoeDsaForCausalLM", "glm_moe_dsa", "glm-moe-dsa-mtp"),
-        ("DeepseekV4ForCausalLM", "deepseek_v4", "deepseek-v4-mtp"),
+        # deepseek_v4 now has a native MLX AR backend (arch_id "deepseek-v4"),
+        # so it is no longer a backend-pending arch — covered by
+        # test_deepseek_v4_routes_to_supported_ar_backend below.
         ("Glm4MoeLiteForCausalLM", "glm4_moe_lite", "glm4-moe-lite-mtp"),
         ("GlmOcrForCausalLM", "glm_ocr", "glm-ocr-mtp"),
         ("MiniMaxM2ForCausalLM", "minimax_m2", "minimax-m2-mtp"),
@@ -1614,6 +1699,52 @@ def test_big_mtp_architecture_markers_are_recognized_backend_pending(
     assert result.compatibility["mtp_supported"] == "recognized"
 
 
+def test_deepseek_v4_routes_to_supported_ar_backend(tmp_path):
+    # The mlx-community DeepSeek-V4-Flash conversion drops the MTP block, so the
+    # artifact is a target-only AR model handled by the native deepseek_v4 MLX
+    # loader (arch_id "deepseek-v4").
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["DeepseekV4ForCausalLM"],
+                "model_type": "deepseek_v4",
+                "num_hidden_layers": 43,
+                "quantization": {"group_size": 64, "bits": 4, "mode": "affine"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["arch_id"] == "deepseek-v4"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["tier"] == "AR-only"
+    assert result.compatibility["recommended_backend"] == "deepseek_v4"
+    assert result.compatibility["mtp_supported"] == "no"
+
+
+def test_deepseek_v4_mtp_split_stays_backend_pending(tmp_path):
+    # An MTP-split V4 checkpoint (vLLM layout) still has no runnable MTP backend;
+    # it must keep detecting as the pending deepseek-v4-mtp arch, not get captured
+    # by the AR "deepseek-v4" entry (the substring-alias hazard).
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["DeepseekV4MTPForCausalLM"],
+                "model_type": "deepseek_v4_mtp",
+                "num_nextn_predict_layers": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["arch_id"] == "deepseek-v4-mtp"
+    assert result.compatibility["can_run"] is False
+
+
 def test_recognized_non_qwen_runtime_contract_stays_backend_pending(tmp_path):
     (tmp_path / "config.json").write_text(
         json.dumps(
@@ -1647,6 +1778,343 @@ def test_llama_without_mtp_is_no_mtp(tmp_path):
 
     assert result.compatibility["tier"] == "no-MTP"
     assert result.compatibility["exit_code"] == 2
+
+
+def _laguna_s_2_1_config(**updates):
+    layer_types = [
+        layer_type
+        for _ in range(12)
+        for layer_type in (
+            "full_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+        )
+    ]
+    from mtplx.models.laguna_config import LAGUNA_S_2_1_QUANTIZATION
+
+    quantization = copy.deepcopy(LAGUNA_S_2_1_QUANTIZATION)
+    config = {
+        "architectures": ["LagunaForCausalLM"],
+        "model_type": "laguna",
+        "hidden_size": 3072,
+        "num_hidden_layers": 48,
+        "intermediate_size": 12288,
+        "num_attention_heads": 48,
+        "num_attention_heads_per_layer": [
+            48 if layer_type == "full_attention" else 72
+            for layer_type in layer_types
+        ],
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "vocab_size": 100352,
+        "bos_token_id": 2,
+        "eos_token_id": [2, 24],
+        "pad_token_id": 9,
+        "rms_norm_eps": 1e-6,
+        "num_experts": 256,
+        "num_experts_per_tok": 10,
+        "moe_intermediate_size": 1024,
+        "shared_expert_intermediate_size": 1024,
+        "decoder_sparse_step": 1,
+        "norm_topk_prob": True,
+        "moe_routed_scaling_factor": 2.5,
+        "moe_router_logit_softcapping": 0.0,
+        "moe_apply_router_weight_on_input": False,
+        "router_aux_loss_coef": 0.0,
+        "mlp_only_layers": [0],
+        "gating": "per-head",
+        "gating_types": ["per_head"] * 48,
+        "sliding_window": 512,
+        "layer_types": layer_types,
+        "mlp_layer_types": ["dense", *("sparse" for _ in range(47))],
+        "rope_parameters": {
+            "full_attention": {
+                "rope_type": "yarn",
+                "rope_theta": 500_000.0,
+                "factor": 128.0,
+                "original_max_position_embeddings": 8192,
+                "beta_slow": 1.0,
+                "beta_fast": 32.0,
+                "attention_factor": 1.4852030263919618,
+                "partial_rotary_factor": 0.5,
+            },
+            "sliding_attention": {
+                "rope_type": "default",
+                "rope_theta": 10_000.0,
+                "partial_rotary_factor": 1.0,
+            },
+        },
+        "max_position_embeddings": 1_048_576,
+        "tie_word_embeddings": False,
+        "torch_dtype": "bfloat16",
+        "use_cache": True,
+        "quantization": copy.deepcopy(quantization),
+        "quantization_config": copy.deepcopy(quantization),
+    }
+    config.update(updates)
+    return config
+
+
+def _pipenetwork_laguna_config(**updates):
+    """The superseded uniform-4bit build; kept only as rejection coverage."""
+
+    quantization = {
+        "bits": 4,
+        "group_size": 64,
+        "mode": "affine",
+        **{
+            f"model.layers.{layer}.mlp.gate": {"bits": 8, "group_size": 64}
+            for layer in range(1, 48)
+        },
+    }
+    return _laguna_s_2_1_config(
+        quantization=copy.deepcopy(quantization),
+        quantization_config=copy.deepcopy(quantization),
+        **updates,
+    )
+
+
+def _write_laguna_s_2_1_artifacts(path, monkeypatch):
+    from mtplx.models import laguna_config
+    from mtplx.models.laguna_config import (
+        LAGUNA_S_2_1_REPO_ID,
+        LAGUNA_S_2_1_REVISION,
+        LAGUNA_S_2_1_SHARD_SIZES,
+    )
+
+    (path / ".mtplx-source.json").write_text(
+        json.dumps(
+            {
+                "repo_id": LAGUNA_S_2_1_REPO_ID,
+                "revision": LAGUNA_S_2_1_REVISION,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    shards = [
+        f"model-{index:05d}-of-00013.safetensors"
+        for index in range(1, 14)
+    ]
+    (path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    f"model.layer.{index}": shard
+                    for index, shard in enumerate(shards)
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    for shard in shards:
+        with (path / shard).open("wb") as handle:
+            handle.truncate(LAGUNA_S_2_1_SHARD_SIZES[shard])
+    (path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (path / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+    (path / "generation_config.json").write_text("{}", encoding="utf-8")
+    (path / "special_tokens_map.json").write_text("{}", encoding="utf-8")
+    (path / "chat_template.jinja").write_text(
+        "{{ messages }}",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        laguna_config,
+        "LAGUNA_S_2_1_SIDECAR_SHA256",
+        {
+            name: hashlib.sha256((path / name).read_bytes()).hexdigest()
+            for name in laguna_config.LAGUNA_S_2_1_SIDECAR_SHA256
+        },
+    )
+
+
+def test_laguna_config_only_directory_is_not_runnable(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(_laguna_s_2_1_config()),
+        encoding="utf-8",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
+
+
+def test_complete_laguna_s_2_1_mlx_4bit_is_runnable_ar_only(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "config.json").write_text(
+        json.dumps(_laguna_s_2_1_config()),
+        encoding="utf-8",
+    )
+    _write_laguna_s_2_1_artifacts(tmp_path, monkeypatch)
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "AR-only"
+    assert result.compatibility["arch_id"] == "laguna-s-2.1-ar"
+    assert result.compatibility["recognized"] is True
+    assert result.compatibility["supported"] is True
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["mtp_supported"] == "no"
+    assert result.compatibility["runtime_compatibility"] == "native-ar-only"
+
+
+def test_laguna_shard_with_wrong_size_is_not_runnable(tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text(
+        json.dumps(_laguna_s_2_1_config()),
+        encoding="utf-8",
+    )
+    _write_laguna_s_2_1_artifacts(tmp_path, monkeypatch)
+    (tmp_path / "model-00013-of-00013.safetensors").write_bytes(b"tampered")
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
+
+
+def test_laguna_without_poolside_chat_template_is_not_runnable(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "config.json").write_text(
+        json.dumps(_laguna_s_2_1_config()),
+        encoding="utf-8",
+    )
+    _write_laguna_s_2_1_artifacts(tmp_path, monkeypatch)
+    (tmp_path / "chat_template.jinja").unlink()
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
+
+
+@pytest.mark.parametrize(
+    ("filename", "contents"),
+    (
+        ("tokenizer.json", "not-json"),
+        ("chat_template.jinja", "{% if broken %}"),
+    ),
+)
+def test_laguna_with_mutated_pinned_sidecar_is_not_runnable(
+    tmp_path, monkeypatch, filename, contents
+):
+    (tmp_path / "config.json").write_text(
+        json.dumps(_laguna_s_2_1_config()),
+        encoding="utf-8",
+    )
+    _write_laguna_s_2_1_artifacts(tmp_path, monkeypatch)
+    (tmp_path / filename).write_text(contents, encoding="utf-8")
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
+
+
+def test_non_4bit_laguna_is_not_admitted_by_target_only_gate(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            _laguna_s_2_1_config(
+                quantization={"bits": 8, "group_size": 64, "mode": "affine"},
+                quantization_config={"bits": 8, "group_size": 64, "mode": "affine"},
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
+
+
+def test_superseded_pipenetwork_laguna_is_not_admitted(tmp_path, monkeypatch):
+    # The pin moved to mlx-community/Laguna-S-2.1-oQ4e; the older uniform-4bit
+    # pipenetwork build shares the geometry but not the quantization map, so it
+    # is now blocked like any other non-pinned variant even with a fully written
+    # (but wrong-hash) artifact set.
+    (tmp_path / "config.json").write_text(
+        json.dumps(_pipenetwork_laguna_config()),
+        encoding="utf-8",
+    )
+    _write_laguna_s_2_1_artifacts(tmp_path, monkeypatch)
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
+
+
+def test_laguna_config_with_remote_model_file_is_blocked(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(_laguna_s_2_1_config(model_file="evil.py")),
+        encoding="utf-8",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
+
+
+def test_wrong_laguna_expert_geometry_is_not_admitted_by_target_only_gate(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(_laguna_s_2_1_config(num_experts=128)),
+        encoding="utf-8",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
+
+
+def test_wrong_laguna_attention_geometry_is_not_admitted_by_target_only_gate(
+    tmp_path,
+):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            _laguna_s_2_1_config(num_attention_heads_per_layer=[48] * 48)
+        ),
+        encoding="utf-8",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
 
 
 def test_hf_qwen_mtp_without_runtime_contract_is_family_runnable(monkeypatch):
@@ -1914,7 +2382,11 @@ def test_gemma4_pair_bundle_root_is_runnable_from_remote_file_listing():
     assert verdict.runtime_compatibility == "assistant-pair-native"
 
 
-def test_gemma4_target_subfolder_alone_still_refuses():
+def test_gemma4_target_subfolder_alone_serves_ar_with_bundle_guidance():
+    # 2026-08-26 (founder): the target trunk loads through the bundled
+    # mlx-lm gemma4 module, so a lone target folder serves autoregressive
+    # (MTP unavailable) while the verdict still points at the assistant-pair
+    # bundle root for full speculative speed.
     from mtplx.artifacts import ModelInspection
     from mtplx.backends.registry import compatibility_for_inspection
 
@@ -1933,105 +2405,164 @@ def test_gemma4_target_subfolder_alone_still_refuses():
 
     verdict = compatibility_for_inspection(inspection)
 
-    assert verdict.can_run is False
-    assert verdict.runtime_compatibility == "incomplete-assistant-pair"
+    assert verdict.can_run is True
+    assert verdict.runtime_compatibility == "native-ar-only-mtp-unsupported"
+    assert "bundle root" in verdict.message
 
 
-def _hy_v3_streaming_inspection(model_dir):
-    """A recognized HY V3 MTP family without its native runtime contract.
-
-    Without a streaming layout this inspection cannot run; with a valid baked
-    streaming layout it must instead report runnable via SSD-streamed AR.
-    """
-    from mtplx.artifacts import ModelInspection
-
-    return ModelInspection(
-        model_dir=str(model_dir),
-        config_exists=True,
-        architecture="HYV3MTPForCausalLM",
-        model_type="hy_v3_mtp",
-        mtp_num_hidden_layers=1,
-        hidden_size=4096,
-        num_hidden_layers=48,
-        vocab_size=128000,
-        source="local",
+def test_mlx_lm_loadable_family_without_mtp_serves_ar(tmp_path):
+    # 2026-08-26 (founder): any trunk this build can construct runs — MTP
+    # is an accelerator, never a load requirement. An mlx-lm-loadable
+    # family with no MTP head serves autoregressive at exit 0.
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["SmolLM3ForCausalLM"],
+                "model_type": "smollm3",
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {"model.layers.0.self_attn.q_proj.weight": np.ones((1,), dtype=np.float32)},
+        tmp_path / "model.safetensors",
     )
 
+    result = inspect_model(tmp_path)
 
-def _install_authoritative_streaming_fixture(model_dir, monkeypatch):
-    from mtplx.expert_manifest import save_expert_manifest
-    from mtplx.expert_streaming_models import MODEL_SPECS
-    from test_expert_manifest import _make_authoritative_checkpoint
-
-    spec, manifest = _make_authoritative_checkpoint(model_dir)
-    saved = save_expert_manifest(manifest, model_dir / "expert-manifest.json")
-    monkeypatch.setitem(MODEL_SPECS, spec.key, spec)
-    return saved
-
-
-def test_baked_streaming_layout_reports_runnable_via_ar(monkeypatch, tmp_path):
-    """Issue: `mtplx inspect` on a published SSD-streaming model wrongly said
-    it CANNOT run, while `mtplx serve --expert-streaming` runs it fine via
-    target-only AR. A valid baked streaming layout (expert-manifest.json plus
-    its named experts bank) must report runnable.
-    """
-    from mtplx.backends.registry import compatibility_for_inspection
-
-    # Preserve the upstream 2.3 family verdict as the non-streaming baseline.
-    model_dir = tmp_path / "model"
-    inspection = _hy_v3_streaming_inspection(model_dir)
-    baseline = compatibility_for_inspection(inspection)
-    assert baseline.can_run is False
-
-    # A valid baked streaming layout is present and inspected by the real
-    # construction-boundary helper.
-    _install_authoritative_streaming_fixture(model_dir, monkeypatch)
-
-    verdict = compatibility_for_inspection(inspection)
-
-    assert verdict.can_run is True
-    assert verdict.exit_code == 0
-    assert verdict.runtime_compatibility == "streaming-ar"
-    assert verdict.support_level == "streaming-ar-target-only"
-    # Streaming is target-only AR: MTP is intentionally disabled, never claimed.
-    assert verdict.mtp_supported != "yes"
-    assert verdict.mtp_supported == "disabled"
-    message = verdict.message.lower()
-    assert "stream" in message and " ar" in message
-    assert "--expert-streaming" in verdict.message
-    # The family is still recognized; the arch id is preserved.
-    assert verdict.arch_id == "hy-v3-mtp"
+    assert result.compatibility["tier"] == "AR-only"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["exit_code"] == 0
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "native-ar-only-missing-mtp"
+    )
+    assert "MTP unavailable" in result.compatibility["message"]
 
 
-def test_streaming_override_absent_keeps_pending_verdict(monkeypatch, tmp_path):
-    """The override only fires for a valid baked streaming layout.
+def test_unknown_family_without_any_implementation_refuses_honestly(tmp_path):
+    # A model_type nothing in this build implements is a capability gap and
+    # says so — never "Model has no MTP head" (that message was a lie for
+    # models that ship one) and never a verification excuse.
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["TotallyNovelForCausalLM"],
+                "model_type": "totally_novel_arch",
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {"model.layers.0.self_attn.q_proj.weight": np.ones((1,), dtype=np.float32)},
+        tmp_path / "model.safetensors",
+    )
 
-    A truncated/missing bank (ok False) and an ordinary non-streaming model
-    (streamed_experts False) must both keep the prior upstream verdict — the
-    override never fabricates runnability.
-    """
-    from mtplx.backends.registry import compatibility_for_inspection
+    result = inspect_model(tmp_path)
 
-    model_dir = tmp_path / "model"
-    inspection = _hy_v3_streaming_inspection(model_dir)
-    baseline = compatibility_for_inspection(inspection)
-    assert baseline.can_run is False
+    assert result.compatibility["can_run"] is False
+    assert "No MLX implementation" in result.compatibility["message"]
+    assert "capability gap" in result.compatibility["message"]
+    assert "MTP-equipped" not in result.compatibility["message"]
 
-    # A real truncated bank -> unchanged prior verdict.
-    manifest = _install_authoritative_streaming_fixture(model_dir, monkeypatch)
-    assert manifest.sidecar is not None
-    bank = model_dir / manifest.sidecar.file
-    bank.write_bytes(bank.read_bytes()[:-1])
-    not_ok = compatibility_for_inspection(inspection)
-    assert not_ok == baseline
 
-    # Ordinary non-streaming model (real status shape) -> unchanged prior
-    # verdict. `ok` defaults True here, so gating on `ok` alone would wrongly
-    # trigger; gating also on `streamed_experts` keeps normal models intact.
-    (model_dir / "expert-manifest.json").unlink()
-    bank.unlink()
-    non_streaming = compatibility_for_inspection(inspection)
-    assert non_streaming == baseline
+def test_qwen4_flash_next_family_is_recognized(tmp_path):
+    # The real T-0 strings (config landed 2026-08-26 15:00 UTC) resolve to
+    # the qwen4-next catalog row even without MTP markers — recognition is
+    # not can_run, and a trunk-only checkpoint still belongs to the family.
+    # With the in-tree backend shipped, the trunk is constructable: AR-only.
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen4ExpForConditionalGeneration"],
+                "model_type": "qwen4_exp",
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {"model.layers.0.self_attn.q_proj.weight": np.ones((1,), dtype=np.float32)},
+        tmp_path / "model.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["arch_id"] == "qwen4-next"
+    assert result.compatibility["recognized"] is True
+    assert result.compatibility["can_run"] is True
+    assert "autoregressive" in result.compatibility["message"]
+
+
+def test_qwen4_speculative_predrop_names_are_not_swallowed(tmp_path):
+    # #268 family-collision law: the speculative pre-drop names
+    # (qwen3_8_flash_next and friends) were purged from the catalog and must
+    # never be swallowed into the qwen4-next family — or any other.
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_8FlashNextForConditionalGeneration"],
+                "model_type": "qwen3_8_flash_next",
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {"model.layers.0.self_attn.q_proj.weight": np.ones((1,), dtype=np.float32)},
+        tmp_path / "model.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["arch_id"] is None
+    assert result.compatibility["tier"] == "incompatible-architecture"
+    assert result.compatibility["can_run"] is False
+
+
+def test_auto_map_is_ignored_when_trunk_is_constructable(tmp_path):
+    # MTPLX never executes repository code, so declared custom classes are
+    # irrelevant when this build ships its own implementation and a fast
+    # tokenizer is present — auto_map alone must not refuse the checkpoint.
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "auto_map": {"AutoModelForCausalLM": "modeling_x.CustomModel"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    save_file(
+        {"model.layers.0.self_attn.q_proj.weight": np.ones((1,), dtype=np.float32)},
+        tmp_path / "model.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["can_run"] is True
+
+
+def test_auto_map_without_native_implementation_still_refuses(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["TotallyNovelForCausalLM"],
+                "model_type": "totally_novel_arch",
+                "auto_map": {"AutoModelForCausalLM": "modeling_x.CustomModel"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {"model.layers.0.self_attn.q_proj.weight": np.ones((1,), dtype=np.float32)},
+        tmp_path / "model.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["can_run"] is False
+    assert "auto_map" in result.compatibility["message"]
 
 
 def test_user_promoted_contract_runs_as_unverified_label(monkeypatch, tmp_path):
@@ -2102,7 +2633,7 @@ def test_pull_refreshes_when_remote_index_changed(monkeypatch, tmp_path):
         encoding="utf-8",
     )
 
-    def fake_download(repo_id, filename, revision=None):
+    def fake_download(repo_id, filename, revision=None, token=None):
         return str(fake_download.target)
 
     monkeypatch.setattr("huggingface_hub.hf_hub_download", fake_download)
@@ -2113,11 +2644,96 @@ def test_pull_refreshes_when_remote_index_changed(monkeypatch, tmp_path):
     fake_download.target = remote_changed
     assert hf_loader._local_matches_remote_index(local, "org/repo", None) is False
 
-    def broken_download(repo_id, filename, revision=None):
+    def broken_download(repo_id, filename, revision=None, token=None):
         raise RuntimeError("offline")
 
     monkeypatch.setattr("huggingface_hub.hf_hub_download", broken_download)
     assert hf_loader._local_matches_remote_index(local, "org/repo", None) is True
+
+
+class _FakeHubResponse:
+    def __init__(self, headers: dict, remote_content: bytes):
+        range_header = headers.get("Range")
+        if range_header:
+            offset = int(range_header.split("=")[1].rstrip("-"))
+            self.payload = remote_content[offset:]
+            self.status_code = 206
+        else:
+            self.payload = remote_content
+            self.status_code = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def iter_content(self, chunk_size):
+        yield self.payload
+
+
+def _run_download_repo_file(monkeypatch, destination, remote_content: bytes, filename: str):
+    from mtplx import hf_loader
+
+    seen_headers: list[dict] = []
+
+    def fake_stream(session, url, headers):
+        seen_headers.append(dict(headers))
+        return _FakeHubResponse(headers, remote_content)
+
+    monkeypatch.setattr(hf_loader, "_open_hub_stream", fake_stream)
+    repo_file = hf_loader.RepoFile(path=filename, size_bytes=len(remote_content))
+    hf_loader._download_repo_file(
+        repo_file,
+        repo_id="org/repo",
+        revision=None,
+        destination=destination,
+        session=None,
+        hf_hub_url=lambda repo_id, filename, revision=None: "https://example.invalid/f",
+        build_hf_headers=lambda token=None: {},
+        hf_raise_for_status=lambda response: None,
+        callback=None,
+        total_bytes=None,
+        started_at=0.0,
+        progress_interval_s=3600.0,
+        last_emit_at=0.0,
+        last_emit_size=0,
+    )
+    return seen_headers
+
+
+def test_download_repo_file_discards_stale_complete_file(monkeypatch, tmp_path):
+    # A file that changed upstream (a repaired index/config gaining vision
+    # entries, issue #263) must be re-fetched from scratch. Range-resuming
+    # from the stale *complete* local copy appends the remote tail onto old
+    # content and corrupts the JSON — the upgrade rehearsal caught exactly
+    # this, leaving the local model unloadable.
+    old_content = b'{"old": true}' + b" " * 8
+    new_content = b'{"new": true, "vision": "restored"}' + b" " * 32
+    destination = tmp_path / "model"
+    destination.mkdir()
+    (destination / "config.json").write_bytes(old_content)
+
+    seen = _run_download_repo_file(monkeypatch, destination, new_content, "config.json")
+
+    assert (destination / "config.json").read_bytes() == new_content
+    assert all("Range" not in headers for headers in seen)
+    assert not (destination / "config.json.incomplete").exists()
+
+
+def test_download_repo_file_still_resumes_incomplete_partial(monkeypatch, tmp_path):
+    # Genuine interrupted downloads (*.incomplete staging files) must keep
+    # their byte-range resume.
+    new_content = b'{"new": true, "vision": "restored"}' + b" " * 32
+    destination = tmp_path / "model"
+    destination.mkdir()
+    (destination / "config.json.incomplete").write_bytes(new_content[:11])
+
+    seen = _run_download_repo_file(monkeypatch, destination, new_content, "config.json")
+
+    assert (destination / "config.json").read_bytes() == new_content
+    assert any(headers.get("Range") == "bytes=11-" for headers in seen)
+    assert not (destination / "config.json.incomplete").exists()
 
 
 def test_served_public_ids_resolve_to_first_party_repos():
@@ -2128,14 +2744,25 @@ def test_served_public_ids_resolve_to_first_party_repos():
     """
     from mtplx.artifacts import _hf_repo_id_from_ref
     from mtplx.profiles import (
-        DEFAULT_HF_MODEL_ID,
+        OPTIMIZED_SPEED_V1_HF_MODEL_ID,
+        OPTIMIZED_SPEED_V2_HF_MODEL_ID,
         QUALITY_HF_MODEL_ID,
         QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
         QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
     )
 
-    assert _hf_repo_id_from_ref("mtplx-qwen36-27b-optimized-speed") == DEFAULT_HF_MODEL_ID
-    assert _hf_repo_id_from_ref("MTPLX-Qwen36-27B-Optimized-Speed") == DEFAULT_HF_MODEL_ID
+    assert (
+        _hf_repo_id_from_ref("mtplx-qwen36-27b-optimized-speed-v2")
+        == OPTIMIZED_SPEED_V2_HF_MODEL_ID
+    )
+    assert (
+        _hf_repo_id_from_ref("mtplx-qwen36-27b-optimized-speed")
+        == OPTIMIZED_SPEED_V1_HF_MODEL_ID
+    )
+    assert (
+        _hf_repo_id_from_ref("MTPLX-Qwen36-27B-Optimized-Speed")
+        == OPTIMIZED_SPEED_V1_HF_MODEL_ID
+    )
     assert _hf_repo_id_from_ref("mtplx-qwen36-27b-optimized-quality") == QUALITY_HF_MODEL_ID
     assert (
         _hf_repo_id_from_ref("mtplx-qwen35-9b-optimized-speed")
@@ -2147,3 +2774,372 @@ def test_served_public_ids_resolve_to_first_party_repos():
     )
     assert _hf_repo_id_from_ref("mtplx-qwopus-madeup-id") is None
     assert _hf_repo_id_from_ref("some-random-model-name") is None
+
+
+def test_lfm2_moe_trunk_serves_target_only_ar(tmp_path):
+    """LFM2.5 (no MTP head by design) runs AR through the mlx-lm loader."""
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Lfm2MoeForCausalLM"],
+                "model_type": "lfm2_moe",
+                "quantization": {"group_size": 64, "bits": 8},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "model.safetensors").write_bytes(b"\x00" * 8)
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["arch_id"] == "lfm2-moe-ar"
+    assert result.compatibility["runtime_compatibility"] == "native-ar-only"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["recommended_backend"] == "mlx_lm_ar"
+
+
+def test_iquestcoder_trunk_serves_target_only_ar(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["IQuestCoderForCausalLM"],
+                "model_type": "iquestcoder",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "model.safetensors").write_bytes(b"\x00" * 8)
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["arch_id"] == "iquestcoder-ar"
+    assert result.compatibility["runtime_compatibility"] == "native-ar-only"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["recommended_backend"] == "mlx_lm_ar"
+
+
+def test_plain_llama_trunk_serves_target_only_ar(tmp_path):
+    """G9v3 / MiniCPM5-class checkpoints: bare LlamaForCausalLM, no MTP head."""
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "quantization": {"group_size": 64, "bits": 4},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "model.safetensors").write_bytes(b"\x00" * 8)
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["arch_id"] == "llama-ar"
+    assert result.compatibility["runtime_compatibility"] == "native-ar-only"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["recommended_backend"] == "mlx_lm_ar"
+
+
+def test_unsupported_quant_bits_refuse_cleanly(tmp_path):
+    """A 1-bit export cannot construct QuantizedLinear on this mlx build."""
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "model_type": "qwen3_5",
+                "quantization": {"group_size": 128, "bits": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "model.safetensors").write_bytes(b"\x00" * 8)
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["runtime_compatibility"] == "unsupported-quant-bits"
+    assert result.compatibility["can_run"] is False
+    assert "1-bit" in result.compatibility["message"]
+    assert "supported widths" in result.compatibility["message"]
+
+
+def test_lfm2_moe_without_trunk_weights_still_refuses(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Lfm2MoeForCausalLM"],
+                "model_type": "lfm2_moe",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["can_run"] is False
+
+
+def test_remote_code_checkpoints_refuse_cleanly(tmp_path):
+    """auto_map custom code refuses loudly; MTPLX never runs repo code."""
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["IQuestCoderForCausalLM"],
+                "model_type": "iquestcoder",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "tokenizer_config.json").write_text(
+        json.dumps(
+            {"auto_map": {"AutoTokenizer": ["tokenization_iquest.IQuestTokenizer", None]}}
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "model.safetensors").write_bytes(b"\x00" * 8)
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["runtime_compatibility"] == "trust-remote-code-required"
+    assert result.compatibility["can_run"] is False
+    assert "trust_remote_code" in result.compatibility["message"]
+
+
+def test_public_model_id_alias_tables_agree():
+    """Every public model id must resolve, by id and by HF folder basename.
+
+    Three hand-maintained alias tables carry these pairs (mtplx/artifacts.py,
+    mtplx/model_catalog.py, mtplx/commands/public.py). They drifted once: the
+    Flash-Next rows were missing from artifacts.py, so the release notes' own
+    `mtplx pull mtplx-flash-next-bare-speed` died with "pull requires a Hugging
+    Face repo id or URL" and `serve --model mtplx-flash-next-bare-speed` raised
+    FileNotFoundError. Enumerating from mtplx.profiles (rather than listing the
+    ids here) means a newly added public id joins this test automatically.
+    """
+
+    from pathlib import Path as _Path
+
+    from mtplx import profiles
+    from mtplx.hf_loader import repo_id_from_model_ref
+
+    public_id_names = sorted(
+        name for name in dir(profiles) if name.endswith("_PUBLIC_MODEL_ID")
+    )
+    assert public_id_names, "no public model ids exported by mtplx.profiles"
+
+    checked = set()
+    for name in public_id_names:
+        hf_name = name.replace("_PUBLIC_MODEL_ID", "_HF_MODEL_ID")
+        assert hasattr(profiles, hf_name), f"{name} has no {hf_name} pair"
+        public_id = getattr(profiles, name)
+        hf_repo_id = getattr(profiles, hf_name)
+
+        assert (
+            repo_id_from_model_ref(public_id) == hf_repo_id
+        ), f"{name} ({public_id!r}) does not resolve to {hf_repo_id!r}"
+        basename = _Path(hf_repo_id).name
+        assert (
+            repo_id_from_model_ref(basename) == hf_repo_id
+        ), f"HF basename {basename!r} does not resolve to {hf_repo_id!r}"
+        checked.add(public_id)
+
+    # The two ids the 2.10.0 release notes tell users to pull by name.
+    assert {
+        "mtplx-flash-next-bare-speed",
+        "mtplx-flash-next-optimized-speed",
+    } <= checked
+
+
+# ---------------------------------------------------------------------------
+# download accounting: leftovers are reported, never counted, never "partial"
+
+
+def _write_bytes(path, count: int, fill: bytes = b"x") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(fill * count)
+
+
+def test_manifest_bytes_ignore_leftovers_and_stale_bytes_report_them(tmp_path):
+    from mtplx import hf_loader
+
+    dest = tmp_path / "model"
+    _write_bytes(dest / "config.json", 100)
+    _write_bytes(dest / "model-00001-of-00002.safetensors.incomplete", 40)
+    _write_bytes(dest / "model-00002-of-00002.safetensors.incomplete", 999)
+    _write_bytes(dest / ".cache" / "huggingface" / "download" / "abc.incomplete", 5000)
+    _write_bytes(dest / "model-00007-of-00039.safetensors.incomplete", 700)
+    manifest = [
+        hf_loader.RepoFile("config.json", 100),
+        hf_loader.RepoFile("model-00001-of-00002.safetensors", 60),
+        hf_loader.RepoFile("model-00002-of-00002.safetensors", 60),
+    ]
+
+    assert hf_loader.manifest_bytes_on_disk(dest, manifest) == 100 + 40 + 60
+    assert hf_loader.stale_transient_bytes(dest, manifest) == (5700, 2)
+    assert hf_loader.directory_size_bytes(dest) == 100 + 40 + 999 + 5000 + 700
+    assert hf_loader.stale_transient_bytes(tmp_path / "missing", manifest) == (0, 0)
+    assert hf_loader._model_bytes_without_transients(dest) == 100
+
+
+def test_cached_model_complete_ignores_stale_partials(tmp_path):
+    # Only a partial whose final file has not landed, of a file the weight
+    # index needs, is an interrupted transfer. Stray markers made a
+    # byte-complete folder "partial" forever: Retry re-fetched nothing and
+    # reached the same verdict.
+    import json as _json
+
+    from mtplx import hf_loader
+
+    model = tmp_path / "model"
+    _write_bytes(model / "config.json", 10)
+    (model / "model.safetensors.index.json").write_text(
+        _json.dumps(
+            {
+                "weight_map": {
+                    "a": "model-00001-of-00002.safetensors",
+                    "b": "model-00002-of-00002.safetensors",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_bytes(model / "model-00001-of-00002.safetensors", 5)
+    _write_bytes(model / "model-00002-of-00002.safetensors", 5)
+    _write_bytes(model / "model-00002-of-00002.safetensors.incomplete", 3)
+    _write_bytes(model / "model-00001-of-00039.safetensors.incomplete", 3)
+    _write_bytes(model / ".cache" / "huggingface" / "download" / "x.incomplete", 3)
+    assert hf_loader.cached_model_is_complete(model)
+
+    (model / "model-00002-of-00002.safetensors").unlink()
+    assert not hf_loader.cached_model_is_complete(model)
+
+    single = tmp_path / "single"
+    _write_bytes(single / "config.json", 10)
+    _write_bytes(single / "model.safetensors", 50)
+    _write_bytes(single / "model-00001-of-00039.safetensors.incomplete", 3)
+    assert hf_loader.cached_model_is_complete(single)
+    (single / "model.safetensors").rename(single / "model.safetensors.incomplete")
+    assert not hf_loader.cached_model_is_complete(single)
+
+
+class _FakeSibling:
+    def __init__(self, rfilename: str, size: int):
+        self.rfilename = rfilename
+        self.size = size
+        self.blob_id = f"blob-{rfilename}"
+
+
+class _FakeModelInfo:
+    def __init__(self, siblings, sha: str = "abc123"):
+        self.siblings = siblings
+        self.sha = sha
+
+
+def _install_fake_hub(monkeypatch, files: dict[str, bytes]) -> None:
+    from mtplx import hf_loader
+
+    class _FakeApi:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def model_info(self, repo_id, revision=None, files_metadata=True, token=None):
+            return _FakeModelInfo([_FakeSibling(name, len(content)) for name, content in files.items()])
+
+    def fake_runtime():
+        return (
+            _FakeApi,
+            lambda repo_id, filename, revision=None: f"https://example.invalid/{filename}",
+            lambda: None,
+            lambda token=None: {},
+            lambda response: None,
+        )
+
+    def fake_stream(session, url, headers):
+        return _FakeHubResponse(headers, files[url.rsplit("/", 1)[1]])
+
+    monkeypatch.setattr(hf_loader, "_hub_runtime", fake_runtime)
+    monkeypatch.setattr(hf_loader, "_open_hub_stream", fake_stream)
+    monkeypatch.setattr(
+        hf_loader,
+        "_query_repo_snapshot",
+        lambda repo_id, revision=None: (
+            "abc123",
+            {name: {"size": len(content), "blob_id": f"blob-{name}"} for name, content in files.items()},
+        ),
+    )
+    monkeypatch.setattr(hf_loader, "hf_token_for_download", lambda: False)
+
+
+_TINY_REPO_FILES = {
+    "config.json": b'{"model_type": "toy"}',
+    "tokenizer.json": b"{}",
+    "model.safetensors": b"w" * 3000,
+}
+
+
+def test_pull_reports_leftovers_and_finishes_complete_despite_them(monkeypatch, tmp_path):
+    from mtplx import hf_loader
+
+    _install_fake_hub(monkeypatch, _TINY_REPO_FILES)
+    cache = tmp_path / "cache"
+    dest = cache / "org--tiny"
+    _write_bytes(dest / ".cache" / "huggingface" / "download" / "old.incomplete", 20_000)
+    _write_bytes(dest / "model-00001-of-00039.safetensors.incomplete", 8_000)
+    events: list[dict] = []
+
+    result = hf_loader.pull_model(
+        "org/tiny", cache_dir=cache, progress_callback=events.append, progress_interval_s=0.0
+    )
+
+    total = sum(len(content) for content in _TINY_REPO_FILES.values())
+    assert events[0]["event"] == "start"
+    assert events[0]["size_bytes"] == 0
+    assert events[0]["total_bytes"] == total
+    assert events[0]["stale_bytes"] == 28_000
+    assert events[0]["stale_files"] == 2
+    assert events[0]["disk_bytes"] == 28_000
+    progress = [event for event in events if event["event"] == "progress"]
+    assert progress
+    assert all(0 <= event["size_bytes"] <= total == event["total_bytes"] for event in progress)
+    complete = events[-1]
+    assert complete["event"] == "complete"
+    assert complete["size_bytes"] == total == complete["total_bytes"]
+    assert complete["stale_bytes"] == 28_000
+    assert complete["stale_files"] == 2
+    assert complete["disk_bytes"] > total
+    assert result["size_bytes"] == total
+    assert result["stale_bytes"] == 28_000
+    assert result["resumed_existing"] is False
+    assert result["reused_existing"] is False
+    assert (dest / "model.safetensors").read_bytes() == _TINY_REPO_FILES["model.safetensors"]
+    # The stray partial next to the weights does not make the model "partial".
+    assert hf_loader.cached_model_is_complete(dest)
+
+
+def test_pull_reuse_reports_the_models_bytes_not_the_folders(monkeypatch, tmp_path):
+    from mtplx import hf_loader
+
+    _install_fake_hub(monkeypatch, _TINY_REPO_FILES)
+    cache = tmp_path / "cache"
+    dest = cache / "org--tiny"
+    for name, content in _TINY_REPO_FILES.items():
+        _write_bytes(dest / name, len(content))
+    hf_loader._write_source_marker(
+        dest,
+        repo_id="org/tiny",
+        revision=None,
+        resolved_sha="abc123",
+        files={name: {"size": len(content), "blob_id": f"blob-{name}"} for name, content in _TINY_REPO_FILES.items()},
+    )
+    _write_bytes(dest / ".cache" / "huggingface" / "download" / "old.incomplete", 20_000)
+    events: list[dict] = []
+
+    result = hf_loader.pull_model("org/tiny", cache_dir=cache, progress_callback=events.append)
+
+    total = sum(len(content) for content in _TINY_REPO_FILES.values())
+    assert result["reused_existing"] is True
+    assert [event["event"] for event in events] == ["complete"]
+    assert events[0]["size_bytes"] == total == events[0]["total_bytes"]
+    assert events[0]["stale_bytes"] == 20_000
+    assert events[0]["disk_bytes"] >= total + 20_000
+    assert result["size_bytes"] == total
+    assert result["stale_bytes"] == 20_000

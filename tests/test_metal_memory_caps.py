@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 from mtplx.server import openai
 
 
@@ -73,6 +75,7 @@ def test_apply_metal_memory_caps_uses_top_level_mlx_apis(monkeypatch):
     assert result["memory_limit_bytes"] == 64 * GiB
     assert result["wired_limit_bytes"] == 48 * GiB
     assert result["memory_limit_api"] == "mx.set_memory_limit"
+    assert result["memory_limit_source"] == "env"
     assert result["wired_limit_api"] == "mx.set_wired_limit"
     assert calls == [("memory", 64 * GiB), ("wired", 48 * GiB)]
 
@@ -89,6 +92,7 @@ def test_apply_metal_memory_caps_caps_large_unified_memory_defaults(monkeypatch)
 
     assert result["applied"] is True
     assert result["memory_limit_bytes"] == 192 * GiB
+    assert result["memory_limit_source"] == "default"
     assert result["wired_limit_bytes"] == 160 * GiB
     assert calls == [("memory", 192 * GiB), ("wired", 160 * GiB)]
 
@@ -107,6 +111,130 @@ def test_apply_metal_memory_caps_preserves_128g_defaults(monkeypatch):
     assert result["memory_limit_bytes"] == 96 * GiB
     assert result["wired_limit_bytes"] == int(128 * GiB * 0.60)
     assert calls == [("memory", 96 * GiB), ("wired", int(128 * GiB * 0.60))]
+
+
+def test_apply_metal_memory_caps_raises_default_wired_floor_for_laguna(
+    monkeypatch,
+):
+    from mtplx.models.laguna_config import LAGUNA_S_2_1_MIN_RESIDENT_BYTES
+
+    mx, calls = _fake_mx(top_level=True)
+    monkeypatch.delenv("MTPLX_MEMORY_LIMIT_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)
+
+    result = openai._apply_metal_memory_caps(
+        mx_module=mx,
+        total_ram_bytes=96 * GiB,
+        minimum_resident_bytes=LAGUNA_S_2_1_MIN_RESIDENT_BYTES,
+    )
+
+    assert result["applied"] is True
+    assert result["memory_limit_bytes"] == 72 * GiB
+    assert result["wired_limit_bytes"] == LAGUNA_S_2_1_MIN_RESIDENT_BYTES
+    assert calls == [
+        ("memory", 72 * GiB),
+        ("wired", LAGUNA_S_2_1_MIN_RESIDENT_BYTES),
+    ]
+
+
+def test_apply_metal_memory_caps_rejects_insufficient_ram_for_laguna(
+    monkeypatch,
+):
+    from mtplx.models.laguna_config import LAGUNA_S_2_1_MIN_RESIDENT_BYTES
+
+    mx, calls = _fake_mx(top_level=True)
+    monkeypatch.delenv("MTPLX_MEMORY_LIMIT_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)
+
+    result = openai._apply_metal_memory_caps(
+        mx_module=mx,
+        total_ram_bytes=64 * GiB,
+        minimum_resident_bytes=LAGUNA_S_2_1_MIN_RESIDENT_BYTES,
+    )
+
+    assert result["applied"] is False
+    assert result["reason"] == "insufficient_ram"
+    assert result["minimum_resident_bytes"] == LAGUNA_S_2_1_MIN_RESIDENT_BYTES
+    assert calls == []
+
+
+def test_laguna_explicit_context_must_fit_active_metal_cap(monkeypatch):
+    from mtplx.backends.descriptors import LAGUNA_AR_DESCRIPTOR
+    from mtplx.models.laguna_config import LAGUNA_S_2_1_MIN_RESIDENT_BYTES
+
+    mx, _calls = _fake_mx(top_level=True)
+    monkeypatch.delenv("MTPLX_MEMORY_LIMIT_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)
+    caps = openai._apply_metal_memory_caps(
+        mx_module=mx,
+        total_ram_bytes=128 * GiB,
+        minimum_resident_bytes=LAGUNA_S_2_1_MIN_RESIDENT_BYTES,
+    )
+
+    openai._validate_backend_context_memory_budget(
+        LAGUNA_AR_DESCRIPTOR,
+        caps,
+        None,
+    )
+    with pytest.raises(RuntimeError, match="context window 1,048,576"):
+        openai._validate_backend_context_memory_budget(
+            LAGUNA_AR_DESCRIPTOR,
+            caps,
+            1_048_576,
+        )
+
+
+def test_laguna_server_uses_safe_default_but_preserves_explicit_context():
+    from mtplx.backends.descriptors import LAGUNA_AR_DESCRIPTOR
+
+    assert (
+        openai._select_backend_context_window(
+            LAGUNA_AR_DESCRIPTOR,
+            model_max=1_048_576,
+            requested=None,
+        )
+        == 32_768
+    )
+    assert (
+        openai._select_backend_context_window(
+            LAGUNA_AR_DESCRIPTOR,
+            model_max=1_048_576,
+            requested=65_536,
+        )
+        == 65_536
+    )
+
+
+def test_prefill_preflight_accepts_qwen_yarn_million_token_window(
+    monkeypatch,
+    tmp_path,
+):
+    model = tmp_path / "qwen-yarn"
+    model.mkdir()
+    (model / "config.json").write_text(
+        '{"text_config":{"max_position_embeddings":1048576}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        openai,
+        "_apply_metal_memory_caps",
+        lambda: {"applied": True, "memory_limit_bytes": 110 * GiB},
+    )
+
+    receipt = openai.apply_memory_caps_preflight(
+        entry="bench.prefill_ladder",
+        model=str(model),
+        contexts=[524_288, 1_048_576],
+    )
+    assert receipt["model_context_window"] == 1_048_576
+    assert receipt["requested_contexts"] == [524_288, 1_048_576]
+
+    with pytest.raises(ValueError, match="1,048,577 tokens exceeds"):
+        openai.apply_memory_caps_preflight(
+            entry="bench.prefill_ladder",
+            model=str(model),
+            contexts=[1_048_577],
+        )
 
 
 def test_apply_metal_memory_caps_falls_back_to_deprecated_metal_apis(monkeypatch):
@@ -138,4 +266,67 @@ def test_apply_metal_memory_caps_skips_when_ram_unknown_without_overrides(
     result = openai._apply_metal_memory_caps(mx_module=mx, total_ram_bytes=0)
 
     assert result == {"applied": False, "reason": "ram_unknown"}
+    assert calls == []
+
+
+# Issue #400: the flat 16 GiB reserve + 6 GiB floor margin refused the
+# Flash-Next Optimized Speed pack on 96 GB Macs by exactly its own margin
+# (77.3 + 6 + 16 = 99.3 > 96) while the machine demonstrably serves it
+# with ~16 GiB left unwired. Both terms scale below 128 GB now; 128 GB+
+# behavior is unchanged.
+
+
+def test_system_reserve_scales_below_128g_and_holds_above():
+    assert openai._metal_system_reserve_bytes(256 * GiB) == 16 * GiB
+    assert openai._metal_system_reserve_bytes(128 * GiB) == 16 * GiB
+    assert openai._metal_system_reserve_bytes(96 * GiB) == 12 * GiB
+    assert openai._metal_system_reserve_bytes(64 * GiB) == 8 * GiB
+    assert openai._metal_system_reserve_bytes(32 * GiB) == 8 * GiB
+
+
+def test_resident_floor_margin_scales_below_112g_and_holds_above():
+    assert openai._resident_floor_margin_bytes(None) == 6 * GiB
+    assert openai._resident_floor_margin_bytes(256 * GiB) == 6 * GiB
+    assert openai._resident_floor_margin_bytes(128 * GiB) == 6 * GiB
+    assert openai._resident_floor_margin_bytes(96 * GiB) == 3 * GiB
+    assert openai._resident_floor_margin_bytes(64 * GiB) == 2 * GiB
+
+
+def test_flash_next_optimized_speed_pack_admits_on_96g(monkeypatch):
+    # The #400 receipt machine: 77.3 GiB of weight files on a 96 GB M2
+    # Max. floor = weights + margin(96G) = 80.3; reserve(96G) = 12;
+    # 92.3 <= 96 admits, and the wired cap rises to the floor.
+    mx, calls = _fake_mx(top_level=True)
+    monkeypatch.delenv("MTPLX_MEMORY_LIMIT_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)
+    weights = int(77.3 * GiB)
+    floor = weights + openai._resident_floor_margin_bytes(96 * GiB)
+
+    result = openai._apply_metal_memory_caps(
+        mx_module=mx,
+        total_ram_bytes=96 * GiB,
+        minimum_resident_bytes=floor,
+    )
+
+    assert result["applied"] is True
+    assert result["wired_limit_bytes"] == floor
+    assert result["minimum_resident_bytes"] == floor
+    # The unwired remainder stays at/above the scaled system reserve.
+    assert 96 * GiB - floor >= openai._metal_system_reserve_bytes(96 * GiB)
+
+
+def test_oversized_pack_still_refuses_on_96g(monkeypatch):
+    mx, calls = _fake_mx(top_level=True)
+    monkeypatch.delenv("MTPLX_MEMORY_LIMIT_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)
+
+    result = openai._apply_metal_memory_caps(
+        mx_module=mx,
+        total_ram_bytes=96 * GiB,
+        minimum_resident_bytes=90 * GiB,
+    )
+
+    assert result["applied"] is False
+    assert result["reason"] == "insufficient_ram"
+    assert result["minimum_system_reserve_bytes"] == 12 * GiB
     assert calls == []

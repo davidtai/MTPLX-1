@@ -18,12 +18,31 @@ import MTPLXAppCore
 // Picking `.other` collapses the row list to a custom-client config
 // form (port + API key + endpoint preview + Start button).
 
-struct LaunchOverlay: View {
-    @EnvironmentObject private var backend: MTPLXBackendStore
+struct LaunchOverlay: View, Equatable {
+    let backend: MTPLXBackendStore
+    let configuration: MTPLXAppConfiguration
+
     @EnvironmentObject private var themeStore: ThemeStore
     @EnvironmentObject private var router: AppRouter
 
     @Binding var presented: Bool
+    private let presentedValue: Bool
+
+    init(
+        backend: MTPLXBackendStore,
+        configuration: MTPLXAppConfiguration,
+        presented: Binding<Bool>
+    ) {
+        self.backend = backend
+        self.configuration = configuration
+        _presented = presented
+        presentedValue = presented.wrappedValue
+    }
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.presentedValue == rhs.presentedValue
+            && lhs.configuration == rhs.configuration
+    }
 
     @State private var borderProgress: CGFloat = 0
     @State private var headerVisible: Bool = false
@@ -55,8 +74,8 @@ struct LaunchOverlay: View {
         .allowsHitTesting(presented)
         .onChange(of: presented) { _, isOn in
             if isOn {
-                customPort = backend.configuration.port
-                customApiKey = backend.configuration.apiKey ?? ""
+                customPort = configuration.port
+                customApiKey = configuration.apiKey ?? ""
                 otherExpanded = false
                 runEnterChoreography()
             } else {
@@ -113,7 +132,7 @@ struct LaunchOverlay: View {
                         target: target,
                         index: idx,
                         visible: rowsVisibleCount > idx,
-                        isLast: backend.configuration.lastLaunchTarget == target.rawValue,
+                        isLast: configuration.lastLaunchTarget == target.rawValue,
                         motionEnabled: motionEnabled,
                         onPick: handlePick
                     )
@@ -130,7 +149,7 @@ struct LaunchOverlay: View {
                     .trim(from: 0, to: borderProgress)
                     .stroke(Brand.separatorStrong, lineWidth: 0.75)
             }
-            .shadow(color: .black.opacity(0.55), radius: 18, x: 0, y: 10)
+            .shadow(color: Brand.shade.opacity(0.55), radius: 18, x: 0, y: 10)
         )
     }
 
@@ -140,7 +159,7 @@ struct LaunchOverlay: View {
     private var header: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(otherExpanded ? "Custom client" : "Start MTPLX")
+                Text(otherExpanded ? tr("Custom client") : tr("Start MTPLX"))
                     .font(.system(.callout, design: .rounded).weight(.semibold))
                     .foregroundStyle(Brand.typeBody)
                 Text(otherExpanded
@@ -162,7 +181,7 @@ struct LaunchOverlay: View {
                         )
                 }
                 .buttonStyle(.plain)
-                .help("Back")
+                .help(tr("Back"))
             }
         }
         .padding(.horizontal, 14)
@@ -191,7 +210,7 @@ struct LaunchOverlay: View {
         VStack(alignment: .leading, spacing: 12) {
             // Port
             HStack(spacing: 10) {
-                Text("Port")
+                Text(tr("Port"))
                     .font(.system(.callout).weight(.medium))
                     .foregroundStyle(Brand.typeBody)
                     .frame(width: 64, alignment: .leading)
@@ -206,11 +225,11 @@ struct LaunchOverlay: View {
 
             // API key
             HStack(spacing: 10) {
-                Text("API key")
+                Text(tr("API key"))
                     .font(.system(.callout).weight(.medium))
                     .foregroundStyle(Brand.typeBody)
                     .frame(width: 64, alignment: .leading)
-                SecureField("optional", text: $customApiKey)
+                SecureField(tr("optional"), text: $customApiKey)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.callout, design: .monospaced))
             }
@@ -219,7 +238,7 @@ struct LaunchOverlay: View {
 
             // Connection details
             VStack(alignment: .leading, spacing: 8) {
-                Text("CONNECT YOUR CLIENT TO")
+                Text(tr("CONNECT YOUR CLIENT TO"))
                     .font(.system(size: 9, weight: .heavy, design: .monospaced))
                     .tracking(1.5)
                     .foregroundStyle(Brand.typeTertiary)
@@ -232,7 +251,7 @@ struct LaunchOverlay: View {
             } label: {
                 HStack {
                     Spacer()
-                    Text("Start serving")
+                    Text(tr("Start serving"))
                         .font(.system(.callout, design: .rounded).weight(.semibold))
                     Image(systemName: "play.fill")
                         .font(.system(size: 10, weight: .semibold))
@@ -278,7 +297,7 @@ struct LaunchOverlay: View {
                     .foregroundStyle(Brand.typeSecondary)
             }
             .buttonStyle(.plain)
-            .help("Copy")
+            .help(tr("Copy"))
         }
     }
 
@@ -304,7 +323,7 @@ struct LaunchOverlay: View {
     // MARK: - Choreography
 
     private var motionEnabled: Bool {
-        !backend.configuration.performanceLock && !themeStore.reduceMotionPreference
+        !configuration.performanceLock && !themeStore.reduceMotionPreference
     }
 
     private func handlePick(_ target: LaunchTarget) {
@@ -396,7 +415,7 @@ private struct LaunchRow: View {
                             .font(.system(.callout, design: .rounded).weight(.medium))
                             .foregroundStyle(Brand.typeBody)
                         if isLast {
-                            Text("LAST")
+                            Text(tr("LAST"))
                                 .font(.system(size: 8, weight: .heavy, design: .monospaced))
                                 .tracking(1)
                                 .foregroundStyle(Brand.typeBody)

@@ -12,6 +12,9 @@ from mtplx.profiles import DEFAULT_PROFILE_NAME, PROFILE_CHOICES, resolve_profil
 
 RUNTIME_CONTRACT_FILE = "mtplx_runtime.json"
 SUPPORTED_ARCH_IDS = {
+    "laguna-s-2.1-ar",
+    "deepseek-v4",
+    "qwen4-next",
     "qwen3-next-mtp",
     "deepseek-v3-mtp",
     "glm-moe-dsa-mtp",
@@ -29,6 +32,7 @@ TIER_FAMILY_COMPATIBLE_UNVERIFIED = "family-compatible-unverified"
 TIER_ARCH_COMPATIBLE_UNVERIFIED = "architecture-compatible-but-unverified"
 TIER_INCOMPATIBLE_ARCHITECTURE = "incompatible-architecture"
 TIER_NO_MTP = "no-MTP"
+TIER_AR_ONLY = "AR-only"
 
 EXIT_VERIFIED = 0
 EXIT_NO_MTP = 2
@@ -113,6 +117,92 @@ class ArchitectureSupport:
 
 
 ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
+    "laguna-s-2.1-ar": ArchitectureSupport(
+        arch_id="laguna-s-2.1-ar",
+        display_name="Laguna-S-2.1 oQ4e (MLX)",
+        family="laguna",
+        backend="laguna_ar",
+        support_level="verified-native-ar-only",
+        runtime_compatibility="native-ar-only",
+        can_run_verified=True,
+        aliases=("laguna", "LagunaForCausalLM"),
+        config_markers=(),
+        family_gate="laguna-s-2.1-mlx-4bit-geometry",
+        references=(
+            "https://huggingface.co/mlx-community/Laguna-S-2.1-oQ4e",
+            "https://huggingface.co/pipenetwork/Laguna-S-2.1-MLX-4bit/blob/5544297f819d50330bc3616dd15cbc7edb598b2f/laguna.py",
+        ),
+        notes=(
+            "Target-only AR runtime for the exact mlx-community Laguna-S-2.1-oQ4e "
+            "checkpoint; the artifact has no native MTP head and must be loaded "
+            "with mtp=False."
+        ),
+    ),
+    "lfm2-moe-ar": ArchitectureSupport(
+        arch_id="lfm2-moe-ar",
+        display_name="LiquidAI LFM2.5 MoE (MLX)",
+        family="lfm2",
+        backend="mlx_lm_ar",
+        support_level="experimental-mlx-lm-ar-only",
+        runtime_compatibility="native-ar-only",
+        can_run_verified=True,
+        aliases=("lfm2_moe", "Lfm2MoeForCausalLM"),
+        config_markers=(),
+        family_gate="mlx-lm-loader-plus-trunk-weights",
+        references=(
+            "https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-MLX-8bit",
+            "REFERENCES:TOOLS/mlx-lm/mlx_lm/models/lfm2_moe.py",
+        ),
+        notes=(
+            "Hybrid ShortConv+GQA MoE without an MTP head; loads through the "
+            "bundled mlx-lm lfm2_moe module and serves target-only AR (the "
+            "lfm2_fast ShortConv decode path installs post-load when "
+            "eligible)."
+        ),
+    ),
+    "iquestcoder-ar": ArchitectureSupport(
+        arch_id="iquestcoder-ar",
+        display_name="IQuest Coder V1 (MLX)",
+        family="iquest",
+        backend="mlx_lm_ar",
+        support_level="experimental-mlx-lm-ar-only",
+        runtime_compatibility="native-ar-only",
+        can_run_verified=True,
+        aliases=("iquestcoder", "IQuestCoderForCausalLM"),
+        config_markers=(),
+        family_gate="mlx-lm-loader-plus-trunk-weights",
+        references=(
+            "https://huggingface.co/mlx-community/IQuest-Coder-V1-7B-Instruct-8bit",
+            "https://github.com/IQuestLab/IQuest-Coder-V1",
+        ),
+        notes=(
+            "Llama-architecture coder without an MTP head (mlx-lm remaps "
+            "iquestcoder -> llama); serves target-only AR."
+        ),
+    ),
+    "llama-ar": ArchitectureSupport(
+        arch_id="llama-ar",
+        display_name="Llama-architecture AR (MLX)",
+        family="llama",
+        backend="mlx_lm_ar",
+        support_level="experimental-mlx-lm-ar-only",
+        runtime_compatibility="native-ar-only",
+        can_run_verified=True,
+        aliases=("llama", "LlamaForCausalLM"),
+        config_markers=(),
+        family_gate="mlx-lm-loader-plus-trunk-weights",
+        references=(
+            "https://huggingface.co/ai9stars/G9v3-3B",
+            "https://huggingface.co/openbmb/MiniCPM5-1B",
+            "REFERENCES:TOOLS/mlx-lm/mlx_lm/models/llama.py",
+        ),
+        notes=(
+            "Plain Llama-architecture checkpoints without an MTP head (G9v3, "
+            "MiniCPM5, Nemotron Llama distills, and other community models); "
+            "loads through the bundled mlx-lm llama module and serves "
+            "target-only AR."
+        ),
+    ),
     "qwen3-next-mtp": ArchitectureSupport(
         arch_id="qwen3-next-mtp",
         display_name="Qwen3.6 / Qwen3-Next / Qwen3.5 MTP",
@@ -130,6 +220,39 @@ ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
             "REFERENCES:TOOLS/mlx-lm/mlx_lm/models/qwen3_5.py",
         ),
         notes="Product-verified default backend; this remains the only promoted shipping runtime.",
+    ),
+    "qwen4-next": ArchitectureSupport(
+        arch_id="qwen4-next",
+        display_name="Qwen4 preview / Qwen3.8-Flash-Next",
+        family="qwen",
+        backend="qwen4_exp",
+        support_level="experimental-native-contract-gated",
+        runtime_compatibility="native",
+        can_run_verified=True,
+        # The real T-0 strings (config landed 2026-08-26 15:00 UTC):
+        # model_type qwen4_exp / qwen4_exp_text, Qwen4ExpForConditionalGeneration.
+        # The speculative pre-drop aliases (qwen4/qwen3_8/qwen3_9) are gone —
+        # qwen3_8-shaped names must never be swallowed into this family (#268).
+        aliases=(
+            "qwen4_exp",
+            "qwen4_exp_text",
+            "Qwen4ExpForConditionalGeneration",
+            "Qwen4ExpForCausalLM",
+        ),
+        config_markers=(),
+        family_gate="mlx-lm-ar",
+        references=(
+            "https://modelscope.cn/models/Qwen/Qwen3.8-Flash-Next",
+        ),
+        notes=(
+            "Qwen4-generation preview family (GDN hybrid MoE + Qwen Sparse "
+            "Attention + n-gram embedding memory, ModelScope 2026-08-26). "
+            "Native backend mtplx.models.qwen4_exp: transformers-parity "
+            "trunk (QSA indexer + SSD-streamed n-gram sidecar with QD16 "
+            "prefetch) and the native MTP draft head attached from the "
+            "pack's self-describing mtp.safetensors, driven through the "
+            "standard speculative lane."
+        ),
     ),
     "deepseek-v3-mtp": ArchitectureSupport(
         arch_id="deepseek-v3-mtp",
@@ -169,18 +292,65 @@ ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
             "MTPLX routes verified-contract artifacts through the DeepSeek MTP backend."
         ),
     ),
+    "deepseek-v4": ArchitectureSupport(
+        arch_id="deepseek-v4",
+        display_name="DeepSeek-V4-Flash (MLX)",
+        family="deepseek",
+        backend="deepseek_v4",
+        support_level="experimental-native-ar-only",
+        runtime_compatibility="native-ar-only",
+        can_run_verified=True,
+        # Keep aliases minimal: "deepseek_v4" is a substring of "deepseek_v4_mtp",
+        # so a longer alias here would out-sort (and wrongly capture) the
+        # deepseek-v4-mtp split config. Detection of the AR checkpoint works via
+        # this alias / the model_type; the MTP-split entry keeps priority for its
+        # own longer "deepseek_v4_mtp" marker.
+        aliases=("deepseek_v4",),
+        config_markers=(),
+        family_gate="deepseek-v4-mlx",
+        references=(
+            "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash",
+            "https://huggingface.co/mlx-community/DeepSeek-V4-Flash-4bit",
+            "REFERENCES:TOOLS/DeepSeek-V4-Flash/inference/model.py",
+        ),
+        notes=(
+            "Native MLX loader (mtplx.models.deepseek_v4) for DeepSeek-V4-Flash. "
+            "V4 adds Hyper-Connections, Compressed-Sparse-Attention, grouped "
+            "output-LoRA, and hash layers over V3.2. This is also the runnable "
+            "V4 MTP arch: the draft block (mtp.0.*) binds through the ordinary "
+            "load path when the checkpoint ships it, and the speculative lane "
+            "drives it through mtplx.generation like every other native MTP "
+            "backend. The published mlx-community conversions drop the block "
+            "while still declaring num_nextn_predict_layers, which is the case "
+            "the runtime's degrade-to-autoregressive branch covers -- those keep "
+            "running target-only (mtp=False). The runtime_compatibility field "
+            "stays 'native-ar-only' because it is what routes a checkpoint with "
+            "no draft head to the AR-only verdict; an MTP-bearing artifact is "
+            "resolved dynamically by the family gate instead."
+        ),
+    ),
     "deepseek-v4-mtp": ArchitectureSupport(
         arch_id="deepseek-v4-mtp",
-        display_name="DeepSeek V4 MTP",
+        display_name="DeepSeek V4 MTP (split checkpoint)",
         family="deepseek",
         backend="deepseek_v4_mtp",
         support_level="recognized-backend-pending",
         runtime_compatibility="recognized-backend-pending",
-        aliases=("deepseek_v4", "deepseek_v4_mtp"),
+        aliases=("deepseek_v4_mtp",),
         references=(
             "REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/deepseek_v4_mtp.py",
         ),
-        notes="Detected separately because vLLM split the V4 MTP implementation from DeepSeek V3.",
+        notes=(
+            "vLLM's SPLIT V4 MTP layout: a standalone checkpoint carrying only "
+            "the draft module (model_type deepseek_v4_mtp / "
+            "DeepseekV4MTPForCausalLM), which vLLM separated out from DeepSeek "
+            "V3. MTPLX now has a real V4 draft-head runtime, but it is not this "
+            "artifact shape -- it loads a MERGED directory whose ordinary shards "
+            "carry mtp.0.* beside the trunk, which detects as arch_id "
+            "'deepseek-v4'. This entry stays pending because MTPLX has no loader "
+            "that assembles a target from two separate repos, not because the "
+            "backend is missing."
+        ),
     ),
     "glm4-moe-mtp": ArchitectureSupport(
         arch_id="glm4-moe-mtp",
@@ -657,10 +827,20 @@ def _detect_arch_id(inspection: Any) -> str | None:
     if _support_alias_matches(qwen_support, combined):
         return "qwen3-next-mtp"
 
+    # qwen4-next's aliases are the exact T-0 strings (qwen4_exp family) and
+    # can't mean any other family, so recognition must not hinge on MTP
+    # markers — a trunk-only or partially-downloaded checkpoint still belongs
+    # to the family (recognition is not can_run). The marker requirement in
+    # the loop below exists for rows whose aliases double as plain trunk
+    # names (deepseek_v3, ...), which this family's do not.
+    qwen4_support = ARCHITECTURE_CATALOG["qwen4-next"]
+    if _support_alias_matches(qwen4_support, combined):
+        return "qwen4-next"
+
     supports = [
         support
         for support in ARCHITECTURE_CATALOG.values()
-        if support.arch_id not in {"qwen3-next-mtp", "generic-mtp"}
+        if support.arch_id not in {"qwen3-next-mtp", "qwen4-next", "generic-mtp"}
     ]
     supports.sort(
         key=lambda row: max(
@@ -670,7 +850,9 @@ def _detect_arch_id(inspection: Any) -> str | None:
         reverse=True,
     )
     for support in supports:
-        if has_explicit_mtp and _support_alias_matches(support, combined):
+        if _support_alias_matches(support, combined) and (
+            has_explicit_mtp or support.runtime_compatibility == "native-ar-only"
+        ):
             return support.arch_id
     if "mtp" in combined or "nextn" in combined:
         return "generic-mtp"
@@ -960,7 +1142,212 @@ def _passes_nemotron_h_gate(inspection: Any) -> bool:
     return _has_marker_under_prefixes(keys, last_prefixes, ("final_layernorm.weight",))
 
 
+def _passes_deepseek_v4_gate(inspection: Any) -> bool:
+    """DeepSeek-V4-Flash MLX artifact: model_type deepseek_v4 (or the
+    DeepseekV4ForCausalLM architecture).  The mlx-community conversion drops the
+    MTP block, so this is a target-only AR gate with no MTP-marker requirement."""
+    model_type = _text(getattr(inspection, "model_type", None))
+    architecture = _compact(_text(getattr(inspection, "architecture", None)))
+    return model_type == "deepseek_v4" or "deepseekv4forcausallm" in architecture
+
+
+# HF class name (as declared in config ``architectures``) -> mlx-lm module
+# implementing it. Single source of truth, shared with mtplx.runtime, which
+# installs a sys.modules alias so ``mlx_lm.utils.load`` resolves a fresh
+# model_type string through the checkpoint's declared class (the Qwen3.6 ->
+# "qwen3_5" precedent, expected again for the Qwen3.8/Qwen4 generation).
+# Extend only with verified schema-compatible pairs; an architecture absent
+# here keeps the fail-loud unknown-model_type behavior.
+ARCHITECTURE_DECLARED_MODULES = {
+    "Qwen3_5ForConditionalGeneration": "qwen3_5",
+    "Qwen3_5ForCausalLM": "qwen3_5",
+    "Qwen3_5TextForCausalLM": "qwen3_5",
+    "Qwen3_5MoeForConditionalGeneration": "qwen3_5_moe",
+    "Qwen3_5MoeForCausalLM": "qwen3_5_moe",
+    "Qwen3_5MoeTextForCausalLM": "qwen3_5_moe",
+}
+
+_DECLARED_MODULES_LOWERED = {
+    key.lower().replace("-", "_"): value
+    for key, value in ARCHITECTURE_DECLARED_MODULES.items()
+}
+
+# model_types constructed by MTPLX-owned in-tree model classes
+# (mtplx/models/); mirrors mtplx.runtime._model_classes_for_config. A new
+# in-tree architecture (e.g. the Qwen3.8-Flash-Next backend) registers its
+# model_type here alongside its runtime dispatch entry. Laguna is
+# deliberately absent: its runnability is decided by the pinned-artifact
+# geometry/sidecar gate on its catalog row (supply-chain fence), never by
+# model_type alone.
+_INTREE_MODEL_TYPES = {"deepseek_v4", "qwen4_exp", "qwen4_exp_text"}
+
+# Families whose catalog family_gate is an artifact-integrity fence (pinned
+# geometry + pinned sidecars). A gate failure here refuses outright and is
+# never eligible for the constructable AR fallback.
+_PINNED_INTEGRITY_ARCH_IDS = {"laguna-s-2.1-ar"}
+
+
+def _file_present(inspection: Any, name: str) -> bool:
+    """File exists in the local dir or the remote repo listing."""
+    model_dir = getattr(inspection, "model_dir", None)
+    if model_dir:
+        try:
+            if (Path(str(model_dir)) / name).exists():
+                return True
+        except OSError:
+            pass
+    files = getattr(inspection, "model_files", None) or ()
+    return any(str(entry).rsplit("/", 1)[-1] == name for entry in files)
+
+
+def _trunk_weights_present(inspection: Any) -> bool:
+    """Trunk shards exist locally or in the remote repo listing."""
+    model_dir = getattr(inspection, "model_dir", None)
+    if model_dir:
+        try:
+            if any(
+                path.name != "mtp.safetensors"
+                for path in Path(str(model_dir)).glob("*.safetensors")
+            ):
+                return True
+        except OSError:
+            pass
+    files = getattr(inspection, "model_files", None) or ()
+    return any(
+        str(entry).endswith(".safetensors")
+        and str(entry).rsplit("/", 1)[-1] != "mtp.safetensors"
+        for entry in files
+    )
+
+
+def _native_construction_path(inspection: Any) -> str | None:
+    """How this build would construct the trunk natively, or None.
+
+    MTP is an accelerator, never a load requirement (founder directive
+    2026-08-09, generalized to all families 2026-08-26): any checkpoint
+    whose trunk MTPLX can build from code it ships — an in-tree model or a
+    bundled mlx-lm module — is runnable, autoregressive at worst. This is
+    the single answer to "can we construct the trunk"; refusals are
+    reserved for checkpoints where it returns None, which is a genuine
+    capability gap in this build (MTPLX never executes repository code),
+    not a verification policy.
+    """
+    import importlib.util
+
+    model_type = _text(getattr(inspection, "model_type", None))
+    if model_type in _INTREE_MODEL_TYPES:
+        return f"in-tree MTPLX model '{model_type}'"
+
+    def _spec_exists(name: str) -> bool:
+        if not name:
+            return False
+        try:
+            return importlib.util.find_spec(f"mlx_lm.models.{name}") is not None
+        except (ImportError, ValueError):
+            return False
+
+    # mlx-lm serves several model_types through another family's module
+    # (mistral -> llama, etc.); honor its own remapping table so the verdict
+    # matches what mlx_lm.utils.load actually resolves.
+    remapped = model_type
+    try:
+        from mlx_lm.utils import MODEL_REMAPPING
+
+        remapped = MODEL_REMAPPING.get(model_type, model_type)
+    except Exception:
+        pass
+    if _spec_exists(remapped):
+        return f"bundled mlx-lm module '{remapped}'"
+    if model_type.endswith("_mtp") and _spec_exists(model_type[: -len("_mtp")]):
+        base = model_type[: -len("_mtp")]
+        return f"bundled mlx-lm module '{base}' (mtp-suffix alias)"
+    architecture = str(getattr(inspection, "architecture", "") or "")
+    for token in architecture.replace(",", " ").split():
+        target = _DECLARED_MODULES_LOWERED.get(token.lower().replace("-", "_"))
+        if target is not None and _spec_exists(target):
+            return f"declared architecture {token} via mlx-lm module '{target}'"
+    return None
+
+
+def _passes_mlx_lm_ar_gate(inspection: Any) -> bool:
+    """Trunk weights exist and the declared quantization is constructible."""
+    if not _trunk_weights_present(inspection):
+        return False
+    model_dir = getattr(inspection, "model_dir", None)
+    return _unsupported_quant_bits(model_dir) is None if model_dir else True
+
+
+# mlx.core.quantize supports exactly these widths; a config declaring any
+# other bit width (e.g. the 1-bit Bonsai export) cannot construct its
+# QuantizedLinear layers on this runtime, whatever the architecture says.
+_MLX_SUPPORTED_QUANT_BITS = frozenset({2, 3, 4, 5, 6, 8})
+
+
+def _unsupported_quant_bits(model_dir: Any) -> int | None:
+    """Return the declared quant bit width when this MLX build cannot load it."""
+    try:
+        config = json.loads(
+            (Path(str(model_dir)) / "config.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None
+    quantization = config.get("quantization")
+    if not isinstance(quantization, dict):
+        return None
+    candidates = [quantization.get("bits")]
+    for value in quantization.values():
+        if isinstance(value, dict):
+            candidates.append(value.get("bits"))
+    for bits in candidates:
+        if isinstance(bits, int) and not isinstance(bits, bool):
+            if bits not in _MLX_SUPPORTED_QUANT_BITS:
+                return bits
+    return None
+
+
+def _requires_remote_code(model_dir: Any) -> bool:
+    """True when loading needs transformers to execute repository code.
+
+    MTPLX never passes trust_remote_code: a checkpoint whose config or
+    tokenizer_config carries an ``auto_map`` (custom Python classes shipped
+    in the repo) cannot be loaded under this policy, whatever the weights
+    look like.
+    """
+    for name in ("config.json", "tokenizer_config.json"):
+        try:
+            data = json.loads(
+                (Path(str(model_dir)) / name).read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            continue
+        auto_map = data.get("auto_map")
+        if isinstance(auto_map, dict) and auto_map:
+            return True
+    return False
+
+
 def _passes_family_runtime_gate(arch_id: str, inspection: Any, tensor_gate: bool) -> bool:
+    if arch_id == "qwen4-next":
+        # Preview family: serve AR only when this build actually ships an
+        # implementation for the trunk — otherwise the honest capability-gap
+        # verdict below beats an unknown-model_type crash deep in the loader.
+        return (
+            _passes_mlx_lm_ar_gate(inspection)
+            and _native_construction_path(inspection) is not None
+        )
+    if arch_id in {"lfm2-moe-ar", "iquestcoder-ar", "llama-ar"}:
+        return _passes_mlx_lm_ar_gate(inspection)
+    if arch_id == "deepseek-v4":
+        return _passes_deepseek_v4_gate(inspection)
+    if arch_id == "laguna-s-2.1-ar":
+        return bool(
+            getattr(inspection, "laguna_s_2_1_mlx_4bit_match", False)
+            and getattr(
+                inspection,
+                "laguna_s_2_1_artifacts_complete",
+                False,
+            )
+        )
     if arch_id == "qwen3-next-mtp":
         return bool(
             tensor_gate
@@ -989,7 +1376,7 @@ def _passes_family_runtime_gate(arch_id: str, inspection: Any, tensor_gate: bool
 
 
 def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
-    model_dir = Path(getattr(inspection, "model_dir", "."))
+    model_dir = Path(getattr(inspection, "model_dir", ".") or ".")
     contract_data = getattr(inspection, "runtime_contract_data", None)
     contract_error = getattr(inspection, "runtime_contract_error", None)
     if contract_data is not None:
@@ -1010,6 +1397,132 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
     contract_path = getattr(inspection, "runtime_contract_path", None)
     if not contract_path:
         contract_path = str(_contract_path(model_dir)) if _contract_path(model_dir).exists() else None
+    # One question decides runnability throughout this function: can this
+    # build construct the trunk from code it ships. MTP, contracts, and
+    # verification tiers are labels and speed levers on top of that answer,
+    # never load gates (founder directive 2026-08-09, generalized
+    # 2026-08-26: "MTP unavailable" degrades to autoregressive, it does not
+    # refuse).
+    native_path = _native_construction_path(inspection)
+    constructable = native_path is not None and _passes_mlx_lm_ar_gate(inspection)
+    if _requires_remote_code(model_dir) and not (
+        native_path is not None and _file_present(inspection, "tokenizer.json")
+    ):
+        # auto_map alone is not a refusal: MTPLX never executes repository
+        # code, so custom classes are simply ignored when this build ships
+        # its own implementation and a standard fast tokenizer is present.
+        # Refuse only when the repo code would be the ONLY way to load.
+        support = architecture_support_for(detected_arch_id)
+        return CompatibilityVerdict(
+            tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
+            arch_id=detected_arch_id,
+            supported=False,
+            recognized=support is not None,
+            can_run=False,
+            exit_code=EXIT_UNVERIFIED,
+            message=(
+                "this checkpoint declares custom code (auto_map) and this "
+                "MTPLX build ships no native implementation able to load it "
+                "without that code; MTPLX never runs repository code "
+                "(trust_remote_code stays off). Support arrives via a "
+                "runtime update, or use a conversion that ships standard "
+                "tokenizer/model classes."
+            ),
+            recommended_backend=(support.backend if support else None),
+            recommended_profile=DEFAULT_PROFILE_NAME,
+            unsafe_force_required=False,
+            unverified_model=True,
+            mtp_supported="no",
+            runtime_compatibility="trust-remote-code-required",
+            support_level="trust-remote-code-refused",
+            support_notes=(support.notes if support else None),
+        )
+    bad_bits = _unsupported_quant_bits(model_dir)
+    if bad_bits is not None:
+        support = architecture_support_for(detected_arch_id)
+        return CompatibilityVerdict(
+            tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
+            arch_id=detected_arch_id,
+            supported=False,
+            recognized=support is not None,
+            can_run=False,
+            exit_code=EXIT_UNVERIFIED,
+            message=(
+                f"config declares {bad_bits}-bit quantization, which this MLX "
+                "runtime cannot construct (supported widths: 2, 3, 4, 5, 6, "
+                "8). Use a variant exported at a supported bit width."
+            ),
+            recommended_backend=(support.backend if support else None),
+            recommended_profile=DEFAULT_PROFILE_NAME,
+            unsafe_force_required=False,
+            unverified_model=True,
+            mtp_supported="no",
+            runtime_compatibility="unsupported-quant-bits",
+            support_level="unsupported-quantization",
+            support_notes=(support.notes if support else None),
+        )
+    body_blocker = _runtime_body_layout_blocker(detected_arch_id, inspection)
+    if body_blocker:
+        support = architecture_support_for(detected_arch_id)
+        return CompatibilityVerdict(
+            tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
+            arch_id=detected_arch_id,
+            supported=False,
+            recognized=support is not None,
+            can_run=False,
+            exit_code=EXIT_UNVERIFIED,
+            message=body_blocker,
+            recommended_backend=(support.backend if support else None),
+            recommended_profile=(
+                contract.recommended_profile if contract is not None else DEFAULT_PROFILE_NAME
+            ),
+            runtime_contract=contract,
+            runtime_contract_path=contract_path,
+            runtime_contract_error=contract_error,
+            unsafe_force_required=False,
+            unverified_model=True,
+            mtp_supported="partial" if has_mtp else "no",
+            runtime_compatibility="invalid-base-tensor-layout",
+            support_level="native-backend-invalid-base-tensors",
+            support_notes=(support.notes if support else None),
+        )
+
+    # Pinned-artifact families carry an integrity fence (exact geometry and
+    # pinned sidecars) that outranks every degrade/fallback lane below: a
+    # tampered or incomplete pinned artifact is refused outright, never
+    # served AR "because the trunk looks loadable". This is a supply-chain
+    # guard, not a verification tier.
+    if detected_arch_id in _PINNED_INTEGRITY_ARCH_IDS and not _passes_family_runtime_gate(
+        detected_arch_id, inspection, tensor_gate
+    ):
+        integrity_support = architecture_support_for(detected_arch_id)
+        return CompatibilityVerdict(
+            tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
+            arch_id=detected_arch_id,
+            supported=False,
+            recognized=True,
+            can_run=False,
+            exit_code=EXIT_UNVERIFIED,
+            message=(
+                f"{integrity_support.display_name if integrity_support else detected_arch_id} "
+                "is a pinned artifact and this copy failed its integrity gate "
+                "(geometry or pinned-sidecar mismatch). Refusing to serve a "
+                "tampered or incomplete pinned artifact; re-download the "
+                "official copy."
+            ),
+            recommended_backend=(
+                integrity_support.backend if integrity_support else None
+            ),
+            recommended_profile=DEFAULT_PROFILE_NAME,
+            unsafe_force_required=False,
+            unverified_model=True,
+            mtp_supported="no",
+            runtime_compatibility="pinned-artifact-integrity-failed",
+            support_level="pinned-artifact-integrity-failed",
+            support_notes=(
+                integrity_support.notes if integrity_support else None
+            ),
+        )
 
     # A published SSD-streaming artifact (a baked expert-manifest.json plus
     # the named experts bank it declares, present at full size) runs via the
@@ -1055,32 +1568,6 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
             mtp_supported="disabled",
             runtime_compatibility="streaming-ar",
             support_level="streaming-ar-target-only",
-            support_notes=(support.notes if support else None),
-        )
-
-    body_blocker = _runtime_body_layout_blocker(detected_arch_id, inspection)
-    if body_blocker:
-        support = architecture_support_for(detected_arch_id)
-        return CompatibilityVerdict(
-            tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
-            arch_id=detected_arch_id,
-            supported=False,
-            recognized=support is not None,
-            can_run=False,
-            exit_code=EXIT_UNVERIFIED,
-            message=body_blocker,
-            recommended_backend=(support.backend if support else None),
-            recommended_profile=(
-                contract.recommended_profile if contract is not None else DEFAULT_PROFILE_NAME
-            ),
-            runtime_contract=contract,
-            runtime_contract_path=contract_path,
-            runtime_contract_error=contract_error,
-            unsafe_force_required=False,
-            unverified_model=True,
-            mtp_supported="partial" if has_mtp else "no",
-            runtime_compatibility="invalid-base-tensor-layout",
-            support_level="native-backend-invalid-base-tensors",
             support_notes=(support.notes if support else None),
         )
 
@@ -1145,6 +1632,33 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
                 support_notes=(support.notes if support else None),
             )
         if arch_id not in SUPPORTED_ARCH_IDS:
+            display = support.display_name if support is not None else arch_id
+            if constructable:
+                return CompatibilityVerdict(
+                    tier=TIER_AR_ONLY,
+                    arch_id=(support.arch_id if support is not None else arch_id),
+                    supported=False,
+                    recognized=support is not None,
+                    can_run=True,
+                    exit_code=EXIT_VERIFIED,
+                    message=(
+                        f"{display} runtime contract detected; MTPLX's "
+                        "speculative backend for this family is pending. MTP "
+                        "unavailable -> mtp_off: serving autoregressive via "
+                        f"{native_path}."
+                    ),
+                    recommended_backend=(support.backend if support else None),
+                    recommended_profile=DEFAULT_PROFILE_NAME,
+                    runtime_contract=contract,
+                    runtime_contract_path=contract_path,
+                    unverified_model=True,
+                    mtp_supported="no",
+                    runtime_compatibility="native-ar-only-mtp-unsupported",
+                    support_level=(
+                        support.support_level if support else "trunk-ar-fallback"
+                    ),
+                    support_notes=(support.notes if support else None),
+                )
             if support is not None:
                 return CompatibilityVerdict(
                     tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
@@ -1155,8 +1669,10 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
                     exit_code=EXIT_UNVERIFIED,
                     message=(
                         f"{support.display_name} runtime contract detected and "
-                        "recognized, but MTPLX does not yet have a native MLX "
-                        "runtime backend for this family."
+                        "recognized, but this MTPLX build ships no MLX "
+                        "implementation of the trunk (MTPLX never executes "
+                        "repository code). Support arrives via a runtime "
+                        "update."
                     ),
                     recommended_backend=support.backend,
                     runtime_contract=contract,
@@ -1175,8 +1691,11 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
                 can_run=False,
                 exit_code=EXIT_INCOMPATIBLE_ARCHITECTURE,
                 message=(
-                    f"{arch_id} runtime contract detected; not supported in "
-                    "v0.2.0. Planned for a later backend."
+                    f"{arch_id} runtime contract detected, but this MTPLX "
+                    "build ships no MLX implementation of the trunk (MTPLX "
+                    "never executes repository code). This is a capability "
+                    "gap, not a verification gate; support arrives via a "
+                    "runtime update."
                 ),
                 runtime_contract=contract,
                 runtime_contract_path=contract_path,
@@ -1188,21 +1707,34 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
             arch_id=arch_id,
             supported=False,
             recognized=True,
-            can_run=False,
+            can_run=constructable,
             exit_code=EXIT_UNVERIFIED,
             message=(
-                "Runtime contract exists but local MTP artifact inspection did not "
-                "pass; refusing to run without repair."
+                "Runtime contract exists but local MTP artifact inspection "
+                "did not pass. MTP unavailable -> mtp_off: serving "
+                "autoregressive without the failing head; repair with Forge "
+                "to restore speculative decode."
+                if constructable
+                else (
+                    "Runtime contract exists but local MTP artifact "
+                    "inspection did not pass, and no trunk weights are "
+                    "loadable from this folder; restore the artifact or "
+                    "repair it with Forge."
+                )
             ),
             recommended_backend=(support.backend if support else "qwen3_next"),
             recommended_profile=contract.recommended_profile,
             runtime_contract=contract,
             runtime_contract_path=contract_path,
             runtime_contract_error=contract_error,
-            unsafe_force_required=True,
+            unsafe_force_required=not constructable,
             unverified_model=True,
-            mtp_supported="partial",
-            runtime_compatibility="needs-grafting",
+            mtp_supported="no" if constructable else "partial",
+            runtime_compatibility=(
+                "native-ar-only-mtp-unsupported"
+                if constructable
+                else "needs-grafting"
+            ),
             support_level="native-backend-needs-contract-repair",
             support_notes=(support.notes if support else None),
         )
@@ -1214,18 +1746,27 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
             arch_id=detected_arch_id,
             supported=False,
             recognized=support is not None,
-            can_run=False,
+            can_run=constructable,
             exit_code=EXIT_UNVERIFIED,
-            message=f"Invalid {RUNTIME_CONTRACT_FILE}: {contract_error}",
+            message=(
+                f"Invalid {RUNTIME_CONTRACT_FILE}: {contract_error}. The "
+                "contract is optional metadata — serving continues as "
+                "unverified; regenerate it with Forge to restore the "
+                "verified badge."
+                if constructable
+                else f"Invalid {RUNTIME_CONTRACT_FILE}: {contract_error}"
+            ),
             recommended_backend=(support.backend if support else None),
             runtime_contract_path=contract_path,
             runtime_contract_error=contract_error,
-            unsafe_force_required=detected_arch_id == "qwen3-next-mtp",
+            unsafe_force_required=(
+                not constructable and detected_arch_id == "qwen3-next-mtp"
+            ),
             unverified_model=True,
             mtp_supported="partial" if has_mtp else "no",
             runtime_compatibility=(
                 "needs-grafting"
-                if detected_arch_id == "qwen3-next-mtp"
+                if detected_arch_id == "qwen3-next-mtp" and not constructable
                 else (support.runtime_compatibility if support else "unsupported")
             ),
             support_level=(support.support_level if support else "unsupported"),
@@ -1263,26 +1804,65 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
                 support_notes=(support.notes if support else None),
             )
         if not mtp_artifact_exists:
+            # No MTP head is a SPEED downgrade, not a blocker: the trunk is a
+            # recognized architecture and serves correctly autoregressive.
+            # Refusing here forced users to Forge before they could even try a
+            # model (founder directive 2026-08-09: "mtp_heads not found ->
+            # mtp_off, run AR"). The serve path auto-degrades on this marker;
+            # attaching an arbitrary sidecar remains forbidden as before.
+            # A dir with no TRUNK weights at all is a different failure — no
+            # model, not a missing head — and keeps a clean human refusal
+            # instead of a FileNotFoundError deep in the loader.
+            try:
+                trunk_weights_exist = any(
+                    path.name != "mtp.safetensors"
+                    for path in Path(model_dir).glob("*.safetensors")
+                )
+            except OSError:
+                trunk_weights_exist = False
+            if not trunk_weights_exist:
+                return CompatibilityVerdict(
+                    tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
+                    arch_id=detected_arch_id,
+                    supported=False,
+                    recognized=True,
+                    can_run=False,
+                    exit_code=EXIT_UNVERIFIED,
+                    message=(
+                        f"{marker_text}, but this folder contains no model "
+                        "weights (*.safetensors). Download or restore the full "
+                        "model before serving."
+                    ),
+                    recommended_backend="qwen3_next",
+                    recommended_profile=DEFAULT_PROFILE_NAME,
+                    unsafe_force_required=False,
+                    unverified_model=True,
+                    mtp_supported="no",
+                    runtime_compatibility="missing-model-weights",
+                    support_level="native-backend-missing-model-weights",
+                    support_notes=(support.notes if support else None),
+                )
             return CompatibilityVerdict(
                 tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
                 arch_id=detected_arch_id,
                 supported=False,
                 recognized=True,
-                can_run=False,
+                can_run=True,
                 exit_code=EXIT_UNVERIFIED,
                 message=(
-                    f"{marker_text}, but this folder does not contain runnable "
-                    "Qwen MTP tensors. mtplx_runtime.json is optional metadata; "
-                    "the blocker is missing MTP weights. Use a model with "
-                    "mtp.safetensors, embedded mtp.* / language_model.mtp.* "
-                    "weights, or graft an MTP sidecar into this base model."
+                    f"{marker_text}, but this folder contains no Qwen MTP "
+                    "tensors (mtp.safetensors or embedded mtp.* / "
+                    "language_model.mtp.* weights). mtp_heads not found -> "
+                    "mtp_off: MTPLX will serve this model autoregressive, "
+                    "without speculative decode acceleration. Build and verify "
+                    "an MTP artifact with Forge for full speed."
                 ),
                 recommended_backend="qwen3_next",
                 recommended_profile=DEFAULT_PROFILE_NAME,
                 unsafe_force_required=False,
                 unverified_model=True,
                 mtp_supported="no",
-                runtime_compatibility="missing-mtp-weights",
+                runtime_compatibility="native-ar-only-missing-mtp",
                 support_level="native-backend-missing-mtp-weights",
                 support_notes=(support.notes if support else None),
             )
@@ -1291,20 +1871,32 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
             arch_id=detected_arch_id,
             supported=False,
             recognized=True,
-            can_run=False,
+            can_run=constructable,
             exit_code=EXIT_UNVERIFIED,
             message=(
-                f"{marker_text}, and an MTP artifact is present, but its tensor "
-                "layout does not match the Qwen native MTP runtime gate. "
-                "mtplx_runtime.json is optional metadata; repair or regenerate "
-                "the MTP sidecar/embedded weights so the tensor gate passes."
+                f"{marker_text}, and an MTP artifact is present, but its "
+                "tensor layout does not match the Qwen native MTP runtime "
+                "gate. MTP unavailable -> mtp_off: serving autoregressive "
+                "without the invalid head; repair or regenerate the MTP "
+                "sidecar/embedded weights for full speculative speed."
+                if constructable
+                else (
+                    f"{marker_text}, and an MTP artifact is present, but its "
+                    "tensor layout does not match the Qwen native MTP "
+                    "runtime gate and no loadable trunk weights were found. "
+                    "Repair or regenerate the artifact."
+                )
             ),
             recommended_backend="qwen3_next",
             recommended_profile=DEFAULT_PROFILE_NAME,
             unsafe_force_required=False,
             unverified_model=True,
-            mtp_supported="partial",
-            runtime_compatibility="invalid-mtp-tensor-layout",
+            mtp_supported="no" if constructable else "partial",
+            runtime_compatibility=(
+                "native-ar-only-mtp-unsupported"
+                if constructable
+                else "invalid-mtp-tensor-layout"
+            ),
             support_level="native-backend-invalid-mtp-tensors",
             support_notes=(support.notes if support else None),
         )
@@ -1345,18 +1937,51 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
                 arch_id=support.arch_id,
                 supported=False,
                 recognized=True,
-                can_run=False,
+                can_run=constructable,
                 exit_code=EXIT_UNVERIFIED,
                 message=(
-                    f"{support.display_name} markers recognized and a native "
-                    "backend exists, but no verified mtplx_runtime.json contract "
-                    "is present for this artifact."
+                    f"{support.display_name} markers recognized, but the MTP "
+                    "tensors do not match this build's native attach layout. "
+                    "MTP unavailable -> mtp_off: serving autoregressive; "
+                    "rebuild the artifact with Forge for speculative decode."
+                    if constructable
+                    else (
+                        f"{support.display_name} markers recognized and a "
+                        "native backend exists, but no loadable trunk "
+                        "weights were found and no verified "
+                        "mtplx_runtime.json contract is present."
+                    )
                 ),
                 recommended_backend=support.backend,
                 recommended_profile=DEFAULT_PROFILE_NAME,
                 unverified_model=True,
-                mtp_supported="recognized",
-                runtime_compatibility="needs-contract",
+                mtp_supported="no" if constructable else "recognized",
+                runtime_compatibility=(
+                    "native-ar-only-mtp-unsupported"
+                    if constructable
+                    else "needs-contract"
+                ),
+                support_level=support.support_level,
+                support_notes=support.notes,
+            )
+        if constructable:
+            return CompatibilityVerdict(
+                tier=TIER_AR_ONLY,
+                arch_id=support.arch_id,
+                supported=False,
+                recognized=True,
+                can_run=True,
+                exit_code=EXIT_VERIFIED,
+                message=(
+                    f"{support.display_name} recognized; MTPLX's speculative "
+                    "backend for this family is pending. MTP unavailable -> "
+                    f"mtp_off: serving autoregressive via {native_path}."
+                ),
+                recommended_backend=support.backend,
+                recommended_profile=DEFAULT_PROFILE_NAME,
+                unverified_model=True,
+                mtp_supported="no",
+                runtime_compatibility="native-ar-only-mtp-unsupported",
                 support_level=support.support_level,
                 support_notes=support.notes,
             )
@@ -1368,8 +1993,11 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
             can_run=False,
             exit_code=EXIT_UNVERIFIED,
             message=(
-                f"{support.display_name} MTP markers recognized, but MTPLX does "
-                "not yet have a native MLX runtime backend for this family."
+                f"{support.display_name} MTP markers recognized, but this "
+                "MTPLX build ships no MLX implementation of the trunk "
+                "(MTPLX never executes repository code). This is a "
+                "capability gap, not a verification gate; support arrives "
+                "via a runtime update."
             ),
             recommended_backend=support.backend,
             unverified_model=True,
@@ -1429,6 +2057,32 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
             or model_type_text == "gemma4_assistant"
         )
         folder_kind = "assistant" if is_assistant else "target"
+        if constructable:
+            return CompatibilityVerdict(
+                tier=TIER_AR_ONLY,
+                arch_id="gemma4-assistant-mtp",
+                supported=False,
+                recognized=True,
+                can_run=True,
+                exit_code=EXIT_VERIFIED,
+                message=(
+                    f"Gemma 4 {folder_kind} folder detected outside its "
+                    "assistant-pair bundle. MTP unavailable -> mtp_off: "
+                    f"serving this folder autoregressive via {native_path}. "
+                    "For full speculative speed, start the bundle root "
+                    "containing mtplx_pair.json, target/, and assistant/."
+                ),
+                recommended_backend="gemma4_assistant",
+                recommended_profile=DEFAULT_PROFILE_NAME,
+                unverified_model=True,
+                mtp_supported="no",
+                runtime_compatibility="native-ar-only-mtp-unsupported",
+                support_level="gemma4-pair-bundle-recommended",
+                support_notes=(
+                    "Drafting comes from the paired assistant model; the "
+                    "bundle root is the fully accelerated artifact."
+                ),
+            )
         return CompatibilityVerdict(
             tier=TIER_NO_MTP,
             arch_id="gemma4-assistant-mtp",
@@ -1437,10 +2091,11 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
             can_run=False,
             exit_code=EXIT_NO_MTP,
             message=(
-                f"Gemma 4 {folder_kind} folder detected, but MTPLX Gemma "
-                "requires the assistant-pair bundle root containing "
-                "mtplx_pair.json, target/, and assistant/. Inspect or start "
-                "the bundle root instead of this subfolder."
+                f"Gemma 4 {folder_kind} folder detected, but this build "
+                "ships no standalone MLX implementation for it and MTPLX "
+                "Gemma runs as an assistant-pair bundle. Inspect or start "
+                "the bundle root containing mtplx_pair.json, target/, and "
+                "assistant/ instead of this subfolder."
             ),
             recommended_backend="gemma4_assistant",
             recommended_profile=DEFAULT_PROFILE_NAME,
@@ -1454,15 +2109,87 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
         )
 
     if not has_mtp:
+        if (
+            support is not None
+            and support.runtime_compatibility == "native-ar-only"
+            and _passes_family_runtime_gate(support.arch_id, inspection, tensor_gate)
+        ):
+            return CompatibilityVerdict(
+                tier=TIER_AR_ONLY,
+                arch_id=support.arch_id,
+                supported=True,
+                recognized=True,
+                can_run=True,
+                exit_code=EXIT_VERIFIED,
+                message=(
+                    f"{support.display_name} matches the bundled MLX loader; "
+                    "run in target-only AR mode because the checkpoint has no "
+                    "native MTP head."
+                ),
+                recommended_backend=support.backend,
+                recommended_profile=DEFAULT_PROFILE_NAME,
+                mtp_supported="no",
+                runtime_compatibility=support.runtime_compatibility,
+                support_level=support.support_level,
+                support_notes=support.notes,
+            )
+        if constructable:
+            # MTP unavailable is a speed downgrade, never a refusal: the
+            # trunk is constructable from code this build ships, so it
+            # serves autoregressive (founder directive 2026-08-09,
+            # generalized to all families 2026-08-26).
+            return CompatibilityVerdict(
+                tier=TIER_AR_ONLY,
+                arch_id=detected_arch_id,
+                supported=False,
+                recognized=support is not None,
+                can_run=True,
+                exit_code=EXIT_VERIFIED,
+                message=(
+                    "No MTP head — MTP unavailable -> mtp_off: serving "
+                    f"autoregressive via {native_path}. Speculative "
+                    "acceleration needs an MTP-equipped artifact."
+                ),
+                recommended_profile=DEFAULT_PROFILE_NAME,
+                unverified_model=support is None,
+                mtp_supported="no",
+                runtime_compatibility="native-ar-only-missing-mtp",
+                support_level=(
+                    support.support_level if support else "trunk-ar-fallback"
+                ),
+                support_notes=(support.notes if support else None),
+            )
+        if native_path is not None and not _trunk_weights_present(inspection):
+            return CompatibilityVerdict(
+                tier=TIER_NO_MTP,
+                arch_id=detected_arch_id,
+                supported=False,
+                recognized=support is not None,
+                can_run=False,
+                exit_code=EXIT_NO_MTP,
+                message=(
+                    "this folder contains no model weights (*.safetensors). "
+                    "Download or restore the full model before serving."
+                ),
+                mtp_supported="no",
+                runtime_compatibility="missing-model-weights",
+                support_level=(support.support_level if support else "unsupported"),
+                support_notes=(support.notes if support else None),
+            )
+        model_type_label = model_type_text or "unknown"
         return CompatibilityVerdict(
-            tier=TIER_NO_MTP,
+            tier=TIER_INCOMPATIBLE_ARCHITECTURE,
             arch_id=detected_arch_id,
             supported=False,
             recognized=support is not None,
             can_run=False,
-            exit_code=EXIT_NO_MTP,
+            exit_code=EXIT_INCOMPATIBLE_ARCHITECTURE,
             message=(
-                "Model has no MTP head. MTPLX requires an MTP-equipped model."
+                f"No MLX implementation for model_type '{model_type_label}' "
+                "in this MTPLX build (no in-tree model and no bundled "
+                "mlx-lm module; MTPLX never executes repository code). "
+                "This is a capability gap, not a verification gate; "
+                "support arrives via a runtime update."
             ),
             mtp_supported="no",
             runtime_compatibility="unsupported",
@@ -1470,6 +2197,25 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
             support_notes=(support.notes if support else None),
         )
 
+    if constructable:
+        return CompatibilityVerdict(
+            tier=TIER_AR_ONLY,
+            arch_id=detected_arch_id or "generic-mtp",
+            supported=False,
+            recognized=False,
+            can_run=True,
+            exit_code=EXIT_VERIFIED,
+            message=(
+                "MTP markers detected, but this build cannot attach this "
+                "family's draft head. MTP unavailable -> mtp_off: serving "
+                f"autoregressive via {native_path}."
+            ),
+            recommended_profile=DEFAULT_PROFILE_NAME,
+            unverified_model=True,
+            mtp_supported="no",
+            runtime_compatibility="native-ar-only-mtp-unsupported",
+            support_level="trunk-ar-fallback",
+        )
     return CompatibilityVerdict(
         tier=TIER_INCOMPATIBLE_ARCHITECTURE,
         arch_id=detected_arch_id or "generic-mtp",
@@ -1478,9 +2224,11 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
         can_run=False,
         exit_code=EXIT_INCOMPATIBLE_ARCHITECTURE,
         message=(
-            f"{detected_arch_id or 'generic MTP'} detected; not supported in "
-            "v0.2.0 because no supported native MLX runtime family "
-            "matched this artifact."
+            "MTP markers detected, but this MTPLX build ships no MLX "
+            "implementation of the trunk and cannot attach this family's "
+            "draft head (MTPLX never executes repository code). This is a "
+            "capability gap, not a verification gate; support arrives via "
+            "a runtime update."
         ),
         mtp_supported="partial",
         runtime_compatibility="unsupported",

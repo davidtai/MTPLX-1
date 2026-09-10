@@ -1,6 +1,6 @@
 # Install MTPLX
 
-MTPLX is early production software for Apple Silicon Macs.
+MTPLX is production software for Apple Silicon Macs, distributed via pip, Homebrew, and a signed DMG.
 
 ## Requirements
 
@@ -21,8 +21,9 @@ mtplx help
 The installer checks Homebrew Python paths directly, so it works even if a fresh
 Terminal tab has not put `/opt/homebrew/bin` on PATH yet. It installs MTPLX from
 PyPI into `~/.mtplx/venv` and writes a durable launcher at `~/.local/bin/mtplx`.
-On Apple Silicon Homebrew installs, it also writes `/opt/homebrew/bin/mtplx` when
-that directory is writable.
+It never writes into Homebrew's directories, so it can be used alongside
+`brew install youssofal/mtplx/mtplx`; set `MTPLX_GLOBAL_BIN` to also link the
+launcher from a directory of your choice.
 
 Python-only install:
 
@@ -37,12 +38,11 @@ For local development:
 python -m pip install -e ".[dev,server]"
 ```
 
-## Runtime dependencies
+## Runtime Dependencies
 
-`mtplx --help`, `mtplx doctor`, `mtplx inspect`, `mtplx settings`, and `mtplx init` are designed to
-work without loading MLX. Generation and serving require the Apple-Silicon `mlx`/`mlx-lm` dependencies
-declared by the installed MTPLX release and a compatible model. Use `mtplx doctor --summary` instead
-of installing an old dependency recipe from a copied guide.
+`mtplx --help`, `mtplx doctor`, `mtplx inspect`, and `mtplx init` are designed to work even before MLX is installed. Generation and serving require MLX and a verified model.
+
+MTPLX runs on stock PyPI MLX; no fork is required for any profile (the legacy `--strict-mlx-fork-assert` flag is a deprecated no-op).
 
 ## Optional Thermal Tools
 

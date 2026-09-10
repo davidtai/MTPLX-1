@@ -170,3 +170,151 @@ def test_batch_key_telemetry_collapses_per_session_suffixes():
         assert session_keys == []
     finally:
         scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def test_park_shutdown_keeps_owner_thread_alive_and_rejects_new_work():
+    # #303: at process exit the owner thread must never pthread_exit — a
+    # clean exit during interpreter finalization runs mlx's TLS destructor
+    # into _Py_Dealloc. park=True leaves the thread blocked on a never-set
+    # Event instead.
+    scheduler = ModelWorkScheduler(name="test-park-scheduler", idle_grace_s=0.01)
+    done = scheduler.submit_foreground(lambda: "ok")
+    assert done.result(timeout=2) == "ok"
+
+    scheduler.shutdown(wait=False, cancel_futures=True, park=True)
+    time.sleep(0.2)
+    assert scheduler._thread.is_alive()
+
+    late = scheduler.submit_foreground(lambda: "never")
+    assert late.cancelled() or isinstance(late.exception(timeout=2), Exception)
+
+
+def test_release_mlx_thread_state_calls_clear_streams(monkeypatch):
+    import sys
+
+    from mtplx import model_scheduler
+
+    calls: list[str] = []
+    fake_core = SimpleNamespace(clear_streams=lambda: calls.append("cleared"))
+    fake_mlx = SimpleNamespace(core=fake_core)
+    monkeypatch.setitem(sys.modules, "mlx", fake_mlx)
+    monkeypatch.setitem(sys.modules, "mlx.core", fake_core)
+
+    model_scheduler._release_mlx_thread_state()
+    assert calls == ["cleared"]
+
+
+def test_release_mlx_thread_state_swallows_missing_and_raising(monkeypatch):
+    import sys
+
+    from mtplx import model_scheduler
+
+    # Older mlx without clear_streams: getattr-guarded no-op.
+    bare_core = SimpleNamespace()
+    monkeypatch.setitem(sys.modules, "mlx", SimpleNamespace(core=bare_core))
+    monkeypatch.setitem(sys.modules, "mlx.core", bare_core)
+    model_scheduler._release_mlx_thread_state()
+
+    # clear_streams that raises must never propagate into teardown.
+    def boom() -> None:
+        raise RuntimeError("stream teardown")
+
+    raising_core = SimpleNamespace(clear_streams=boom)
+    monkeypatch.setitem(sys.modules, "mlx", SimpleNamespace(core=raising_core))
+    monkeypatch.setitem(sys.modules, "mlx.core", raising_core)
+    model_scheduler._release_mlx_thread_state()
+
+
+# --- idle keepalive (GPU residency) -----------------------------------------
+
+
+def test_idle_keepalive_beats_on_owner_thread_only_while_attentive():
+    scheduler = ModelWorkScheduler(name="test-model-scheduler", idle_grace_s=0.01)
+    beat_threads: list[int] = []
+    try:
+        scheduler.arm_idle_keepalive(
+            lambda: beat_threads.append(get_ident()),
+            interval_s=0.05,
+            attentive_s=0.4,
+        )
+        # Arming starts the attentive window: beats begin without any request.
+        time.sleep(0.3)
+        state = scheduler.keepalive_state()
+        assert state["armed"] and state["attentive"]
+        assert state["beats"] >= 3, state
+        assert set(beat_threads) == {scheduler.owner_thread_id}
+        # The window expires: the owner thread parks and beats stop.
+        time.sleep(0.4)
+        settled = scheduler.keepalive_state()["beats"]
+        assert not scheduler.keepalive_state()["attentive"]
+        time.sleep(0.2)
+        assert scheduler.keepalive_state()["beats"] == settled
+        # A foreground completion re-opens the window and beats resume.
+        scheduler.submit_foreground(lambda: None).result(timeout=2)
+        time.sleep(0.25)
+        assert scheduler.keepalive_state()["beats"] > settled
+        assert scheduler.keepalive_state()["attentive"]
+    finally:
+        scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def test_idle_keepalive_never_runs_while_work_is_queued_and_yields_to_foreground():
+    scheduler = ModelWorkScheduler(name="test-model-scheduler", idle_grace_s=0.01)
+    events: list[str] = []
+    release = Event()
+
+    def long_foreground() -> None:
+        events.append("fg-start")
+        assert release.wait(timeout=2)
+        events.append("fg-end")
+
+    try:
+        scheduler.arm_idle_keepalive(
+            lambda: events.append("beat"), interval_s=0.02, attentive_s=10.0
+        )
+        future = scheduler.submit_foreground(long_foreground)
+        time.sleep(0.15)  # several intervals pass while the item runs
+        assert "fg-start" in events
+        # No beat interleaves with a running item (single owner thread).
+        assert events.count("beat") <= events.index("fg-start")
+        release.set()
+        future.result(timeout=2)
+        time.sleep(0.1)
+        assert events.index("fg-end") < len(events) - 1, "beats resume after the item"
+        # Everything the keepalive did happened strictly between items.
+        assert events[events.index("fg-start") + 1] == "fg-end"
+    finally:
+        scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def test_idle_keepalive_disarms_after_repeated_failures_and_reports_them():
+    scheduler = ModelWorkScheduler(name="test-model-scheduler", idle_grace_s=0.01)
+
+    def boom() -> None:
+        raise RuntimeError("no metal device")
+
+    try:
+        scheduler.arm_idle_keepalive(boom, interval_s=0.02, attentive_s=10.0)
+        time.sleep(0.3)
+        state = scheduler.keepalive_state()
+        assert state["errors"] == 3
+        assert state["armed"] is False
+        assert "no metal device" in (state["last_error"] or "")
+        # The owner thread is still healthy for real work.
+        assert scheduler.submit_foreground(lambda: 7).result(timeout=2) == 7
+    finally:
+        scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def test_idle_keepalive_warm_flag_tracks_recent_owner_activity():
+    scheduler = ModelWorkScheduler(name="test-model-scheduler", idle_grace_s=0.01)
+    try:
+        assert scheduler.keepalive_state()["warm"] is False  # not armed
+        scheduler.arm_idle_keepalive(lambda: None, interval_s=0.05, attentive_s=10.0)
+        time.sleep(0.2)
+        assert scheduler.keepalive_state()["warm"] is True
+        scheduler.disarm_idle_keepalive()
+        assert scheduler.keepalive_state()["armed"] is False
+        assert "idle_keepalive" in scheduler.stats()
+    finally:
+        scheduler.shutdown(wait=True, cancel_futures=True)

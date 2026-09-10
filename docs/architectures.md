@@ -1,14 +1,14 @@
 # Architectures
 
-Architecture support is registry-driven and may differ by installed release. Inspect the current
-matrix without loading a model:
+## Supported today
 
-```bash
-mtplx model architectures
-mtplx model architectures --json
-```
+- Qwen3-Next-MTP with an MTPLX runtime contract
+- DeepSeek V3 MTP — shipped experimental native backend (registry `experimental-native-contract-gated`); loads verified-contract artifacts, per-model QA still gates promotion
+- DeepSeek-V4-Flash (`model_type: deepseek_v4`) — experimental native AR backend, new this cycle (registry `experimental-native-ar-only`); optional single-block MTP engages when the checkpoint carries `mtp.0.*` weights
 
-`mtplx inspect MODEL --json` classifies an individual artifact as verified,
-architecture-compatible-but-unverified, incompatible, or lacking MTP heads. The registry reports the
-backend lifecycle, supported capabilities, and an actionable reason when a model cannot run; do not
-maintain a static family list in an integration.
+## Recognized but not yet runnable
+
+- Llama-MTP
+- generic MTP layouts — pending tier (registry `recognized-backend-pending`), not a hard reject
+
+The registry should tell users why a model is rejected and which release track is expected to support it.

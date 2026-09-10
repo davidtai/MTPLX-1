@@ -1,8 +1,6 @@
 """forward_ar engages the compiled AR path when flagged (wiring test)."""
 import json
-from pathlib import Path
 
-import mlx.core as mx
 import pytest
 
 hy_v3 = pytest.importorskip(
@@ -10,9 +8,11 @@ hy_v3 = pytest.importorskip(
     reason="mlx-lm does not ship models/hy_v3 yet (unreleased upstream)",
 )
 
-# These imports stay behind the optional hy_v3 availability gate.
-from mtplx.mtp_patch import MTPContract  # noqa: E402
-from mtplx.runtime import MTPLXRuntime  # noqa: E402
+import mlx.core as mx
+from pathlib import Path
+
+from mtplx.mtp_patch import MTPContract
+from mtplx.runtime import MTPLXRuntime
 
 
 def _tiny_model():

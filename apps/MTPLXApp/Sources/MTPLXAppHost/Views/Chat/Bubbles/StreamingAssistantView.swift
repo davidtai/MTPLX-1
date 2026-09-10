@@ -27,6 +27,7 @@ import MTPLXAppCore
 
 struct StreamingAssistantView: View {
     @ObservedObject var viewModel: ChatViewModel
+    @Environment(\.mtplxPerformanceLock) private var performanceLock
 
     /// The open well. Auto-follows `streamingPhase`; chip taps can
     /// override until the next phase change reasserts the live tool.
@@ -52,8 +53,7 @@ struct StreamingAssistantView: View {
                 expandedDetail: $expandedDetail,
                 thoughtWell: {
                     StreamingThoughtWell(
-                        document: viewModel.streamingReasoningDocument,
-                        fallback: viewModel.streamingReasoning
+                        document: viewModel.streamingReasoningDocument
                     )
                 },
                 searchWell: {
@@ -67,9 +67,16 @@ struct StreamingAssistantView: View {
 
             if contentHasStarted {
                 HStack(alignment: .top, spacing: 0) {
+                    // Pending buffer, not `streamingContent`: the
+                    // fallback only renders while the document is still
+                    // empty, and nothing has flushed at that point — so
+                    // the buffer IS the full text. The concatenating
+                    // property cost O(answer) per body eval for a value
+                    // read on one frame (2026-08-17 field regression).
                     StreamingAssistantMarkdownView(
                         document: viewModel.streamingContentDocument,
-                        fallbackText: viewModel.streamingContent
+                        fallbackText: viewModel.streamingContentPending,
+                        plainTextOnly: performanceLock
                     )
                     .frame(maxWidth: 576, alignment: .leading)
                     .padding(.horizontal, 14)
@@ -121,7 +128,9 @@ struct StreamingAssistantView: View {
         traces.map { trace in
             ThinkingActivityRow(
                 id: trace.id,
-                systemName: icon(for: trace.name),
+                // A failed call is marked as one; its detail already
+                // reads "Search failed: <reason>".
+                systemName: trace.status == .failed ? "exclamationmark.triangle" : icon(for: trace.name),
                 text: activityText(for: trace),
                 detail: trace.status == .pending ? "" : trace.detail,
                 isLive: trace.status == .pending
@@ -139,8 +148,8 @@ struct StreamingAssistantView: View {
                 .replacingOccurrences(of: "Searching: ", with: "")
         }
         switch trace.name {
-        case "web_search": return "Searching the web"
-        case "fetch_url": return "Reading page"
+        case "web_search": return tr("Searching the web")
+        case "fetch_url": return tr("Reading page")
         default: return trace.name.replacingOccurrences(of: "_", with: " ")
         }
     }

@@ -841,6 +841,39 @@ class VllmMetalPagedKVCache:
         self.kv_quant_dequant_calls = 0
         self.kv_quant_dequant_time_s = 0.0
         self.kv_quant_dequant_tokens = 0
+        self.kv_quant_dequant_memo_hits = 0
+        self.kv_quant_dequant_memo_rebuilds = 0
+        self.kv_quant_kernel_calls = 0
+        # Incremental dequant memo: a bf16 mirror of the quantized cache that
+        # is extended tail-only per step. Without it every attention call on
+        # the dequant fallback re-dequantized the whole prefix — O(context)
+        # per token, the q8/q4 decode collapse. q8-only, sized to the offset
+        # (geometric growth, never the paged capacity), and released when a
+        # request latches the q8-kernel route — a persistent capacity-sized
+        # mirror inverted the feature's memory promise (quantized + full
+        # bf16 > plain bf16). q4 keeps no bf16 mirror at all — its kernel
+        # route reads the quantized bank below instead. dict: mirror_k,
+        # mirror_v (flat [rows, heads, dim]), tokens (valid prefix rows).
+        self._dequant_memo: dict[str, Any] | None = None
+        # Head-major QUANTIZED bank for the packed-quant kernel (q4 route):
+        # [1, H_kv, rows, packed] payloads + [1, H_kv, rows, 1] fp32 scales,
+        # the transposed twin of the token-major pages, extended tail-only
+        # per step under the same lifecycle as the dequant memo. It stores
+        # the same integers the pages hold (transpose commutes with the
+        # rowwise quantizer), so at q4 it costs ~0.26x of a bf16 mirror
+        # instead of inverting the memory promise. dict: k, v, ks, vs
+        # ([1, heads, rows, width]), tokens (valid prefix rows).
+        self._quant_bank: dict[str, Any] | None = None
+        self.kv_quant_bank_rebuilds = 0
+        self.kv_quant_bank_extended_tokens = 0
+        # Per-request numerics route for kv_quant attention: None until the
+        # request's first attention call latches "kernel" or "dequant" from
+        # the offset it starts attending at. Deciding once per request keeps
+        # temp-0 outputs on ONE math path — a per-call offset check switched
+        # numerics mid-generation when a request crossed the two-pass
+        # threshold.
+        self._kv_quant_route: str | None = None
+        self._kv_quant_route_offset = -1
         self.dense_fallback_calls = 0
         self.dense_fallback_calls_by_phase: dict[str, int] = {}
         self.paged_attention_bailouts_by_phase_reason: dict[str, int] = {}
@@ -877,17 +910,33 @@ class VllmMetalPagedKVCache:
         )
 
     @property
+    def allocated_blocks(self) -> int | None:
+        """Physical block count of the live pages (None before allocation)."""
+        return None if self.key_cache is None else int(self.key_cache.shape[0])
+
+    @property
     def capacity(self) -> int:
-        return int(self.block_size) * int(self.num_blocks)
+        # Capacity is a fact about the allocated pages, not about the mutable
+        # num_blocks claim — re-configs and snapshot restores stomp the claim
+        # without reallocating, and a lying capacity skips the growth guard
+        # into silent scatter truncation (#310).
+        allocated_blocks = self.allocated_blocks
+        return int(self.block_size) * int(
+            self.num_blocks if allocated_blocks is None else allocated_blocks
+        )
 
     def _grow_to_capacity(self, required_tokens: int) -> bool:
         if not _env_truthy("MTPLX_DYNAMIC_PAGED_KV"):
             return False
+        allocated_blocks = self.allocated_blocks
+        current_blocks = (
+            int(self.num_blocks) if allocated_blocks is None else int(allocated_blocks)
+        )
         required_blocks = (int(required_tokens) + self.block_size - 1) // self.block_size
         grown_blocks = max(
             required_blocks,
-            int((self.num_blocks * 3 + 1) // 2),
-            int(self.num_blocks) + 1,
+            int((current_blocks * 3 + 1) // 2),
+            int(current_blocks) + 1,
         )
         window_tokens = _env_int("MTPLX_CONTEXT_WINDOW_TOKENS", 0)
         if window_tokens > 0:
@@ -898,9 +947,10 @@ class VllmMetalPagedKVCache:
             window_blocks = (int(window_tokens) + self.block_size - 1) // self.block_size
             if window_blocks >= required_blocks:
                 grown_blocks = min(
-                    grown_blocks, max(window_blocks, int(self.num_blocks))
+                    grown_blocks, max(window_blocks, int(current_blocks))
                 )
-        if grown_blocks <= self.num_blocks:
+        if grown_blocks <= current_blocks:
+            self.num_blocks = int(current_blocks)
             return True
         if self.key_cache is None or self.value_cache is None:
             self.num_blocks = int(grown_blocks)
@@ -909,7 +959,7 @@ class VllmMetalPagedKVCache:
 
         import mlx.core as mx
 
-        extra_blocks = int(grown_blocks) - int(self.num_blocks)
+        extra_blocks = int(grown_blocks) - int(current_blocks)
         key_extra = mx.zeros(
             (extra_blocks, *self.key_cache.shape[1:]),
             dtype=self.key_cache.dtype,
@@ -962,6 +1012,14 @@ class VllmMetalPagedKVCache:
                     f"had {self._shape}/{self._dtypes}, got {shape}/{dtypes}"
                 )
             return
+        # Fresh allocation: any surviving dequant mirror or quantized bank
+        # belongs to the previous buffer's contents and must not be served
+        # against the new one (single choke point for every reset ->
+        # reallocate path). The kv_quant numerics route re-latches with the
+        # new contents too.
+        self._invalidate_dequant_memo()
+        self._invalidate_quant_bank()
+        self._reset_kv_quant_route()
         n_kv_heads, k_head_dim, v_head_dim = shape
         # Defense-in-depth: if a TurboQuant cache reaches first allocation but
         # the external vllm-metal ops can't load, gracefully degrade to the
@@ -1049,8 +1107,11 @@ class VllmMetalPagedKVCache:
                 dtype=cache_dtype,
             )
             scale_shape = (self.num_blocks, self.block_size, n_kv_heads, 1)
-            self.key_scale_cache = mx.zeros(scale_shape, dtype=mx.float16)
-            self.value_scale_cache = mx.zeros(scale_shape, dtype=mx.float16)
+            # fp32 scales: quantize_symmetric computes them in fp32 and every
+            # consumer multiplies in fp32; storing fp16 only added rounding
+            # error (see kv_quant.quantize_symmetric).
+            self.key_scale_cache = mx.zeros(scale_shape, dtype=mx.float32)
+            self.value_scale_cache = mx.zeros(scale_shape, dtype=mx.float32)
             self.key_zero_cache = None
             mx.eval(
                 self.key_cache,
@@ -1197,9 +1258,20 @@ class VllmMetalPagedKVCache:
             self.value_cache = flat_v.reshape(self.value_cache.shape)
         self.offset += steps
         self.update_calls += 1
+        if self.kv_quant:
+            phase = current_attention_phase()
+            if phase == "prefill" or (phase == "unknown" and steps > 1):
+                # A new prompt is being written: the per-request numerics
+                # route re-latches at this request's first attention call.
+                # Decode/verify appends (single-token steps, decode phases)
+                # stay inside the current request's latched route.
+                self._reset_kv_quant_route()
         self.cache_write_time_s += time.perf_counter() - started
 
     def _load_contiguous_state(self, keys: Any, values: Any, offset: int) -> None:
+        self._invalidate_dequant_memo()
+        self._invalidate_quant_bank()
+        self._reset_kv_quant_route()
         self.key_cache = None
         self.value_cache = None
         self.key_scale_cache = None
@@ -1229,6 +1301,198 @@ class VllmMetalPagedKVCache:
             return 0
         gqa_factor = max(1, query_heads // kv_heads)
         return max(1, 1024 // max(1, 32 * gqa_factor))
+
+    @staticmethod
+    def _kv_quant_kernel_enabled() -> bool:
+        """Master kill-switch for the inline-dequant kv_quant kernels (default on).
+
+        MTPLX_KV_QUANT_2PASS_KERNEL=0 restores the dequant-fallback dispatch
+        for one release in case a field regression needs the old path. Gates
+        both the q8 paged two-pass route and the q4 packed-quant route.
+        """
+        raw = os.environ.get("MTPLX_KV_QUANT_2PASS_KERNEL")
+        if raw is None or not raw.strip():
+            return True
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _kv_quant_q4_kernel_enabled() -> bool:
+        """Kill-switch for the q4 packed-quant kernel route (default on).
+
+        MTPLX_KV_QUANT_Q4_KERNEL=0 restores the chunked-dequant dispatch for
+        one release in case a field regression needs the old q4 path. The
+        master MTPLX_KV_QUANT_2PASS_KERNEL switch gates this route too.
+        """
+        raw = os.environ.get("MTPLX_KV_QUANT_Q4_KERNEL")
+        if raw is None or not raw.strip():
+            return True
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    def _packed_quant_safe_q_len(self, *, query_heads: int) -> int:
+        """Max q_len the packed-quant kernel accepts for this cache's geometry.
+
+        Zero means the geometry can never route (the packed-quant kernel's
+        own gates, mirrored host-side so the route latch never picks a lane
+        that bails every call): equal K/V head dims in {64, 128, 256}, GQA
+        factor dividing evenly with a legal 32-wide threadgroup. The kernel
+        itself caps QL at 8 (two float4 query banks).
+        """
+        if self._shape is None:
+            return 0
+        kv_heads, k_dim, v_dim = (int(x) for x in self._shape)
+        if k_dim != v_dim or k_dim not in (64, 128, 256):
+            return 0
+        query_heads = int(query_heads)
+        if kv_heads <= 0 or query_heads <= 0 or query_heads % kv_heads:
+            return 0
+        if 32 * (query_heads // kv_heads) > 1024:
+            return 0
+        return 8
+
+    def _reset_kv_quant_route(self) -> None:
+        self._kv_quant_route = None
+        self._kv_quant_route_offset = -1
+
+    def _kv_quant_route_decision(self, queries: Any, *, sliding_window: int) -> str:
+        """Choose this request's kv_quant numerics path, once.
+
+        Latched at the request's first attention call and held until a new
+        prompt write or a buffer reload resets it: a request must not hop
+        between kernel math and dequant math because its offset crossed the
+        two-pass threshold mid-generation (temp-0 exactness — one request,
+        one math path). trim() deliberately does NOT reset the route:
+        speculative-verify rejections retract rows mid-request, and
+        re-latching there would reintroduce the switch at the threshold
+        boundary. Structural no-gos (kill-switches, sliding window, GQA
+        shapes the kernels refuse) latch "dequant"; otherwise the starting
+        offset decides: below the threshold the memoized dequant path is
+        cheap and the kernel has no KV-bandwidth advantage to harvest.
+        q8 routes to the paged two-pass q8 kernel; q4 routes to the
+        packed-quant bank kernel (kernels/sdpa_gqa_packed_quant).
+        """
+        if (
+            not self.kv_quant
+            or self.turboquant
+            or not self._kv_quant_kernel_enabled()
+            or int(sliding_window) > 0
+            or self.key_cache is None
+        ):
+            return "dequant"
+        bits = int(self.kv_quant_config.bits)
+        if bits == 8:
+            if (
+                self._safe_2pass_paged_q_len(
+                    query_heads=int(queries.shape[1]),
+                    kv_heads=int(self.key_cache.shape[2]),
+                )
+                < 1
+            ):
+                return "dequant"
+        elif bits == 4:
+            if not self._kv_quant_q4_kernel_enabled():
+                return "dequant"
+            if self._packed_quant_safe_q_len(query_heads=int(queries.shape[1])) < 1:
+                return "dequant"
+        else:
+            return "dequant"
+        two_pass_threshold = int(
+            os.environ.get(
+                "MTPLX_VLLM_METAL_PAGED_ATTN_2PASS_THRESHOLD",
+                "1024",
+            )
+            or "1024"
+        )
+        return "kernel" if int(self.offset) >= two_pass_threshold else "dequant"
+
+    def _kv_quant_2pass_attention(
+        self,
+        queries: Any,
+        *,
+        scale: float,
+        mask: Any | None,
+        sliding_window: int,
+        q_len: int,
+    ) -> Any | None:
+        """Decode/verify attention reading quantized pages directly (no dequant).
+
+        This is the lane that makes kv_quant an actual memory feature during
+        decode: no bf16 materialization at all. q8 dispatches the paged
+        two-pass q8 kernel over the token-major pages; q4 dispatches the
+        packed-quant GQA kernel (kernels/sdpa_gqa_packed_quant) over the
+        persistent head-major quant bank — the lane that kills the
+        full-prefix-dequant-every-round halving. Only requests routed
+        "kernel" (see _kv_quant_route_decision — the offset-vs-threshold
+        call happens once per request, not per call) dispatch here;
+        per-call eligibility mirrors each kernel's contract (causal,
+        batch 1, no window, q_len within the threadgroup budget); anything
+        else falls back for that call. The kernels' closed-lane verdicts
+        (~0.8x June, 0.61-0.78x v5) were measured against the DENSE kernel
+        on unquantized caches — irrelevant here, where the alternative is
+        the dequant fallback.
+        """
+        if (
+            not self.kv_quant
+            or self.turboquant
+            or not self._kv_quant_kernel_enabled()
+        ):
+            return None
+        if mask is not None and not (isinstance(mask, str) and mask == "causal"):
+            return None
+        if int(sliding_window) > 0:
+            return None
+        if (
+            self.key_cache is None
+            or self.value_cache is None
+            or self.key_scale_cache is None
+            or self.value_scale_cache is None
+        ):
+            return None
+        bits = int(self.kv_quant_config.bits)
+        if bits == 4:
+            if not self._kv_quant_q4_kernel_enabled():
+                return None
+            safe_q = self._packed_quant_safe_q_len(
+                query_heads=int(queries.shape[1])
+            )
+            if safe_q < 1 or q_len > safe_q:
+                # Bail BEFORE touching the bank: prefill-width bursts must
+                # not build (or extend) the bank they cannot consume.
+                return None
+            from .kernels.sdpa_gqa_packed_quant import sdpa_gqa_packed_tail_quant
+
+            bank_k, bank_v, bank_ks, bank_vs = self._quant_bank_arrays()
+            return sdpa_gqa_packed_tail_quant(
+                queries=queries,
+                k_q=bank_k,
+                k_scale=bank_ks,
+                v_q=bank_v,
+                v_scale=bank_vs,
+                offset=int(self.offset),
+                scale=float(scale),
+                bits=4,
+                max_q_len=safe_q,
+            )
+        if bits != 8:
+            return None
+        safe_q = self._safe_2pass_paged_q_len(
+            query_heads=int(queries.shape[1]),
+            kv_heads=int(self.key_cache.shape[2]),
+        )
+        if q_len > safe_q:
+            return None
+        from .kernels.sdpa_2pass_paged_q8 import sdpa_2pass_paged_q8_tail
+
+        return sdpa_2pass_paged_q8_tail(
+            queries=queries,
+            key_q=self.key_cache,
+            key_scales=self.key_scale_cache[..., 0],
+            value_q=self.value_cache,
+            value_scales=self.value_scale_cache[..., 0],
+            offset=int(self.offset),
+            block_size=int(self.block_size),
+            scale=float(scale),
+            max_q_len=safe_q,
+        )
 
     def _long_context_dense_fallback_forbidden(self) -> bool:
         if _env_truthy("MTPLX_ALLOW_LONG_CONTEXT_DENSE_FALLBACK"):
@@ -1343,7 +1607,8 @@ class VllmMetalPagedKVCache:
             int(self.dense_fallback_calls_by_phase.get(phase, 0)) + 1
         )
 
-    def _paged_range(self, start: int, end: int) -> tuple[Any, Any]:
+    def _paged_range_flat(self, start: int, end: int) -> tuple[Any, Any]:
+        """Rows [start:end) as flat [tokens, heads, dim], dequantized."""
         if self.key_cache is None or self.value_cache is None:
             raise RuntimeError("paged KV cache is not allocated")
         start = max(0, int(start))
@@ -1393,7 +1658,167 @@ class VllmMetalPagedKVCache:
                 bits=bits,
                 head_dim=int(self._shape[2]),
             ).astype(self._dtypes[1])
+        return flat_k, flat_v
+
+    def _paged_range(self, start: int, end: int) -> tuple[Any, Any]:
+        flat_k, flat_v = self._paged_range_flat(start, end)
         return flat_k.transpose(1, 0, 2)[None, ...], flat_v.transpose(1, 0, 2)[None, ...]
+
+    def _invalidate_dequant_memo(self) -> None:
+        self._dequant_memo = None
+
+    def _invalidate_quant_bank(self) -> None:
+        self._quant_bank = None
+
+    def _quant_bank_arrays(self) -> tuple[Any, Any, Any, Any]:
+        """Head-major quantized banks for the packed-quant kernel, tail-extended.
+
+        The packed-quant kernel (kernels/sdpa_gqa_packed_quant) walks
+        [1, H_kv, capacity, packed] payloads with one fp32 scale per row —
+        a transposed twin of the token-major pages holding the SAME
+        integers (the rowwise quantizer commutes with the transpose).
+        Rebuilding that layout per call would be the O(context)-per-round
+        disease again, so the bank persists and extends tail-only per step
+        under the dequant memo's exact lifecycle: sized to the offset
+        (geometric growth clamped to the paged capacity), trim() truncates
+        its valid-token count, every buffer reallocation drops it via
+        _invalidate_quant_bank, and growing the quantized store keeps it
+        (flat row indices are append-stable). Returns the WHOLE allocated
+        bank buffers (k, v, ks, vs) — the kernel's whole-buffer contract —
+        with valid rows [0, offset).
+        """
+        import mlx.core as mx
+
+        offset = int(self.offset)
+        if (
+            self.key_cache is None
+            or self.value_cache is None
+            or self.key_scale_cache is None
+            or self.value_scale_cache is None
+        ):
+            raise RuntimeError("paged KV quantization cache is incomplete")
+        heads = int(self.key_cache.shape[2])
+        bank = self._quant_bank
+        if bank is None:
+            bank = {"tokens": 0, "k": None, "v": None, "ks": None, "vs": None}
+            self._quant_bank = bank
+            self.kv_quant_bank_rebuilds += 1
+        if int(bank["tokens"]) > offset:
+            # The offset moved backwards without trim() (meta_state rewind):
+            # the bank prefix below the new offset still mirrors unchanged
+            # page rows; anything above re-extends when the offset
+            # re-advances over rewrites.
+            bank["tokens"] = offset
+        valid = int(bank["tokens"])
+        bank_k = bank["k"]
+        bank_rows = 0 if bank_k is None else int(bank_k.shape[2])
+        if offset > bank_rows:
+            capacity_rows = int(self.key_cache.shape[0]) * int(
+                self.key_cache.shape[1]
+            )
+            grown_rows = min(
+                capacity_rows,
+                max(offset, (bank_rows * 3) // 2, int(self.block_size)),
+            )
+            for name, source in (
+                ("k", self.key_cache),
+                ("v", self.value_cache),
+                ("ks", self.key_scale_cache),
+                ("vs", self.value_scale_cache),
+            ):
+                dtype = mx.float32 if name in ("ks", "vs") else source.dtype
+                grown = mx.zeros(
+                    (1, heads, grown_rows, int(source.shape[3])), dtype=dtype
+                )
+                if valid > 0:
+                    grown[:, :, :valid, :] = bank[name][:, :, :valid, :]
+                bank[name] = grown
+        if valid < offset:
+            for name, source in (
+                ("k", self.key_cache),
+                ("v", self.value_cache),
+                ("ks", self.key_scale_cache),
+                ("vs", self.value_scale_cache),
+            ):
+                tail = source.reshape(-1, heads, int(source.shape[3]))[
+                    valid:offset
+                ].transpose(1, 0, 2)[None, ...]
+                if name in ("ks", "vs"):
+                    tail = tail.astype(mx.float32)
+                bank[name][:, :, valid:offset, :] = tail
+            bank["tokens"] = offset
+            self.kv_quant_bank_extended_tokens += offset - valid
+        return bank["k"], bank["v"], bank["ks"], bank["vs"]
+
+    def _dequant_active_arrays(self) -> tuple[Any, Any]:
+        """Full active K/V for kv_quant, dequantizing only the unseen tail.
+
+        The bf16 mirror is a q8-only working set sized to the offset
+        (geometric growth clamped to the paged capacity — never allocated
+        AT capacity: a capacity-sized mirror inverted the feature's memory
+        promise). It extends tail-only per step; trim() truncates its
+        valid-token count (retracted rows are rewritten through _write_tail
+        and re-dequantized); every buffer reallocation path drops it via
+        _invalidate_dequant_memo; and the kernel route-latch drops it once
+        per request. Growing the quantized store keeps it: flat row indices
+        are append-stable. q4 never uses this bf16 mirror — a persistent
+        bf16 copy on top of the quantized store would defeat the point of
+        q4. Its kernel route reads the head-major quant bank
+        (_quant_bank_arrays) instead, and its dequant fallbacks materialize
+        transiently.
+        """
+        import mlx.core as mx
+
+        offset = int(self.offset)
+        if int(self.kv_quant_config.bits) != 8:
+            self.kv_quant_dequant_tokens += offset
+            return self._paged_range(0, offset)
+        if self._shape is None or self._dtypes is None:
+            raise RuntimeError("paged KV quantization cache is incomplete")
+        memo = self._dequant_memo
+        if memo is None:
+            memo = {"tokens": 0, "mirror_k": None, "mirror_v": None}
+            self._dequant_memo = memo
+            self.kv_quant_dequant_memo_rebuilds += 1
+        if int(memo["tokens"]) > offset:
+            # The offset moved backwards without trim() (meta_state rewind):
+            # the mirror prefix below the new offset is still the dequant of
+            # unchanged rows; anything above re-dequantizes when the offset
+            # re-advances over rewrites.
+            memo["tokens"] = offset
+        valid = int(memo["tokens"])
+        mirror_k = memo["mirror_k"]
+        mirror_rows = 0 if mirror_k is None else int(mirror_k.shape[0])
+        if offset > mirror_rows:
+            capacity_rows = int(self.key_cache.shape[0]) * int(self.key_cache.shape[1])
+            grown_rows = min(
+                capacity_rows,
+                max(offset, (mirror_rows * 3) // 2, int(self.block_size)),
+            )
+            grown_k = mx.zeros(
+                (grown_rows, int(self.key_cache.shape[2]), int(self._shape[1])),
+                dtype=self._dtypes[0],
+            )
+            grown_v = mx.zeros(
+                (grown_rows, int(self.value_cache.shape[2]), int(self._shape[2])),
+                dtype=self._dtypes[1],
+            )
+            if valid > 0:
+                grown_k[:valid] = memo["mirror_k"][:valid]
+                grown_v[:valid] = memo["mirror_v"][:valid]
+            memo["mirror_k"] = grown_k
+            memo["mirror_v"] = grown_v
+        if valid < offset:
+            tail_k, tail_v = self._paged_range_flat(valid, offset)
+            memo["mirror_k"][valid:offset] = tail_k
+            memo["mirror_v"][valid:offset] = tail_v
+            memo["tokens"] = offset
+            self.kv_quant_dequant_tokens += offset - valid
+        else:
+            self.kv_quant_dequant_memo_hits += 1
+        keys = memo["mirror_k"][:offset].transpose(1, 0, 2)[None, ...]
+        values = memo["mirror_v"][:offset].transpose(1, 0, 2)[None, ...]
+        return keys, values
 
     def _large_q_split_sdpa_fallback(
         self,
@@ -1414,7 +1839,7 @@ class VllmMetalPagedKVCache:
                 sliding_window=int(sliding_window),
             )
             return None
-        if mask is not None and mask != "causal":
+        if mask is not None and not (isinstance(mask, str) and mask == "causal"):
             self._record_paged_bailout(
                 "unsupported_mask",
                 impl="large_q_split_sdpa",
@@ -1508,7 +1933,11 @@ class VllmMetalPagedKVCache:
                     ) * float(scale)
                 else:
                     scores = mx.matmul(q, k.transpose(0, 1, 3, 2)) * float(scale)
-                if mask == "causal":
+                # The native paged kernels are causal when no explicit mask is
+                # supplied. Preserve that contract in the in-tree fallback;
+                # treating ``None`` as unmasked would let a multi-token query
+                # read later keys from the same update.
+                if mask is None or mask == "causal":
                     key_positions = mx.arange(k_start, k_end)
                     allowed = q_positions[:, None] >= key_positions[None, :]
                     valid = mx.any(allowed, axis=-1, keepdims=True)
@@ -1583,10 +2012,9 @@ class VllmMetalPagedKVCache:
                 return None, None
             if self.kv_quant:
                 dequant_started = time.perf_counter()
-                keys, values = self._paged_range(0, int(self.offset))
+                keys, values = self._dequant_active_arrays()
                 self.kv_quant_dequant_calls += 1
                 self.kv_quant_dequant_time_s += time.perf_counter() - dequant_started
-                self.kv_quant_dequant_tokens += int(self.offset)
                 return keys, values
             flat_k = self.key_cache.reshape(
                 -1,
@@ -1672,9 +2100,22 @@ class VllmMetalPagedKVCache:
     def meta_state(self, value) -> None:
         if not value:
             return
-        self.block_size = int(value[0])
-        self.num_blocks = int(value[1])
-        self.offset = int(value[2])
+        if self.key_cache is None:
+            self.block_size = int(value[0])
+            self.num_blocks = int(value[1])
+            self.offset = int(value[2])
+            return
+        # `state` already rebuilt these pages; the snapshot's block count
+        # describes a buffer that no longer exists (#310). The live pages own
+        # the geometry — only the offset is restored, and it must fit them.
+        self.num_blocks = int(self.key_cache.shape[0])
+        offset = int(value[2])
+        if offset > self.capacity:
+            raise ValueError(
+                "restored paged KV offset exceeds page capacity: "
+                f"{offset} > {self.capacity}"
+            )
+        self.offset = offset
 
     def is_trimmable(self) -> bool:
         return True
@@ -1682,6 +2123,23 @@ class VllmMetalPagedKVCache:
     def trim(self, n: int) -> int:
         n = min(int(self.offset), int(n))
         self.offset -= n
+        if self._dequant_memo is not None:
+            # Retracted rows are rewritten via _write_tail before reuse; the
+            # mirror prefix below the new offset is still exact.
+            self._dequant_memo["tokens"] = min(
+                int(self._dequant_memo["tokens"]), int(self.offset)
+            )
+        if self._quant_bank is not None:
+            # Same append-stable argument as the memo: the bank prefix below
+            # the new offset still mirrors unchanged page rows exactly.
+            self._quant_bank["tokens"] = min(
+                int(self._quant_bank["tokens"]), int(self.offset)
+            )
+        # The kv_quant numerics route deliberately survives trim():
+        # speculative-verify rejections retract rows mid-request, and
+        # re-latching here would switch math when a rejection lands the
+        # offset back across the two-pass threshold. The next prompt write
+        # is the request boundary that re-latches.
         return n
 
     def make_mask(self, *args, **kwargs):
@@ -1704,6 +2162,16 @@ class VllmMetalPagedKVCache:
         ):
             if extra is not None:
                 total += int(extra.nbytes)
+        memo = self._dequant_memo
+        if memo is not None and memo.get("mirror_k") is not None:
+            # The live dequant mirror is real memory; hiding it from the
+            # bytes stat is how the kv-quant memory inversion went unnoticed.
+            total += int(memo["mirror_k"].nbytes) + int(memo["mirror_v"].nbytes)
+        bank = self._quant_bank
+        if bank is not None and bank.get("k") is not None:
+            # Same honesty rule for the head-major quant bank (q4 route).
+            for name in ("k", "v", "ks", "vs"):
+                total += int(bank[name].nbytes)
         return total
 
     def _effective_sliding_window(self, requested: int) -> int:
@@ -1956,6 +2424,11 @@ class VllmMetalPagedKVCache:
                 mask=mask,
             )
             self.paged_attention_calls += 1
+            if self.kv_quant:
+                # This branch serves kv_quant traffic through the dequant
+                # gather; without the increment the dashboard undercounted
+                # quantized attention calls on exactly this hot path.
+                self.kv_quant_attention_calls += 1
             self.attention_time_s += time.perf_counter() - started
             return out
         if not self.turboquant and not self.kv_quant and impl in {"sdpa_2pass_paged", "mlx_vector_paged"}:
@@ -2057,6 +2530,55 @@ class VllmMetalPagedKVCache:
                 return out
             return bailout("kernel_unavailable")
         if self.kv_quant:
+            if self._kv_quant_route is None:
+                self._kv_quant_route = self._kv_quant_route_decision(
+                    queries, sliding_window=int(sliding_window)
+                )
+                self._kv_quant_route_offset = int(self.offset)
+                if self._kv_quant_route == "kernel":
+                    # The kernel owns this request's decode: any prefill-era
+                    # bf16 mirror is dead weight, released exactly once,
+                    # here at latch. A later shape-driven dequant call (a
+                    # verify burst past the kernel's q budget, an exotic
+                    # mask) may rebuild it and keep it tail-extended —
+                    # kernel calls never re-release, which would thrash
+                    # full-prefix rebuild stalls.
+                    self._invalidate_dequant_memo()
+            if self._kv_quant_route == "kernel":
+                kernel_out = self._kv_quant_2pass_attention(
+                    queries,
+                    scale=scale,
+                    mask=mask,
+                    sliding_window=int(sliding_window),
+                    q_len=q_len,
+                )
+                if kernel_out is not None:
+                    self.paged_attention_calls += 1
+                    self.kv_quant_attention_calls += 1
+                    self.kv_quant_kernel_calls += 1
+                    self.attention_time_s += time.perf_counter() - started
+                    return kernel_out
+            if int(self.kv_quant_config.bits) != 8:
+                # q4 keeps no bf16 mirror, so the full-width fallback below
+                # would re-materialize offset-sized K/V on every step. The
+                # chunked online-softmax path dequantizes in bounded
+                # windows and is the lane that keeps q4 an actual memory
+                # feature — including for kernel-routed calls the
+                # packed-quant kernel declined (prefill-width bursts,
+                # q_len past the two-bank budget); the rare shapes it
+                # declines itself (non-causal array masks, ragged GQA)
+                # fall through to the transient full-width path.
+                split_out = self._large_q_split_sdpa_fallback(
+                    queries,
+                    scale=scale,
+                    sliding_window=int(sliding_window),
+                    mask=mask,
+                )
+                if split_out is not None:
+                    self.paged_attention_calls += 1
+                    self.kv_quant_attention_calls += 1
+                    self.attention_time_s += time.perf_counter() - started
+                    return split_out
             from mlx_lm.models.base import scaled_dot_product_attention
 
             gqa_decision = _paged_gqa_sdpa_route_decision_from_env(
@@ -2242,6 +2764,17 @@ class VllmMetalPagedKVCache:
             "kv_quant_dequant_calls": int(self.kv_quant_dequant_calls),
             "kv_quant_dequant_time_s": float(self.kv_quant_dequant_time_s),
             "kv_quant_dequant_tokens": int(self.kv_quant_dequant_tokens),
+            "kv_quant_dequant_memo_hits": int(self.kv_quant_dequant_memo_hits),
+            "kv_quant_dequant_memo_rebuilds": int(
+                self.kv_quant_dequant_memo_rebuilds
+            ),
+            "kv_quant_kernel_calls": int(self.kv_quant_kernel_calls),
+            "kv_quant_bank_rebuilds": int(self.kv_quant_bank_rebuilds),
+            "kv_quant_bank_extended_tokens": int(
+                self.kv_quant_bank_extended_tokens
+            ),
+            "kv_quant_route": str(self._kv_quant_route or ""),
+            "kv_quant_route_offset": int(self._kv_quant_route_offset),
             "dense_fallback_calls": int(self.dense_fallback_calls),
             "prefill_dense_fallback_calls": int(
                 self.dense_fallback_calls_by_phase.get("prefill", 0)
@@ -2447,10 +2980,29 @@ class TensorOffsetVllmMetalPagedKVCache:
         impl_override: str | None = None,
     ):
         del impl_override
+        import mlx.core as mx
+
         if int(sliding_window) > 0:
             return None
         if int(queries.shape[0]) != 1:
             return None
+        if (
+            _env_truthy("MTPLX_PAGED_TAILMASK_ELIDE")
+            and isinstance(mask, mx.array)
+            and mask.dtype == mx.bool_
+            and int(mask.shape[-2]) == int(queries.shape[2])
+            and int(mask.shape[-1]) == int(self.capacity)
+        ):
+            # The capacity-wide tail-causal bool mask this class's make_mask
+            # emits (row j sees keys <= offset+j) is exactly the dynamic-
+            # offset kernel's built-in visibility — the same equivalence the
+            # packed route documents for the identical mask object. The
+            # kernel refuses array masks outright (its mask gate is the
+            # 147.4k decline, receipts 2026-08-26 12:58), so elide it.
+            # Equivalence is pinned numerically by
+            # tests/test_paged_tailmask_elide.py; opt-in until a serve
+            # trajectory-sha gate runs on a bench window.
+            mask = None
         static_max_offset = self._static_attention_max_offset()
         started = time.perf_counter()
         from .kernels.sdpa_2pass_paged import sdpa_2pass_paged_tail_dynamic_offset
@@ -2619,6 +3171,332 @@ class TensorOffsetVllmMetalPagedKVCache:
         }
 
 
+class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
+    """GraphBank-safe QUANTIZED paged KV cache with an array-backed offset.
+
+    The compiled verify bank refused ``--kv-quant`` pages outright
+    ("quantized_paged_kv"), so every verify round under kv-quant ran eager
+    (~380 ms vs ~137 ms banked at long context, receipts 2026-08-25). This
+    adapter makes quantized state promotable: the compiled leaves are the
+    HEAD-MAJOR quantized banks the packed-quant kernel
+    (kernels/sdpa_gqa_packed_quant) walks —
+
+        cache = [key_bank   (1, H_kv, capacity, packed)  int8/uint8,
+                 value_bank (1, H_kv, capacity, packed)  int8/uint8,
+                 offset     ()                           int32 array,
+                 key_scales   (1, H_kv, capacity, 1)     fp32,
+                 value_scales (1, H_kv, capacity, 1)     fp32]
+
+    — one fp32 rowwise-symmetric scale per (token, head) row, exactly the
+    layout kv_quant.quantize_symmetric produces on head-major inputs (the
+    quantizer commutes with the pages<->banks transpose, so promotion
+    carries the SAME integers the eager pages hold). ``offset`` stays at
+    ``cache[2]``: bucket resolution and every positional offset reader keep
+    working unchanged. Shapes and dtypes of all five leaves are fixed at
+    promotion, which is the whole point of the bank — the compiled verify
+    graph sees stable tensors across calls; in-graph writes quantize the
+    incoming bf16 window with pure mx ops (trace-safe) and slice_update the
+    banks at the traced offset.
+
+    Promotion (``from_paged_cache``) transposes pages -> banks once per
+    request; ``demote``/``to_paged_cache`` transposes back once at the end
+    of the generation — quantized bytes both ways, milliseconds at 128k.
+    """
+
+    def __init__(
+        self,
+        *,
+        key_cache: Any,
+        value_cache: Any,
+        offset: int | Any,
+        key_scale_cache: Any,
+        value_scale_cache: Any,
+        block_size: int,
+        num_blocks: int,
+        kv_quant_config: Any,
+        source_dtypes: tuple[Any, Any],
+        head_dims: tuple[int, int],
+    ) -> None:
+        super().__init__(
+            key_cache=key_cache,
+            value_cache=value_cache,
+            offset=offset,
+            block_size=block_size,
+            num_blocks=num_blocks,
+        )
+        self.cache.extend([key_scale_cache, value_scale_cache])
+        self.rollback_state = [None, None, None, None, None]
+        self.kv_quant_config = kv_quant_config
+        self.source_dtypes = tuple(source_dtypes)
+        self.head_dims = (int(head_dims[0]), int(head_dims[1]))
+
+    @property
+    def kv_bits(self) -> int:
+        return int(self.kv_quant_config.bits)
+
+    @property
+    def key_scale_cache(self):
+        return self.cache[3]
+
+    @key_scale_cache.setter
+    def key_scale_cache(self, value) -> None:
+        self.cache[3] = value
+
+    @property
+    def value_scale_cache(self):
+        return self.cache[4]
+
+    @value_scale_cache.setter
+    def value_scale_cache(self, value) -> None:
+        self.cache[4] = value
+
+    @classmethod
+    def promotable(cls, entry: Any) -> bool:
+        """True when the eager cache's quantized state fits this adapter.
+
+        Mirrors the packed-quant kernel's structural gates that are knowable
+        from the cache alone (equal K/V head dims in {64, 128, 256}, bits in
+        {4, 8}, live scale planes). GQA legality depends on the query heads
+        and stays a per-call kernel gate. Fail-closed: anything else keeps
+        the eager refusal.
+        """
+        if not getattr(entry, "kv_quant", False) or getattr(entry, "turboquant", False):
+            return False
+        config = getattr(entry, "kv_quant_config", None)
+        if config is None or int(config.bits) not in (4, 8):
+            return False
+        if (
+            entry.key_cache is None
+            or entry.value_cache is None
+            or entry.key_scale_cache is None
+            or entry.value_scale_cache is None
+        ):
+            return False
+        shape = getattr(entry, "_shape", None)
+        dtypes = getattr(entry, "_dtypes", None)
+        if shape is None or dtypes is None:
+            return False
+        k_dim, v_dim = int(shape[1]), int(shape[2])
+        return k_dim == v_dim and k_dim in (64, 128, 256)
+
+    @classmethod
+    def from_paged_cache(
+        cls, entry: VllmMetalPagedKVCache
+    ) -> "TensorOffsetQuantizedPagedKVCache":
+        import mlx.core as mx
+
+        if not cls.promotable(entry):
+            raise ValueError(
+                "paged cache is not promotable to the quantized adapter"
+            )
+        heads = int(entry.key_cache.shape[2])
+
+        def head_major(pages: Any, *, dtype: Any | None = None) -> Any:
+            flat = pages.reshape(-1, heads, int(pages.shape[3]))
+            bank = mx.contiguous(flat.transpose(1, 0, 2))[None, ...]
+            return bank if dtype is None else bank.astype(dtype)
+
+        return cls(
+            key_cache=head_major(entry.key_cache),
+            value_cache=head_major(entry.value_cache),
+            offset=int(entry.offset),
+            key_scale_cache=head_major(entry.key_scale_cache, dtype=mx.float32),
+            value_scale_cache=head_major(entry.value_scale_cache, dtype=mx.float32),
+            block_size=int(entry.block_size),
+            # Geometry from the LIVE pages, never the mutable claim (#310).
+            num_blocks=int(entry.key_cache.shape[0]),
+            kv_quant_config=entry.kv_quant_config,
+            source_dtypes=tuple(entry._dtypes),
+            head_dims=(int(entry._shape[1]), int(entry._shape[2])),
+        )
+
+    def update_without_fetch(self, keys: Any, values: Any) -> None:
+        import mlx.core as mx
+
+        from .kv_quant import quantize_symmetric
+
+        steps = int(keys.shape[2])
+        started = time.perf_counter()
+        bits = self.kv_bits
+        # Head-major incoming (1, H, steps, D): quantizing here yields the
+        # same integers/scales the eager pages would hold for these rows
+        # (rowwise quantizer, transpose-commutative) — one math for the
+        # whole feature, no layout shuffle on the write path.
+        q_k, s_k = quantize_symmetric(keys, bits=bits)
+        q_v, s_v = quantize_symmetric(values, bits=bits)
+        offset = self.cache[2]
+        self.rollback_state[0] = offset
+        for slot, (buf_idx, update) in enumerate(
+            ((0, q_k), (1, q_v), (3, s_k), (4, s_v)), start=1
+        ):
+            self.rollback_state[slot] = mx.slice(
+                self.cache[buf_idx],
+                offset,
+                axes=(2,),
+                slice_size=update.shape,
+            )
+            self.cache[buf_idx] = mx.slice_update(
+                self.cache[buf_idx], update, offset, axes=(2,)
+            )
+        self.cache[2] = offset + steps
+        self.update_calls += 1
+        self.cache_write_time_s += time.perf_counter() - started
+
+    def paged_attention(
+        self,
+        queries: Any,
+        *,
+        scale: float,
+        sliding_window: int = -1,
+        mask: Any | None = None,
+        impl_override: str | None = None,
+    ):
+        del impl_override
+        if int(sliding_window) > 0:
+            return None
+        if mask is not None and not (isinstance(mask, str) and mask == "causal"):
+            return None
+        if int(queries.shape[0]) != 1:
+            return None
+        static_max_offset = self._static_attention_max_offset()
+        started = time.perf_counter()
+        from .kernels.sdpa_gqa_packed_quant import sdpa_gqa_packed_tail_quant
+
+        out = sdpa_gqa_packed_tail_quant(
+            queries=queries,
+            k_q=self.cache[0],
+            k_scale=self.cache[3],
+            v_q=self.cache[1],
+            v_scale=self.cache[4],
+            offset=self.cache[2],
+            scale=float(scale),
+            bits=self.kv_bits,
+            max_q_len=8,
+            max_offset=static_max_offset,
+        )
+        if out is not None:
+            self.paged_attention_calls += 1
+            self.attention_time_s += time.perf_counter() - started
+        return out
+
+    @property
+    def state(self):
+        from .kv_quant import dequantize_symmetric
+
+        keys = dequantize_symmetric(
+            self.cache[0],
+            self.cache[3],
+            bits=self.kv_bits,
+            head_dim=self.head_dims[0],
+        ).astype(self.source_dtypes[0])
+        values = dequantize_symmetric(
+            self.cache[1],
+            self.cache[4],
+            bits=self.kv_bits,
+            head_dim=self.head_dims[1],
+        ).astype(self.source_dtypes[1])
+        return keys, values
+
+    @state.setter
+    def state(self, value) -> None:
+        keys, values = value
+        if keys is None or values is None:
+            for slot in range(len(self.cache)):
+                if slot != 2:
+                    self.cache[slot] = None
+            self.offset = 0
+            return
+        paged = VllmMetalPagedKVCache(
+            block_size=int(self.block_size),
+            num_blocks=int(self.num_blocks),
+            kv_quant_config=self.kv_quant_config,
+        )
+        paged.update_without_fetch(keys, values)
+        promoted = type(self).from_paged_cache(paged)
+        self.cache = promoted.cache
+        self.rollback_state = [None, None, None, None, None]
+        self.num_blocks = int(promoted.num_blocks)
+        self.source_dtypes = promoted.source_dtypes
+        self.head_dims = promoted.head_dims
+
+    def trim(self, n: int) -> int:
+        import mlx.core as mx
+
+        n = int(n)
+        rollback = self.rollback_state
+        if (
+            all(rollback[slot] is not None for slot in range(5))
+            and int(rollback[1].shape[2]) == n
+        ):
+            for slot, buf_idx in ((1, 0), (2, 1), (3, 3), (4, 4)):
+                self.cache[buf_idx] = mx.slice_update(
+                    self.cache[buf_idx],
+                    rollback[slot],
+                    rollback[0],
+                    axes=(2,),
+                )
+            self.cache[2] = rollback[0]
+        else:
+            self.cache[2] = mx.maximum(
+                self.cache[2] - n,
+                mx.array(0, dtype=self.cache[2].dtype),
+            )
+        return n
+
+    def to_paged_cache(self) -> "VllmMetalPagedKVCache":
+        """Restore a stock quantized ``VllmMetalPagedKVCache`` (banks -> pages).
+
+        One transposed copy of the quantized payloads + scales — the inverse
+        of ``from_paged_cache`` and byte-exact with it (integer payloads,
+        fp32 scales). Shape/dtype metadata is rebuilt so the next
+        ``update_without_fetch`` appends in place instead of re-allocating,
+        and the restored cache re-latches its own numerics route.
+        """
+        import mlx.core as mx
+
+        paged = VllmMetalPagedKVCache(
+            block_size=int(self.block_size),
+            num_blocks=int(self.num_blocks),
+            kv_quant_config=self.kv_quant_config,
+        )
+        if self.cache[0] is None or self.cache[1] is None:
+            return paged
+        heads = int(self.cache[0].shape[1])
+
+        def pages(bank: Any) -> Any:
+            rows = mx.contiguous(bank[0].transpose(1, 0, 2))
+            return rows.reshape(
+                int(self.num_blocks),
+                int(self.block_size),
+                heads,
+                int(bank.shape[3]),
+            )
+
+        paged.key_cache = pages(self.cache[0])
+        paged.value_cache = pages(self.cache[1])
+        paged.key_scale_cache = pages(self.cache[3])
+        paged.value_scale_cache = pages(self.cache[4])
+        paged.offset = int(self.size())
+        paged._shape = (heads, int(self.head_dims[0]), int(self.head_dims[1]))
+        paged._dtypes = tuple(self.source_dtypes)
+        return paged
+
+    @property
+    def nbytes(self) -> int:
+        if self.cache[0] is None or self.cache[1] is None:
+            return 0
+        total = int(self.cache[2].nbytes)
+        for slot in (0, 1, 3, 4):
+            total += int(self.cache[slot].nbytes)
+        return total
+
+    def paged_stats(self) -> dict[str, int | float | str]:
+        stats = super().paged_stats()
+        stats["mode"] = "tensor_offset_quantized_paged"
+        stats["kv_quant_bits"] = int(self.kv_bits)
+        return stats
+
+
 class OwnedRecurrentStateCache:
     """Fixed-shape recurrent cache with persistent owned state buffers.
 
@@ -2697,6 +3575,63 @@ class OwnedRecurrentStateCache:
             self.cache[idx] = self._own_value(idx, item)
         for idx in range(len(value), len(self.cache)):
             self.cache[idx] = None
+
+    def restore_masked(
+        self,
+        snapshot_state: list[Any] | tuple[Any, ...] | None,
+        row_mask: Any,
+    ) -> None:
+        """Per-row masked restore of the recurrent leaves (fold-in REPLAY rewind).
+
+        Rows where ``row_mask`` is ``True`` revert each leaf (batch-major
+        ``[conv_tail, gdn_matrix]``, axis 0 == batch) to ``snapshot_state``; rows
+        where it is ``False`` keep their current advanced state.  This is the
+        per-row analogue of ``rollback_after_verify``'s whole-batch restore,
+        following the same snapshot-in / restore-out convention (the snapshot
+        comes from ``snapshot_untrimmable_cache``), and it covers a REPLAY row's
+        rewind: the conv tail is sliding-window / positional, so its missed-cycle
+        pollution is undone here (a test pins this bitwise).
+
+        REBINDS ``self.cache[idx]`` with a lazy ``mx.where`` expression -- it does
+        NOT route through ``replace_state``/``_own_value`` (those force an
+        ``mx.eval`` into the owned buffer), so the restore stays a device op that
+        adds no sync to the single-sync fold-in loop.  Signature is additive;
+        nothing existing changes.
+        """
+        import mlx.core as mx
+
+        if snapshot_state is None:
+            return
+        mask = row_mask if isinstance(row_mask, mx.array) else mx.array(row_mask)
+        mask = mask.astype(mx.bool_).reshape(-1)
+        for idx in range(len(self.cache)):
+            cur = self.cache[idx]
+            snap = snapshot_state[idx] if idx < len(snapshot_state) else None
+            if cur is None or snap is None:
+                continue
+            # broadcast the [B] row selector across each leaf's trailing dims.
+            m = mask.reshape((int(mask.size),) + (1,) * (int(cur.ndim) - 1))
+            self.cache[idx] = mx.where(m, snap, cur)
+
+    def zero_rows(self, row_mask: Any) -> None:
+        """Per-row masked ZERO of the recurrent leaves (refill admission).
+
+        Rows where ``row_mask`` is ``True`` have every leaf reset to zeros —
+        the recurrent fresh-start value (the causal-conv tail and the GDN
+        matrix state both zero-initialize), so an admission prefill over those
+        rows reproduces a from-scratch prefill.  Same lazy rebind contract as
+        :meth:`restore_masked`: a device-side ``mx.where``, no sync, additive.
+        """
+        import mlx.core as mx
+
+        mask = row_mask if isinstance(row_mask, mx.array) else mx.array(row_mask)
+        mask = mask.astype(mx.bool_).reshape(-1)
+        for idx in range(len(self.cache)):
+            cur = self.cache[idx]
+            if cur is None:
+                continue
+            m = mask.reshape((int(mask.size),) + (1,) * (int(cur.ndim) - 1))
+            self.cache[idx] = mx.where(m, mx.zeros_like(cur), cur)
 
     @property
     def meta_state(self) -> tuple[str, str]:
@@ -3111,8 +4046,18 @@ def install_vllm_metal_paged_attention_kv_cache(
             stats["skipped"] = int(stats["skipped"]) + 1
             continue
         if isinstance(entry, VllmMetalPagedKVCache):
-            entry.block_size = int(block_size)
-            entry.num_blocks = int(num_blocks)
+            if entry.key_cache is None:
+                entry.block_size = int(block_size)
+                entry.num_blocks = int(num_blocks)
+            else:
+                # Live pages own the geometry; a re-config is a request for
+                # room satisfied by an explicit grow — never a claim of blocks
+                # that do not exist (#310). block_size stays put too: changing
+                # it would reinterpret the live buffer.
+                entry.num_blocks = int(entry.key_cache.shape[0])
+                wanted = int(block_size) * int(num_blocks)
+                if wanted > entry.capacity:
+                    entry._grow_to_capacity(wanted)
             entry.turboquant_config = turboquant_config
             entry.turboquant = turboquant_config is not None
             entry.kv_quant_config = kv_quant_config
@@ -3238,7 +4183,13 @@ def tail_owned_attention_kv_stats(cache: list[Any] | None) -> dict[str, Any]:
         "mode": "disabled",
     }
     for entry in cache or []:
-        if isinstance(entry, VllmMetalPagedKVCache):
+        # TensorOffset adapters are paged caches too (2026-08-26): the
+        # 147.4k investigation ran blind for hours because adapter entries
+        # were invisible here — rows said paged_attention never engaged
+        # while the adapter was serving (and declining) every verify round.
+        if isinstance(
+            entry, (VllmMetalPagedKVCache, TensorOffsetVllmMetalPagedKVCache)
+        ):
             stats = entry.paged_stats()
             aggregate["enabled"] = 1
             aggregate["entries"] = int(aggregate["entries"]) + 1
@@ -3281,6 +4232,15 @@ def tail_owned_attention_kv_stats(cache: list[Any] | None) -> dict[str, Any]:
             aggregate["kv_quant_dequant_tokens"] = int(
                 aggregate.get("kv_quant_dequant_tokens", 0)
             ) + int(stats.get("kv_quant_dequant_tokens", 0))
+            aggregate["kv_quant_dequant_memo_hits"] = int(
+                aggregate.get("kv_quant_dequant_memo_hits", 0)
+            ) + int(stats.get("kv_quant_dequant_memo_hits", 0))
+            aggregate["kv_quant_dequant_memo_rebuilds"] = int(
+                aggregate.get("kv_quant_dequant_memo_rebuilds", 0)
+            ) + int(stats.get("kv_quant_dequant_memo_rebuilds", 0))
+            aggregate["kv_quant_kernel_calls"] = int(
+                aggregate.get("kv_quant_kernel_calls", 0)
+            ) + int(stats.get("kv_quant_kernel_calls", 0))
             aggregate["dense_fallback_calls"] = int(
                 aggregate.get("dense_fallback_calls", 0)
             ) + int(stats.get("dense_fallback_calls", 0))
@@ -3439,6 +4399,46 @@ def snapshot_untrimmable_cache(cache: list[Any]) -> CacheSnapshot:
     return CacheSnapshot(states=tuple(states), meta_states=tuple(meta_states))
 
 
+def snapshot_untrimmable_cache_lazy(cache: list[Any]) -> CacheSnapshot:
+    """Zero-copy-view variant of :func:`snapshot_untrimmable_cache`.
+
+    Identical entry selection (trimmable KV -> ``None``; recurrent/non-trimmable
+    -> captured), but each recurrent leaf is retained as a lazy view
+    (:func:`_lazy_state_view`, ``value[...]``, zero kernel) instead of a
+    materialized clone (:func:`_clone_tree`, ``value + mx.zeros`` -- a full
+    device copy of the whole batch's GDN matrix state every cycle).
+
+    COW-safety basis (why the view can never be mutated behind our back on the
+    fold-in loop):
+
+    * The GDN forward REBINDS the recurrent cache slots
+      (``cache[idx] = new_state``; ``gdn_capture.py`` ->
+      ``OwnedRecurrentStateCache.__setitem__``) rather than writing in place, so
+      advancing the state leaves the retained view pointing at the pre-forward
+      array's value.
+    * The per-row REPLAY rewind (:func:`restore_untrimmable_cache_masked` ->
+      ``OwnedRecurrentStateCache.restore_masked``) also REBINDS via a fresh
+      ``mx.where`` expression, never a setitem into the snapshot's buffer.
+
+    Only the authoritative commit path (``replace_state`` / ``_own_value``'s
+    in-place ``target[:] = value``) writes a recurrent buffer in place, and that
+    path is not on the fold-in decode forward.  Meta-states are tiny string
+    tuples and are still cloned.  :func:`snapshot_untrimmable_cache` (eager) is
+    left byte-for-byte unchanged for every other caller (serial/pipelined
+    scalar-repair lanes, ``generation.py``).
+    """
+    states = []
+    meta_states = []
+    for entry in cache:
+        if _is_trimmable(entry):
+            states.append(None)
+            meta_states.append(None)
+        else:
+            states.append(_lazy_state_view(getattr(entry, "state", None)))
+            meta_states.append(_clone_tree(getattr(entry, "meta_state", None)))
+    return CacheSnapshot(states=tuple(states), meta_states=tuple(meta_states))
+
+
 def restore_cache(
     cache: list[Any],
     snapshot: CacheSnapshot,
@@ -3448,19 +4448,27 @@ def restore_cache(
 ) -> None:
     for entry, state, meta_state in zip(cache, snapshot.states, snapshot.meta_states):
         if state is not None:
-            install_as_is = not clone_states and _is_trimmable(entry)
-            _restore_state_preserving_container(entry, state, clone=not install_as_is)
+            install_view = not clone_states and _is_trimmable(entry)
+            _restore_state_preserving_container(entry, state, clone=not install_view)
         if restore_meta_state and meta_state is not None:
             entry.meta_state = _clone_tree(meta_state)
 
 
 def _restore_state_preserving_container(entry: Any, state: Any, *, clone: bool = True) -> None:
-    # Lazy (view-based) snapshots install their states as-is into trimmable KV
-    # containers: those containers only rebind or setitem (both COW-safe with
-    # a retained reference), so the snapshot cannot be mutated through them.
+    # clone=False (lazy snapshots into trimmable KV) must still never install
+    # the snapshot's own array objects. A setitem-style container write
+    # (`self.keys[..., a:b, :] = tail`) mutates the installed *object* itself,
+    # and a rebind-style write may donate its buffer (the lone shared object
+    # counts as uniquely referenced) — either way the borrower's suffix
+    # prefill/decode lands inside the bank entry's stored span and every later
+    # restore serves the poisoned pages (issue #247). Installing a fresh
+    # zero-copy view keeps restore O(1) while restoring the two-object
+    # geometry commit relies on: the retained snapshot reference blocks buffer
+    # donation, so the borrower's first write pays the single deferred
+    # divergence copy (COW rules pinned by tests/test_lazy_snapshot_cow.py).
     # Containers with replace_state (owned recurrent) copy into owned buffers
-    # and must always receive a clone-or-view they are free to consume.
-    cloned = _clone_tree(state) if clone else state
+    # and must always receive a full clone they are free to consume.
+    cloned = _clone_tree(state) if clone else _lazy_state_view(state)
     if hasattr(entry, "replace_state"):
         entry.replace_state(cloned)
         return
@@ -3485,6 +4493,75 @@ def rollback_after_verify(cache: list[Any], snapshot: CacheSnapshot, verified_to
         if _is_trimmable(entry) and hasattr(entry, "trim"):
             entry.trim(verified_tokens)
     restore_cache(cache, snapshot)
+
+
+def restore_untrimmable_cache_masked(
+    cache: list[Any],
+    snapshot: CacheSnapshot,
+    row_mask: Any,
+) -> None:
+    """Per-row masked restore of every non-trimmable (recurrent) entry.
+
+    The fold-in decode loop's REPLAY rewind: rows selected by ``row_mask`` revert
+    their recurrent state to ``snapshot`` (the pre-verify snapshot of the cycle
+    they missed, from :func:`snapshot_untrimmable_cache`); every other row keeps
+    advancing.  This is the per-row companion to :func:`rollback_after_verify`'s
+    whole-batch restore.
+
+    Trimmable KV carries a ``None`` snapshot state here (see
+    :func:`snapshot_untrimmable_cache`) and is skipped -- the ragged fold-in KV
+    lane rolls a missed row back by OVERWRITING its stale draft slot on the replay
+    write, not by snapshot restore, so only the recurrent leaves need this.
+
+    Entries exposing ``restore_masked`` (``OwnedRecurrentStateCache``) take the
+    lazy device rebind path (no sync).  A plain list/array-state recurrent entry
+    (e.g. the CPU test fake) falls back to a generic per-row selection so the same
+    loop drives both.
+    """
+    for entry, state in zip(cache, snapshot.states):
+        if state is None:
+            continue
+        restore_masked = getattr(entry, "restore_masked", None)
+        if callable(restore_masked):
+            restore_masked(state, row_mask)
+        else:
+            entry.state = _select_rows_masked(getattr(entry, "state", None), state, row_mask)
+
+
+def _select_rows_masked(current: Any, snapshot: Any, row_mask: Any) -> Any:
+    """Per-row masked blend of ``current`` and ``snapshot`` recurrent state.
+
+    Fallback for entries WITHOUT ``restore_masked`` (array-state recurrent caches
+    take the class method instead).  Handles the two shapes such an entry's
+    ``state`` can take:
+
+    * a single batch-major ``mx.array`` (``[B, ...]``) -> ``mx.where`` on axis 0;
+    * a per-row Python container (``list[row]`` -- the CPU test fake's histories)
+      -> pick whole rows by the host mask, COPYING reverted rows so a later
+      in-place append can't mutate the retained snapshot.
+
+    A ``list``-of-arrays *leaves* container (``[conv_tail, gdn_matrix]``) is NOT
+    handled here on purpose -- that is ``OwnedRecurrentStateCache.restore_masked``'s
+    job, and the fold-in make-cache converts every real recurrent entry to that
+    class, so only per-row list state ever reaches this fallback.
+    """
+    import mlx.core as mx
+
+    if current is None or snapshot is None:
+        return current if current is not None else snapshot
+    if isinstance(current, mx.array) and isinstance(snapshot, mx.array):
+        mask = row_mask if isinstance(row_mask, mx.array) else mx.array(row_mask)
+        mask = mask.astype(mx.bool_).reshape((-1,) + (1,) * (int(current.ndim) - 1))
+        return mx.where(mask, snapshot, current)
+    if isinstance(current, (list, tuple)) and isinstance(snapshot, (list, tuple)):
+        flags = row_mask.tolist() if isinstance(row_mask, mx.array) else list(row_mask)
+        out = []
+        for r in range(len(current)):
+            revert = bool(flags[r]) if r < len(flags) else False
+            src = snapshot[r] if revert else current[r]
+            out.append(list(src) if isinstance(src, list) else src)
+        return type(current)(out)
+    return current
 
 
 def trim_verified_window_to_prefix(
@@ -3540,6 +4617,38 @@ def trim_verified_window_to_prefix(
     return True
 
 
+def trim_verified_window_without_snapshot(
+    cache: list[Any],
+    *,
+    verified_tokens: int,
+    keep_tokens: int,
+) -> bool:
+    """Snapshot-free ``trim_verified_window_to_prefix``.
+
+    The snapshot's only role in the trim path is proving that no
+    recurrent/non-trimmable state needs restoring; when every cache entry is
+    trimmable that property holds by construction, so a skipped verify
+    snapshot (MTPLX_SKIP_VERIFY_SNAPSHOT=1) must not strand the repair.
+    Returns False for any cache carrying non-trimmable entries — those
+    genuinely need the snapshot.
+    """
+
+    if not cache:
+        return False
+    if any(not _is_trimmable(entry) for entry in cache):
+        return False
+    empty = CacheSnapshot(
+        states=tuple(None for _ in cache),
+        meta_states=tuple(None for _ in cache),
+    )
+    return trim_verified_window_to_prefix(
+        cache,
+        empty,
+        verified_tokens=verified_tokens,
+        keep_tokens=keep_tokens,
+    )
+
+
 def _entry_offsets(entry: Any) -> tuple[int, ...] | None:
     nested = getattr(entry, "caches", None)
     if isinstance(nested, (list, tuple)):
@@ -3552,7 +4661,6 @@ def _entry_offsets(entry: Any) -> tuple[int, ...] | None:
                 return None
             offsets.extend(child_offsets)
         return tuple(offsets)
-
     offset = getattr(entry, "offset", None)
     if offset is None:
         return None

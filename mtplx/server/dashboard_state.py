@@ -21,6 +21,7 @@ worst one frame of stale visualization, which is acceptable.
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import time
 from collections import OrderedDict, deque
@@ -184,7 +185,14 @@ class InFlightRegistry:
             handle = self._handles.get(request_id)
         if handle is None:
             return False
-        handle.cancel_event.set()
+        # Duck-typed: attributed events record that THIS trip really came
+        # from the POST /v1/mtplx/cancel endpoint, so the stream's terminal
+        # frame can stop blaming the endpoint for internal cancels (#381).
+        set_origin = getattr(handle.cancel_event, "set_origin", None)
+        if set_origin is not None:
+            set_origin("post_endpoint")
+        else:
+            handle.cancel_event.set()
         return True
 
     def update_progress(self, request_id: str, progress: dict[str, Any]) -> None:
@@ -209,6 +217,17 @@ class InFlightRegistry:
     def count(self) -> int:
         with self._lock:
             return len(self._handles)
+
+    def session_ids(self) -> list[str]:
+        """Session ids of live requests (memory guard: these sessions'
+        bank entries must keep dynamic-ceiling protection even when one
+        turn outlives the bank's activity-pin TTL)."""
+        with self._lock:
+            return [
+                handle.session_id
+                for handle in self._handles.values()
+                if handle.session_id
+            ]
 
     def _reap_stale_locked(self) -> None:
         now = time.time()
@@ -443,7 +462,27 @@ class PrefillHistory:
     def __init__(self, *, capacity: int = 100) -> None:
         self._capacity = int(capacity)
         self._rows: deque[dict[str, Any]] = deque(maxlen=self._capacity)
+        # Producer-side samples: polling/SSE consumers must not count the
+        # same chunk again. Keep actual compute separate from restore/setup.
+        self._chunks: deque[tuple[int, float]] = deque(maxlen=self._capacity)
         self._lock = threading.Lock()
+
+    def record_chunk(self, tokens: int, elapsed_s: float) -> None:
+        if tokens <= 0 or not math.isfinite(elapsed_s) or elapsed_s <= 0:
+            return
+        with self._lock:
+            self._chunks.append((tokens, elapsed_s))
+
+    def rates(self) -> dict[str, Any]:
+        with self._lock:
+            chunks = list(self._chunks)
+        return {
+            "tokens": sum(tokens for tokens, _ in chunks),
+            "compute_time_s": sum(seconds for _, seconds in chunks),
+            "peak_tok_s": max((tokens / seconds for tokens, seconds in chunks), default=None),
+            "samples": len(chunks),
+            "capacity": self._capacity,
+        }
 
     def append(self, row: dict[str, Any]) -> None:
         with self._lock:
@@ -602,3 +641,10 @@ class DashboardState:
     # macOS kern.memorystatus_vm_pressure_level: 1 normal, 2 warning,
     # 4 critical, 0 unknown. Written by the memory-pressure guard loop.
     last_memory_pressure_level: int = 0
+    # Which signal produced the level above: "macos" (system-wide — often
+    # another process allocating) or "allocator" (this engine's Metal
+    # active+cache near its limit). Lets the app banner name the culprit
+    # instead of implying the engine is misbehaving under an external storm.
+    last_memory_pressure_source: str = "macos"
+    # (active+cache)/metal-limit at the same tick, for the banner detail.
+    last_allocator_fraction: float = 0.0

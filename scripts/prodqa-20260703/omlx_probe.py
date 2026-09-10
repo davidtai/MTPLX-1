@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """oMLX head-to-head on OUR Speed artifact: cold/warm at 4k/12k, decode,
 then (orchestrated by caller) a restart-warm leg against its SSD cache."""
-import json
-import sys
-import time
-import urllib.request
+import json, sys, time, urllib.request, os
 
 PORT = 18310
 KEY = "mtplx-qa"

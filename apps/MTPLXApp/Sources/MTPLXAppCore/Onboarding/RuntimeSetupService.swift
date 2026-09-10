@@ -13,9 +13,9 @@ public enum RuntimeSetupRowID: String, CaseIterable, Equatable, Sendable {
 
     public var title: String {
         switch self {
-        case .engine: return "MTPLX engine"
-        case .fanControl: return "Fan control"
-        case .globalCLI: return "Terminal command line"
+        case .engine: return tr("MTPLX engine")
+        case .fanControl: return tr("Fan control")
+        case .globalCLI: return tr("Terminal command line")
         }
     }
 }
@@ -144,7 +144,7 @@ public struct RuntimeSetupService: Sendable {
                 continuation.yield(.rows(rows.ordered()))
 
                 // Phase 1 — engine (blocking).
-                rows.update(.engine, .running, "Checking MTPLX runtime")
+                rows.update(.engine, .running, tr("Checking MTPLX runtime"))
                 continuation.yield(.rows(rows.ordered()))
                 let executable: URL
                 do {
@@ -177,7 +177,7 @@ public struct RuntimeSetupService: Sendable {
                     continuation.finish()
                     return
                 }
-                rows.update(.fanControl, .running, "Checking fan control")
+                rows.update(.fanControl, .running, tr("Checking fan control"))
                 continuation.yield(.rows(rows.ordered()))
                 let ensure: FanControlEnsurer = service.fanControlEnsurer ?? { executable, status in
                     FanControlInstaller(processEnvironment: service.processEnvironment)
@@ -188,7 +188,7 @@ public struct RuntimeSetupService: Sendable {
                     continuation.yield(.rows(rows.ordered()))
                 }
                 if fanControl.ok {
-                    rows.update(.fanControl, .done, "Fan control ready")
+                    rows.update(.fanControl, .done, tr("Fan control ready"))
                 } else {
                     rows.update(
                         .fanControl,
@@ -229,10 +229,37 @@ public struct RuntimeSetupService: Sendable {
         rows: RuntimeSetupRowsBox,
         publish: () -> Void
     ) {
-        rows.update(.globalCLI, .running, "Checking for an existing mtplx command")
+        rows.update(.globalCLI, .running, tr("Checking for an existing mtplx command"))
         publish()
 
-        guard let globalCLI = MTPLXCommandBuilder.detectGlobalCLIExecutable(
+        // Local-wrapper bundles are isolated QA/dev artifacts. Their engine
+        // must exercise the selected checkout, but onboarding must never
+        // repoint or upgrade the user's public terminal installation to that
+        // checkout. Public bundles cannot enter this branch because they do
+        // not allow development wrappers.
+        if MTPLXRuntimeUpdateService.installKind(
+            for: engineExecutable,
+            environment: processEnvironment
+        ) == .sourceCheckout {
+            rows.update(
+                .globalCLI,
+                .done,
+                tr("Source checkout runtime active. Existing terminal command left unchanged.")
+            )
+            publish()
+            return
+        }
+
+        // The user's login shell is the only honest oracle for which
+        // executable `mtplx` actually runs in their terminal — the app's
+        // Finder-launched PATH lacks the shell rc's /opt/homebrew/bin
+        // ordering and certified a false green (2026-08-28 receipt: setup
+        // said "Up to date (2.10.0)" while `command -v MTPLX` served the
+        // Homebrew 2.9.2). Fall back to the in-process scan when the probe
+        // fails.
+        guard let globalCLI = MTPLXCommandBuilder.detectShellWinningCLIExecutable(
+            environment: processEnvironment
+        ) ?? MTPLXCommandBuilder.detectGlobalCLIExecutable(
             environment: processEnvironment
         ) else {
             // No user-managed CLI anywhere — install the terminal
@@ -243,14 +270,14 @@ public struct RuntimeSetupService: Sendable {
                     .globalCLI,
                     .done,
                     installedNow
-                        ? "Installed the mtplx command — open a new terminal to use it."
-                        : "mtplx command ready."
+                        ? tr("Installed the mtplx command — open a new terminal to use it.")
+                        : tr("mtplx command ready.")
                 )
             } catch {
                 rows.update(
                     .globalCLI,
                     .warning,
-                    "Couldn't install the mtplx terminal command (\(error.localizedDescription)). The app is unaffected.",
+                    tr("Couldn't install the mtplx terminal command (%@). The app is unaffected.", error.localizedDescription),
                     command: MTPLXCommandBuilder.homebrewInstallCommand
                 )
             }
@@ -275,13 +302,13 @@ public struct RuntimeSetupService: Sendable {
                 rows.update(
                     .globalCLI,
                     .done,
-                    "Replaced an unreadable mtplx at \(globalCLI.path) — open a new terminal to use the updated command."
+                    tr("Replaced an unreadable mtplx at %@ — open a new terminal to use the updated command.", globalCLI.path)
                 )
             } catch {
                 rows.update(
                     .globalCLI,
                     .warning,
-                    "Found \(globalCLI.path) but couldn't read its version. The app uses its own runtime either way."
+                    tr("Found %@ but couldn't read its version. The app uses its own runtime either way.", globalCLI.path)
                 )
             }
             publish()
@@ -290,7 +317,11 @@ public struct RuntimeSetupService: Sendable {
 
         let latest = appVersion.flatMap(MTPLXSemanticVersion.init)
         guard let latest, version < latest else {
-            rows.update(.globalCLI, .done, "Up to date (\(version)) — \(kind.displayName)")
+            rows.update(
+                .globalCLI,
+                .done,
+                tr("Up to date (%@) — %@", String(describing: version), kind.displayName)
+            )
             publish()
             return
         }
@@ -303,12 +334,20 @@ public struct RuntimeSetupService: Sendable {
                     rows: rows,
                     oldVersion: version,
                     latest: latest,
-                    detailWhenShimmed: "Homebrew was not found, so your terminal now uses the app's CLI (\(latest), was \(version)). Open a new terminal."
+                    detailWhenShimmed: tr("Homebrew was not found, so your terminal now uses the app's CLI (%@, was %@). Open a new terminal.", String(describing: latest), String(describing: version))
                 )
                 publish()
                 return
             }
-            rows.update(.globalCLI, .running, "Updating your Homebrew CLI (\(version) → \(latest))")
+            rows.update(
+                .globalCLI,
+                .running,
+                tr(
+                    "Updating your Homebrew CLI (%@ → %@)",
+                    String(describing: version),
+                    String(describing: latest)
+                )
+            )
             publish()
             do {
                 let upgraded = try upgrade()
@@ -316,7 +355,7 @@ public struct RuntimeSetupService: Sendable {
                     executableURL: upgraded,
                     environment: processEnvironment
                 ) ?? "\(latest)"
-                rows.update(.globalCLI, .done, "Homebrew CLI updated to \(upgradedVersion)")
+                rows.update(.globalCLI, .done, tr("Homebrew CLI updated to %@", upgradedVersion))
             } catch {
                 let message = (error as? LocalizedError)?.errorDescription
                     ?? error.localizedDescription
@@ -325,7 +364,7 @@ public struct RuntimeSetupService: Sendable {
                     rows: rows,
                     oldVersion: version,
                     latest: latest,
-                    detailWhenShimmed: "Homebrew didn't update (\(message)), so your terminal now uses the app's CLI (\(latest)). Open a new terminal."
+                    detailWhenShimmed: tr("Homebrew didn't update (%@), so your terminal now uses the app's CLI (%@). Open a new terminal.", message, String(describing: latest))
                 )
             }
             publish()
@@ -333,7 +372,7 @@ public struct RuntimeSetupService: Sendable {
             rows.update(
                 .globalCLI,
                 .done,
-                "Source checkout on PATH (\(version)). The app uses its own runtime."
+                tr("Source checkout on PATH (%@). The app uses its own runtime.", String(describing: version))
             )
             publish()
         case .pipLike, .appOwned, .custom, .missing:
@@ -345,7 +384,7 @@ public struct RuntimeSetupService: Sendable {
                 rows: rows,
                 oldVersion: version,
                 latest: latest,
-                detailWhenShimmed: "Updated the mtplx command to \(latest) (was \(version)). Open a new terminal to use it."
+                detailWhenShimmed: tr("Updated the mtplx command to %@ (was %@). Open a new terminal to use it.", String(describing: latest), String(describing: version))
             )
             publish()
         }
@@ -369,7 +408,7 @@ public struct RuntimeSetupService: Sendable {
             rows.update(
                 .globalCLI,
                 .warning,
-                "Your mtplx CLI is \(oldVersion); the app ships \(latest). It couldn't be updated automatically (\(error.localizedDescription)).",
+                tr("Your mtplx CLI is %@; the app ships %@. It couldn't be updated automatically (%@).", String(describing: oldVersion), String(describing: latest), error.localizedDescription),
                 command: MTPLXCommandBuilder.homebrewInstallCommand
             )
         }
@@ -489,8 +528,21 @@ public struct RuntimeSetupService: Sendable {
             # Added by MTPLX.app — terminal command
             export PATH="$HOME/.mtplx/bin:$PATH"
             """
-            let updated = existing + block + "\n"
-            try updated.write(to: zshrc, atomically: true, encoding: .utf8)
+            // Append through a file handle, never an atomic rewrite (#292):
+            // atomic write is write-temp-then-rename, which replaces a
+            // symlinked ~/.zshrc with a plain file and silently detaches the
+            // user's dotfile repo. Appending through the handle follows the
+            // link, preserves the inode (hard links and concurrent editors
+            // survive), and only ever adds bytes the app authored.
+            let payload = Data((block + "\n").utf8)
+            if fileManager.fileExists(atPath: zshrc.path) {
+                let handle = try FileHandle(forWritingTo: zshrc)
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: payload)
+            } else {
+                try payload.write(to: zshrc)
+            }
             changed = true
         }
         return changed
@@ -514,17 +566,17 @@ public struct RuntimeSetupService: Sendable {
 
     private static func engineReadyDetail(version: String?) -> String {
         if let version, !version.isEmpty {
-            return "MTPLX \(version) ready"
+            return tr("MTPLX %@ ready", version)
         }
-        return "MTPLX runtime ready"
+        return tr("MTPLX runtime ready")
     }
 
     private static func fanControlWarningDetail(message: String) -> String {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
-            return "Fan control unavailable — tuning will use safe defaults."
+            return tr("Fan control unavailable — tuning will use safe defaults.")
         }
-        return "Fan control unavailable — tuning will use safe defaults. (\(trimmed))"
+        return tr("Fan control unavailable — tuning will use safe defaults. (%@)", trimmed)
     }
 }
 

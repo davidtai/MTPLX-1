@@ -4,6 +4,391 @@ import Foundation
 import AppKit
 #endif
 
+/// Ownership receipt for one Terminal client handoff. The UUID travels in the
+/// terminal process environment, so a later reap can fail closed unless the
+/// exact PID still belongs to this invocation.
+public struct MTPLXTerminalHandoffLease: Equatable, Sendable {
+    public let handoffID: UUID
+    public let processID: Int
+    public let cancellationMarkerURL: URL
+    /// The durable Terminal script that created this receipt. It lets a
+    /// failed marker write fail closed before a delayed Terminal launch reads
+    /// that one-use script.
+    public let commandURL: URL?
+    /// The receipt is retained only long enough to unlink it during explicit
+    /// cancellation if an earlier cleanup attempt did not complete.
+    public let receiptURL: URL?
+
+    public init(
+        handoffID: UUID,
+        processID: Int,
+        cancellationMarkerURL: URL,
+        commandURL: URL? = nil,
+        receiptURL: URL? = nil
+    ) {
+        self.handoffID = handoffID
+        self.processID = processID
+        self.cancellationMarkerURL = cancellationMarkerURL
+        self.commandURL = commandURL
+        self.receiptURL = receiptURL
+    }
+}
+
+/// Result of receipt collection. Once cancellation is marked, a receipt is
+/// useful only to reap a process that escaped the script's final marker check;
+/// it must never be reported as a successful handoff.
+struct MTPLXTerminalHandoffReceiptResult: Sendable {
+    let lease: MTPLXTerminalHandoffLease?
+    let cancellationMarked: Bool
+    /// A cancellation was requested even when the marker write failed.
+    /// Callers must never report this result as a live handoff.
+    let cancellationRequested: Bool
+}
+
+extension MTPLXTerminalHandoffLease {
+    static let environmentVariable = "MTPLX_APP_HANDOFF_ID"
+
+    @MainActor
+    static func awaitReceipt(
+        handoffID: UUID,
+        receiptURL: URL,
+        cancellationMarkerURL: URL,
+        commandURL: URL? = nil,
+        isCurrent: (() -> Bool)?,
+        timeoutSeconds: TimeInterval = 5,
+        delayedCancellationSeconds: TimeInterval = 1,
+        markerWriter: ((URL) -> Bool)? = nil
+    ) async -> MTPLXTerminalHandoffReceiptResult {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if let lease = lease(
+                handoffID: handoffID,
+                receiptURL: receiptURL,
+                cancellationMarkerURL: cancellationMarkerURL,
+                commandURL: commandURL
+            ) {
+                guard removeHandoffArtifacts(
+                    commandURL: commandURL,
+                    receiptURL: receiptURL
+                ) else {
+                    let cancellationMarked = markerWriter?(cancellationMarkerURL)
+                        ?? writeCancellationMarker(at: cancellationMarkerURL)
+                    if !cancellationMarked {
+                        _ = removeDurableCommandScript(at: commandURL)
+                    }
+                    return MTPLXTerminalHandoffReceiptResult(
+                        lease: lease,
+                        cancellationMarked: cancellationMarked,
+                        cancellationRequested: true
+                    )
+                }
+                return MTPLXTerminalHandoffReceiptResult(
+                    lease: lease,
+                    cancellationMarked: false,
+                    cancellationRequested: false
+                )
+            }
+            if !(isCurrent?() ?? true) {
+                let cancellationMarked = markerWriter?(cancellationMarkerURL)
+                    ?? writeCancellationMarker(at: cancellationMarkerURL)
+                if !cancellationMarked {
+                    _ = removeDurableCommandScript(at: commandURL)
+                }
+                return await delayedReceipt(
+                    handoffID: handoffID,
+                    receiptURL: receiptURL,
+                    cancellationMarkerURL: cancellationMarkerURL,
+                    commandURL: commandURL,
+                    timeoutSeconds: delayedCancellationSeconds,
+                    cancellationMarked: cancellationMarked
+                )
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        let cancellationMarked = markerWriter?(cancellationMarkerURL)
+            ?? writeCancellationMarker(at: cancellationMarkerURL)
+        if !cancellationMarked {
+            _ = removeDurableCommandScript(at: commandURL)
+        }
+        return await delayedReceipt(
+            handoffID: handoffID,
+            receiptURL: receiptURL,
+            cancellationMarkerURL: cancellationMarkerURL,
+            commandURL: commandURL,
+            timeoutSeconds: delayedCancellationSeconds,
+            cancellationMarked: cancellationMarked
+        )
+    }
+
+    static func prepareArtifactDirectory(_ directory: URL) throws {
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+    }
+
+    static func writeSecureCommandScript(_ script: String, to destination: URL) throws {
+        let fileManager = FileManager.default
+        let directory = destination.deletingLastPathComponent()
+        try prepareArtifactDirectory(directory)
+        let temporary = directory.appendingPathComponent(
+            ".\(destination.lastPathComponent).\(UUID().uuidString.lowercased()).tmp"
+        )
+        guard fileManager.createFile(
+            atPath: temporary.path,
+            contents: nil,
+            attributes: [.posixPermissions: 0o600]
+        ) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        defer { try? fileManager.removeItem(at: temporary) }
+        let handle = try FileHandle(forWritingTo: temporary)
+        try handle.write(contentsOf: Data(script.utf8))
+        try handle.close()
+        try fileManager.moveItem(at: temporary, to: destination)
+        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: destination.path)
+    }
+
+    @discardableResult
+    static func writeCancellationMarker(at url: URL) -> Bool {
+        do {
+            try prepareArtifactDirectory(url.deletingLastPathComponent())
+            let fileManager = FileManager.default
+            if fileManager.fileExists(atPath: url.path) {
+                let attributes = try fileManager.attributesOfItem(atPath: url.path)
+                guard attributes[.type] as? FileAttributeType == .typeRegular else {
+                    return false
+                }
+                try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+                return true
+            }
+            let temporary = url.deletingLastPathComponent().appendingPathComponent(
+                ".\(url.lastPathComponent).\(UUID().uuidString.lowercased()).tmp"
+            )
+            guard fileManager.createFile(
+                atPath: temporary.path,
+                contents: Data("cancelled\n".utf8),
+                attributes: [.posixPermissions: 0o600]
+            ) else { return false }
+            defer { try? fileManager.removeItem(at: temporary) }
+            let renameStatus = temporary.path.withCString { sourcePath in
+                url.path.withCString { destinationPath in
+                    rename(sourcePath, destinationPath)
+                }
+            }
+            guard renameStatus == 0 else { return false }
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// A private marker is the primary cancellation mechanism. If creating it
+    /// fails, removing the one-use command artifact prevents a delayed
+    /// Terminal invocation from executing it. An already-absent artifact is
+    /// safe by definition.
+    @discardableResult
+    static func removeDurableCommandScript(at url: URL?) -> Bool {
+        guard let url else { return false }
+        return removeArtifact(at: url)
+    }
+
+    private static func removeHandoffArtifacts(
+        commandURL: URL?,
+        receiptURL: URL?
+    ) -> Bool {
+        let commandRemoved = commandURL.map { removeArtifact(at: $0) } ?? true
+        let receiptRemoved = receiptURL.map { removeArtifact(at: $0) } ?? true
+        return commandRemoved && receiptRemoved
+    }
+
+    private static func removeArtifact(at url: URL) -> Bool {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: url.path) else { return true }
+        do {
+            try fileManager.removeItem(at: url)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    static func process(
+        pid: pid_t,
+        hasExactHandoffID handoffID: UUID,
+        timeoutSeconds: TimeInterval = 1
+    ) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-wwE", "-p", String(pid), "-o", "command="]
+        let output = Pipe()
+        process.standardOutput = output
+        let watchdog = SubprocessWatchdog(process)
+        do {
+            try process.run()
+        } catch {
+            return false
+        }
+        let drain = SubprocessPipeDrain(output)
+        guard watchdog.wait(
+            for: process,
+            timeout: timeoutSeconds,
+            terminateGrace: 0.1,
+            killGrace: 0.1
+        ), drain.join(timeout: 1), process.terminationStatus == 0
+        else { return false }
+        // `ps` is bounded and drained only as a liveness/readability check.
+        // Its command column merges argv and environment, so it must not
+        // decide ownership: an arbitrary argv token could impersonate this
+        // UUID. KERN_PROCARGS2 retains the boundary and fails closed. The
+        // Terminal script can be observed for a few milliseconds between its
+        // final marker check and `exec`, so retry the *same PID* briefly for
+        // the post-exec environment rather than abandoning that narrow race.
+        for attempt in 0..<6 {
+            if processHasExactHandoffID(pid, handoffID: handoffID) {
+                return true
+            }
+            if attempt < 5 {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+        }
+        return false
+    }
+
+    /// Darwin's KERN_PROCARGS2 stores argv and environment as distinct NUL
+    /// strings. This is deliberately not parsed from `ps -E`, whose display
+    /// column permits an argv token to look like an environment assignment.
+    private static func processHasExactHandoffID(
+        _ pid: pid_t,
+        handoffID: UUID
+    ) -> Bool {
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var byteCount = 0
+        guard sysctl(&mib, UInt32(mib.count), nil, &byteCount, nil, 0) == 0,
+              byteCount > MemoryLayout<Int32>.size
+        else { return false }
+
+        var bytes = [UInt8](repeating: 0, count: byteCount)
+        guard bytes.withUnsafeMutableBytes({ buffer in
+            sysctl(&mib, UInt32(mib.count), buffer.baseAddress, &byteCount, nil, 0)
+        }) == 0,
+        byteCount <= bytes.count
+        else { return false }
+        bytes.removeSubrange(byteCount..<bytes.count)
+        guard bytes.count >= MemoryLayout<Int32>.size else { return false }
+
+        let argc = bytes.withUnsafeBytes {
+            Int($0.loadUnaligned(fromByteOffset: 0, as: Int32.self))
+        }
+        guard argc >= 0 else { return false }
+        var cursor = MemoryLayout<Int32>.size
+        guard skipCString(in: bytes, cursor: &cursor) else { return false }
+        while cursor < bytes.count, bytes[cursor] == 0 {
+            cursor += 1
+        }
+        for _ in 0..<argc {
+            guard skipCString(in: bytes, cursor: &cursor) else { return false }
+        }
+
+        let expected = Array(
+            "\(environmentVariable)=\(handoffID.uuidString.lowercased())".utf8
+        )
+        while cursor < bytes.count {
+            while cursor < bytes.count, bytes[cursor] == 0 {
+                cursor += 1
+            }
+            guard cursor < bytes.count else { break }
+            let start = cursor
+            guard skipCString(in: bytes, cursor: &cursor) else { return false }
+            let end = cursor - 1
+            if bytes[start..<end].elementsEqual(expected) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func skipCString(in bytes: [UInt8], cursor: inout Int) -> Bool {
+        guard cursor < bytes.count,
+              let terminator = bytes[cursor...].firstIndex(of: 0)
+        else { return false }
+        cursor = terminator + 1
+        return true
+    }
+
+    private static func lease(
+        handoffID: UUID,
+        receiptURL: URL,
+        cancellationMarkerURL: URL,
+        commandURL: URL?
+    ) -> MTPLXTerminalHandoffLease? {
+        guard let contents = try? String(contentsOf: receiptURL, encoding: .utf8),
+              let processID = Int(contents.trimmingCharacters(in: .whitespacesAndNewlines)),
+              processID > 1
+        else { return nil }
+        return MTPLXTerminalHandoffLease(
+            handoffID: handoffID,
+            processID: processID,
+            cancellationMarkerURL: cancellationMarkerURL,
+            commandURL: commandURL,
+            receiptURL: receiptURL
+        )
+    }
+
+    @MainActor
+    private static func delayedReceipt(
+        handoffID: UUID,
+        receiptURL: URL,
+        cancellationMarkerURL: URL,
+        commandURL: URL?,
+        timeoutSeconds: TimeInterval,
+        cancellationMarked: Bool
+    ) async -> MTPLXTerminalHandoffReceiptResult {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if let lease = lease(
+                handoffID: handoffID,
+                receiptURL: receiptURL,
+                cancellationMarkerURL: cancellationMarkerURL,
+                commandURL: commandURL
+            ) {
+                _ = removeHandoffArtifacts(
+                    commandURL: commandURL,
+                    receiptURL: receiptURL
+                )
+                return MTPLXTerminalHandoffReceiptResult(
+                    lease: lease,
+                    cancellationMarked: cancellationMarked,
+                    cancellationRequested: true
+                )
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        _ = removeHandoffArtifacts(commandURL: commandURL, receiptURL: receiptURL)
+        return MTPLXTerminalHandoffReceiptResult(
+            lease: nil,
+            cancellationMarked: cancellationMarked,
+            cancellationRequested: true
+        )
+    }
+}
+
+/// PID reuse protection for LaunchServices clients. A stale lifecycle may
+/// target an app only when both its PID and launch identity still match.
+public struct MTPLXDesktopHandoffIdentity: Equatable, Sendable {
+    public let processID: Int
+    public let launchDate: Date
+
+    public init(processID: Int, launchDate: Date) {
+        self.processID = processID
+        self.launchDate = launchDate
+    }
+
+    public func matches(processID: Int, launchDate: Date?) -> Bool {
+        self.processID == processID && self.launchDate == launchDate
+    }
+}
+
 public struct HermesProfile: Identifiable, Equatable, Sendable {
     public let name: String
     public let path: String
@@ -68,7 +453,7 @@ public struct HermesInstallStatus: Equatable, Sendable {
             capabilitySummary: HermesIntegration.capabilitySummary,
             integrationSummaries: integrationSummaries,
             warnings: warnings,
-            detail: versionSummary ?? "Hermes is ready.",
+            detail: versionSummary ?? tr("Hermes is ready."),
             updateCommand: updateSummary == nil ? nil : "hermes update"
         )
     }
@@ -85,7 +470,7 @@ public struct HermesInstallStatus: Equatable, Sendable {
             capabilitySummary: HermesIntegration.capabilitySummary,
             integrationSummaries: [],
             warnings: [],
-            detail: "Hermes is not on PATH.",
+            detail: tr("Hermes is not on PATH."),
             updateCommand: "pip install -U hermes-agent[web,pty]"
         )
     }
@@ -141,6 +526,33 @@ public struct HermesLaunchResult: Equatable, Sendable {
     public let action: HermesLaunchAction
     public let command: String
     public let detail: String
+    /// Exact processes opened by this handoff, when the platform can report
+    /// them.  The backend uses this to reap only a stale handoff, never a
+    /// client belonging to a newer daemon lifecycle.
+    public let launchedProcessIDs: [Int]
+    /// Terminal ownership is a UUID-backed lease rather than an inferred
+    /// process-list delta. Desktop launches leave this nil and use their
+    /// exact LaunchServices PID in `launchedProcessIDs`.
+    public let terminalHandoffLease: MTPLXTerminalHandoffLease?
+    /// LaunchServices identity for an app created by this invocation. PID
+    /// reuse must fail closed when a stale lifecycle later tries to reap it.
+    public let desktopHandoffIdentity: MTPLXDesktopHandoffIdentity?
+
+    public init(
+        action: HermesLaunchAction,
+        command: String,
+        detail: String,
+        launchedProcessIDs: [Int] = [],
+        terminalHandoffLease: MTPLXTerminalHandoffLease? = nil,
+        desktopHandoffIdentity: MTPLXDesktopHandoffIdentity? = nil
+    ) {
+        self.action = action
+        self.command = command
+        self.detail = detail
+        self.launchedProcessIDs = launchedProcessIDs
+        self.terminalHandoffLease = terminalHandoffLease
+        self.desktopHandoffIdentity = desktopHandoffIdentity
+    }
 }
 
 public enum HermesIntegrationError: Error, Equatable, LocalizedError {
@@ -153,15 +565,15 @@ public enum HermesIntegrationError: Error, Equatable, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .executableNotFound:
-            return "Hermes is not installed or not on PATH."
+            return tr("Hermes is not installed or not on PATH.")
         case .incompatible(let detail):
             return detail
         case .launchFailed(let detail):
-            return "Hermes could not start: \(detail)"
+            return tr("Hermes could not start: %@", detail)
         case .dashboardTokenTimeout:
-            return "Hermes dashboard started, but the session token never appeared."
+            return tr("Hermes dashboard started, but the session token never appeared.")
         case .profileCreateFailed(let detail):
-            return "Hermes profile could not be created: \(detail)"
+            return tr("Hermes profile could not be created: %@", detail)
         }
     }
 }
@@ -320,7 +732,7 @@ public struct HermesIntegration: Sendable {
         return .incompatible(
             executablePath: executable.path,
             versionSummary: versionSummary,
-            detail: "Hermes must expose the chat command before MTPLX can launch it."
+            detail: tr("Hermes must expose the chat command before MTPLX can launch it.")
         )
     }
 
@@ -426,16 +838,30 @@ public struct HermesIntegration: Sendable {
         // not own (memory/providers/delegation/…), so the template is merged
         // over the existing file instead: app-owned keys are rewritten, all
         // other content is preserved byte-for-byte.
-        let existingConfigText = try? String(contentsOf: configURL, encoding: .utf8)
+        let existingConfigText = FileManager.default.fileExists(atPath: configURL.path)
+            ? try String(contentsOf: configURL, encoding: .utf8) : nil
+        var seededConfigText = existingConfigText
+        if !Self.profileDeclaresTerminalBackend(existingConfigText) {
+            // The root config is read only when a terminal policy has to be
+            // inherited (#460): a profile with its own backend never depends
+            // on it, so an unreadable root cannot fail that profile's launch.
+            // When inheritance is needed, an unreadable root is a thrown
+            // error rather than a silently dropped sandbox choice.
+            let rootConfigURL = hermesHome.appendingPathComponent("config.yaml")
+            let rootConfigText = FileManager.default.fileExists(atPath: rootConfigURL.path)
+                ? try String(contentsOf: rootConfigURL, encoding: .utf8) : nil
+            seededConfigText = Self.inheritTerminalConfig(existing: existingConfigText, root: rootConfigText)
+        }
         let configText = Self.mergedConfigYAML(
-            existing: existingConfigText,
+            existing: seededConfigText,
             template: Self.configYAML(
                 modelID: modelID,
                 baseURL: baseURL,
                 apiKey: apiKey,
                 workspacePath: workspacePath,
                 showReasoning: reasoning != "off",
-                reasoningEffort: reasoningEffort
+                reasoningEffort: reasoningEffort,
+                vision: MTPLXModelOption.supportsVision(model: configuration.model)
             )
         )
         let envText = Self.dotenv(
@@ -493,6 +919,55 @@ public struct HermesIntegration: Sendable {
             Self.terminate(pid: pid)
         }
         return pids.count
+    }
+
+    /// Reap only the LaunchServices app created by this invocation. Terminal
+    /// ownership uses `cancelTerminalHandoff(_:)`; a PID alone is never a
+    /// sufficient desktop ownership proof.
+    @MainActor
+    @discardableResult
+    public func cancelLaunchedDesktop(_ identity: MTPLXDesktopHandoffIdentity) -> Bool {
+        #if os(macOS)
+        guard identity.processID > 1,
+              let application = NSRunningApplication
+                .runningApplications(withBundleIdentifier: Self.desktopBundleIdentifier)
+                .first(where: {
+                    !$0.isTerminated
+                        && identity.matches(
+                            processID: Int($0.processIdentifier),
+                            launchDate: $0.launchDate
+                        )
+                })
+        else { return false }
+        application.terminate()
+        return true
+        #else
+        _ = identity
+        return false
+        #endif
+    }
+
+    /// Cancels one Terminal lease. The marker makes a delayed Terminal launch
+    /// self-cancel; the signal is sent only after proving the exact PID still
+    /// carries this invocation's UUID token.
+    @MainActor
+    @discardableResult
+    public func cancelTerminalHandoff(_ lease: MTPLXTerminalHandoffLease) -> Bool {
+        let cancellationMarked = MTPLXTerminalHandoffLease.writeCancellationMarker(
+            at: lease.cancellationMarkerURL
+        )
+        let commandRemoved = lease.commandURL.map {
+            MTPLXTerminalHandoffLease.removeDurableCommandScript(at: $0)
+        } ?? true
+        let receiptRemoved = lease.receiptURL.map {
+            MTPLXTerminalHandoffLease.removeDurableCommandScript(at: $0)
+        } ?? true
+        let pid = pid_t(lease.processID)
+        guard pid > 1,
+              MTPLXTerminalHandoffLease.process(pid: pid, hasExactHandoffID: lease.handoffID)
+        else { return false }
+        Self.terminate(pid: pid)
+        return cancellationMarked && commandRemoved && receiptRemoved
     }
 
     public func hasLaunchedTerminalAgent() -> Bool {
@@ -561,9 +1036,13 @@ public struct HermesIntegration: Sendable {
     /// exists so the caller can fall back to the Terminal handoff.
     @MainActor
     public func launchDesktopApplication(
-        configuration: MTPLXAppConfiguration
+        configuration: MTPLXAppConfiguration,
+        isCurrent: (() -> Bool)? = nil
     ) async -> HermesLaunchResult? {
         guard let appURL = desktopApplicationURL() else { return nil }
+        guard isCurrent?() ?? true else {
+            return staleHandoffResult(command: "open \(appURL.path)")
+        }
         let command = "open \(appURL.path)"
         do {
             _ = try sync(configuration: configuration)
@@ -571,9 +1050,10 @@ public struct HermesIntegration: Sendable {
             return HermesLaunchResult(
                 action: .unavailable,
                 command: command,
-                detail: "could not sync Hermes profile: \(error)"
+                detail: tr("could not sync Hermes profile: %@", String(describing: error))
             )
         }
+        guard isCurrent?() ?? true else { return staleHandoffResult(command: command) }
         let previous: String?
         do {
             previous = try writeActiveDesktopProfile()
@@ -581,36 +1061,72 @@ public struct HermesIntegration: Sendable {
             return HermesLaunchResult(
                 action: .unavailable,
                 command: command,
-                detail: "could not pin Hermes Desktop to the MTPLX profile: \(error)"
+                detail: tr("could not pin Hermes Desktop to the MTPLX profile: %@", String(describing: error))
             )
         }
+        guard isCurrent?() ?? true else { return staleHandoffResult(command: command) }
+        let preexistingDesktopPIDs = Set(
+            NSRunningApplication
+                .runningApplications(withBundleIdentifier: Self.desktopBundleIdentifier)
+                .filter { !$0.isTerminated }
+                .map(\.processIdentifier)
+        )
         let openConfiguration = NSWorkspace.OpenConfiguration()
         openConfiguration.activates = true
-        let opened = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+        let opened = await withCheckedContinuation { (continuation: CheckedContinuation<(Bool, Int?, Date?), Never>) in
             NSWorkspace.shared.openApplication(
                 at: appURL,
                 configuration: openConfiguration
-            ) { _, error in
-                continuation.resume(returning: error == nil)
+            ) { application, error in
+                continuation.resume(
+                    returning: (
+                        error == nil,
+                        application.map { Int($0.processIdentifier) },
+                        application?.launchDate
+                    )
+                )
             }
         }
-        guard opened else {
+        let desktopHandoffIdentity: MTPLXDesktopHandoffIdentity?
+        if opened.0,
+           let processID = opened.1,
+           let launchDate = opened.2,
+           !preexistingDesktopPIDs.contains(pid_t(processID)) {
+            desktopHandoffIdentity = MTPLXDesktopHandoffIdentity(
+                processID: processID,
+                launchDate: launchDate
+            )
+        } else {
+            desktopHandoffIdentity = nil
+        }
+        guard isCurrent?() ?? true else {
             return HermesLaunchResult(
                 action: .unavailable,
                 command: command,
-                detail: "could not open Hermes Desktop at \(appURL.path)"
+                detail: tr("Hermes handoff cancelled because the daemon lifecycle changed."),
+                launchedProcessIDs: desktopHandoffIdentity.map { [$0.processID] } ?? [],
+                desktopHandoffIdentity: desktopHandoffIdentity
+            )
+        }
+        guard opened.0 else {
+            return HermesLaunchResult(
+                action: .unavailable,
+                command: command,
+                detail: tr("could not open Hermes Desktop at %@", appURL.path)
             )
         }
         let previousNote: String
         if let previous, previous != Self.profileName {
-            previousNote = " (was \(previous); the in-app profile picker switches back)"
+            previousNote = tr(" (was %@; the in-app profile picker switches back)", previous)
         } else {
             previousNote = ""
         }
         return HermesLaunchResult(
             action: .launched,
             command: command,
-            detail: "opened Hermes Desktop pinned to profile \(Self.profileName)\(previousNote)"
+            detail: tr("opened Hermes Desktop pinned to profile %@%@", Self.profileName, previousNote),
+            launchedProcessIDs: desktopHandoffIdentity.map { [$0.processID] } ?? [],
+            desktopHandoffIdentity: desktopHandoffIdentity
         )
     }
 
@@ -619,38 +1135,63 @@ public struct HermesIntegration: Sendable {
     /// broken Desktop bundle falls back to Terminal rather than stranding
     /// the user, carrying both details.
     @MainActor
-    public func launch(configuration: MTPLXAppConfiguration) async -> HermesLaunchResult {
-        guard let desktop = await launchDesktopApplication(configuration: configuration) else {
-            return launchInTerminal(configuration: configuration)
+    public func launch(
+        configuration: MTPLXAppConfiguration,
+        isCurrent: (() -> Bool)? = nil
+    ) async -> HermesLaunchResult {
+        guard isCurrent?() ?? true else {
+            return staleHandoffResult(command: Self.launchCommand(for: configuration.model))
         }
+        guard let desktop = await launchDesktopApplication(
+            configuration: configuration,
+            isCurrent: isCurrent
+        ) else {
+            guard isCurrent?() ?? true else {
+                return staleHandoffResult(command: Self.launchCommand(for: configuration.model))
+            }
+            return await launchInTerminal(configuration: configuration, isCurrent: isCurrent)
+        }
+        guard isCurrent?() ?? true else { return desktop }
         if desktop.action == .launched {
             return desktop
         }
-        let terminal = launchInTerminal(configuration: configuration)
+        guard isCurrent?() ?? true else { return desktop }
+        let terminal = await launchInTerminal(configuration: configuration, isCurrent: isCurrent)
         return HermesLaunchResult(
             action: terminal.action,
             command: terminal.command,
-            detail: "\(desktop.detail); fell back to Terminal: \(terminal.detail)"
+            detail: tr("%@; fell back to Terminal: %@", desktop.detail, terminal.detail),
+            launchedProcessIDs: terminal.launchedProcessIDs,
+            terminalHandoffLease: terminal.terminalHandoffLease,
+            desktopHandoffIdentity: terminal.desktopHandoffIdentity
         )
     }
     #endif
 
-    public func launchInTerminal(configuration: MTPLXAppConfiguration) -> HermesLaunchResult {
+    @MainActor
+    public func launchInTerminal(
+        configuration: MTPLXAppConfiguration,
+        isCurrent: (() -> Bool)? = nil
+    ) async -> HermesLaunchResult {
+        let fallbackCommand = Self.launchCommand(for: configuration.model)
+        guard isCurrent?() ?? true else { return staleHandoffResult(command: fallbackCommand) }
         do {
             _ = try sync(configuration: configuration)
         } catch {
             return HermesLaunchResult(
                 action: .unavailable,
                 command: Self.launchCommand(for: configuration.model),
-                detail: "could not sync Hermes profile: \(error)"
+                detail: tr("could not sync Hermes profile: %@", String(describing: error))
             )
         }
+
+        guard isCurrent?() ?? true else { return staleHandoffResult(command: fallbackCommand) }
 
         guard let executable = resolveExecutable() else {
             return HermesLaunchResult(
                 action: .unavailable,
                 command: Self.launchCommand(for: configuration.model),
-                detail: "Hermes is not installed or not on PATH."
+                detail: tr("Hermes is not installed or not on PATH.")
             )
         }
 
@@ -661,24 +1202,26 @@ public struct HermesIntegration: Sendable {
             autoApprove: configuration.hermesAutoApprove
         )
         #if os(macOS)
-        let scriptURL: URL
+        let handoff = makeTerminalHandoffFiles()
         do {
-            scriptURL = try writeTerminalCommandFile(
+            guard isCurrent?() ?? true else { return staleHandoffResult(command: command) }
+            try writeTerminalCommandFile(
                 command: command,
                 hermesExecutablePath: executable.path,
-                configuration: configuration
+                configuration: configuration,
+                handoff: handoff
             )
         } catch {
             return HermesLaunchResult(
                 action: .unavailable,
                 command: command,
-                detail: "could not prepare Hermes terminal command: \(error)"
+                detail: tr("could not prepare Hermes terminal command: %@", String(describing: error))
             )
         }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        process.arguments = ["-a", "Terminal", scriptURL.path]
+        process.arguments = ["-a", "Terminal", handoff.commandURL.path]
         let stderr = Pipe()
         process.standardError = stderr
         // The backend store calls this from the main actor, so a wedged
@@ -692,44 +1235,109 @@ public struct HermesIntegration: Sendable {
         defer { stderr.fileHandleForReading.readabilityHandler = nil }
         let watchdog = SubprocessWatchdog(process)
         do {
+            guard isCurrent?() ?? true else {
+                await cancelPendingTerminalHandoff(handoff)
+                return staleHandoffResult(command: command)
+            }
             try process.run()
             guard watchdog.wait(for: process, timeout: 30) else {
+                await cancelPendingTerminalHandoff(handoff)
                 return HermesLaunchResult(
                     action: .unavailable,
                     command: command,
-                    detail: "could not open Hermes automatically: open timed out after 30s and was terminated"
+                    detail: tr("could not open Hermes automatically: open timed out after 30s and was terminated")
                 )
             }
             guard process.terminationStatus == 0 else {
+                await cancelPendingTerminalHandoff(handoff)
                 let message = stderrTail.snapshot()
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 return HermesLaunchResult(
                     action: .unavailable,
                     command: command,
                     detail: message.isEmpty
-                        ? "could not open Hermes automatically: open exited \(process.terminationStatus)"
-                        : "could not open Hermes automatically: \(message)"
+                        ? tr("could not open Hermes automatically: open exited %@", String(process.terminationStatus))
+                        : tr("could not open Hermes automatically: %@", message)
+                )
+            }
+            let receipt = await MTPLXTerminalHandoffLease.awaitReceipt(
+                handoffID: handoff.handoffID,
+                receiptURL: handoff.receiptURL,
+                cancellationMarkerURL: handoff.cancellationMarkerURL,
+                commandURL: handoff.commandURL,
+                isCurrent: isCurrent
+            )
+            if receipt.cancellationRequested {
+                if let lease = receipt.lease {
+                    _ = cancelTerminalHandoff(lease)
+                }
+                let stale = !(isCurrent?() ?? true)
+                return HermesLaunchResult(
+                    action: .unavailable,
+                    command: command,
+                    detail: stale
+                        ? "Hermes handoff cancelled because the daemon lifecycle changed."
+                        : "Hermes Terminal did not report its launch receipt."
+                )
+            }
+            guard let lease = receipt.lease else {
+                return HermesLaunchResult(
+                    action: .unavailable,
+                    command: command,
+                    detail: tr("Hermes Terminal did not report its launch receipt.")
+                )
+            }
+            guard isCurrent?() ?? true else {
+                _ = cancelTerminalHandoff(lease)
+                return HermesLaunchResult(
+                    action: .unavailable,
+                    command: command,
+                    detail: tr("Hermes handoff cancelled because the daemon lifecycle changed."),
+                    launchedProcessIDs: [lease.processID],
+                    terminalHandoffLease: lease
                 )
             }
             return HermesLaunchResult(
                 action: .launched,
                 command: command,
-                detail: "opened Hermes in Terminal"
+                detail: tr("opened Hermes in Terminal"),
+                launchedProcessIDs: [lease.processID],
+                terminalHandoffLease: lease
             )
         } catch {
+            await cancelPendingTerminalHandoff(handoff)
             return HermesLaunchResult(
                 action: .unavailable,
                 command: command,
-                detail: "could not open Hermes automatically: \(error)"
+                detail: tr("could not open Hermes automatically: %@", String(describing: error))
             )
         }
         #else
         return HermesLaunchResult(
             action: .unavailable,
             command: command,
-            detail: "automatic Hermes launch currently requires macOS Terminal"
+            detail: tr("automatic Hermes launch currently requires macOS Terminal")
         )
         #endif
+    }
+
+    /// Once a handoff script exists, every abandoned path marks it cancelled
+    /// and gives a delayed Terminal one short receipt window. That closes the
+    /// marker-after-final-check race without ever treating the lease as live.
+    @MainActor
+    private func cancelPendingTerminalHandoff(_ handoff: TerminalHandoffFiles) async {
+        let receipt = await MTPLXTerminalHandoffLease.awaitReceipt(
+            handoffID: handoff.handoffID,
+            receiptURL: handoff.receiptURL,
+            cancellationMarkerURL: handoff.cancellationMarkerURL,
+            commandURL: handoff.commandURL,
+            isCurrent: { false },
+            timeoutSeconds: 0,
+            delayedCancellationSeconds: 1
+        )
+        if let lease = receipt.lease {
+            _ = cancelTerminalHandoff(lease)
+        }
     }
 
     public func startDashboard(
@@ -863,8 +1471,20 @@ public struct HermesIntegration: Sendable {
         apiKey: String,
         workspacePath: String,
         showReasoning: Bool,
-        reasoningEffort: String?
+        reasoningEffort: String?,
+        vision: Bool
     ) -> String {
+        // SYNC PAIR: public.py _hermes_config_yaml — both writers must emit
+        // the same template shape or the shared merge sweeps each other's
+        // lines. model.default_headers is the only client-side identity hook
+        // hermes exposes; without x-mtplx-client every hermes-conditional
+        // server branch (tool contract, managed-thinking carve-out,
+        // injected-cap strip) is dead. Reasoning effort must sit under
+        // agent: — hermes reads CLI_CONFIG["agent"]["reasoning_effort"]; a
+        // model.reasoning_effort line is silently ignored. terminal.backend
+        // is deliberately absent: it is the user's sandbox choice (hermes
+        // defaults it to local) and the merge preserves a user-set value
+        // (issue #460).
         let effortLine = reasoningEffort.map { "  reasoning_effort: \(yamlQuote($0))\n" } ?? ""
         let showReasoningText = showReasoning ? "true" : "false"
         return """
@@ -874,7 +1494,10 @@ public struct HermesIntegration: Sendable {
           base_url: \(yamlQuote(baseURL))
           api_key: \(yamlQuote(apiKey))
           api_mode: chat_completions
-        """ + "\n" + effortLine + """
+          supports_vision: \(vision ? "true" : "false")
+          reasoning_echo: true
+          default_headers:
+            x-mtplx-client: hermes
         toolsets:
           - terminal
           - file
@@ -885,11 +1508,13 @@ public struct HermesIntegration: Sendable {
           system_prompt: \(yamlQuote(systemPrompt))
           max_turns: 200
           tool_use_enforcement: auto
+        """ + "\n" + effortLine + """
         terminal:
-          backend: local
           cwd: \(yamlQuote(workspacePath))
           timeout: 180
           persistent_shell: true
+        compression:
+          tool_image_retention: until_compaction
         display:
           streaming: true
           show_reasoning: \(showReasoningText)
@@ -916,11 +1541,14 @@ public struct HermesIntegration: Sendable {
 
     /// Children the app owns under a template section even when the current
     /// template does not emit them — conditional lines must be able to
-    /// disappear instead of being resurrected as "user content". Today that
-    /// is only `model.reasoning_effort` (emitted only while an effort is
-    /// configured).
+    /// disappear instead of being resurrected as "user content".
+    /// `agent.reasoning_effort` is emitted only while an effort is
+    /// configured. `model` stays owned because pre-2026-08-22 writers
+    /// emitted `reasoning_effort` under `model:` (a key hermes never read);
+    /// owning it sweeps the stale line from user files.
     static let conditionallyOwnedChildKeys: [String: Set<String>] = [
-        "model": ["reasoning_effort"]
+        "model": ["reasoning_effort"],
+        "agent": ["reasoning_effort"]
     ]
 
     /// Merge the generated template over the existing profile config.
@@ -937,6 +1565,29 @@ public struct HermesIntegration: Sendable {
     /// The child-key scan assumes the template's own two-space indentation,
     /// which is what the app has always written; user files started from our
     /// template keep that shape.
+    /// Inherit the root execution policy only when the profile has no backend.
+    /// Provider credentials and other root sections stay outside this profile.
+    /// True when the profile config sets `terminal.backend` itself.
+    static func profileDeclaresTerminalBackend(_ existing: String?) -> Bool {
+        guard let terminal = parseTopLevelBlocks(existing ?? "").blocks
+            .first(where: { $0.keyName == "terminal" }) else { return false }
+        return directChildBlocks(of: terminal).contains(where: { $0.key == "backend" })
+    }
+
+    static func inheritTerminalConfig(existing: String?, root: String?) -> String? {
+        guard let root, !profileDeclaresTerminalBackend(existing) else { return existing }
+        guard let terminal = parseTopLevelBlocks(root).blocks.first(where: { $0.keyName == "terminal" }) else {
+            return existing
+        }
+        let body = Array(terminal.lines.dropFirst())
+        let indent = body.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            .map { $0.prefix(while: { $0 == " " }).count }.min() ?? 0
+        let normalized = body.map { $0.isEmpty ? "" : "  " + $0.dropFirst(indent) }
+        let seed = ([terminal.lines[0]] + normalized).joined(separator: "\n") + "\n"
+        guard let existing, !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return seed }
+        return mergedConfigYAML(existing: seed, template: existing)
+    }
+
     static func mergedConfigYAML(existing: String?, template: String) -> String {
         guard
             let existing,
@@ -1088,7 +1739,11 @@ public struct HermesIntegration: Sendable {
         TERMINAL_CWD=\(dotenvQuote(workspacePath))
         """
         if let reasoningEffort {
-            text += "HERMES_MTPLX_REASONING_EFFORT=\(dotenvQuote(reasoningEffort))\n"
+            // The literal above ends without a newline: appending straight
+            // onto it fused TERMINAL_CWD and this key into one line, which
+            // Hermes' dotenv parser rejected ("could not parse statement"),
+            // silently dropping both the working directory and the effort.
+            text += "\nHERMES_MTPLX_REASONING_EFFORT=\(dotenvQuote(reasoningEffort))"
         }
         if !bridgeText.isEmpty {
             text += "\n" + bridgeText
@@ -1116,7 +1771,7 @@ public struct HermesIntegration: Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         switch raw {
-        case "low", "medium", "high":
+        case "low", "medium", "high", "xhigh":
             return raw
         default:
             return nil
@@ -1149,16 +1804,34 @@ public struct HermesIntegration: Sendable {
         return parts.joined(separator: " ")
     }
 
+    private struct TerminalHandoffFiles: Sendable {
+        let handoffID: UUID
+        let commandURL: URL
+        let receiptURL: URL
+        let cancellationMarkerURL: URL
+    }
+
+    private func makeTerminalHandoffFiles() -> TerminalHandoffFiles {
+        let handoffID = UUID()
+        let directory = terminalCommandURL.deletingLastPathComponent()
+        let basename = terminalCommandURL.deletingPathExtension().lastPathComponent
+        let suffix = handoffID.uuidString.lowercased()
+        return TerminalHandoffFiles(
+            handoffID: handoffID,
+            commandURL: directory.appendingPathComponent("\(basename)-\(suffix).command"),
+            receiptURL: directory.appendingPathComponent("\(basename)-\(suffix).pid"),
+            cancellationMarkerURL: directory.appendingPathComponent("\(basename)-\(suffix).cancelled")
+        )
+    }
+
     private func writeTerminalCommandFile(
         command: String,
         hermesExecutablePath: String,
-        configuration: MTPLXAppConfiguration
-    ) throws -> URL {
-        let directory = terminalCommandURL.deletingLastPathComponent()
-        try FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true
-        )
+        configuration: MTPLXAppConfiguration,
+        handoff: TerminalHandoffFiles
+    ) throws {
+        let directory = handoff.commandURL.deletingLastPathComponent()
+        try MTPLXTerminalHandoffLease.prepareArtifactDirectory(directory)
         let profileURL = hermesHome
             .appendingPathComponent("profiles", isDirectory: true)
             .appendingPathComponent(Self.profileName, isDirectory: true)
@@ -1169,6 +1842,12 @@ public struct HermesIntegration: Sendable {
         )
         let script = """
         #!/bin/zsh
+        _mtplx_handoff_cancel=\(Self.shellQuote(handoff.cancellationMarkerURL.path))
+        _mtplx_handoff_receipt=\(Self.shellQuote(handoff.receiptURL.path))
+        export MTPLX_APP_HANDOFF_ID=\(Self.shellQuote(handoff.handoffID.uuidString.lowercased()))
+        if [[ -e "$_mtplx_handoff_cancel" ]]; then
+          exit 0
+        fi
         cd \(Self.shellQuote(workspacePath))
         print -r -- \(Self.shellQuote("MTPLX Hermes tools: \(Self.codingToolsets)"))
         print -r -- \(Self.shellQuote(Self.messagingSetupHint))
@@ -1215,14 +1894,18 @@ public struct HermesIntegration: Sendable {
         export HERMES_SESSION_PLATFORM=\(Self.shellQuote(env["HERMES_SESSION_PLATFORM"] ?? ""))
         export HERMES_WORKSPACE=\(Self.shellQuote(workspacePath))
         export TERMINAL_CWD=\(Self.shellQuote(workspacePath))
+        if [[ -e "$_mtplx_handoff_cancel" ]]; then
+          exit 0
+        fi
+        umask 077
+        print -r -- "$$" > "${_mtplx_handoff_receipt}.$$.tmp"
+        mv -f "${_mtplx_handoff_receipt}.$$.tmp" "$_mtplx_handoff_receipt"
+        if [[ -e "$_mtplx_handoff_cancel" ]]; then
+          exit 0
+        fi
         exec \(command)
         """ + "\n"
-        try script.write(to: terminalCommandURL, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: terminalCommandURL.path
-        )
-        return terminalCommandURL
+        try MTPLXTerminalHandoffLease.writeSecureCommandScript(script, to: handoff.commandURL)
     }
 
     private struct LocalMessagingStatus {
@@ -1265,25 +1948,25 @@ public struct HermesIntegration: Sendable {
 
         var warnings: [String] = []
         if String(data: data, encoding: .utf8) == nil {
-            warnings.append("Hermes root .env has invalid UTF-8; some Hermes status/tools commands may fail.")
+            warnings.append(tr("Hermes root .env has invalid UTF-8; some Hermes status/tools commands may fail."))
         }
         let text = String(decoding: data, as: UTF8.self)
         var configured: [String] = []
         if Self.dotenvHasValue("TELEGRAM_BOT_TOKEN", in: text) {
             configured.append(
                 Self.dotenvHasValue("TELEGRAM_HOME_CHANNEL", in: text)
-                    ? "Telegram configured with a home channel."
-                    : "Telegram configured; no home channel set."
+                    ? tr("Telegram configured with a home channel.")
+                    : tr("Telegram configured; no home channel set.")
             )
         }
         if Self.dotenvHasValue("DISCORD_BOT_TOKEN", in: text) {
-            configured.append("Discord configured.")
+            configured.append(tr("Discord configured."))
         }
         if Self.dotenvHasValue("SLACK_BOT_TOKEN", in: text) {
-            configured.append("Slack configured.")
+            configured.append(tr("Slack configured."))
         }
         if Self.dotenvValue("WHATSAPP_ENABLED", in: text)?.lowercased() == "true" {
-            configured.append("WhatsApp enabled.")
+            configured.append(tr("WhatsApp enabled."))
         }
 
         return LocalMessagingStatus(
@@ -1324,16 +2007,16 @@ public struct HermesIntegration: Sendable {
         guard !text.isEmpty else { return nil }
         var parts: [String] = []
         if text.localizedCaseInsensitiveContains("Gateway service is loaded") {
-            parts.append("Gateway service loaded")
+            parts.append(tr("Gateway service loaded"))
         }
         if let pid = launchctlValue("PID", in: text) {
-            parts.append("PID \(pid)")
+            parts.append(tr("PID %@", pid))
         }
         if text.localizedCaseInsensitiveContains("stale relative") {
-            parts.append("service definition stale")
+            parts.append(tr("service definition stale"))
         }
         if text.localizedCaseInsensitiveContains("not loaded") {
-            parts.append("Gateway service not loaded")
+            parts.append(tr("Gateway service not loaded"))
         }
         if parts.isEmpty {
             return text
@@ -1366,10 +2049,10 @@ public struct HermesIntegration: Sendable {
         guard !text.isEmpty else { return [] }
         var warnings: [String] = []
         if text.localizedCaseInsensitiveContains("stale relative") {
-            warnings.append("Hermes Gateway LaunchAgent is stale; run `hermes gateway start` before relying on messaging.")
+            warnings.append(tr("Hermes Gateway LaunchAgent is stale; run `hermes gateway start` before relying on messaging."))
         }
         if text.localizedCaseInsensitiveContains("not loaded") {
-            warnings.append("Hermes Gateway is not loaded; run `hermes gateway start` before using messaging.")
+            warnings.append(tr("Hermes Gateway is not loaded; run `hermes gateway start` before using messaging."))
         }
         return warnings
     }
@@ -1380,7 +2063,7 @@ public struct HermesIntegration: Sendable {
             .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         guard !lines.isEmpty else {
-            return "Hermes Gateway start command completed."
+            return tr("Hermes Gateway start command completed.")
         }
         if let loaded = lines.first(where: { $0.localizedCaseInsensitiveContains("loaded") }) {
             return loaded
@@ -1613,6 +2296,14 @@ public struct HermesIntegration: Sendable {
             let command = String(text[firstSpace...])
             return isAppLaunchedTerminalAgentCommand(command) ? pid : nil
         }
+    }
+
+    private func staleHandoffResult(command: String) -> HermesLaunchResult {
+        HermesLaunchResult(
+            action: .unavailable,
+            command: command,
+            detail: tr("Hermes handoff cancelled because the daemon lifecycle changed.")
+        )
     }
 
     private static func terminate(pid: pid_t) {

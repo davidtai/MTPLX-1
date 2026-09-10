@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from types import SimpleNamespace
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -69,7 +70,14 @@ def selfcheck_enabled() -> bool:
         return False
     if raw in {"1", "true", "on", "yes"}:
         return True
-    return _env_on("MTPLX_NAX_VERIFY") or _env_on("MTPLX_GQA_PACKED_SDPA")
+    return (
+        _env_on("MTPLX_NAX_VERIFY")
+        or _env_on("MTPLX_GQA_PACKED_SDPA")
+        or _env_on("MTPLX_QWEN_ROW_OWNED_ROUTER")
+        or _env_on("MTPLX_QWEN_COMBINE_TAIL")
+        or _env_on("MTPLX_FUSE_GDN_POST_CONV")
+        or _env_on("MTPLX_A3B_WHOLE_MOE_FUSION")
+    )
 
 
 def lane_disabled(lane: str) -> bool:
@@ -134,17 +142,87 @@ def _check_qmm_lane(mx, fn, m: int, bits: int, group_size: int, dtype) -> float:
     return _max_abs_diff(mx, y, ref)
 
 
-def _check_gqa_packed(mx, dtype) -> float:
+def _check_qwen_row_owned_router(mx, dtype) -> float:
+    """Require bitwise stock routing for every installed M1-M16 row count."""
+
+    if dtype != mx.bfloat16:
+        return float("inf")
+    from .qwen_row_owned_router import qwen_row_owned_route
+
+    fixture = mx.arange(16 * 256, dtype=mx.float32).reshape(16, 256)
+    logits = (
+        mx.sin(fixture * 0.017) * 0.5
+        + mx.cos(fixture * 0.031) * 0.125
+    ).astype(dtype)
+    probabilities = mx.softmax(logits, axis=-1, precise=True)
+    for rows in range(1, 17):
+        current = probabilities[:rows]
+        stock_ids = mx.argpartition(current, kth=-8, axis=-1)[..., -8:]
+        stock_scores = mx.take_along_axis(current, stock_ids, axis=-1)
+        stock_scores = stock_scores / stock_scores.sum(axis=-1, keepdims=True)
+        candidate_ids, candidate_scores = qwen_row_owned_route(current)
+        mx.eval(stock_ids, stock_scores, candidate_ids, candidate_scores)
+        if not bool(mx.array_equal(candidate_ids, stock_ids).item()):
+            return float("inf")
+        if not bool(mx.array_equal(candidate_scores, stock_scores).item()):
+            return float("inf")
+    return 0.0
+
+
+def _check_qwen_combine_tail_m1_m2(mx, dtype) -> float:
+    """Require bitwise stock arithmetic for every installed combine shape."""
+
+    if dtype != mx.bfloat16:
+        return float("inf")
+    from .qwen_row_owned_router import (
+        qwen_combine_tail_m1,
+        qwen_combine_tail_m16,
+        qwen_combine_tail_m2,
+        qwen_combine_tail_m8,
+    )
+
+    for rows, entrypoint in (
+        (1, qwen_combine_tail_m1),
+        (2, qwen_combine_tail_m2),
+        (8, qwen_combine_tail_m8),
+        (16, qwen_combine_tail_m16),
+    ):
+        routed_fixture = mx.arange(
+            rows * 8 * 2048, dtype=mx.float32
+        ).reshape(1, rows, 8, 2048)
+        routed = (
+            mx.sin(routed_fixture * 0.013) * 0.5
+            + mx.cos(routed_fixture * 0.007) * 0.125
+        ).astype(dtype)
+        score_fixture = mx.arange(rows * 8, dtype=mx.float32).reshape(
+            1, rows, 8
+        )
+        scores = mx.softmax(
+            mx.sin(score_fixture * 0.11)
+            + mx.cos(score_fixture * 0.07) * 0.25,
+            axis=-1,
+        ).astype(dtype)
+        stock = (routed * scores[..., None]).sum(axis=-2)
+        candidate = entrypoint(routed, scores)
+        mx.eval(stock, candidate)
+        if tuple(candidate.shape) != (1, rows, 2048):
+            return float("inf")
+        if not bool(mx.array_equal(candidate, stock).item()):
+            return float("inf")
+    return 0.0
+
+
+def _check_gqa_packed(mx, dtype, kernel=None, *, d=128, q_len=4) -> float:
     from .kernels.sdpa_gqa_packed import sdpa_gqa_packed_tail
 
-    hq, hk, d = 8, 2, 128
-    capacity, offset, q_len = 512, 200, 4
+    hq, hk = (24, 4) if d == 256 else (8, 2)
+    capacity, offset = 512, 200
     scale = d**-0.5
     mx.random.seed(11)
     queries = (mx.random.normal((1, hq, q_len, d), dtype=mx.float32) * 0.5).astype(dtype)
     keys = (mx.random.normal((1, hk, capacity, d), dtype=mx.float32) * 0.5).astype(dtype)
     values = (mx.random.normal((1, hk, capacity, d), dtype=mx.float32) * 0.5).astype(dtype)
-    out = sdpa_gqa_packed_tail(
+    out = (kernel or sdpa_gqa_packed_tail)(
         queries=queries,
         keys=keys,
         values=values,
@@ -168,21 +246,34 @@ def _check_gqa_packed(mx, dtype) -> float:
 
 
 def _check_fused_add_rmsnorm(mx, dtype) -> float:
+    from .gdn_capture import _fused_post_norm_tg_override
     from .kernels.fused_norm import fused_add_rmsnorm
 
+    # Probe the production configuration (same threadgroup resolution as the
+    # gdn_capture call site) at real model widths. The pre-#319 probe used
+    # axis=512 with a hardcoded threadgroup_size=512 — the one width where a
+    # forced 512-lane loop matches the reference partition, so it validated a
+    # configuration production never hit and stayed green while axes 3072/5120
+    # flipped fp16 ULPs from 64 rows up. This lane claims bitwise identity, so
+    # its tolerance at the _record call site is 0.0 — never widen it back.
     mx.random.seed(13)
-    rows, axis = 4, 512
-    x = (mx.random.normal((rows, axis), dtype=mx.float32) * 0.5).astype(dtype)
-    residual = (mx.random.normal((rows, axis), dtype=mx.float32) * 0.5).astype(dtype)
-    weight = (mx.random.normal((axis,), dtype=mx.float32) * 0.1 + 1.0).astype(dtype)
-    eps = 1e-6
-    h, normed = fused_add_rmsnorm(x, residual, weight, eps, threadgroup_size=512)
-    ref_h = x + residual
-    ref_normed = mx.fast.rms_norm(ref_h, weight, eps).astype(dtype)
-    return max(
-        _max_abs_diff(mx, h, ref_h),
-        _max_abs_diff(mx, normed, ref_normed),
-    )
+    tg = _fused_post_norm_tg_override()
+    worst = 0.0
+    for axis in (512, 3072, 5120):
+        weight = (mx.random.normal((axis,), dtype=mx.float32) * 0.1 + 1.0).astype(dtype)
+        for rows in (1, 4, 128):
+            x = (mx.random.normal((rows, axis), dtype=mx.float32) * 0.5).astype(dtype)
+            residual = (mx.random.normal((rows, axis), dtype=mx.float32) * 0.5).astype(dtype)
+            eps = 1e-6
+            h, normed = fused_add_rmsnorm(x, residual, weight, eps, threadgroup_size=tg)
+            ref_h = x + residual
+            ref_normed = mx.fast.rms_norm(ref_h, weight, eps).astype(dtype)
+            worst = max(
+                worst,
+                _max_abs_diff(mx, h, ref_h),
+                _max_abs_diff(mx, normed, ref_normed),
+            )
+    return worst
 
 
 def _check_fused_gdn_norm_gate(mx, dtype) -> float:
@@ -201,80 +292,177 @@ def _check_fused_gdn_norm_gate(mx, dtype) -> float:
     return _max_abs_diff(mx, y, ref)
 
 
-def _check_expert_gather(
-    mx,
-    dtype,
-    bits: int,
-    group_size: int,
-    *,
-    bank_group_size: int | None = None,
-) -> float:
-    """Synthetic ``mx.gather_qmm`` round-trip at a streamed expert bank's format.
+def _check_gdn_postconv_inline_g(mx, dtype) -> float:
+    """Compare the exact A3B M1/M2 stock captures with their fixed routes."""
+    if dtype != mx.bfloat16:
+        return float("inf")
 
-    Mirrors the routed-expert path (``models/expert_mlx._gather_component_bank``
-    / ``hy3_expert_wave_m4._tuned_qmm``): tiny quantized bank of shape
-    ``(experts, N, K)``, activations shaped ``(rows, 1, 1, K)`` with per-row
-    slot indices ``(rows, 1)``, ``transpose=True`` affine gather. The reference
-    is a per-expert ``mx.quantized_matmul`` on the selected slot — the exact
-    stock op the gather fans out over. Returns the worst per-row max-abs diff;
-    a broken (bits, group_size) gather lands at O(1) or raises.
-
-    ``bank_group_size`` lets a caller quantize the bank at one group size while
-    the gather runs at another, forcing the fail-closed mismatch path.
-    """
-    experts, rows, K, N = 4, 4, _K, 256
-    bank_gs = int(group_size if bank_group_size is None else bank_group_size)
-    mx.random.seed(19)
-    w = (mx.random.normal((experts, N, K), dtype=mx.float32) * 0.02).astype(dtype)
-    w_q, scales, biases = mx.quantize(w, group_size=bank_gs, bits=bits)
-    mx.eval(w_q, scales, biases)
-    x = (mx.random.normal((rows, 1, 1, K), dtype=mx.float32) * 0.5).astype(dtype)
-    slots = mx.array([r % experts for r in range(rows)], dtype=mx.uint32).reshape(
-        (rows, 1)
+    from .gdn_capture import (
+        _a3b_compiled_target_gdn_postconv_m1_tgy4,
+        _a3b_compiled_target_gdn_postconv_m2_tgy4,
+        _stock_gated_delta_capture,
     )
-    y = mx.gather_qmm(
-        x,
-        w_q,
-        scales,
-        biases,
-        rhs_indices=slots,
-        transpose=True,
-        group_size=group_size,
-        bits=bits,
-        mode="affine",
-    ).reshape((rows, N))
-    worst = 0.0
-    for r in range(rows):
-        expert = r % experts
-        ref = mx.quantized_matmul(
-            x[r].reshape((1, K)),
-            w_q[expert],
-            scales=scales[expert],
-            biases=biases[expert],
-            transpose=True,
-            group_size=group_size,
-            bits=bits,
-        ).reshape((N,))
-        worst = max(worst, _max_abs_diff(mx, y[r], ref))
-    return worst
+
+    conv_values = mx.arange(2 * 8192, dtype=mx.float32).reshape(1, 2, 8192)
+    conv_out = (mx.sin(conv_values * 0.013) * 0.5).astype(mx.bfloat16)
+    gate_values = mx.arange(64, dtype=mx.float32).reshape(1, 2, 32)
+    a = (mx.sin(gate_values * 0.11) * 0.5).astype(mx.bfloat16)
+    b = (mx.cos(gate_values * 0.07) * 0.5).astype(mx.bfloat16)
+    state_values = mx.arange(32 * 128 * 128, dtype=mx.float32).reshape(
+        1, 32, 128, 128
+    )
+    state = mx.sin(state_values * 0.001) * 0.1
+    gdn = SimpleNamespace(
+        A_log=mx.linspace(0.0, 2.0, 32).astype(dtype),
+        dt_bias=mx.linspace(-5.0, -3.0, 32).astype(dtype),
+        conv_dim=8192,
+        key_dim=2048,
+        num_k_heads=16,
+        num_v_heads=32,
+        head_k_dim=128,
+        head_v_dim=128,
+        training=False,
+    )
+    inv_scale = 128**-0.5
+    routes = (
+        (1, _a3b_compiled_target_gdn_postconv_m1_tgy4),
+        (2, _a3b_compiled_target_gdn_postconv_m2_tgy4),
+    )
+    differences = []
+    for logical_m, route in routes:
+        route_conv = conv_out[:, :logical_m]
+        route_a = a[:, :logical_m]
+        route_b = b[:, :logical_m]
+        q, k, v = [
+            tensor.reshape(1, logical_m, heads, 128)
+            for tensor, heads in zip(
+                mx.split(route_conv, [2048, 4096], axis=-1),
+                [16, 16, 32],
+            )
+        ]
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        ref_out, ref_states = _stock_gated_delta_capture(
+            q,
+            k,
+            v,
+            route_a,
+            route_b,
+            state,
+            None,
+            gdn,
+        )
+        out, states = route(
+            route_conv,
+            route_a,
+            route_b,
+            state,
+            A_log=gdn.A_log,
+            dt_bias=gdn.dt_bias,
+        )
+        mx.eval(ref_out, ref_states, out, states)
+        if tuple(out.shape) != tuple(ref_out.shape) or tuple(states.shape) != tuple(
+            ref_states.shape
+        ):
+            return float("inf")
+        differences.extend(
+            (
+                _max_abs_diff(mx, out, ref_out),
+                _max_abs_diff(mx, states, ref_states),
+            )
+        )
+    return max(differences)
 
 
-def run_kernel_selfcheck(
-    dtype, bits: int, group_size: int, *, expert_signature=None
-) -> dict[str, Any]:
+def _check_gdn_postconv_headquarter(mx, dtype) -> float:
+    """Compare the exact A3B M1/M2 stock captures with the C1 headquarter routes."""
+    if dtype != mx.bfloat16:
+        return float("inf")
+
+    from .gdn_capture import (
+        _a3b_compiled_target_gdn_postconv_m1_headquarter,
+        _a3b_compiled_target_gdn_postconv_m2_headquarter,
+        _stock_gated_delta_capture,
+    )
+
+    conv_values = mx.arange(2 * 8192, dtype=mx.float32).reshape(1, 2, 8192)
+    conv_out = (mx.sin(conv_values * 0.013) * 0.5).astype(mx.bfloat16)
+    gate_values = mx.arange(64, dtype=mx.float32).reshape(1, 2, 32)
+    a = (mx.sin(gate_values * 0.11) * 0.5).astype(mx.bfloat16)
+    b = (mx.cos(gate_values * 0.07) * 0.5).astype(mx.bfloat16)
+    state_values = mx.arange(32 * 128 * 128, dtype=mx.float32).reshape(
+        1, 32, 128, 128
+    )
+    state = mx.sin(state_values * 0.001) * 0.1
+    gdn = SimpleNamespace(
+        A_log=mx.linspace(0.0, 2.0, 32).astype(dtype),
+        dt_bias=mx.linspace(-5.0, -3.0, 32).astype(dtype),
+        conv_dim=8192,
+        key_dim=2048,
+        num_k_heads=16,
+        num_v_heads=32,
+        head_k_dim=128,
+        head_v_dim=128,
+        training=False,
+    )
+    inv_scale = 128**-0.5
+    routes = (
+        (1, _a3b_compiled_target_gdn_postconv_m1_headquarter),
+        (2, _a3b_compiled_target_gdn_postconv_m2_headquarter),
+    )
+    differences = []
+    for logical_m, route in routes:
+        route_conv = conv_out[:, :logical_m]
+        route_a = a[:, :logical_m]
+        route_b = b[:, :logical_m]
+        q, k, v = [
+            tensor.reshape(1, logical_m, heads, 128)
+            for tensor, heads in zip(
+                mx.split(route_conv, [2048, 4096], axis=-1),
+                [16, 16, 32],
+            )
+        ]
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        ref_out, ref_states = _stock_gated_delta_capture(
+            q,
+            k,
+            v,
+            route_a,
+            route_b,
+            state,
+            None,
+            gdn,
+        )
+        out, states = route(
+            route_conv,
+            route_a,
+            route_b,
+            state,
+            A_log=gdn.A_log,
+            dt_bias=gdn.dt_bias,
+        )
+        mx.eval(ref_out, ref_states, out, states)
+        if tuple(out.shape) != tuple(ref_out.shape) or tuple(states.shape) != tuple(
+            ref_states.shape
+        ):
+            return float("inf")
+        differences.extend(
+            (
+                _max_abs_diff(mx, out, ref_out),
+                _max_abs_diff(mx, states, ref_states),
+            )
+        )
+    return max(differences)
+
+
+def run_kernel_selfcheck(dtype, bits: int, group_size: int) -> dict[str, Any]:
     """Probe every turbo lane that can engage for this model configuration.
 
     Returns ``{"lanes": {lane: status}, "dmax": {lane: float}, ...}`` and
     updates the process-wide disable registry: lanes reported ``fallback``
     stop engaging (their call sites route the stock path) until the process
     restarts. Idempotent — each run rebuilds the registry from scratch.
-
-    ``expert_signature`` is ``(dtype, bits, group_size)`` for a streamed routed
-    expert bank whose quant format may differ from the resident trunk (e.g.
-    q8-gs64 residents serving 2-bit gs128 experts). When supplied, the
-    ``expert_gather`` lane exercises ``mx.gather_qmm`` at that format in
-    addition to the resident lanes; when ``None`` no expert lane is added and
-    the report is byte-identical to the resident-only path.
     """
     import mlx.core as mx
 
@@ -455,15 +643,56 @@ def run_kernel_selfcheck(
     # lm_head_topk kernels exist but are not routed on the serve path.
     lanes["lm_head_topk"] = _STATUS_SKIPPED
 
+    if _env_on("MTPLX_QWEN_ROW_OWNED_ROUTER"):
+        _record(
+            "qwen_row_owned_router",
+            0.002,
+            lambda: _check_qwen_row_owned_router(mx, dtype),
+        )
+    else:
+        lanes["qwen_row_owned_router"] = _STATUS_SKIPPED
+
+    if _env_on("MTPLX_QWEN_COMBINE_TAIL"):
+        _record(
+            "qwen_combine_tail_m1_m2",
+            0.0,
+            lambda: _check_qwen_combine_tail_m1_m2(mx, dtype),
+        )
+    else:
+        lanes["qwen_combine_tail_m1_m2"] = _STATUS_SKIPPED
+
     if _env_on("MTPLX_GQA_PACKED_SDPA"):
         _record("gqa_packed_sdpa", _SDPA_TOLERANCE, lambda: _check_gqa_packed(mx, dtype))
     else:
         lanes["gqa_packed_sdpa"] = _STATUS_SKIPPED
 
+    # NAX attention has its own kernels: validating the scalar packed lane
+    # cannot certify these. Probe both physical geometries before serving,
+    # and retain the established packed route on non-G17 GPUs / older macOS.
+    from .kernels.sdpa_nax_flash import sdpa_nax_flash
+    from .kernels.sdpa_nax_flash_dsplit import sdpa_nax_flash_dsplit
+    from .kernels.sdpa_nax_tile import sdpa_nax_tile
+
+    for lane, env, kernel, rows in (
+        ("nax_flash_sdpa", "MTPLX_NAX_FLASH_ROUTE", sdpa_nax_flash, 8),
+        ("nax_flash_dsplit_sdpa", "MTPLX_NAX_FLASH_ROUTE", sdpa_nax_flash_dsplit, 4),
+        ("nax_tile_sdpa", "MTPLX_NAX_TILE_ROUTE", sdpa_nax_tile, 8),
+    ):
+        if _env_on("MTPLX_GQA_PACKED_SDPA") and _env_on(env) and nax_verify.nax_available():
+            _record(lane, _SDPA_TOLERANCE,
+                    lambda kernel=kernel, rows=rows: _check_gqa_packed(
+                        mx, dtype, kernel, d=256, q_len=rows))
+        else:
+            lanes[lane] = _STATUS_SKIPPED
+
     if _env_on("MTPLX_FUSE_POST_NORM_RESIDUAL"):
+        # Bitwise gate: this lane's contract is exact identity with the
+        # unfused reference (#319). _NORM_TOLERANCE stays loose only for
+        # fused_gdn_norm_gate, whose fp32 gate/SiLU is legitimately not
+        # bitwise.
         _record(
             "fused_add_rmsnorm",
-            _NORM_TOLERANCE,
+            0.0,
             lambda: _check_fused_add_rmsnorm(mx, dtype),
         )
     else:
@@ -478,19 +707,26 @@ def run_kernel_selfcheck(
     else:
         lanes["fused_gdn_norm_gate"] = _STATUS_SKIPPED
 
-    # Routed expert bank (expert-streaming specs only): validate the actual
-    # gather_qmm op family at the bank's own (bits, group_size), which can
-    # differ from the resident trunk. Absent entirely for non-streaming loads
-    # so their report is unchanged.
-    if expert_signature is not None:
-        e_dtype, e_bits, e_group_size = expert_signature
-        _record(
-            "expert_gather",
-            _QMM_TOLERANCE,
-            lambda: _check_expert_gather(
-                mx, e_dtype, int(e_bits), int(e_group_size)
-            ),
-        )
+    if _env_on("MTPLX_FUSE_GDN_POST_CONV"):
+        from .gdn_capture import _a3b_gdn_postconv_headquarter_requested
+
+        if _a3b_gdn_postconv_headquarter_requested():
+            lanes["gdn_postconv_inline_g"] = _STATUS_SKIPPED
+            _record(
+                "gdn_postconv_headquarter",
+                0.03125,
+                lambda: _check_gdn_postconv_headquarter(mx, dtype),
+            )
+        else:
+            _record(
+                "gdn_postconv_inline_g",
+                0.03125,
+                lambda: _check_gdn_postconv_inline_g(mx, dtype),
+            )
+            lanes["gdn_postconv_headquarter"] = _STATUS_SKIPPED
+    else:
+        lanes["gdn_postconv_inline_g"] = _STATUS_SKIPPED
+        lanes["gdn_postconv_headquarter"] = _STATUS_SKIPPED
 
     elapsed_ms = (time.perf_counter() - started) * 1000.0
 
@@ -545,41 +781,11 @@ def _model_quant_signature(model: Any):
     return None
 
 
-def _expert_quant_signature(spec: Any):
-    """(dtype, bits, group_size) of a streamed routed expert bank, or None.
-
-    A streamed model's routed experts carry their own affine quant format,
-    independent of the resident trunk (``ExpertStreamingModelSpec.quant_bits`` /
-    ``quant_group_size``). Scales and biases are stored as BF16 leaves
-    (``quant_parameter_bytes == 2`` across the affine specs), so the gather
-    lane runs at BF16. Shadow-codec banks (the q1 lane) do not run the affine
-    ``gather_qmm`` path and yield no signature.
-    """
-    import mlx.core as mx
-
-    if spec is None:
-        return None
-    bits = getattr(spec, "quant_bits", None)
-    group_size = getattr(spec, "quant_group_size", None)
-    if bits is None or group_size is None:
-        return None
-    if getattr(spec, "expert_codec", "affine") != "affine":
-        return None
-    scale_bytes = int(getattr(spec, "quant_parameter_bytes", 2) or 2)
-    dtype = mx.float32 if scale_bytes == 4 else mx.bfloat16
-    return dtype, int(bits), int(group_size)
-
-
-def maybe_run_model_selfcheck(
-    model: Any, *, expert_spec: Any = None
-) -> dict[str, Any] | None:
+def maybe_run_model_selfcheck(model: Any) -> dict[str, Any] | None:
     """Run the selfcheck for a freshly loaded model if turbo lanes are active.
 
     Called once from ``runtime.load()`` before the runtime is returned; any
     failure inside the probe itself must never break model loading.
-    ``expert_spec`` is the ``ExpertStreamingModelSpec`` for expert-streaming
-    loads (``None`` for dense/non-streaming models), used to add the routed
-    expert bank's ``gather_qmm`` lane at its own quant format.
     """
     if not selfcheck_enabled():
         return None
@@ -595,10 +801,7 @@ def maybe_run_model_selfcheck(
             group_size = 64
         else:
             dtype, bits, group_size = signature
-        expert_signature = _expert_quant_signature(expert_spec)
-        report = run_kernel_selfcheck(
-            dtype, bits, group_size, expert_signature=expert_signature
-        )
+        report = run_kernel_selfcheck(dtype, bits, group_size)
         fallbacks = sorted(
             lane for lane, status in report["lanes"].items() if status == _STATUS_FALLBACK
         )

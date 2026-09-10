@@ -16,6 +16,7 @@ from .constants import (
     EXPECTED_PREQUANTIZED_MTP_KEYS,
     EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS,
     EXPECTED_QWEN_MOE_SWITCH_MLP_PREQUANTIZED_MTP_KEYS,
+    expand_mtp_layer_keys,
 )
 from .expert_layout import num_experts_from_config, stack_numbered_experts
 
@@ -368,13 +369,10 @@ def _restore_delta_encoded_mtp_norms(
     return restored
 
 
-_QK_NORM_SUFFIXES = ("self_attn.q_norm.weight", "self_attn.k_norm.weight")
-_LOW_SET_NORM_SUFFIXES = (
-    "input_layernorm.weight",
-    "post_attention_layernorm.weight",
-    "pre_fc_norm_hidden.weight",
-    "pre_fc_norm_embedding.weight",
-)
+# Norm-suffix sets and the delta-detection thresholds live in
+# compressed_tensors (#301): mtp_sidecar_norms_are_delta /
+# mtp_norms_are_delta_encoded — one predicate for this heal path and
+# the forge's set-level shift decision.
 
 
 def _heal_raw_delta_mtp_norms(weights: dict[str, Any]) -> dict[str, Any]:
@@ -384,50 +382,13 @@ def _heal_raw_delta_mtp_norms(weights: dict[str, Any]) -> dict[str, Any]:
     convention); mlx-lm's trunk sanitize restores +1.0 but the MTP tensors are
     loaded separately and must be restored here. The shipped 4B artifact
     (#176) carries raw norms with no declared encoding, which poisons every
-    draft. Detection uses two independent signals with a wide fleet margin:
-    every healthy shipped sidecar has q/k norm means >= 1.74, raw exports sit
-    near 0.75; and raw low-set norms (input/post/pre_fc) fall below 0.5 while
-    healthy ones sit >= 0.87.
+    draft. Convention detection and the shift itself live in
+    compressed_tensors.shift_delta_mtp_norms (shared with forge, #301).
     """
 
-    def _mean(value: Any) -> float | None:
-        try:
-            if getattr(value, "ndim", None) != 1:
-                return None
-            return float(value.mean().item())
-        except Exception:
-            return None
+    from .compressed_tensors import shift_delta_mtp_norms
 
-    qk_means = [
-        m
-        for key, value in weights.items()
-        if any(key.endswith(sfx) for sfx in _QK_NORM_SUFFIXES)
-        and (m := _mean(value)) is not None
-    ]
-    low_means = [
-        m
-        for key, value in weights.items()
-        if any(key.endswith(sfx) for sfx in _LOW_SET_NORM_SUFFIXES)
-        and (m := _mean(value)) is not None
-    ]
-    if not qk_means or not low_means:
-        return weights
-    if max(qk_means) >= 1.25 or min(low_means) >= 0.5:
-        return weights
-
-    from .compressed_tensors import sanitize_plain_weight
-
-    logger.warning(
-        "[MTP inject] sidecar norms are raw delta-encoded "
-        "(q/k means %.2f, lowest norm %.2f); restoring the +1.0 convention (#176)",
-        max(qk_means),
-        min(low_means),
-    )
-    healed = dict(weights)
-    for key, value in list(healed.items()):
-        if getattr(value, "ndim", None) == 1:
-            healed[key] = sanitize_plain_weight(f"mtp.{key}", value)
-    return healed
+    return shift_delta_mtp_norms(weights)
 
 
 def _infer_prequantized_group_size(weights: dict[str, Any], bits: int | None) -> int | None:
@@ -634,13 +595,20 @@ def _mtp_contract_for_weight_keys(
     normalized = {normalize_mtp_key(key) for key in keys}
     if contract.mtp_prequantized:
         return contract
-    if normalized == set(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS):
+    # The named key sets are depth-1 templates; expand per the declared layer
+    # count so N-layer sidecars are recognized identically.
+    n_layers = max(_num_mtp_layers(config), 1)
+    if normalized == expand_mtp_layer_keys(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS, n_layers):
         policy = "all"
-    elif normalized == set(EXPECTED_QWEN_MOE_SWITCH_MLP_PREQUANTIZED_MTP_KEYS):
+    elif normalized == expand_mtp_layer_keys(
+        EXPECTED_QWEN_MOE_SWITCH_MLP_PREQUANTIZED_MTP_KEYS, n_layers
+    ):
         policy = "all"
-    elif normalized == set(EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS):
+    elif normalized == expand_mtp_layer_keys(
+        EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS, n_layers
+    ):
         policy = "cyankiwi"
-    elif normalized == set(EXPECTED_PREQUANTIZED_MTP_KEYS):
+    elif normalized == expand_mtp_layer_keys(EXPECTED_PREQUANTIZED_MTP_KEYS, n_layers):
         policy = "cyankiwi"
     else:
         return contract
@@ -1032,15 +1000,28 @@ def inject_mtp_support(
             parts = [e, h] if order == "embedding_hidden" else [h, e]
             x = self.mtp.fc(mx.concatenate(parts, axis=-1))
             fc_hidden = x
-            layer_cache = mtp_cache[0] if mtp_cache else None
-            mask = create_attention_mask(x, layer_cache)
-            x = self._mtp_full_attention_layer(
-                self.mtp.layers[0],
-                x,
-                mask=mask,
-                cache=layer_cache,
-                position_offset=position_offset,
-            )
+            num_draft_layers = len(self.mtp.layers)
+            if mtp_cache:
+                if len(mtp_cache) < num_draft_layers:
+                    raise ValueError(
+                        "MTP cache carries "
+                        f"{len(mtp_cache)} entries for {num_draft_layers} draft "
+                        "layers; rebuild it with make_mtp_cache()"
+                    )
+                layer_caches = mtp_cache
+            else:
+                layer_caches = [None] * num_draft_layers
+            # All draft-layer caches advance in lockstep, so the mask derived
+            # from the first layer's cache offset is valid for every layer.
+            mask = create_attention_mask(x, layer_caches[0])
+            for mtp_layer, layer_cache in zip(self.mtp.layers, layer_caches):
+                x = self._mtp_full_attention_layer(
+                    mtp_layer,
+                    x,
+                    mask=mask,
+                    cache=layer_cache,
+                    position_offset=position_offset,
+                )
             pre_norm = x
             post_norm = self.mtp.norm(x)
             hidden = self._mixed_hidden(

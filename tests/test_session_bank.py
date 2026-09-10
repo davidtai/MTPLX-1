@@ -3,9 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
-from mtplx.cache_state import CacheSnapshot
 from mtplx.session_bank import SessionBank
 
 
@@ -45,340 +42,6 @@ class RuntimeWithCaches:
 
     def make_mtp_cache(self):
         return [TrimmableLiveCache(0)]
-
-
-class AROnlyRuntime:
-    model_path = Path("models/example")
-    mtp_enabled = False
-
-    def __init__(self):
-        self.make_mtp_cache_calls = 0
-
-    def make_cache(self):
-        return []
-
-    def make_mtp_cache(self):
-        self.make_mtp_cache_calls += 1
-        raise AssertionError("AR-only SessionBank restore must not build MTP cache")
-
-
-_EMPTY_SNAPSHOT = CacheSnapshot(states=(), meta_states=())
-
-
-@pytest.mark.parametrize(
-    "auxiliary",
-    [
-        {"hidden": "stale-hidden"},
-        {"hidden_variant": "post_norm"},
-        {"mtp_history_snapshot": _EMPTY_SNAPSHOT},
-        {"mtp_history_cache_ref": []},
-        {"mtp_snapshot_epoch": 3},
-        {"gdn_boundaries": [(2, _EMPTY_SNAPSHOT, "stale-boundary-hidden")]},
-    ],
-    ids=[
-        "hidden",
-        "hidden-variant",
-        "mtp-snapshot",
-        "mtp-live-ref",
-        "mtp-epoch",
-        "boundary-hidden",
-    ],
-)
-def test_session_bank_put_rejects_explicit_none_auxiliary_state(auxiliary):
-    bank = SessionBank()
-    kwargs = {
-        "runtime": AROnlyRuntime(),
-        "token_ids": [1, 2, 3],
-        "cache": [],
-        "logits": "logits",
-        "hidden": None,
-        "mtp_history_policy": "none",
-        "snapshot_epoch": 3,
-        **auxiliary,
-    }
-
-    with pytest.raises(ValueError, match="mtp_history_policy='none'"):
-        bank.put(**kwargs)
-
-
-@pytest.mark.parametrize(
-    "auxiliary",
-    [
-        {"hidden": "stale-hidden"},
-        {"hidden_variant": "post_norm"},
-        {"mtp_history_snapshot": _EMPTY_SNAPSHOT},
-        {"mtp_snapshot_epoch": 3},
-    ],
-    ids=["hidden", "hidden-variant", "mtp-snapshot", "mtp-epoch"],
-)
-def test_session_bank_put_snapshot_rejects_explicit_none_auxiliary_state(
-    auxiliary,
-):
-    bank = SessionBank()
-    kwargs = {
-        "runtime": AROnlyRuntime(),
-        "token_ids": [1, 2, 3],
-        "cache_snapshot": _EMPTY_SNAPSHOT,
-        "logits": "logits",
-        "hidden": None,
-        "mtp_history_policy": "none",
-        "snapshot_epoch": 3,
-        **auxiliary,
-    }
-
-    with pytest.raises(ValueError, match="mtp_history_policy='none'"):
-        bank.put_snapshot(**kwargs)
-
-
-def test_session_bank_exact_none_restore_ignores_stale_auxiliary_state():
-    bank = SessionBank()
-    runtime = AROnlyRuntime()
-    entry = bank.put(
-        runtime=runtime,
-        token_ids=[1, 2, 3],
-        cache=[],
-        logits="logits",
-        hidden=None,
-        hidden_variant=None,
-        mtp_history_policy="none",
-        snapshot_epoch=3,
-    )
-    assert entry is not None
-    # Models a pre-fix RAM entry or corrupt persisted payload.
-    entry.hidden = "stale-hidden"
-    entry.hidden_variant = "post_norm"
-    entry.mtp_history_snapshot = _EMPTY_SNAPSHOT
-    entry.mtp_history_cache_ref = [TrimmableLiveCache(offset=2)]
-    entry.mtp_snapshot_epoch = 999
-
-    restored = bank.restore(
-        runtime,
-        [1, 2, 3, 4],
-        hidden_variant=None,
-        mtp_history_policy="none",
-    )
-
-    assert restored is not None
-    assert runtime.make_mtp_cache_calls == 0
-    assert restored.hidden is None
-    assert restored.mtp_history_snapshot is None
-    assert restored.mtp_history_cache is None
-    assert restored.entry.hidden_variant is None
-    assert restored.entry.mtp_snapshot_epoch is None
-
-
-def test_session_bank_near_none_restore_ignores_stale_live_mtp_reference():
-    bank = SessionBank()
-    runtime = AROnlyRuntime()
-    entry = bank.put(
-        runtime=runtime,
-        token_ids=[1, 2, 3, 4, 5, 6],
-        cache=[],
-        logits="logits",
-        hidden=None,
-        hidden_variant=None,
-        mtp_history_policy="none",
-        snapshot_epoch=6,
-    )
-    assert entry is not None
-    entry.cache_ref = [TrimmableLiveCache(offset=5)]
-    entry.mtp_history_cache_ref = [TrimmableLiveCache(offset=5)]
-    entry.hidden = "stale-hidden"
-
-    restored = bank.restore_entry_prefix_cache(
-        runtime,
-        entry,
-        5,
-        mode="reference",
-    )
-
-    assert restored is not None
-    cache, mtp_cache, restore_mode, restore_point, boundary_hidden = restored
-    assert cache is not None
-    assert mtp_cache is None
-    assert restore_mode == "reference_lease"
-    assert restore_point == 5
-    assert boundary_hidden is None
-    assert runtime.make_mtp_cache_calls == 0
-    assert entry.hidden is None
-    assert entry.mtp_history_cache_ref is None
-
-
-def test_session_bank_cold_none_restore_ignores_stale_auxiliary_state():
-    runtime = AROnlyRuntime()
-    record = SimpleNamespace(
-        token_ids=(1, 2, 3),
-        cache_snapshot=_EMPTY_SNAPSHOT,
-        logits="logits",
-        hidden="stale-hidden",
-        mtp_history_snapshot=_EMPTY_SNAPSHOT,
-        nbytes=128,
-        restore_s=0.01,
-        metadata={
-            "model_path": str(runtime.model_path),
-            "mtp_enabled": False,
-            "hidden_variant": "post_norm",
-            "mtp_history_policy": "none",
-            "snapshot_epoch": 3,
-            "mtp_snapshot_epoch": 999,
-        },
-    )
-
-    class ColdTier:
-        def lookup(self, *_args, **_kwargs):
-            return record
-
-    bank = SessionBank(cold_tier=ColdTier())
-    restored = bank.restore(
-        runtime,
-        [1, 2, 3, 4],
-        hidden_variant=None,
-        mtp_history_policy="none",
-    )
-
-    assert restored is not None
-    assert restored.cache_source == "ssd"
-    assert runtime.make_mtp_cache_calls == 0
-    assert restored.hidden is None
-    assert restored.mtp_history_snapshot is None
-    assert restored.mtp_history_cache is None
-    assert restored.entry.hidden_variant is None
-    assert restored.entry.mtp_snapshot_epoch is None
-
-
-def test_session_bank_committed_restore_keeps_hidden_and_mtp_snapshot():
-    bank = SessionBank()
-    runtime = RuntimeWithCaches()
-    entry = bank.put(
-        runtime=runtime,
-        token_ids=[1, 2, 3],
-        cache=[],
-        logits="logits",
-        hidden="committed-hidden",
-        hidden_variant="post_norm",
-        mtp_history_policy="committed",
-        mtp_history_snapshot=_EMPTY_SNAPSHOT,
-        snapshot_epoch=3,
-        mtp_snapshot_epoch=3,
-    )
-    assert entry is not None
-
-    incompatible = bank.restore(
-        runtime,
-        [1, 2, 3, 4],
-        hidden_variant=None,
-        mtp_history_policy="none",
-    )
-
-    assert incompatible is None
-    assert entry.hidden == "committed-hidden"
-    assert entry.mtp_history_snapshot is not None
-
-    restored = bank.restore(
-        runtime,
-        [1, 2, 3, 4],
-        hidden_variant="post_norm",
-        mtp_history_policy="committed",
-    )
-
-    assert restored is not None
-    assert restored.hidden == "committed-hidden"
-    assert restored.mtp_history_snapshot is not None
-    assert restored.mtp_history_cache is not None
-
-
-@pytest.mark.parametrize(
-    "ar_tokens",
-    [
-        [1, 2, 3],
-        [1, 2, 3, 4],
-    ],
-    ids=["same-key", "prefix-donor"],
-)
-def test_session_bank_none_put_strips_inherited_boundary_hidden(ar_tokens):
-    bank = SessionBank()
-    boundary_snapshot = CacheSnapshot(states=("trunk-boundary",), meta_states=(None,))
-    committed = bank.put(
-        runtime=RuntimeWithCaches(),
-        token_ids=[1, 2, 3],
-        cache=[],
-        logits="logits",
-        hidden="committed-hidden",
-        hidden_variant="post_norm",
-        mtp_history_policy="committed",
-        snapshot_epoch=3,
-        gdn_boundaries=[(2, boundary_snapshot, "committed-boundary-hidden")],
-    )
-    assert committed is not None
-
-    ar_entry = bank.put(
-        runtime=AROnlyRuntime(),
-        token_ids=ar_tokens,
-        cache=[],
-        logits="ar-logits",
-        hidden=None,
-        hidden_variant=None,
-        mtp_history_policy="none",
-        snapshot_epoch=len(ar_tokens),
-    )
-
-    assert ar_entry is not None
-    assert len(ar_entry.gdn_boundaries) == 1
-    boundary, restored_snapshot, boundary_hidden = ar_entry.gdn_boundaries[0]
-    assert boundary == 2
-    assert restored_snapshot.states == ("trunk-boundary",)
-    assert boundary_hidden is None
-
-
-def test_session_bank_none_put_sanitizes_loader_boundaries_before_ssd_enqueue():
-    enqueued: list[tuple[list[tuple], list[str]]] = []
-
-    class ColdTier:
-        def put_entry(self, entry, *, capabilities):
-            enqueued.append((list(entry.gdn_boundaries), list(capabilities)))
-
-    bank = SessionBank(cold_tier=ColdTier())
-    committed = bank.put(
-        runtime=RuntimeWithCaches(),
-        token_ids=[1, 2, 3],
-        cache=[],
-        logits="logits",
-        hidden="committed-hidden",
-        hidden_variant="post_norm",
-        mtp_history_policy="committed",
-        snapshot_epoch=3,
-    )
-    assert committed is not None
-    enqueued.clear()
-    committed.gdn_boundary_loader = lambda: [
-        (
-            2,
-            CacheSnapshot(states=("lazy-trunk-boundary",), meta_states=(None,)),
-            "lazy-committed-hidden",
-        )
-    ]
-
-    ar_entry = bank.put(
-        runtime=AROnlyRuntime(),
-        token_ids=[1, 2, 3, 4],
-        cache=[],
-        logits="ar-logits",
-        hidden=None,
-        hidden_variant=None,
-        mtp_history_policy="none",
-        snapshot_epoch=4,
-    )
-
-    assert ar_entry is not None
-    assert ar_entry.gdn_boundary_loader is None
-    assert len(ar_entry.gdn_boundaries) == 1
-    assert ar_entry.gdn_boundaries[0][1].states == ("lazy-trunk-boundary",)
-    assert ar_entry.gdn_boundaries[0][2] is None
-    assert len(enqueued) == 1
-    persisted_boundaries, capabilities = enqueued[0]
-    assert persisted_boundaries[0][1].states == ("lazy-trunk-boundary",)
-    assert persisted_boundaries[0][2] is None
-    assert capabilities == ["ar_insert"]
 
 
 def test_session_bank_skips_single_oversized_snapshot_before_insert():
@@ -843,3 +506,110 @@ def test_eviction_log_is_bounded_for_daemon_lifetime():
     assert len(bank.eviction_log) == 256
     # Newest entry survives at the tail; the oldest 44 fell off the front.
     assert bank.eviction_log[-1]["reason"] == "skipped_oversized_snapshot"
+
+
+def test_cross_session_eviction_prefers_idle_sessions_over_active_ones():
+    # 2026-07-31 live incident: cross-session LRU pressure evicted a
+    # mid-run coding session's warm entry, forcing an 85.6k-token full
+    # re-prefill on its next turn. Sessions that touched the bank within
+    # the active-pin TTL are eviction-last under cross-session pressure.
+    bank = SessionBank(max_entries=8, max_bytes=1000, per_session_max_bytes=1000)
+    runtime = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
+    bank.put(
+        runtime=runtime, token_ids=[1, 2, 3], cache=[], logits=None,
+        hidden=None, session_id="idle", nbytes_override=400,
+    )
+    bank.put(
+        runtime=runtime, token_ids=[9, 9, 9], cache=[], logits=None,
+        hidden=None, session_id="active", nbytes_override=400,
+    )
+    # The idle session went stale past the TTL; rig last_access so pure LRU
+    # would pick the ACTIVE session's entry — the preference must override.
+    bank._session_last_active["idle"] -= bank.active_pin_ttl_s + 1.0
+    for entry in bank._entries.values():
+        entry.last_access_s = 0.0 if entry.session_id == "active" else 1e12
+    bank.put(
+        runtime=runtime, token_ids=[5, 5, 5], cache=[], logits=None,
+        hidden=None, session_id="trigger", nbytes_override=400,
+    )
+    survivors = {entry.session_id for entry in bank._entries.values()}
+    assert survivors == {"active", "trigger"}
+    assert bank.eviction_log[-1]["session_id"] == "idle"
+    assert bank.eviction_log[-1]["session_active"] is False
+
+
+def test_active_session_over_its_own_budget_still_self_evicts():
+    # Per-session budget enforcement is self-inflicted pressure: an active
+    # session exceeding its own cap sheds its oldest entries even while
+    # pinned, keeping the newest (protected) snapshot.
+    bank = SessionBank(max_entries=8, max_bytes=10_000, per_session_max_bytes=500)
+    runtime = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
+    bank.put(
+        runtime=runtime, token_ids=[1, 2], cache=[], logits=None,
+        hidden=None, session_id="live", nbytes_override=300,
+    )
+    bank.put(
+        runtime=runtime, token_ids=[7, 7, 7], cache=[], logits=None,
+        hidden=None, session_id="live", nbytes_override=300,
+    )
+    lens = sorted(entry.prefix_len for entry in bank._entries.values())
+    assert lens == [3]
+    assert bank.eviction_log[-1]["session_id"] == "live"
+
+
+def test_per_session_entry_retention_bounds_divergent_siblings():
+    # 2026-08-01 live leak: divergent same-session tails are not strict
+    # prefixes, so supersede never fires and one agent session accumulated
+    # 5 near-duplicate multi-GB snapshots. Newest-K retention bounds it.
+    bank = SessionBank(max_entries=16, max_bytes=10_000, per_session_max_bytes=10_000)
+    runtime = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
+    for i in range(5):
+        bank.put(
+            runtime=runtime, token_ids=[7, 7, 100 + i], cache=[], logits=None,
+            hidden=None, session_id="agent", nbytes_override=100,
+        )
+    survivors = sorted(e.token_ids[-1] for e in bank._entries.values())
+    assert len(survivors) == bank.per_session_max_entries == 3
+    assert 104 in survivors  # newest always kept
+    assert bank.eviction_log[-1]["reason"] == "session_entry_retention"
+    # Other sessions unaffected by one session's churn.
+    bank.put(
+        runtime=runtime, token_ids=[9, 9, 9], cache=[], logits=None,
+        hidden=None, session_id="other", nbytes_override=100,
+    )
+    assert sum(1 for e in bank._entries.values() if e.session_id == "other") == 1
+    assert sum(1 for e in bank._entries.values() if e.session_id == "agent") == 3
+
+
+def test_longest_shared_prefix_tokens_sees_entries_that_are_not_exact_prefixes():
+    bank = SessionBank(max_entries=4, max_bytes=1024, per_session_max_bytes=512)
+    runtime = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
+    shared = list(range(1, 41))
+    # The forced-round shape: prompt + sentinel + completion, then a follow-up
+    # prompt that shares the 40-token head but not the sentinel.
+    bank.put(
+        runtime=runtime,
+        token_ids=shared + [901, 902, 903],
+        cache=[],
+        logits=None,
+        hidden=None,
+        session_id="agent",
+        nbytes_override=16,
+    )
+    bank.put(
+        runtime=runtime,
+        token_ids=[7, 8, 9, 10],
+        cache=[],
+        logits=None,
+        hidden=None,
+        session_id="other",
+        nbytes_override=16,
+    )
+    follow_up = shared + [501, 502, 503, 504]
+
+    assert bank.longest_prefix(follow_up) is None
+    assert bank.longest_shared_prefix_tokens(follow_up) == 40
+    assert bank.longest_shared_prefix_tokens(follow_up, session_id="agent") == 40
+    assert bank.longest_shared_prefix_tokens(follow_up, session_id="other") == 0
+    assert bank.longest_shared_prefix_tokens([7, 8, 9, 99]) == 3
+    assert bank.longest_shared_prefix_tokens([]) == 0

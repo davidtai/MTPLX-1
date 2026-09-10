@@ -1,5 +1,6 @@
 from mtplx import thermal
 import subprocess
+import time as _time
 
 import pytest
 
@@ -49,9 +50,23 @@ _FAKE_THERMALFORGE_DETECTION = {
 }
 
 
+_AUTO_SUMMARY = {
+    "ok": True,
+    "fans": [
+        {
+            "mode": "auto",
+            "target_rpm": 2317,
+            "actual_rpm": 2320,
+            "max_capacity_rpm": 7826,
+        }
+    ],
+}
+
+
 def test_set_thermal_profile_silent_prefers_daemon_socket(monkeypatch):
     """The fan reset goes through the daemon socket (no sudo, no app-kill) and
-    does not fall back to the `auto` CLI when the socket accepts it."""
+    does not fall back to the `auto` CLI when the socket accepts it AND the
+    fan rows verify back on the auto curve (#201)."""
     monkeypatch.setattr(thermal, "detect_thermal_control", lambda: _FAKE_THERMALFORGE_DETECTION)
 
     sent: list[str] = []
@@ -61,6 +76,7 @@ def test_set_thermal_profile_silent_prefers_daemon_socket(monkeypatch):
         return {"ok": True, "response": "ok", "command": ["<thermalforge-daemon-socket>", command]}
 
     monkeypatch.setattr(thermal, "_daemon_socket_send", fake_socket)
+    monkeypatch.setattr(thermal, "fan_summary", lambda: _AUTO_SUMMARY)
 
     def no_cli(command, *, timeout_s=None, cwd=None):
         raise AssertionError(f"CLI should not run when the socket handles it: {command}")
@@ -72,6 +88,83 @@ def test_set_thermal_profile_silent_prefers_daemon_socket(monkeypatch):
     assert result["ok"] is True
     assert sent == ["auto"]
     assert result["command"] == ["<thermalforge-daemon-socket>", "auto"]
+    assert result["attempts"][0]["verified"] is True
+
+
+def test_set_thermal_profile_silent_socket_ack_without_effect_falls_back_to_cli(monkeypatch):
+    """#201 regression guard: a daemon that replies ok but leaves the fans
+    pinned must not be trusted — the same call falls through to the CLI
+    candidates instead of reporting a restore that never happened."""
+    monkeypatch.setattr(thermal, "detect_thermal_control", lambda: _FAKE_THERMALFORGE_DETECTION)
+    monkeypatch.setattr(
+        thermal,
+        "_daemon_socket_send",
+        lambda command, *, timeout_s=3.0: {
+            "ok": True,
+            "response": "ok",
+            "command": ["<thermalforge-daemon-socket>", command],
+        },
+    )
+    # Fans stay ramped no matter what the daemon claims.
+    monkeypatch.setattr(thermal, "fan_summary", lambda: _RAMPED_SUMMARY)
+    monkeypatch.setattr(thermal, "time", _FastTime())
+
+    ran: list[list[str]] = []
+
+    def fake_run(command, *, timeout_s=None, cwd=None):
+        ran.append(command)
+        return {"command": command, "returncode": 0, "ok": True, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(thermal, "_run_probe", fake_run)
+
+    result = thermal.set_thermal_profile("silent")
+
+    assert result["ok"] is True
+    assert result["attempts"][0]["verified"] is False
+    assert ran and ran[0][-1] == "auto"
+
+
+class _FastTime:
+    """time shim: monotonic advances 1s per call so bounded verify loops
+    exhaust instantly and sleep is a no-op."""
+
+    def __init__(self) -> None:
+        self._now = 0.0
+
+    def monotonic(self) -> float:
+        self._now += 1.0
+        return self._now
+
+    def time(self) -> float:
+        return self.monotonic()
+
+    def sleep(self, _s: float) -> None:
+        return None
+
+
+def test_wait_for_auto_fans_polls_until_rows_report_auto(monkeypatch):
+    """The shared #201 verification (used by set_thermal_profile and the fan
+    sidecar) keeps polling through ramped and unreadable summaries and returns
+    True the moment every fan row is back on auto."""
+    summaries = iter([_RAMPED_SUMMARY, {"ok": False, "fans": []}, _AUTO_SUMMARY])
+    polled = {"n": 0}
+
+    def fake_summary():
+        polled["n"] += 1
+        return next(summaries)
+
+    monkeypatch.setattr(thermal, "fan_summary", fake_summary)
+    monkeypatch.setattr(thermal, "time", _FastTime())
+
+    assert thermal.wait_for_auto_fans(timeout_s=10.0) is True
+    assert polled["n"] == 3
+
+
+def test_wait_for_auto_fans_gives_up_at_the_deadline(monkeypatch):
+    monkeypatch.setattr(thermal, "fan_summary", lambda: _RAMPED_SUMMARY)
+    monkeypatch.setattr(thermal, "time", _FastTime())
+
+    assert thermal.wait_for_auto_fans(timeout_s=3.0) is False
 
 
 def test_set_thermal_profile_silent_falls_back_to_cli_without_daemon(monkeypatch):
@@ -125,6 +218,19 @@ def _patch_smart_fan_hardware(monkeypatch, calls, *, set_results=None):
     )
     monkeypatch.setattr(thermal, "set_thermal_profile", fake_set)
     monkeypatch.setattr(thermal, "fan_summary", lambda: _RAMPED_SUMMARY)
+    # #227's heat-soak hold made the worker's restore path probe the real
+    # SoC die temperature (soc_temperature_c -> `thermalforge status`).
+    # Stub it like every other hardware touchpoint: on a machine whose die
+    # is above MTPLX_SMART_FAN_SOAK_RELEASE_C (75C) -- routine late in a
+    # full pytest battery -- the hold defers the restore, and any test that
+    # waits for "auto" without end_request's wait_for_restore soak bypass
+    # times out. "No usable reading" selects the legacy instant restore;
+    # soak-specific tests override this via _patch_soak_probe.
+    monkeypatch.setattr(
+        thermal,
+        "soc_temperature_c",
+        lambda: {"ok": False, "celsius": None, "sensor": None},
+    )
 
 
 def test_smart_fan_controller_keeps_max_until_final_request(monkeypatch):
@@ -252,6 +358,113 @@ def test_smart_fan_controller_detach_never_touches_hardware(monkeypatch):
 
     _time.sleep(0.2)
     assert calls == ["performance"]
+
+
+def _wait_until(predicate, timeout_s=5.0, interval_s=0.02):
+    import time as _time
+
+    deadline = _time.monotonic() + timeout_s
+    while _time.monotonic() < deadline:
+        if predicate():
+            return True
+        _time.sleep(interval_s)
+    return predicate()
+
+
+def test_smart_fan_restore_retries_with_backoff_until_verified(monkeypatch):
+    """#201: a restore that fails verification must be retried until the
+    fans actually come back to auto — not marked restored and forgotten
+    while the hardware stays pinned at max."""
+    calls: list[str] = []
+    monkeypatch.setattr(thermal, "check_and_recover_stale_max", lambda: None)
+    monkeypatch.setattr(thermal, "set_thermal_profile", lambda profile: (
+        calls.append(profile) or {"ok": True, "profile": profile}
+    ))
+    monkeypatch.setattr(thermal, "fan_summary", lambda: _RAMPED_SUMMARY)
+    monkeypatch.setattr(thermal, "_clear_max_marker", lambda: None)
+
+    restore_results = [
+        {"ok": False, "message": "socket ack without effect"},
+        {"ok": False, "message": "socket ack without effect"},
+        {"ok": True, "profile": "silent"},
+    ]
+    restore_calls: list[int] = []
+
+    def fake_cleanup():
+        restore_calls.append(1)
+        return restore_results.pop(0)
+
+    monkeypatch.setattr(thermal, "install_max_lifecycle_hooks", lambda: fake_cleanup)
+    monkeypatch.setattr(
+        thermal, "restore_thermal_profile_verified", lambda **_kw: fake_cleanup()
+    )
+    monkeypatch.setattr(
+        thermal.SmartFanController, "_RESTORE_RETRY_BACKOFF_S", (0.05, 0.05, 0.05, 0.05)
+    )
+
+    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller.begin_request("req")
+    assert controller.wait_for_ramp(5.0) is True
+    controller.end_request("req", wait_for_restore=True)
+
+    # First restore failed; the worker must keep retrying on its own with
+    # backoff until the third attempt verifies.
+    assert _wait_until(lambda: len(restore_calls) >= 3)
+    assert _wait_until(lambda: controller.status()["restore_verified"] is True)
+    status = controller.status()
+    assert status["restore_failures"] == 0
+    assert status["commanded_max"] is False
+    controller._shutdown = True
+
+
+def test_smart_fan_stale_lease_reconciler_drops_leaked_leases(monkeypatch):
+    """#201: a lease held while the engine is continuously idle is a leak
+    from a wedged request path — it must be dropped and fans restored
+    instead of pinning the fans forever."""
+    calls: list[str] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
+    monkeypatch.setattr(thermal.SmartFanController, "_ACTIVITY_POLL_INTERVAL_S", 0.05)
+    monkeypatch.setenv("MTPLX_SMART_FAN_STALE_LEASE_S", "0.2")
+
+    controller = thermal.SmartFanController(
+        restore_delay_s=0, activity_probe=lambda: False
+    )
+    controller.begin_request("leaked-lease")
+    assert controller.wait_for_ramp(5.0) is True
+
+    # Never end_request: the reconciler must clear it once the probe has
+    # reported the engine idle past the stale window.
+    assert _wait_until(lambda: controller.status()["active_count"] == 0)
+    assert _wait_until(lambda: "auto" in calls)
+    status = controller.status()
+    assert status["stale_leases_reconciled"] == 1
+    assert status["commanded_max"] is False
+    controller._shutdown = True
+
+
+def test_smart_fan_stale_lease_reconciler_never_fires_while_engine_busy(monkeypatch):
+    """The reconciler must not drop leases while the activity probe reports
+    model work — a long legitimate generation keeps its fan boost."""
+    calls: list[str] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
+    monkeypatch.setattr(thermal.SmartFanController, "_ACTIVITY_POLL_INTERVAL_S", 0.02)
+    monkeypatch.setenv("MTPLX_SMART_FAN_STALE_LEASE_S", "0.1")
+
+    controller = thermal.SmartFanController(
+        restore_delay_s=0, activity_probe=lambda: True
+    )
+    controller.begin_request("long-generation")
+    assert controller.wait_for_ramp(5.0) is True
+
+    import time as _time
+
+    _time.sleep(0.5)
+    status = controller.status()
+    assert status["active_count"] == 1
+    assert status["stale_leases_reconciled"] == 0
+    assert status["commanded_max"] is True
+    controller.end_request("long-generation", wait_for_restore=True)
+    controller._shutdown = True
 
 
 def test_thermalforge_profile_candidates_match_real_cli():
@@ -503,40 +716,60 @@ def test_install_thermal_control_homebrew_alias_still_works(monkeypatch):
     assert thermal.install_thermal_control_homebrew is thermal.install_thermal_control
 
 
+def _is_sudo_install(command) -> bool:
+    return (
+        command
+        and command[0] == "sudo"
+        and "/bin/sh" in command
+        and thermal._PRIVILEGED_SUDOERS_SCRIPT in command
+    )
+
+
+def _is_security_install(command) -> bool:
+    return command[:3] == ["/usr/bin/security", "execute-with-privileges", "/bin/sh"]
+
+
+def _fake_probe_ok(command, *, timeout_s=None, cwd=None):
+    """visudo pre-check and the final `sudo -n ... status` verification both pass."""
+    return {"command": command, "returncode": 0, "ok": True, "stdout": "{}", "stderr": ""}
+
+
 def test_passwordless_sudoers_rule_uses_security_prompt_when_gui_sudo_fails(monkeypatch):
     invocations: list[list[str]] = []
 
     def fake_which(name):
         if name == "security":
             return "/usr/bin/security"
+        if name == "visudo":
+            return "/usr/sbin/visudo"
         return None
 
     def fake_subprocess_run(command, **kwargs):
         invocations.append(command)
-        if command == ["sudo", "tee", thermal.SUDOERS_FILE]:
+        if _is_sudo_install(command):
             return subprocess.CompletedProcess(
                 command,
                 1,
                 stdout="",
                 stderr="sudo: a terminal is required to read the password",
             )
-        if command[:3] == ["/usr/bin/security", "execute-with-privileges", "/bin/sh"]:
+        if _is_security_install(command):
+            # The privileged script receives the finished rule line, never
+            # the raw user name, so the escaping decided in Python is what
+            # lands on disk.
             assert command[-3:] == [
                 thermal.SUDOERS_FILE,
-                "testuser",
+                "testuser ALL=(root) NOPASSWD: /tmp/mtplx-bin/thermalforge",
                 "/tmp/mtplx-bin/thermalforge",
             ]
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
         raise AssertionError(f"unexpected subprocess call: {command}")
 
-    def fake_probe(command, *, timeout_s=None):
-        assert command == ["sudo", "-n", "/tmp/mtplx-bin/thermalforge", "status"]
-        return {"command": command, "returncode": 0, "ok": True, "stdout": "{}", "stderr": ""}
-
     monkeypatch.setenv("USER", "testuser")
+    monkeypatch.setattr(thermal, "_stdin_is_tty", lambda: False)
     monkeypatch.setattr(thermal.shutil, "which", fake_which)
     monkeypatch.setattr(thermal.subprocess, "run", fake_subprocess_run)
-    monkeypatch.setattr(thermal, "_run_probe", fake_probe)
+    monkeypatch.setattr(thermal, "_run_probe", _fake_probe_ok)
 
     result = thermal.install_passwordless_sudoers_rule(
         binary_path="/tmp/mtplx-bin/thermalforge"
@@ -544,10 +777,11 @@ def test_passwordless_sudoers_rule_uses_security_prompt_when_gui_sudo_fails(monk
 
     assert result["ok"] is True, result
     assert result["method"] == "security_execute_with_privileges"
-    assert any(
-        command[:3] == ["/usr/bin/security", "execute-with-privileges", "/bin/sh"]
-        for command in invocations
-    )
+    assert any(_is_security_install(command) for command in invocations)
+    # Without a terminal the sudo attempt must be non-interactive so it can
+    # never sit on a password prompt nobody can see.
+    sudo_calls = [command for command in invocations if _is_sudo_install(command)]
+    assert sudo_calls and sudo_calls[0][1] == "-n", sudo_calls
 
 
 def test_passwordless_sudoers_rule_reports_security_prompt_failure(monkeypatch):
@@ -557,14 +791,14 @@ def test_passwordless_sudoers_rule_reports_security_prompt_failure(monkeypatch):
         return None
 
     def fake_subprocess_run(command, **kwargs):
-        if command == ["sudo", "tee", thermal.SUDOERS_FILE]:
+        if _is_sudo_install(command):
             return subprocess.CompletedProcess(
                 command,
                 1,
                 stdout="",
                 stderr="sudo: a terminal is required to read the password",
             )
-        if command[:3] == ["/usr/bin/security", "execute-with-privileges", "/bin/sh"]:
+        if _is_security_install(command):
             return subprocess.CompletedProcess(
                 command,
                 1,
@@ -574,16 +808,204 @@ def test_passwordless_sudoers_rule_reports_security_prompt_failure(monkeypatch):
         raise AssertionError(f"unexpected subprocess call: {command}")
 
     monkeypatch.setenv("USER", "testuser")
+    monkeypatch.setattr(thermal, "_stdin_is_tty", lambda: False)
     monkeypatch.setattr(thermal.shutil, "which", fake_which)
     monkeypatch.setattr(thermal.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(thermal, "_run_probe", _fake_probe_ok)
 
     result = thermal.install_passwordless_sudoers_rule(
         binary_path="/tmp/mtplx-bin/thermalforge"
     )
 
     assert result["ok"] is False
-    assert result["step"] == "sudo_tee"
+    assert result["step"] == "sudo_install"
     assert "macOS admin authorization failed" in result["message"]
+    # No terminal: the user is told where to type the password instead of
+    # being left with a command that appears to hang.
+    assert "Run `mtplx max --grant-sudo` in a terminal" in result["message"]
+
+
+# -- sudoers rule construction (C-15) -----------------------------------------
+
+
+def test_sudoers_rule_escapes_spaces_in_binary_path():
+    """A home on a volume with a space used to produce a rule whose command was
+    split at the space; visudo accepts that rule, so the install reported ok
+    while `sudo -n thermalforge max` was refused and fans never ramped."""
+    rule = thermal.sudoers_rule_for("testuser", "/Volumes/My Drive/.mtplx/bin/thermalforge")
+    assert rule == "testuser ALL=(root) NOPASSWD: /Volumes/My\\ Drive/.mtplx/bin/thermalforge"
+    # The other characters sudo's lexer accepts only when escaped.
+    rule = thermal.sudoers_rule_for("testuser", "/tmp/a=b,c:d#e/thermalforge")
+    assert rule == "testuser ALL=(root) NOPASSWD: /tmp/a\\=b\\,c\\:d\\#e/thermalforge"
+    # A plain path is written verbatim.
+    assert (
+        thermal.sudoers_rule_for("test.user-2", "/Users/test/.mtplx/bin/thermalforge")
+        == "test.user-2 ALL=(root) NOPASSWD: /Users/test/.mtplx/bin/thermalforge"
+    )
+
+
+@pytest.mark.parametrize(
+    "binary_path",
+    [
+        "/tmp/mtplx-bin/thermalforge\nroot ALL=(ALL) NOPASSWD: ALL",
+        "/tmp/mtplx-bin/thermal\rforge",
+        '/tmp/my "quoted" dir/thermalforge',
+        "/tmp/it's/thermalforge",
+        "/tmp/mtplx-bin/*",
+        "/tmp/mtplx-bin/thermalforge?",
+        "/tmp/[bin]/thermalforge",
+        "/tmp/back\\slash/thermalforge",
+        "/tmp/tab\tdir/thermalforge",
+        "relative/thermalforge",
+    ],
+)
+def test_sudoers_rule_rejects_unsafe_binary_paths(binary_path):
+    with pytest.raises(ValueError) as excinfo:
+        thermal.sudoers_rule_for("testuser", binary_path)
+    assert "sudoers rule" in str(excinfo.value) or "absolute" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("user", ["", "_unknown user", "-root", "%admin", "#0", "a,b", "bob\n"])
+def test_sudoers_rule_rejects_unsafe_user_names(user):
+    with pytest.raises(ValueError):
+        thermal.sudoers_rule_for(user, "/tmp/mtplx-bin/thermalforge")
+
+
+def test_install_passwordless_sudoers_rule_installs_nothing_when_visudo_rejects(monkeypatch):
+    """The rule is parsed on a temporary file we own before any privileged
+    call; a rejected rule ends the install with nothing written."""
+    privileged: list[list[str]] = []
+
+    def fake_probe(command, *, timeout_s=None, cwd=None):
+        if command[1:3] == ["-c", "-f"]:
+            assert command[-1] != thermal.SUDOERS_FILE
+            return {
+                "command": command,
+                "returncode": 1,
+                "ok": False,
+                "stdout": "",
+                "stderr": f"{command[-1]}:1:10: syntax error",
+            }
+        raise AssertionError(f"unexpected probe: {command}")
+
+    def fake_subprocess_run(command, **kwargs):
+        privileged.append(command)
+        raise AssertionError(f"privileged call must not run: {command}")
+
+    monkeypatch.setenv("USER", "testuser")
+    monkeypatch.setattr(thermal, "_run_probe", fake_probe)
+    monkeypatch.setattr(thermal.subprocess, "run", fake_subprocess_run)
+
+    result = thermal.install_passwordless_sudoers_rule(binary_path="/tmp/mtplx-bin/thermalforge")
+
+    assert result["ok"] is False
+    assert result["step"] == "visudo_check"
+    assert "nothing was installed" in result["message"]
+    assert "syntax error" in result["message"]
+    assert privileged == []
+
+
+def test_install_passwordless_sudoers_rule_refuses_unsafe_path_before_any_call(monkeypatch):
+    def fake_probe(command, *, timeout_s=None, cwd=None):
+        raise AssertionError(f"no command may run: {command}")
+
+    monkeypatch.setenv("USER", "testuser")
+    monkeypatch.setattr(thermal, "_run_probe", fake_probe)
+    monkeypatch.setattr(thermal.subprocess, "run", fake_probe)
+
+    result = thermal.install_passwordless_sudoers_rule(
+        binary_path="/tmp/mtplx-bin/thermalforge\nroot ALL=(ALL) NOPASSWD: ALL"
+    )
+
+    assert result["ok"] is False
+    assert result["step"] == "build_rule"
+    assert "cannot be written to a sudoers rule" in result["message"]
+
+
+def test_install_passwordless_sudoers_rule_defaults_to_the_binary_fan_commands_use(
+    monkeypatch, tmp_path
+):
+    """`mtplx max --grant-sudo` used to grant the PATH copy of thermalforge
+    (or /usr/local/bin/thermalforge) while fan control ran MTPLX's own copy in
+    ~/.mtplx/bin, so the grant never applied to the binary that needed it."""
+    bin_dir = tmp_path / "mtplx bin"
+    bin_dir.mkdir()
+    own = bin_dir / "thermalforge"
+    own.write_text("#!/bin/sh\nexit 0\n")
+    own.chmod(0o755)
+    monkeypatch.setattr(thermal, "MTPLX_THERMALFORGE_DIR", str(bin_dir))
+    monkeypatch.setattr(thermal, "MTPLX_THERMALFORGE_PATH", str(own))
+    monkeypatch.setattr(
+        thermal.shutil,
+        "which",
+        lambda name: "/usr/local/bin/thermalforge" if name == "thermalforge" else None,
+    )
+
+    sudo_calls: list[list[str]] = []
+
+    def fake_subprocess_run(command, **kwargs):
+        assert _is_sudo_install(command), command
+        assert "timeout" in kwargs and kwargs["timeout"], "sudo must be bounded"
+        sudo_calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setenv("USER", "testuser")
+    monkeypatch.setattr(thermal, "_stdin_is_tty", lambda: True)
+    monkeypatch.setattr(thermal.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(thermal, "_run_probe", _fake_probe_ok)
+
+    result = thermal.install_passwordless_sudoers_rule()
+
+    assert result["ok"] is True, result
+    assert result["method"] == "sudo"
+    assert result["binary_path"] == str(own)
+    assert result["rule"] == f"testuser ALL=(root) NOPASSWD: {tmp_path}/mtplx\\ bin/thermalforge"
+    # Interactive terminal: plain `sudo` (may prompt), the script gets the
+    # escaped rule and the raw path it must find executable.
+    assert len(sudo_calls) == 1
+    assert sudo_calls[0][1] == "/bin/sh"
+    assert sudo_calls[0][-3:] == [thermal.SUDOERS_FILE, result["rule"], str(own)]
+
+
+def test_install_passwordless_sudoers_rule_reports_missing_thermalforge(monkeypatch):
+    monkeypatch.setattr(thermal, "_find_thermalforge", lambda: None)
+    monkeypatch.setattr(
+        thermal.subprocess, "run", lambda *a, **k: pytest.fail("no command may run")
+    )
+
+    result = thermal.install_passwordless_sudoers_rule()
+
+    assert result["ok"] is False
+    assert result["step"] == "locate_thermalforge"
+    assert "mtplx max --install" in result["message"]
+
+
+def test_install_passwordless_sudoers_rule_sudo_timeout_is_reported(monkeypatch):
+    def fake_which(name):
+        if name == "security":
+            return "/usr/bin/security"
+        return None
+
+    def fake_subprocess_run(command, **kwargs):
+        if _is_sudo_install(command):
+            raise subprocess.TimeoutExpired(command, kwargs.get("timeout"))
+        if _is_security_install(command):
+            return subprocess.CompletedProcess(
+                command, 1, stdout="", stderr="The user canceled authorization."
+            )
+        raise AssertionError(f"unexpected subprocess call: {command}")
+
+    monkeypatch.setenv("USER", "testuser")
+    monkeypatch.setattr(thermal, "_stdin_is_tty", lambda: True)
+    monkeypatch.setattr(thermal.shutil, "which", fake_which)
+    monkeypatch.setattr(thermal.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(thermal, "_run_probe", _fake_probe_ok)
+
+    result = thermal.install_passwordless_sudoers_rule(binary_path="/tmp/mtplx-bin/thermalforge")
+
+    assert result["ok"] is False
+    assert result["step"] == "sudo_install"
+    assert "did not finish within" in result["message"]
 
 
 def test_fan_summary_parses_thermalforge_status_json(monkeypatch):
@@ -1088,3 +1510,168 @@ def test_install_always_restores_fans_even_when_verification_fails(monkeypatch, 
     # Critical: even though verification failed, we restored fans.
     assert "silent" in restored, restored
     thermal.detect_thermal_control.cache_clear()
+
+
+# -- heat-soak release hold (#227) ------------------------------------------
+
+
+def _wait_for(predicate, timeout_s: float = 5.0) -> bool:
+    deadline = _time.monotonic() + timeout_s
+    while _time.monotonic() < deadline:
+        if predicate():
+            return True
+        _time.sleep(0.01)
+    return False
+
+
+def _patch_soak_probe(monkeypatch, temps):
+    """soc_temperature_c stub returning readings from ``temps`` (last repeats)."""
+    sequence = list(temps)
+
+    def fake_probe():
+        value = sequence.pop(0) if len(sequence) > 1 else sequence[0]
+        if value is None:
+            return {"ok": False, "celsius": None, "sensor": None}
+        return {"ok": True, "celsius": float(value), "sensor": "TCMb"}
+
+    monkeypatch.setattr(thermal, "soc_temperature_c", fake_probe)
+    monkeypatch.setattr(thermal.SmartFanController, "_SOAK_PROBE_INTERVAL_S", 0.01)
+
+
+def test_smart_fan_soak_hold_keeps_max_until_cooled(monkeypatch):
+    calls: list[str] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
+    _patch_soak_probe(monkeypatch, [92.0, 91.0, 60.0])
+
+    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller.begin_request("burst")
+    assert controller.wait_for_ramp(5.0) is True
+
+    controller.end_request("burst")
+
+    assert _wait_for(lambda: "auto" in calls), controller.status()
+    status = controller.status()
+    assert status["soak_holds"] >= 1
+    assert status["soak_release_reason"] == "cooled"
+    assert status["soak_last_temp_c"] == 60.0
+
+
+def test_smart_fan_soak_hold_cap_bounds_the_pin(monkeypatch):
+    calls: list[str] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
+    _patch_soak_probe(monkeypatch, [95.0])
+    monkeypatch.setenv("MTPLX_SMART_FAN_SOAK_HOLD_CAP_S", "0.2")
+
+    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller.begin_request("burst")
+    assert controller.wait_for_ramp(5.0) is True
+
+    controller.end_request("burst")
+
+    # The die never cools, but the cap guarantees the fans come back.
+    assert _wait_for(lambda: "auto" in calls), controller.status()
+    assert controller.status()["soak_release_reason"] == "hold_cap"
+
+
+def test_smart_fan_soak_probe_failure_falls_back_to_legacy_restore(monkeypatch):
+    calls: list[str] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
+    _patch_soak_probe(monkeypatch, [None])
+
+    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller.begin_request("burst")
+    assert controller.wait_for_ramp(5.0) is True
+
+    controller.end_request("burst")
+
+    assert _wait_for(lambda: "auto" in calls), controller.status()
+    status = controller.status()
+    assert status["soak_holds"] == 0
+    assert status["soak_release_reason"] is None
+
+
+def test_smart_fan_soak_disabled_by_env_restores_immediately(monkeypatch):
+    calls: list[str] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
+    probes: list[str] = []
+
+    def fake_probe():
+        probes.append("probe")
+        return {"ok": True, "celsius": 99.0, "sensor": "TCMb"}
+
+    monkeypatch.setattr(thermal, "soc_temperature_c", fake_probe)
+    monkeypatch.setenv("MTPLX_SMART_FAN_SOAK_RELEASE_C", "0")
+
+    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller.begin_request("burst")
+    assert controller.wait_for_ramp(5.0) is True
+
+    controller.end_request("burst", wait_for_restore=True)
+
+    assert calls == ["performance", "auto"]
+    assert probes == []
+
+
+def test_smart_fan_wait_for_restore_bypasses_soak_hold(monkeypatch):
+    calls: list[str] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
+    _patch_soak_probe(monkeypatch, [95.0])
+
+    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller.begin_request("bench")
+    assert controller.wait_for_ramp(5.0) is True
+
+    # Bench lanes and shutdown paths must not sit behind a hot-die hold.
+    controller.end_request("bench", wait_for_restore=True)
+
+    assert calls == ["performance", "auto"]
+
+
+def _patch_status_temperatures(monkeypatch, temperatures):
+    import json as _json
+
+    monkeypatch.setattr(
+        thermal,
+        "thermal_status",
+        lambda: {
+            "ok": True,
+            "status": {"stdout": _json.dumps({"fans": [], "temperatures": temperatures})},
+        },
+    )
+
+
+def test_soc_temperature_prefers_hottest_cpu_die_sensor(monkeypatch):
+    _patch_status_temperatures(
+        monkeypatch,
+        {"TCMb": 91.8, "TCDX": 60.9, "TB0T": 35.8, "Tp0C": 99.0},
+    )
+
+    reading = thermal.soc_temperature_c()
+
+    assert reading["ok"] is True
+    assert reading["sensor"] == "TCMb"
+    assert reading["celsius"] == 91.8
+
+
+def test_soc_temperature_filters_sentinel_values_and_falls_back(monkeypatch):
+    _patch_status_temperatures(monkeypatch, {"TCMb": 0.0, "Tp0C": 61.7})
+
+    reading = thermal.soc_temperature_c()
+
+    assert reading["ok"] is True
+    assert reading["sensor"] == "Tp0C"
+
+
+def test_soc_temperature_pinned_sensor_env(monkeypatch):
+    _patch_status_temperatures(monkeypatch, {"TCMb": 91.8, "TCDX": 60.9})
+    monkeypatch.setenv("MTPLX_SMART_FAN_SOAK_SENSOR", "TCDX")
+
+    reading = thermal.soc_temperature_c()
+
+    assert reading == {"ok": True, "celsius": 60.9, "sensor": "TCDX"}
+
+
+def test_soc_temperature_without_temperature_data_is_not_ok(monkeypatch):
+    _patch_status_temperatures(monkeypatch, {})
+
+    assert thermal.soc_temperature_c()["ok"] is False

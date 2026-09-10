@@ -1,1 +1,1 @@
-"""Model overlays used by optional MTPLX execution paths."""
+"""MTPLX-owned model implementations unavailable in the pinned mlx-lm."""

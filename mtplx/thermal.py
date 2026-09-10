@@ -9,10 +9,13 @@ to spin loops or clock-anchor hacks.
 from __future__ import annotations
 
 import os
+import pwd
+import re
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -345,6 +348,54 @@ def fan_summary() -> dict[str, Any]:
     }
 
 
+def soc_temperature_c() -> dict[str, Any]:
+    """Best-effort SoC die temperature from the thermal tool's status JSON.
+
+    ThermalForge's status payload carries a ``temperatures`` map of SMC
+    sensors. The heat-soak bug class (#227) is a CPU-die soak, so prefer the
+    hottest ``TC*`` (CPU cluster/die) sensor; fall back to the hottest
+    plausible sensor of any name. Sensor names differ per Apple Silicon
+    generation, so ``MTPLX_SMART_FAN_SOAK_SENSOR`` can pin an exact key.
+
+    Returns ``{"ok": bool, "celsius": float|None, "sensor": str|None}``.
+    ``ok`` is False whenever no usable die reading exists — callers must
+    treat that as "no temperature data", never as "cool".
+    """
+    status = thermal_status()
+    if not status.get("ok"):
+        return {"ok": False, "celsius": None, "sensor": None}
+    raw_stdout = status.get("status", {}).get("stdout") or ""
+    try:
+        import json as _json
+
+        parsed = _json.loads(raw_stdout)
+    except Exception:
+        parsed = None
+    temps = parsed.get("temperatures") if isinstance(parsed, dict) else None
+    if not isinstance(temps, dict) or not temps:
+        return {"ok": False, "celsius": None, "sensor": None}
+    readings: dict[str, float] = {}
+    for key, value in temps.items():
+        try:
+            celsius = float(value)
+        except (TypeError, ValueError):
+            continue
+        # Discard sentinel / absent-sensor values (0, negatives, SMC junk).
+        if 1.0 <= celsius <= 130.0:
+            readings[str(key)] = celsius
+    if not readings:
+        return {"ok": False, "celsius": None, "sensor": None}
+    pinned = os.environ.get("MTPLX_SMART_FAN_SOAK_SENSOR", "").strip()
+    if pinned:
+        if pinned in readings:
+            return {"ok": True, "celsius": readings[pinned], "sensor": pinned}
+        return {"ok": False, "celsius": None, "sensor": None}
+    cpu_sensors = {key: val for key, val in readings.items() if key.upper().startswith("TC")}
+    pool = cpu_sensors or readings
+    sensor = max(pool, key=pool.get)
+    return {"ok": True, "celsius": pool[sensor], "sensor": sensor}
+
+
 # Fraction of a fan's reported capacity that proves a max/performance command
 # has reached the controller. Some Macs report very different RPM envelopes, so
 # use hardware capacity when available and keep the old absolute threshold only
@@ -452,6 +503,37 @@ def _summary_indicates_auto(summary: dict[str, Any]) -> bool:
             continue
         return False
     return True
+
+
+# How long a restore may take to show up in the fan rows before the reply
+# that promised it is disbelieved (#201).
+FAN_RESTORE_VERIFY_TIMEOUT_S = 3.0
+
+
+def wait_for_auto_fans(
+    *,
+    timeout_s: float = FAN_RESTORE_VERIFY_TIMEOUT_S,
+    poll_interval_s: float = 0.5,
+) -> bool:
+    """Poll the fan rows until every one reports the automatic curve.
+
+    A daemon "ok" reply or a zero exit from ``thermalforge auto`` is a
+    promise, not proof: a wedged or stale daemon can acknowledge without
+    acting (#201). Only the fan rows say whether the restore happened. Returns
+    False once ``timeout_s`` passes without a verified reading. Shared by the
+    in-process restore path and the detached fan-restore sidecar.
+    """
+
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    while True:
+        try:
+            if _summary_indicates_auto(fan_summary()):
+                return True
+        except Exception:
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(max(0.05, float(poll_interval_s)))
 
 
 def set_thermal_profile_verified(
@@ -695,10 +777,17 @@ def open_thermalforge_app() -> dict[str, Any]:
 
 SUDOERS_FILE = "/etc/sudoers.d/mtplx-thermalforge"
 
+# The one privileged step, shared by the terminal (``sudo``) and GUI
+# (``security execute-with-privileges``) paths. It receives the finished,
+# already-validated rule line and writes it to a temporary name that sudo
+# ignores (sudoers.d skips file names containing a '.'), sets owner and
+# mode, re-checks the fragment with visudo as root, and only then renames it
+# into place. A rejected fragment is removed by the trap and never becomes
+# live, so a bad rule can never take every sudo on the machine down with it.
 _PRIVILEGED_SUDOERS_SCRIPT = r"""
 set -eu
 sudoers_file="$1"
-user_name="$2"
+rule_line="$2"
 binary_path="$3"
 
 case "$sudoers_file" in
@@ -720,7 +809,7 @@ tmp_file="${sudoers_file}.tmp.$$"
 trap 'rm -f "$tmp_file"' EXIT
 
 umask 077
-printf '%s ALL=(root) NOPASSWD: %s\n' "$user_name" "$binary_path" > "$tmp_file"
+printf '%s\n' "$rule_line" > "$tmp_file"
 chown root:wheel "$tmp_file"
 chmod 440 "$tmp_file"
 /usr/sbin/visudo -c -f "$tmp_file" >/dev/null
@@ -728,10 +817,148 @@ mv "$tmp_file" "$sudoers_file"
 trap - EXIT
 """
 
+# Inside a sudoers command path these characters are accepted only when
+# backslash-escaped, and the parser strips the backslash again, so escaping
+# them yields exactly the on-disk path (sudo: plugins/sudoers/toke.l PATH
+# token and toke_util.c SPECIAL()). An unescaped space is not a syntax
+# error: it ends the command and turns the rest of the path into an
+# argument, which visudo happily accepts.
+_SUDOERS_PATH_ESCAPE = frozenset(", :=#")
+# The escape character itself cannot appear in a path token; '*', '?', '[',
+# ']' are wildcards when sudo matches a command, so a rule containing them
+# would cover more than the one binary; quotes have no place in a binary
+# path. These are refused rather than escaped.
+_SUDOERS_PATH_REJECT = frozenset("\\*?[]\"'")
+_SUDOERS_USER_RE = re.compile(r"[A-Za-z0-9_.][A-Za-z0-9_.-]*")
+
+# Interactive sudo waits for a password; a non-interactive ``sudo -n`` either
+# succeeds on cached credentials or fails at once. Both are bounded so a
+# prompt nobody can see never wedges the caller.
+SUDO_PROMPT_TIMEOUT_S = 180.0
+SUDO_NONINTERACTIVE_TIMEOUT_S = 20.0
+
+
+def sudoers_rule_for(user: str, binary_path: str) -> str:
+    """Return the one-line sudoers rule granting ``user`` passwordless root for
+    exactly ``binary_path`` (no trailing newline).
+
+    Raises ``ValueError`` with a plain message when either value cannot be
+    written safely.
+    """
+
+    if not _SUDOERS_USER_RE.fullmatch(user or ""):
+        raise ValueError(f"the user name {user!r} cannot be written to a sudoers rule")
+    if not binary_path.startswith("/"):
+        raise ValueError("the thermalforge path must be absolute")
+    for ch in binary_path:
+        if ch in _SUDOERS_PATH_REJECT or not ch.isprintable() or (ch.isspace() and ch != " "):
+            raise ValueError(
+                f"the thermalforge path {binary_path!r} contains a character "
+                "that cannot be written to a sudoers rule"
+            )
+    escaped = "".join(f"\\{ch}" if ch in _SUDOERS_PATH_ESCAPE else ch for ch in binary_path)
+    return f"{user} ALL=(root) NOPASSWD: {escaped}"
+
+
+def _current_user() -> str:
+    for key in ("USER", "LOGNAME"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        return ""
+
+
+def _stdin_is_tty() -> bool:
+    try:
+        return bool(sys.stdin is not None and sys.stdin.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def _visudo_check_rule(rule_line: str) -> dict[str, Any]:
+    """Parse ``rule_line`` with ``visudo -c -f`` on a temporary file we own.
+
+    ``-f`` skips the owner and mode checks, so this needs no privilege and
+    runs before any password prompt. It catches syntax errors only; the
+    character rules in :func:`sudoers_rule_for` are what keep the command
+    path intact.
+    """
+
+    visudo = shutil.which("visudo") or "/usr/sbin/visudo"
+    fd, tmp_path = tempfile.mkstemp(prefix="mtplx-sudoers-", suffix=".check")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(rule_line + "\n")
+        result = _run_probe([visudo, "-c", "-f", tmp_path], timeout_s=10.0)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+    result["step"] = "visudo_check"
+    return result
+
+
+def _install_sudoers_rule_with_sudo(
+    *,
+    rule_line: str,
+    binary_path: str,
+    interactive: bool,
+) -> dict[str, Any]:
+    """Run the privileged install script through ``sudo``.
+
+    With ``interactive`` false the call uses ``sudo -n`` and cannot prompt;
+    it either rides cached credentials or fails immediately.
+    """
+
+    command = ["sudo"]
+    if not interactive:
+        command.append("-n")
+    command += ["/bin/sh", "-c", _PRIVILEGED_SUDOERS_SCRIPT, "sh", SUDOERS_FILE, rule_line, binary_path]
+    timeout_s = SUDO_PROMPT_TIMEOUT_S if interactive else SUDO_NONINTERACTIVE_TIMEOUT_S
+    try:
+        proc = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "step": "sudo_install",
+            "command": ["sudo", *([] if interactive else ["-n"]), "/bin/sh", "-c", "..."],
+            "returncode": None,
+            "stdout": "",
+            "stderr": f"sudo did not finish within {int(timeout_s)} seconds",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "step": "sudo_install",
+            "command": ["sudo", *([] if interactive else ["-n"]), "/bin/sh", "-c", "..."],
+            "returncode": None,
+            "stdout": "",
+            "stderr": f"{type(exc).__name__}: {exc}",
+        }
+    return {
+        "ok": proc.returncode == 0,
+        "step": "sudo_install",
+        "command": ["sudo", *([] if interactive else ["-n"]), "/bin/sh", "-c", "..."],
+        "returncode": proc.returncode,
+        "stdout": (proc.stdout or "").strip(),
+        "stderr": (proc.stderr or "").strip(),
+    }
+
 
 def _install_sudoers_rule_with_security(
     *,
-    user: str,
+    rule_line: str,
     binary_path: str,
 ) -> dict[str, Any]:
     security = shutil.which("security")
@@ -752,7 +979,7 @@ def _install_sudoers_rule_with_security(
         _PRIVILEGED_SUDOERS_SCRIPT,
         "sh",
         SUDOERS_FILE,
-        user,
+        rule_line,
         binary_path,
     ]
     try:
@@ -804,93 +1031,103 @@ def install_passwordless_sudoers_rule(
     "Run with sudo." even with the daemon running. The sudoers rule scopes
     NOPASSWD to exactly the ``thermalforge`` binary, which is the minimum
     elevation needed for fan control.
+
+    The rule is built and character-checked in Python, parsed by visudo on a
+    temporary file we own, and only then handed to one privileged script
+    that installs it atomically (see ``_PRIVILEGED_SUDOERS_SCRIPT``). Nothing
+    unvalidated ever reaches ``/etc/sudoers.d``. ``streaming`` is accepted
+    for existing callers; sudo prompts on the terminal itself in both modes.
     """
 
-    runner = _run_streaming if streaming else _run_probe
-
+    # Grant exactly the binary the fan commands run. `mtplx max --grant-sudo`
+    # used to default to the PATH copy while fan control ran MTPLX's own
+    # ~/.mtplx/bin/thermalforge, so the grant never applied.
     if binary_path is None:
-        binary_path = shutil.which("thermalforge") or "/usr/local/bin/thermalforge"
-
-    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "_unknown"
-    rule = f"{user} ALL=(root) NOPASSWD: {binary_path}\n"
-
-    # `sudo tee` keeps terminal installs simple. In the GUI app there is no
-    # terminal for sudo to read from, so we fall back to macOS's admin
-    # authorization prompt below.
-    write_proc = subprocess.run(
-        ["sudo", "tee", SUDOERS_FILE],
-        input=rule,
-        text=True,
-        check=False,
-        capture_output=True,
-    )
-    if write_proc.returncode != 0:
-        security_result = _install_sudoers_rule_with_security(
-            user=user,
-            binary_path=binary_path,
-        )
-        if security_result.get("ok"):
-            probe = _run_probe(["sudo", "-n", binary_path, "status"], timeout_s=5.0)
+        binary_path = _find_thermalforge()
+        if binary_path is None:
             return {
-                "ok": probe.get("ok", False),
-                "step": "verify_passwordless",
-                "method": "security_execute_with_privileges",
-                "binary_path": binary_path,
-                "message": (
-                    "Passwordless sudo for thermalforge is configured."
-                    if probe.get("ok")
-                    else (
-                        "Admin authorization installed the sudoers rule, but "
-                        "`sudo -n thermalforge status` still failed: "
-                        + (probe.get("stderr") or "").strip()
-                    )
-                ),
-                "steps": [security_result, {**probe, "step": "verify"}],
+                "ok": False,
+                "step": "locate_thermalforge",
+                "message": "ThermalForge is not installed. Run `mtplx max --install` first.",
             }
+
+    user = _current_user()
+    try:
+        rule_line = sudoers_rule_for(user, binary_path)
+    except ValueError as exc:
         return {
             "ok": False,
-            "step": "sudo_tee",
-            "message": (
-                f"Could not write {SUDOERS_FILE}. sudo said: "
-                f"{(write_proc.stderr or '').strip()}. "
-                f"{security_result.get('message', '')}"
-            ),
-            "steps": [security_result],
+            "step": "build_rule",
+            "binary_path": binary_path,
+            "message": f"Passwordless sudo was not configured: {exc}.",
         }
 
-    chmod_result = runner(["sudo", "chmod", "440", SUDOERS_FILE])
-    chmod_result["step"] = "chmod"
-    validate_result = runner(["sudo", "visudo", "-c", "-f", SUDOERS_FILE])
-    validate_result["step"] = "visudo_check"
-    if not validate_result.get("ok"):
-        # If syntax is bad, remove the file so we don't leave the system
-        # with an unparseable sudoers fragment.
-        runner(["sudo", "rm", "-f", SUDOERS_FILE])
+    # Check the rule before anything privileged runs, on a file we own.
+    check = _visudo_check_rule(rule_line)
+    if not check.get("ok"):
         return {
             "ok": False,
             "step": "visudo_check",
+            "binary_path": binary_path,
+            "rule": rule_line,
             "message": (
-                "Sudoers rule was rejected by visudo and rolled back. "
-                f"Validation error: {validate_result.get('stderr', '').strip()}"
-            ),
-            "steps": [chmod_result, validate_result],
+                "Passwordless sudo was not configured: visudo rejected the rule, "
+                f"so nothing was installed. {(check.get('stderr') or '').strip()}"
+            ).strip(),
+            "steps": [check],
         }
 
-    # Final sanity: passwordless sudo should now work.
+    steps: list[dict[str, Any]] = [check]
+    interactive = _stdin_is_tty()
+    install = _install_sudoers_rule_with_sudo(
+        rule_line=rule_line, binary_path=binary_path, interactive=interactive
+    )
+    steps.append(install)
+    method = "sudo"
+    if not install.get("ok"):
+        # No terminal to type a password into (the GUI app, a piped or
+        # background `mtplx start`), or sudo refused: ask through macOS's
+        # admin authorization dialog instead of hanging on a prompt.
+        security_result = _install_sudoers_rule_with_security(
+            rule_line=rule_line, binary_path=binary_path
+        )
+        steps.append(security_result)
+        method = "security_execute_with_privileges"
+        if not security_result.get("ok"):
+            parts = [f"Could not write {SUDOERS_FILE}."]
+            sudo_said = (install.get("stderr") or "").strip()
+            if sudo_said:
+                parts.append(f"sudo said: {sudo_said}.")
+            if security_result.get("message"):
+                parts.append(str(security_result["message"]))
+            if not interactive:
+                parts.append("Run `mtplx max --grant-sudo` in a terminal to enter your password.")
+            return {
+                "ok": False,
+                "step": "sudo_install",
+                "binary_path": binary_path,
+                "message": " ".join(parts),
+                "steps": steps,
+            }
+
+    # Final sanity: passwordless sudo should now work for this exact binary.
     probe = _run_probe(["sudo", "-n", binary_path, "status"], timeout_s=5.0)
+    steps.append({**probe, "step": "verify"})
     return {
         "ok": probe.get("ok", False),
         "step": "verify_passwordless",
+        "method": method,
         "binary_path": binary_path,
+        "rule": rule_line,
         "message": (
             "Passwordless sudo for thermalforge is configured."
             if probe.get("ok")
             else (
-                "Sudoers rule installed but `sudo -n thermalforge status` "
+                "The sudoers rule was installed, but `sudo -n thermalforge status` "
                 "still failed: " + (probe.get("stderr") or "").strip()
             )
         ),
-        "steps": [chmod_result, validate_result, {**probe, "step": "verify"}],
+        "steps": steps,
     }
 
 
@@ -900,7 +1137,7 @@ def remove_passwordless_sudoers_rule(*, streaming: bool = True) -> dict[str, Any
     runner = _run_streaming if streaming else _run_probe
     if not os.path.exists(SUDOERS_FILE):
         return {"ok": True, "message": f"{SUDOERS_FILE} already absent"}
-    result = runner(["sudo", "rm", "-f", SUDOERS_FILE])
+    result = runner(["sudo", "rm", "-f", SUDOERS_FILE], timeout_s=SUDO_PROMPT_TIMEOUT_S)
     return {
         "ok": result.get("ok", False),
         "message": (
@@ -923,16 +1160,65 @@ def remove_passwordless_sudoers_rule(*, streaming: bool = True) -> dict[str, Any
 # doesn't end up with a screaming Mac because of a previous crash.
 
 import atexit  # noqa: E402  (deferred until after main module body)
+import fcntl  # noqa: E402  (macOS process-wide marker coordination)
 import json as _json  # noqa: E402  (avoid clashing with local json imports)
+import secrets  # noqa: E402
 import signal  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 MAX_MARKER_FILE = Path("~/.mtplx/max-active.json").expanduser()
 
 
-def _write_max_marker(pid: int | None = None) -> None:
+@contextmanager
+def _max_marker_lock(marker_path: str | Path | None = None) -> Iterator[None]:
+    """Serialize fan-owner handoffs across overlapping MTPLX processes."""
+
+    handle = None
+    try:
+        target = Path(marker_path) if marker_path is not None else MAX_MARKER_FILE
+        lock_path = Path(f"{target}.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    except Exception:
+        # Marker ownership is crash-safety, not permission to make `serve`
+        # unusable on an unusual filesystem. The marker write below remains
+        # best-effort, matching the historical behavior.
+        if handle is not None:
+            handle.close()
+        handle = None
+    try:
+        yield
+    finally:
+        if handle is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            handle.close()
+
+
+def _max_marker_owned_by(
+    marker_path: str | Path | None,
+    owner_token: str | None,
+) -> bool:
+    """True for legacy sidecars, or when the current lease is still theirs."""
+
+    if not owner_token:
+        return True
+    if marker_path is None:
+        return False
+    try:
+        loaded = _json.loads(Path(marker_path).read_text())
+        return isinstance(loaded, dict) and loaded.get("owner_token") == owner_token
+    except Exception:
+        return False
+
+
+def _write_max_marker(pid: int | None = None) -> str | None:
     if pid is None:
         pid = os.getpid()
+    owner_token = secrets.token_hex(16)
     binary = None
     try:
         selected = detect_thermal_control().get("selected")
@@ -940,36 +1226,51 @@ def _write_max_marker(pid: int | None = None) -> None:
             binary = selected.get("path")
     except Exception:
         binary = None
-    try:
-        MAX_MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)
-        MAX_MARKER_FILE.write_text(
-            _json.dumps(
-                {
-                    "pid": int(pid),
-                    "started_at": time.time(),
-                    "binary": binary or _find_thermalforge(),
-                }
+    with _max_marker_lock():
+        try:
+            MAX_MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)
+            MAX_MARKER_FILE.write_text(
+                _json.dumps(
+                    {
+                        "pid": int(pid),
+                        "owner_token": owner_token,
+                        "started_at": time.time(),
+                        "binary": binary or _find_thermalforge(),
+                    }
+                )
             )
-        )
-    except Exception:
-        pass  # marker is best-effort; don't crash --max because we can't write it
+            return owner_token
+        except Exception:
+            # Marker is best-effort; don't crash --max because we can't write it.
+            return None
+
+
+def _clear_max_marker_unlocked() -> None:
+    if MAX_MARKER_FILE.exists():
+        MAX_MARKER_FILE.unlink()
 
 
 def _clear_max_marker() -> None:
-    try:
-        if MAX_MARKER_FILE.exists():
-            MAX_MARKER_FILE.unlink()
-    except Exception:
-        pass
+    with _max_marker_lock():
+        try:
+            _clear_max_marker_unlocked()
+        except Exception:
+            pass
+
+
+def _read_max_marker_unlocked() -> dict[str, Any] | None:
+    if not MAX_MARKER_FILE.exists():
+        return None
+    loaded = _json.loads(MAX_MARKER_FILE.read_text())
+    return loaded if isinstance(loaded, dict) else None
 
 
 def _read_max_marker() -> dict[str, Any] | None:
-    try:
-        if not MAX_MARKER_FILE.exists():
+    with _max_marker_lock():
+        try:
+            return _read_max_marker_unlocked()
+        except Exception:
             return None
-        return _json.loads(MAX_MARKER_FILE.read_text())
-    except Exception:
-        return None
 
 
 def check_and_recover_stale_max() -> dict[str, Any]:
@@ -980,33 +1281,43 @@ def check_and_recover_stale_max() -> dict[str, Any]:
     no marker exists.
     """
 
-    marker = _read_max_marker()
-    if not marker:
-        return {"recovered": False, "stale_pid": None, "still_running": False}
-    stale_pid = marker.get("pid")
-    if isinstance(stale_pid, int):
+    # Hold the ownership lock through restore. A newer daemon waits here,
+    # writes its own lease after Auto is confirmed, then commands Max; an old
+    # cleanup can no longer land between those steps and undo the new pin.
+    with _max_marker_lock():
         try:
-            os.kill(stale_pid, 0)
-            return {
-                "recovered": False,
-                "stale_pid": stale_pid,
-                "still_running": True,
-            }
-        except OSError:
-            pass  # process is gone, marker is stale
-    restore = restore_thermal_profile_verified()
-    if restore.get("ok"):
-        _clear_max_marker()
-    return {
-        "recovered": bool(restore.get("ok")),
-        "stale_pid": stale_pid,
-        "still_running": False,
-        "restore": restore,
-        "marker_cleared": bool(restore.get("ok")),
-    }
+            marker = _read_max_marker_unlocked()
+        except Exception:
+            marker = None
+        if not marker:
+            return {"recovered": False, "stale_pid": None, "still_running": False}
+        stale_pid = marker.get("pid")
+        if isinstance(stale_pid, int):
+            try:
+                os.kill(stale_pid, 0)
+                return {
+                    "recovered": False,
+                    "stale_pid": stale_pid,
+                    "still_running": True,
+                }
+            except OSError:
+                pass  # process is gone, marker is stale
+        restore = restore_thermal_profile_verified()
+        if restore.get("ok"):
+            try:
+                _clear_max_marker_unlocked()
+            except Exception:
+                pass
+        return {
+            "recovered": bool(restore.get("ok")),
+            "stale_pid": stale_pid,
+            "still_running": False,
+            "restore": restore,
+            "marker_cleared": bool(restore.get("ok")),
+        }
 
 
-def _spawn_thermal_sidecar() -> subprocess.Popen | None:
+def _spawn_thermal_sidecar(owner_token: str | None = None) -> subprocess.Popen | None:
     """Launch a detached fan-restore watchdog.
 
     Required because closing a macOS Terminal window sends SIGHUP and
@@ -1038,6 +1349,8 @@ def _spawn_thermal_sidecar() -> subprocess.Popen | None:
         "--marker",
         str(MAX_MARKER_FILE),
     ]
+    if owner_token:
+        cmd.extend(["--owner-token", owner_token])
     try:
         return subprocess.Popen(
             cmd,
@@ -1061,23 +1374,43 @@ def install_max_lifecycle_hooks() -> Any:
     belt-and-suspenders alongside the sidecar.
     """
 
-    _write_max_marker()
-    _sidecar = _spawn_thermal_sidecar()
+    owner_token = _write_max_marker()
+    _sidecar = _spawn_thermal_sidecar(owner_token)
     cleaned_up = [False]
 
     def cleanup() -> dict[str, Any]:
         if cleaned_up[0]:
             return {"ok": True, "already_cleaned": True}
         cleaned_up[0] = True
-        try:
-            restore = restore_thermal_profile_verified()
-        except Exception as exc:
-            restore = {"ok": False, "error": str(exc), "message": "fan restore raised"}
-        if restore.get("ok"):
-            _clear_max_marker()
+        with _max_marker_lock():
+            try:
+                marker = _read_max_marker_unlocked()
+            except Exception:
+                marker = None
+            if owner_token and (not marker or marker.get("owner_token") != owner_token):
+                # A newer Max session owns the machine (or the user already
+                # cleared our lease). Old cleanup must never switch it to Auto.
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "max_owner_changed",
+                }
+            try:
+                restore = restore_thermal_profile_verified()
+            except Exception as exc:
+                restore = {
+                    "ok": False,
+                    "error": str(exc),
+                    "message": "fan restore raised",
+                }
+            if restore.get("ok"):
+                try:
+                    _clear_max_marker_unlocked()
+                except Exception:
+                    pass
         # The sidecar will notice the parent is gone and re-issue auto
-        # too — that's intentional belt-and-suspenders. If the in-process
-        # cleanup succeeded, the sidecar's call is a harmless no-op.
+        # too when this lease is still current. If another process has already
+        # taken ownership, both cleanup paths leave its Max pin untouched.
         return restore
 
     def _signal_handler(signum: int, _frame: Any) -> None:
@@ -1238,10 +1571,32 @@ class SmartFanController:
     _ACTUAL_RAMP_TIMEOUT_S = 30.0
     _ACTUAL_RAMP_POLL_INTERVAL_S = 1.0
     _WAIT_FOR_RESTORE_TIMEOUT_S = 30.0
+    _ACTIVITY_POLL_INTERVAL_S = 5.0
+    _RESTORE_RETRY_BACKOFF_S = (5.0, 15.0, 30.0, 60.0)
+    _SOAK_PROBE_INTERVAL_S = 5.0
 
-    def __init__(self, *, log: Any = None, restore_delay_s: float = 2.0) -> None:
+    def __init__(
+        self,
+        *,
+        log: Any = None,
+        restore_delay_s: float = 2.0,
+        activity_probe: Any = None,
+    ) -> None:
         self.log = log
         self.restore_delay_s = max(0.0, float(restore_delay_s))
+        # Optional callable returning True while the engine is executing or
+        # queueing model work. Powers the stale-lease reconciler (#201): a
+        # lease held while the engine has been continuously idle for
+        # MTPLX_SMART_FAN_STALE_LEASE_S seconds is a leak upstream (hung
+        # HTTP response, abandoned future), not a running request, and must
+        # not pin the fans forever. 0 disables the reconciler.
+        self._activity_probe = activity_probe
+        try:
+            self._stale_lease_idle_s = max(
+                0.0, float(os.environ.get("MTPLX_SMART_FAN_STALE_LEASE_S", "120"))
+            )
+        except ValueError:
+            self._stale_lease_idle_s = 120.0
         self._lock = threading.RLock()
         self._cond = threading.Condition(self._lock)
         self._active_requests: set[str] = set()
@@ -1261,6 +1616,44 @@ class SmartFanController:
         self._last_transition_at: float | None = None
         self._last_result: dict[str, Any] | None = None
         self._last_error: str | None = None
+        # #201 restore-retry state: a restore that ran but could not verify
+        # the fans back on the auto curve re-arms with backoff instead of
+        # being forgotten while the hardware stays pinned.
+        self._restore_unverified = False
+        self._restore_retry_at: float | None = None
+        self._restore_failures = 0
+        self._engine_idle_since: float | None = None
+        self._next_activity_probe_at: float | None = None
+        self._stale_leases_reconciled = 0
+        # Heat-soak release hold (#227): under bursty agent load the SoC
+        # soaks past 90C during a burst and the Apple auto curve is too lazy
+        # to drain it during the short idle gaps, so every following turn
+        # runs throttled (field A/B: -51% decode). After the idle debounce,
+        # keep the fans at max until the die has actually cooled below the
+        # release threshold — bounded by a hard hold cap so fans can never
+        # stay pinned on an idle machine, and falling back to the legacy
+        # instant restore whenever no die temperature is readable.
+        # MTPLX_SMART_FAN_SOAK_RELEASE_C=0 disables the hold entirely.
+        try:
+            self._soak_release_temp_c = float(
+                os.environ.get("MTPLX_SMART_FAN_SOAK_RELEASE_C", "75")
+            )
+        except ValueError:
+            self._soak_release_temp_c = 75.0
+        try:
+            self._soak_hold_cap_s = max(
+                0.0, float(os.environ.get("MTPLX_SMART_FAN_SOAK_HOLD_CAP_S", "180"))
+            )
+        except ValueError:
+            self._soak_hold_cap_s = 180.0
+        self._soak_bypass = False
+        self._soak_probe_failed = False
+        self._soak_holding = False
+        self._soak_holds = 0
+        self._soak_last_temp_c: float | None = None
+        self._soak_last_sensor: str | None = None
+        self._soak_next_probe_at: float | None = None
+        self._soak_release_reason: str | None = None
         self._worker: threading.Thread | None = None
         self._shutdown = False
 
@@ -1281,6 +1674,17 @@ class SmartFanController:
             self._active_requests.add(request_key)
             self._generation += 1
             self._idle_since = None
+            self._engine_idle_since = None
+            # New lease: stale soak readings from a previous idle window must
+            # not decide the next release, and a transient probe failure must
+            # not disable the hold forever.
+            self._soak_bypass = False
+            self._soak_probe_failed = False
+            self._soak_holding = False
+            self._soak_last_temp_c = None
+            self._soak_last_sensor = None
+            self._soak_next_probe_at = None
+            self._soak_release_reason = None
             if not self._commanded_max and self._ramp_requested_at is None:
                 self._ramp_requested_at = time.monotonic()
             self._ensure_worker_locked()
@@ -1296,9 +1700,10 @@ class SmartFanController:
             if became_idle:
                 self._idle_since = time.monotonic()
                 if wait_for_restore:
-                    # Skip the debounce for explicit synchronous restores
-                    # (bench lanes, shutdown paths).
+                    # Skip the debounce (and the heat-soak hold) for explicit
+                    # synchronous restores (bench lanes, shutdown paths).
                     self._idle_since -= self.restore_delay_s
+                    self._soak_bypass = True
             self._ensure_worker_locked()
             self._cond.notify_all()
             if not became_idle:
@@ -1314,6 +1719,7 @@ class SmartFanController:
             self._active_requests.clear()
             self._generation += 1
             self._idle_since = time.monotonic() - self.restore_delay_s
+            self._soak_bypass = True
             self._ensure_worker_locked()
             self._cond.notify_all()
         if wait:
@@ -1338,6 +1744,19 @@ class SmartFanController:
             self._actual_poll_deadline = None
             self._next_actual_probe_at = None
             self._idle_since = None
+            # The external owner (Max mode) owns the hardware now: pending
+            # restore retries and idle bookkeeping belong to the old regime.
+            self._restore_unverified = False
+            self._restore_retry_at = None
+            self._restore_failures = 0
+            self._engine_idle_since = None
+            self._soak_bypass = False
+            self._soak_probe_failed = False
+            self._soak_holding = False
+            self._soak_last_temp_c = None
+            self._soak_last_sensor = None
+            self._soak_next_probe_at = None
+            self._soak_release_reason = None
             # Drop our reference so the worker does not schedule a restore;
             # the atexit hook installed by install_max_lifecycle_hooks stays
             # registered and still restores fans on process exit.
@@ -1383,6 +1802,16 @@ class SmartFanController:
             "last_transition_at": self._last_transition_at,
             "last_error": self._last_error,
             "last_result": self._last_result,
+            "restore_verified": not self._restore_unverified,
+            "restore_failures": self._restore_failures,
+            "stale_leases_reconciled": self._stale_leases_reconciled,
+            "soak_release_temp_c": self._soak_release_temp_c,
+            "soak_hold_cap_s": self._soak_hold_cap_s,
+            "soak_holding": bool(self._soak_holding),
+            "soak_holds": self._soak_holds,
+            "soak_last_temp_c": self._soak_last_temp_c,
+            "soak_last_sensor": self._soak_last_sensor,
+            "soak_release_reason": self._soak_release_reason,
         }
 
     # -- worker machinery -------------------------------------------------
@@ -1406,6 +1835,18 @@ class SmartFanController:
                     return
                 self._cond.wait(timeout=remaining)
 
+    def _reconciler_enabled_locked(self) -> bool:
+        return self._activity_probe is not None and self._stale_lease_idle_s > 0
+
+    def _wait_capped_by_activity_probe_locked(self, timeout: float | None, now: float) -> None:
+        """cond.wait, but never sleep past the next activity-probe slot while
+        leases are active and the reconciler is enabled — a wedged lease must
+        still get its periodic engine-idle check (#201)."""
+        if self._active_requests and self._reconciler_enabled_locked():
+            probe_in = max(0.05, (self._next_activity_probe_at or now) - now)
+            timeout = probe_in if timeout is None else min(timeout, probe_in)
+        self._cond.wait(timeout=timeout)
+
     def _worker_loop(self) -> None:
         while True:
             action: str | None = None
@@ -1415,23 +1856,48 @@ class SmartFanController:
                         return
                     now = time.monotonic()
                     desired_max = bool(self._active_requests)
-                    if desired_max and not self._commanded_max:
+                    if (
+                        desired_max
+                        and self._reconciler_enabled_locked()
+                        and now >= (self._next_activity_probe_at or 0.0)
+                    ):
+                        action = "probe_activity"
+                    elif desired_max and not self._commanded_max:
                         if self._ramp_failed_generation == self._generation:
                             # The last ramp (with its retry) failed for this
                             # lease generation; don't hammer the daemon.
                             # A new begin_request bumps the generation and
                             # re-arms the attempt.
-                            self._cond.wait()
+                            self._wait_capped_by_activity_probe_locked(None, now)
                             continue
                         action = "ramp"
                     elif not desired_max and (self._commanded_max or self._cleanup is not None):
                         if self._idle_since is None:
                             self._idle_since = now
                         remaining = self._idle_since + self.restore_delay_s - now
-                        if remaining <= 0:
+                        if remaining > 0:
+                            self._cond.wait(timeout=remaining)
+                        else:
+                            soak = self._soak_decision_locked(now)
+                            if soak == "probe":
+                                action = "probe_soak"
+                            elif soak == "hold":
+                                hold_until = min(
+                                    self._soak_next_probe_at or now,
+                                    self._idle_since + self._soak_hold_cap_s,
+                                )
+                                self._cond.wait(timeout=max(0.05, hold_until - now))
+                            else:
+                                action = "restore"
+                    elif not desired_max and self._restore_unverified:
+                        # A previous restore ran but the fans never verified
+                        # back on the auto curve (#201). Keep retrying with
+                        # backoff until they do or a new lease re-ramps.
+                        retry_in = (self._restore_retry_at or now) - now
+                        if retry_in <= 0:
                             action = "restore"
                         else:
-                            self._cond.wait(timeout=remaining)
+                            self._cond.wait(timeout=max(0.05, retry_in))
                     elif (
                         desired_max
                         and self._commanded_max
@@ -1441,17 +1907,86 @@ class SmartFanController:
                         if now >= (self._next_actual_probe_at or 0.0):
                             action = "probe_actual"
                         else:
-                            self._cond.wait(
-                                timeout=max(0.05, (self._next_actual_probe_at or now) - now)
+                            self._wait_capped_by_activity_probe_locked(
+                                max(0.05, (self._next_actual_probe_at or now) - now), now
                             )
                     else:
-                        self._cond.wait()
+                        self._wait_capped_by_activity_probe_locked(None, now)
             if action == "ramp":
                 self._do_ramp()
             elif action == "restore":
                 self._do_restore()
             elif action == "probe_actual":
                 self._do_probe_actual()
+            elif action == "probe_activity":
+                self._do_probe_activity()
+            elif action == "probe_soak":
+                self._do_probe_soak()
+
+    def _soak_decision_locked(self, now: float) -> str:
+        """After the idle debounce elapses: restore now, probe, or hold (#227).
+
+        Returns "restore" | "probe" | "hold". Fails open: any state in which
+        a die temperature cannot be trusted resolves to "restore" (the
+        pre-#227 behavior), and the hold cap bounds the pin regardless of
+        sensor state so an idle machine always gets its fans back.
+        """
+        if not self._commanded_max:
+            return "restore"  # nothing ramped, nothing soaked to drain
+        if (
+            self._soak_bypass
+            or self._soak_probe_failed
+            or self._soak_release_temp_c <= 0
+            or self._soak_hold_cap_s <= 0
+        ):
+            return "restore"
+        if self._idle_since is not None and now >= self._idle_since + self._soak_hold_cap_s:
+            self._soak_release_reason = "hold_cap"
+            return "restore"
+        if (
+            self._soak_last_temp_c is not None
+            and self._soak_last_temp_c <= self._soak_release_temp_c
+        ):
+            self._soak_release_reason = "cooled"
+            return "restore"
+        if now >= (self._soak_next_probe_at or 0.0):
+            return "probe"
+        return "hold"
+
+    def _do_probe_soak(self) -> None:
+        try:
+            reading = soc_temperature_c()
+        except Exception:
+            reading = {"ok": False, "celsius": None, "sensor": None}
+        now = time.monotonic()
+        with self._cond:
+            if reading.get("ok") and reading.get("celsius") is not None:
+                self._soak_last_temp_c = float(reading["celsius"])
+                self._soak_last_sensor = reading.get("sensor")
+                if (
+                    self._soak_last_temp_c > self._soak_release_temp_c
+                    and not self._soak_holding
+                ):
+                    self._soak_holding = True
+                    self._soak_holds += 1
+                    self._emit(
+                        "[smart-fan] heat-soak hold: "
+                        f"{self._soak_last_sensor} {self._soak_last_temp_c:.1f}C is above "
+                        f"the {self._soak_release_temp_c:.1f}C release threshold — "
+                        "holding max fans until the die cools (#227)"
+                    )
+                elif self._soak_last_temp_c <= self._soak_release_temp_c and self._soak_holding:
+                    self._soak_holding = False
+                    self._emit(
+                        "[smart-fan] heat-soak drained: "
+                        f"{self._soak_last_sensor} {self._soak_last_temp_c:.1f}C — releasing"
+                    )
+            else:
+                # No usable die temperature on this machine/tool: restore on
+                # the legacy debounce instead of pinning fans on a blind hold.
+                self._soak_probe_failed = True
+            self._soak_next_probe_at = now + self._SOAK_PROBE_INTERVAL_S
+            self._cond.notify_all()
 
     def _do_ramp(self) -> None:
         with self._lock:
@@ -1549,6 +2084,50 @@ class SmartFanController:
                 )
             self._cond.notify_all()
 
+    def _do_probe_activity(self) -> None:
+        """Stale-lease reconciler (#201). A smart-fan lease is only legitimate
+        while its request is somewhere in the engine (queued, executing, or
+        streaming tokens). If leases are held while the activity probe reports
+        the engine continuously idle for ``_stale_lease_idle_s`` seconds, the
+        leases are leaked bookkeeping from a wedged request path: drop them,
+        log loudly, and let the normal restore flow bring the fans back to
+        auto. The probe fails open (busy) so a broken probe can never restore
+        fans under a live workload."""
+        busy = True
+        probe = self._activity_probe
+        if probe is not None:
+            try:
+                busy = bool(probe())
+            except Exception:
+                busy = True
+        now = time.monotonic()
+        with self._cond:
+            self._next_activity_probe_at = now + self._ACTIVITY_POLL_INTERVAL_S
+            if not self._active_requests:
+                self._engine_idle_since = None
+                return
+            if busy:
+                self._engine_idle_since = None
+                return
+            if self._engine_idle_since is None:
+                self._engine_idle_since = now
+                return
+            if now - self._engine_idle_since < self._stale_lease_idle_s:
+                return
+            stale = sorted(self._active_requests)
+            self._active_requests.clear()
+            self._generation += 1
+            self._stale_leases_reconciled += len(stale)
+            self._engine_idle_since = None
+            self._idle_since = now - self.restore_delay_s
+            self._emit(
+                f"[smart-fan] WARNING: dropped {len(stale)} stale fan lease(s) held "
+                f"while the engine was idle for {self._stale_lease_idle_s:.0f}s "
+                f"({', '.join(stale)}) — restoring fans. A request path leaked its "
+                "lease; please report this log line on GitHub issue #201."
+            )
+            self._cond.notify_all()
+
     def _do_restore(self) -> None:
         with self._lock:
             if self._active_requests:
@@ -1574,19 +2153,42 @@ class SmartFanController:
                 self._ramp_requested_at = None
                 self._actual_poll_deadline = None
                 self._last_error = None
+                if self._restore_unverified:
+                    self._emit(
+                        "[smart-fan] fans verified back on the Apple auto curve "
+                        f"after {self._restore_failures} failed restore attempt(s)"
+                    )
+                self._restore_unverified = False
+                self._restore_retry_at = None
+                self._restore_failures = 0
             else:
                 self._last_error = str(
                     result.get("message") or result.get("error") or "restore failed"
                 )
-                self._emit(f"[smart-fan] restore warning: {self._last_error}")
-                # Do not leave a half-restored latch: treat as restored so
-                # the next lease re-commands max from a clean slate, and
-                # keep the error surfaced in status()/health.
+                # #201: a failed restore used to be marked "restored" and
+                # forgotten, leaving the physical fans pinned at max until
+                # the next request cycle happened to fix them. Keep the
+                # clean-slate contract for the NEXT lease (commanded_max
+                # drops so a new request re-commands max), but re-arm the
+                # restore with backoff so the hardware is actually brought
+                # back to auto even when no further request ever arrives.
                 self._commanded_max = False
                 self._target_verified = False
                 self._actual_ramp_verified = False
                 self._ramp_requested_at = None
                 self._actual_poll_deadline = None
+                self._restore_unverified = True
+                self._restore_failures += 1
+                backoff = self._RESTORE_RETRY_BACKOFF_S[
+                    min(self._restore_failures - 1, len(self._RESTORE_RETRY_BACKOFF_S) - 1)
+                ]
+                self._restore_retry_at = time.monotonic() + backoff
+                if self._restore_failures <= 3 or self._restore_failures % 5 == 0:
+                    self._emit(
+                        f"[smart-fan] restore FAILED (attempt {self._restore_failures}): "
+                        f"{self._last_error} — retrying in {backoff:.0f}s; fans may still "
+                        "be ramped, check `mtplx max --status`"
+                    )
             self._cond.notify_all()
 
 
@@ -1620,19 +2222,29 @@ def set_thermal_profile(profile: str, *, dry_run: bool = False) -> dict[str, Any
     # (no sudo) and, unlike the `auto` CLI, never quits the menu bar app. Prefer
     # it for the fan reset so restoring fans can't take down a running app; the
     # CLI candidates below stay the fallback when no daemon is reachable.
+    #
+    # #201: the daemon's "ok" reply is not proof the fans actually dropped —
+    # a wedged/stale daemon can acknowledge without acting, and trusting it
+    # here left fans pinned at max after the workload ended. Verify the fan
+    # rows are back on the auto curve before accepting the socket path; on
+    # verification failure fall through to the CLI candidates in this same
+    # call instead of reporting a restore that never happened.
     if profile == "silent" and str(selected.get("kind")) == "thermalforge":
         reset = _daemon_socket_send("auto")
         if reset is not None:
             attempts.append(reset)
             if reset["ok"]:
-                return {
-                    "ok": True,
-                    "profile": profile,
-                    "dry_run": False,
-                    "detection": detection,
-                    "command": reset["command"],
-                    "attempts": attempts,
-                }
+                verified = wait_for_auto_fans()
+                reset["verified"] = verified
+                if verified:
+                    return {
+                        "ok": True,
+                        "profile": profile,
+                        "dry_run": False,
+                        "detection": detection,
+                        "command": reset["command"],
+                        "attempts": attempts,
+                    }
 
     for command in commands:
         result = _run_probe(command, timeout_s=15.0)

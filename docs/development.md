@@ -14,17 +14,16 @@ Keep generated artifacts, model weights, and local credentials out of Git. The r
 Release artifacts are published from a clean tag:
 
 ```bash
-VERSION=vX.Y.Z  # replace with the release tag
-git tag -a "$VERSION" -m "MTPLX $VERSION"
-git push origin "$VERSION"
-gh release create "$VERSION" dist/* scripts/install_macos.sh --title "MTPLX $VERSION"
+git tag -a vX.Y.Z -m "MTPLX vX.Y.Z"
+git push origin vX.Y.Z
+gh release create vX.Y.Z dist/* scripts/install_macos.sh --title "MTPLX vX.Y.Z"
 ```
 
 Use GitHub CLI authentication for artifact smoke tests:
 
 ```bash
-gh release download "$VERSION" --repo youssofal/mtplx --pattern 'mtplx-*-py3-none-any.whl'
-python3 -m pip install ./mtplx-*-py3-none-any.whl
+gh release download vX.Y.Z --repo youssofal/mtplx --pattern 'mtplx-X.Y.Z-py3-none-any.whl'
+python3 -m pip install ./mtplx-X.Y.Z-py3-none-any.whl
 mtplx help
 ```
 

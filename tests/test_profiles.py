@@ -11,9 +11,9 @@ from mtplx.profiles import (
     list_profiles,
     normalize_runtime_env_overrides,
     profile_env_status,
-    restore_profile_env,
     resolve_long_context_mtp_depth,
     resolve_profile_name,
+    restore_profile_env,
     runtime_env_with_contract_overrides,
 )
 
@@ -64,9 +64,12 @@ def test_apply_and_restore_profile_env() -> None:
 
     previous = apply_profile_env("performance-cold", environ=environ)
     assert previous == {key: None for key in NATIVE_MTP_60_FAST_PATH_ENV}
-    assert profile_env_status("performance-cold", environ=environ)[
-        "MTPLX_LAZY_VERIFY_LOGITS"
-    ]["ok"] is True
+    assert (
+        profile_env_status("performance-cold", environ=environ)[
+            "MTPLX_LAZY_VERIFY_LOGITS"
+        ]["ok"]
+        is True
+    )
 
     restore_profile_env(previous, environ=environ)
     assert environ == {}
@@ -126,6 +129,107 @@ def test_contract_runtime_env_overrides_are_normalized_and_restricted() -> None:
         raise AssertionError("unknown runtime env override should fail")
 
 
+def test_qwen_mtp_batch_construction_flags_are_validated_runtime_overrides() -> None:
+    assert normalize_runtime_env_overrides(
+        {
+            "MTPLX_A3B_GDN_POSTCONV_IMPL": "headquarter",
+            "MTPLX_LINEAR_GDN_FROM_CONV_TGY": 4,
+            "MTPLX_QWEN_COMBINE_TAIL": True,
+            "MTPLX_QWEN_MOE_PACK_GATE_UP": True,
+            "MTPLX_QWEN_ROW_OWNED_ROUTER": 1,
+        }
+    ) == {
+        "MTPLX_A3B_GDN_POSTCONV_IMPL": "headquarter",
+        "MTPLX_LINEAR_GDN_FROM_CONV_TGY": "4",
+        "MTPLX_QWEN_COMBINE_TAIL": "1",
+        "MTPLX_QWEN_MOE_PACK_GATE_UP": "1",
+        "MTPLX_QWEN_ROW_OWNED_ROUTER": "1",
+    }
+
+
+def test_qwen4_m4_routed_down_reduce_is_a_validated_runtime_override() -> None:
+    assert normalize_runtime_env_overrides(
+        {"MTPLX_QWEN4_M4_ROUTED_DOWN_REDUCE": True}
+    ) == {"MTPLX_QWEN4_M4_ROUTED_DOWN_REDUCE": "1"}
+
+
+def test_qwen4_m4_routed_down_residual_tail_is_a_validated_runtime_override() -> None:
+    assert normalize_runtime_env_overrides(
+        {"MTPLX_QWEN4_M4_ROUTED_DOWN_RESIDUAL_TAIL": True}
+    ) == {"MTPLX_QWEN4_M4_ROUTED_DOWN_RESIDUAL_TAIL": "1"}
+
+
+def test_qwen4_m4_routed_glu_is_a_validated_runtime_override() -> None:
+    assert normalize_runtime_env_overrides(
+        {"MTPLX_QWEN4_M4_ROUTED_GLU": True}
+    ) == {"MTPLX_QWEN4_M4_ROUTED_GLU": "1"}
+
+
+def test_fused_qsa_indexer_is_a_validated_runtime_override() -> None:
+    assert normalize_runtime_env_overrides({"MTPLX_FUSED_QSA_INDEXER": True}) == {
+        "MTPLX_FUSED_QSA_INDEXER": "1"
+    }
+
+
+def test_compiled_qsa_indexer_is_a_validated_runtime_override() -> None:
+    assert normalize_runtime_env_overrides({"MTPLX_COMPILED_QSA_INDEXER": True}) == {
+        "MTPLX_COMPILED_QSA_INDEXER": "1"
+    }
+
+
+def test_qsa_prefill_settings_are_validated_runtime_overrides() -> None:
+    assert normalize_runtime_env_overrides(
+        {
+            "MTPLX_QSA_PREFILL": True,
+            "MTPLX_QSA_PREFILL_MIN_ROWS": 64,
+            "MTPLX_QSA_PREFILL_MIN_CONTEXT": 32768,
+            "MTPLX_QSA_PREFILL_FLASH_MIN_CONTEXT": 65536,
+            "MTPLX_QSA_PREFILL_SCORE_MB": 96,
+            "MTPLX_QSA_PREFILL_COMPILE_ROWS": 2048,
+        }
+    ) == {
+        "MTPLX_QSA_PREFILL": "1",
+        "MTPLX_QSA_PREFILL_MIN_ROWS": "64",
+        "MTPLX_QSA_PREFILL_MIN_CONTEXT": "32768",
+        "MTPLX_QSA_PREFILL_FLASH_MIN_CONTEXT": "65536",
+        "MTPLX_QSA_PREFILL_SCORE_MB": "96",
+        "MTPLX_QSA_PREFILL_COMPILE_ROWS": "2048",
+    }
+
+
+def test_qsa_mtp_precompute_is_a_validated_runtime_override() -> None:
+    assert normalize_runtime_env_overrides({"MTPLX_QSA_MTP_PRECOMPUTE": True}) == {
+        "MTPLX_QSA_MTP_PRECOMPUTE": "1"
+    }
+
+
+def test_compiled_verify_growth_reserve_is_a_validated_runtime_override() -> None:
+    assert normalize_runtime_env_overrides(
+        {"MTPLX_COMPILED_VERIFY_GROWTH_RESERVE": 2048}
+    ) == {"MTPLX_COMPILED_VERIFY_GROWTH_RESERVE": "2048"}
+
+
+def test_no_shipped_profile_enables_candidate_qsa_lanes() -> None:
+    candidate_flags = {
+        "MTPLX_FUSED_QSA_INDEXER",
+        "MTPLX_COMPILED_QSA_INDEXER",
+        "MTPLX_QSA_PREFILL",
+        "MTPLX_QSA_PREFILL_MIN_ROWS",
+        "MTPLX_QSA_PREFILL_MIN_CONTEXT",
+        "MTPLX_QSA_PREFILL_FLASH_MIN_CONTEXT",
+        "MTPLX_QSA_PREFILL_SCORE_MB",
+        "MTPLX_QSA_PREFILL_COMPILE_ROWS",
+        "MTPLX_QSA_MTP_PRECOMPUTE",
+    }
+
+    for profile in list_profiles():
+        enabled = candidate_flags.intersection(profile["env"])
+        assert not enabled, (
+            f"profile {profile['name']} enables default-off QSA candidates: "
+            f"{sorted(enabled)}"
+        )
+
+
 def test_apply_profile_env_preserves_mtp_history_policy_override() -> None:
     environ = {"MTPLX_MTP_HISTORY_POLICY": "committed"}
 
@@ -133,9 +237,12 @@ def test_apply_profile_env_preserves_mtp_history_policy_override() -> None:
 
     assert previous["MTPLX_MTP_HISTORY_POLICY"] == "committed"
     assert environ["MTPLX_MTP_HISTORY_POLICY"] == "committed"
-    assert profile_env_status("sustained", environ=environ)["MTPLX_MTP_HISTORY_POLICY"][
-        "ok"
-    ] is True
+    assert (
+        profile_env_status("sustained", environ=environ)["MTPLX_MTP_HISTORY_POLICY"][
+            "ok"
+        ]
+        is True
+    )
 
     restore_profile_env(previous, environ=environ)
     assert environ["MTPLX_MTP_HISTORY_POLICY"] == "committed"
@@ -178,7 +285,14 @@ def test_apply_profile_env_preserves_long_context_depth_overrides() -> None:
 def test_list_profiles_includes_all_public_modes() -> None:
     names = [profile["name"] for profile in list_profiles()]
 
-    assert names == ["stable", "performance-cold", "sustained", "turbo", "exact", "max-diagnostic"]
+    assert names == [
+        "stable",
+        "performance-cold",
+        "sustained",
+        "turbo",
+        "exact",
+        "max-diagnostic",
+    ]
 
 
 def test_sustained_profile_is_native_mtp_long_context_path() -> None:
@@ -188,7 +302,7 @@ def test_sustained_profile_is_native_mtp_long_context_path() -> None:
     assert profile.draft_lm_head is not None
     assert profile.env_dict() == SUSTAINED_PREFILL_ENV
     assert profile.env_dict()["MTPLX_SUSTAINED_PREFILL_LAYOUT"] == "auto"
-    assert profile.env_dict()["MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT"] == "131072"
+    assert profile.env_dict()["MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT"] == "auto"
     assert profile.env_dict()["MTPLX_PREFILL_CHUNK_SIZE"] == "auto"
     assert profile.env_dict()["MTPLX_PREFILL_CHUNK_SIZE_DENSE"] == "2048"
     assert profile.env_dict()["MTPLX_PREFILL_CHUNK_SIZE_REPAGE"] == "2048"
@@ -200,10 +314,15 @@ def test_sustained_profile_is_native_mtp_long_context_path() -> None:
     assert profile.env_dict()["MTPLX_CLEAR_CACHE_EVERY_CONTEXT_THRESHOLD"] == "16384"
     assert profile.env_dict()["MTPLX_CLEAR_CACHE_EVERY_LONG_CONTEXT"] == "1024"
     assert profile.env_dict()["MTPLX_LAZY_VERIFY_LOGITS"] == "1"
-    assert profile.env_dict()["MTPLX_BATCH_TARGET_ARRAYS"] == "1"
+    # The active verify strategy is lazy per-row distributions; the batched
+    # lane is gated off by it at runtime, so the profile must not claim it
+    # (the "1"/"1" pair shipped contradictory 1.0.0 -> 2.9.0, PR #314).
+    assert profile.env_dict()["MTPLX_BATCH_TARGET_ARRAYS"] == "0"
     assert profile.env_dict()["MTPLX_LAZY_TARGET_DISTRIBUTIONS"] == "1"
     assert profile.env_dict()["MTPLX_DEFER_VERIFY_HIDDEN_EVAL"] == "1"
-    assert profile.env_dict()["MTPLX_VERIFY_HIDDEN_MODE"] == "logits_first_committed_slice"
+    assert (
+        profile.env_dict()["MTPLX_VERIFY_HIDDEN_MODE"] == "logits_first_committed_slice"
+    )
     assert profile.env_dict()["MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY"] == "off"
     assert profile.env_dict()["MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD"] == "98304"
     assert profile.env_dict()["MTPLX_LONG_CONTEXT_MTP_DEPTH"] == "3"

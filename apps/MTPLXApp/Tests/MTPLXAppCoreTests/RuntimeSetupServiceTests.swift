@@ -71,6 +71,19 @@ final class RuntimeSetupServiceTests: XCTestCase {
         return url
     }
 
+    private func makeFakeSourceCLI(in root: URL, version: String) throws -> URL {
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("mtplx", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try Data().write(to: root.appendingPathComponent("pyproject.toml"))
+        try Data().write(to: root.appendingPathComponent("mtplx/cli.py"))
+        return try makeFakeCLI(
+            in: root.appendingPathComponent("bin", isDirectory: true),
+            version: version
+        )
+    }
+
     private func assertTerminalWrapper(
         home: URL,
         engine: URL,
@@ -121,6 +134,33 @@ final class RuntimeSetupServiceTests: XCTestCase {
     }
 
     // MARK: Engine
+
+    func testBootstrapperPrefersAllowedSourceWrapperOverStaleAppRuntime() throws {
+        let home = temporaryDirectory()
+        let appRuntimeBin = URL(
+            fileURLWithPath: MTPLXCommandBuilder.appRuntimeBinDirectory(
+                environment: ["HOME": home.path]
+            ),
+            isDirectory: true
+        )
+        _ = try makeFakeCLI(in: appRuntimeBin, version: "2.10.1")
+        let source = try makeFakeSourceCLI(
+            in: home.appendingPathComponent("candidate", isDirectory: true),
+            version: "2.11.1"
+        )
+        let bootstrapper = MTPLXRuntimeBootstrapper(environment: [
+            "HOME": home.path,
+            "PATH": "/usr/bin:/bin",
+            "MTPLX_APP_ALLOW_SOURCE_WRAPPER": "1",
+            "MTPLX_APP_SOURCE_WRAPPER_PATH": source.path,
+            "MTPLX_APP_REQUIRED_RUNTIME_VERSION": "2.11.1",
+            "MTPLX_APP_HOMEBREW_PATH": "",
+        ])
+
+        let resolved = try bootstrapper.installOrUpdate()
+
+        XCTAssertEqual(resolved.path, source.path)
+    }
 
     func testEngineFailureBlocksSetupAndLeavesLaterRowsPending() async throws {
         struct InstallError: LocalizedError {
@@ -176,6 +216,41 @@ final class RuntimeSetupServiceTests: XCTestCase {
 
     // MARK: Global CLI sync
 
+    func testSourceCheckoutEngineLeavesGlobalCLIUntouched() async throws {
+        let home = temporaryDirectory()
+        let source = try makeFakeSourceCLI(
+            in: home.appendingPathComponent("candidate", isDirectory: true),
+            version: "2.11.1"
+        )
+        let globalDir = home.appendingPathComponent("global-bin", isDirectory: true)
+        _ = try makeFakeCLI(in: globalDir, version: "2.10.1")
+        let upgrades = CallCounter()
+        let service = RuntimeSetupService(
+            processEnvironment: isolatedEnvironment(home: home, pathDir: globalDir),
+            appVersion: "2.11.1",
+            engineInstaller: { _ in source },
+            fanControlEnsurer: fanControlOK(),
+            homebrewUpgrader: {
+                upgrades.increment()
+                return source
+            }
+        )
+
+        let result = await run(service)
+
+        XCTAssertEqual(result.outcome?.engineReady, true)
+        XCTAssertEqual(result.row(.globalCLI)?.state, .done)
+        XCTAssertEqual(
+            result.row(.globalCLI)?.detail,
+            "Source checkout runtime active. Existing terminal command left unchanged."
+        )
+        XCTAssertEqual(upgrades.count(), 0)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: home.appendingPathComponent(".mtplx/bin/mtplx").path)
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent(".zshrc").path))
+    }
+
     func testUpgradesOldHomebrewCLIExactlyOnce() async throws {
         let home = temporaryDirectory()
         let engine = try makeFakeCLI(in: home.appendingPathComponent("engine"), version: "1.0.0")
@@ -207,6 +282,52 @@ final class RuntimeSetupServiceTests: XCTestCase {
             result.row(.globalCLI)?.detail ?? "nil"
         )
         XCTAssertEqual(result.outcome?.engineReady, true)
+    }
+
+    func testSetupProgressUsesTheActiveLanguage() async throws {
+        L10n.activate(.simplifiedChinese)
+        defer { L10n.activate(.english) }
+
+        let home = temporaryDirectory()
+        let engine = try makeFakeCLI(in: home.appendingPathComponent("engine"), version: "1.0.0")
+        let globalDir = home.appendingPathComponent("global-bin", isDirectory: true)
+        _ = try makeFakeCLI(in: globalDir, version: "0.3.7")
+        let upgraded = try makeFakeCLI(in: home.appendingPathComponent("brew-upgraded"), version: "1.0.0")
+
+        var environment = isolatedEnvironment(home: home, pathDir: globalDir)
+        environment["MTPLX_APP_FAKE_INSTALL_KIND"] = "homebrew"
+        let service = RuntimeSetupService(
+            processEnvironment: environment,
+            appVersion: "1.0.0",
+            engineInstaller: { status in
+                status(tr("Installing MTPLX runtime"))
+                return engine
+            },
+            fanControlEnsurer: { _, status in
+                status(tr("Checking fan control"))
+                return FanControlSetupResult(
+                    ok: true,
+                    exitCode: 0,
+                    message: tr("Fan control ready")
+                )
+            },
+            homebrewUpgrader: { upgraded }
+        )
+        let result = await run(service)
+        let details = result.snapshots.flatMap { $0.map(\.detail) }
+
+        for expected in [
+            "正在检查 MTPLX 运行时",
+            "正在安装 MTPLX 运行时",
+            "正在检查风扇控制",
+            "正在检查现有的 mtplx 命令",
+            "正在更新你的 Homebrew CLI（0.3.7 → 1.0.0）",
+        ] {
+            XCTAssertTrue(details.contains(expected), "\(expected) missing from \(details)")
+        }
+        XCTAssertEqual(result.row(.engine)?.detail, "MTPLX 1.0.0 就绪")
+        XCTAssertEqual(result.row(.fanControl)?.detail, "风扇控制就绪")
+        XCTAssertEqual(result.row(.globalCLI)?.detail, "Homebrew CLI 已更新至 1.0.0")
     }
 
     func testHomebrewUpgradeFailureFallsBackToShim() async throws {
@@ -280,6 +401,54 @@ final class RuntimeSetupServiceTests: XCTestCase {
         )
     }
 
+    /// #292: a symlinked ~/.zshrc (dotfile-repo users) must survive the PATH
+    /// append. The old atomic rewrite replaced the link with a plain file and
+    /// silently detached the user's dotfiles.
+    func testSymlinkedZshrcSurvivesPathAppend() async throws {
+        let home = temporaryDirectory()
+        let engine = try makeFakeCLI(in: home.appendingPathComponent("engine"), version: "1.0.0")
+        let globalDir = home.appendingPathComponent("global-bin", isDirectory: true)
+        _ = try makeFakeCLI(in: globalDir, version: "0.3.7")
+
+        let fileManager = FileManager.default
+        let dotfiles = home.appendingPathComponent("dotfiles", isDirectory: true)
+        try fileManager.createDirectory(at: dotfiles, withIntermediateDirectories: true)
+        let realZshrc = dotfiles.appendingPathComponent("zshrc")
+        let userContent = "# user's own config\nalias ll='ls -la'\n"
+        try userContent.write(to: realZshrc, atomically: true, encoding: .utf8)
+        let zshrcLink = home.appendingPathComponent(".zshrc")
+        try fileManager.createSymbolicLink(
+            at: zshrcLink,
+            withDestinationURL: realZshrc
+        )
+
+        var environment = isolatedEnvironment(home: home, pathDir: globalDir)
+        environment["MTPLX_APP_FAKE_INSTALL_KIND"] = "pipLike"
+        let service = RuntimeSetupService(
+            processEnvironment: environment,
+            appVersion: "1.0.0",
+            engineInstaller: { _ in engine },
+            fanControlEnsurer: fanControlOK(),
+            homebrewUpgrader: { engine }
+        )
+        _ = await run(service)
+
+        let destination = try? fileManager.destinationOfSymbolicLink(
+            atPath: zshrcLink.path
+        )
+        XCTAssertEqual(
+            destination,
+            realZshrc.path,
+            "~/.zshrc must still be the user's symlink, not a replacement file"
+        )
+        let target = try String(contentsOf: realZshrc, encoding: .utf8)
+        XCTAssertTrue(target.contains("alias ll"), "user content preserved")
+        XCTAssertTrue(
+            target.contains(".mtplx/bin"),
+            "PATH line written through the link into the real dotfile"
+        )
+    }
+
     /// The founder's edge case: a CLI newer than the app is the user's
     /// business — no shim, no downgrade, no nagging.
     func testNewerThanAppCLIIsLeftAlone() async throws {
@@ -335,6 +504,41 @@ final class RuntimeSetupServiceTests: XCTestCase {
             encoding: .utf8
         )
         XCTAssertTrue(zshrc.contains(#"export PATH="$HOME/.mtplx/bin:$PATH""#), zshrc)
+    }
+
+    /// A ~/.zshrc symlinked into a dotfiles repo (stow/chezmoi/yadm) must be
+    /// written through, never replaced by a plain file that silently detaches
+    /// it from version control (#292).
+    func testZshrcSymlinkIsPreservedWhenAddingPATHLine() async throws {
+        let home = temporaryDirectory()
+        let engine = try makeFakeCLI(in: home.appendingPathComponent("engine"), version: "1.0.0")
+        let emptyDir = home.appendingPathComponent("empty-bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: emptyDir, withIntermediateDirectories: true)
+        let dotfiles = home.appendingPathComponent("dotfiles", isDirectory: true)
+        try FileManager.default.createDirectory(at: dotfiles, withIntermediateDirectories: true)
+        let target = dotfiles.appendingPathComponent("zshrc")
+        try "# dotfiles-managed\n".write(to: target, atomically: true, encoding: .utf8)
+        let link = home.appendingPathComponent(".zshrc")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+
+        let service = RuntimeSetupService(
+            processEnvironment: isolatedEnvironment(home: home, pathDir: emptyDir),
+            appVersion: "1.0.0",
+            engineInstaller: { _ in engine },
+            fanControlEnsurer: fanControlOK()
+        )
+        let result = await run(service)
+        XCTAssertEqual(result.outcome?.engineReady, true)
+
+        let destination = try FileManager.default.destinationOfSymbolicLink(atPath: link.path)
+        XCTAssertEqual(
+            destination,
+            target.path,
+            ".zshrc must remain a symlink into the dotfiles repo"
+        )
+        let repoCopy = try String(contentsOf: target, encoding: .utf8)
+        XCTAssertTrue(repoCopy.contains(".mtplx/bin"), "PATH line must land in the linked target")
+        XCTAssertTrue(repoCopy.hasPrefix("# dotfiles-managed"), "existing content preserved")
     }
 
     func testTerminalShimInstallIsIdempotent() async throws {

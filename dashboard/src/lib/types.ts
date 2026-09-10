@@ -216,6 +216,7 @@ export type MutableSettings = {
 };
 
 export type MachineInfo = {
+  chip: string | null;
   machine_model: string | null;
   unified_memory_bytes: number | null;
 };
@@ -337,7 +338,8 @@ export type ConnectionState =
   | "connecting"
   | "open"
   | "reconnecting"
-  | "failed";
+  | "failed"
+  | "unauthorized";
 
 export type PrefillRow = {
   t: number;

@@ -3,6 +3,17 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from mtplx.benchmarks.runners import mtp_depth_sweep
+import pytest
+
+
+def test_draft_cycle_mean_uses_proposals_when_event_recording_is_disabled():
+    # Actual installed-artifact tune receipts had events=[] and incorrectly
+    # reported 333 / 370 accepted drafts per cycle from 512 generated tokens.
+    mean = mtp_depth_sweep._accepted_drafts_per_cycle
+    assert mean(333, [178, 178]) == pytest.approx(333 / 178)
+    assert mean(370, [139, 139, 138]) == pytest.approx(370 / 139)
+    assert mean(0, []) is None
+    assert mean(0, [0, 0]) is None
 
 
 def test_depth_sweep_uses_packaged_draft_lm_head_helper(monkeypatch, tmp_path) -> None:
@@ -24,14 +35,10 @@ def test_depth_sweep_uses_packaged_draft_lm_head_helper(monkeypatch, tmp_path) -
     )
 
     monkeypatch.setattr(mtp_depth_sweep, "load", lambda *_args, **_kwargs: fake_runtime)
-    monkeypatch.setattr(
-        mtp_depth_sweep, "load_prompt_suite", lambda *_args, **_kwargs: []
-    )
+    monkeypatch.setattr(mtp_depth_sweep, "load_prompt_suite", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         "mtplx.draft_lm_head._install_draft_lm_head",
-        lambda runtime, **kwargs: (
-            calls.append((runtime, kwargs)) or {"installed": True}
-        ),
+        lambda runtime, **kwargs: calls.append((runtime, kwargs)) or {"installed": True},
     )
 
     result = mtp_depth_sweep.run_mtp_depth_sweep(
@@ -77,9 +84,7 @@ def test_depth_sweep_passes_merge_mtp_adapter_to_runtime(monkeypatch, tmp_path) 
         return fake_runtime
 
     monkeypatch.setattr(mtp_depth_sweep, "load", fake_load)
-    monkeypatch.setattr(
-        mtp_depth_sweep, "load_prompt_suite", lambda *_args, **_kwargs: []
-    )
+    monkeypatch.setattr(mtp_depth_sweep, "load_prompt_suite", lambda *_args, **_kwargs: [])
 
     result = mtp_depth_sweep.run_mtp_depth_sweep(
         tmp_path / "model",
@@ -93,7 +98,25 @@ def test_depth_sweep_passes_merge_mtp_adapter_to_runtime(monkeypatch, tmp_path) 
     assert load_kwargs[0]["merge_mtp_adapter"] is True
     assert result["mtp_adapter_kind"] == "c4_mtp_lora_adapter"
     assert result["mtp_adapter_merged"] is True
-    assert result["mtp_adapter_merge_report"] == {
-        "merged": 1,
-        "targets": [{"target": "fc"}],
-    }
+    assert result["mtp_adapter_merge_report"] == {"merged": 1, "targets": [{"target": "fc"}]}
+
+
+def test_sum_draft_core_preserves_greedy_confidence_counters() -> None:
+    summary = mtp_depth_sweep._sum_draft_core(
+        [
+            {
+                "requested": "stock",
+                "greedy_confidence_sync_calls": 3,
+                "greedy_confidence_token_reuses": 2,
+            },
+            {
+                "requested": "stock",
+                "greedy_confidence_sync_calls": 4,
+                "greedy_confidence_token_reuses": 4,
+            },
+            {"requested": "stock"},
+        ]
+    )
+
+    assert summary["greedy_confidence_sync_calls"] == 7
+    assert summary["greedy_confidence_token_reuses"] == 6

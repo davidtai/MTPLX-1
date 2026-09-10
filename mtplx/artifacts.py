@@ -12,26 +12,36 @@ from typing import Any
 
 from .constants import (
     EXPECTED_ALL_PREQUANTIZED_MTP_KEYS,
-    EXPECTED_ALL_PREQUANTIZED_MTP_TENSOR_COUNT,
     EXPECTED_MTP_KEYS,
-    EXPECTED_PREQUANTIZED_MTP_KEYS,
-    EXPECTED_PREQUANTIZED_MTP_TENSOR_COUNT,
     EXPECTED_MTP_TENSOR_COUNT,
+    EXPECTED_PREQUANTIZED_MTP_KEYS,
     EXPECTED_QWEN_MOE_MTP_KEYS,
-    EXPECTED_QWEN_MOE_MTP_TENSOR_COUNT,
     EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS,
-    EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_TENSOR_COUNT,
     EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS,
-    EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_TENSOR_COUNT,
     MULTIMODAL_SIDECARS,
+    expand_mtp_layer_keys,
+)
+from .models.laguna_config import (
+    LAGUNA_S_2_1_REPO_ID,
+    LAGUNA_S_2_1_REQUIRED_FILES,
+    LAGUNA_S_2_1_REVISION,
+    LAGUNA_S_2_1_WEIGHT_SHARDS,
+    is_laguna_s_2_1_mlx_4bit_config,
+    laguna_s_2_1_artifact_integrity_errors,
 )
 from .profiles import (
     DEFAULT_FP16_HF_MODEL_ID,
     DEFAULT_FP16_PUBLIC_MODEL_ID,
-    DEFAULT_HF_MODEL_ID,
-    DEFAULT_PUBLIC_MODEL_ID,
+    FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+    FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
     LEGACY_OPTIMIZED_HF_MODEL_ID,
     LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
+    OPTIMIZED_SPEED_V1_HF_MODEL_ID,
+    OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID,
+    OPTIMIZED_SPEED_V2_HF_MODEL_ID,
+    OPTIMIZED_SPEED_V2_PUBLIC_MODEL_ID,
     QUALITY_FP16_HF_MODEL_ID,
     QUALITY_FP16_PUBLIC_MODEL_ID,
     QUALITY_HF_MODEL_ID,
@@ -48,6 +58,18 @@ from .profiles import (
     QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
     QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
     QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+    QWEN38_BARE_SPEED_HF_MODEL_ID,
+    QWEN38_BARE_SPEED_PUBLIC_MODEL_ID,
+    QWEN38_OPTIMIZED_QUALITY_HF_MODEL_ID,
+    QWEN38_OPTIMIZED_QUALITY_PUBLIC_MODEL_ID,
+    QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID,
+    QWEN38_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+    QWEN38_BARE_SPEED_FP16_HF_MODEL_ID,
+    QWEN38_BARE_SPEED_FP16_PUBLIC_MODEL_ID,
+    QWEN38_OPTIMIZED_QUALITY_FP16_HF_MODEL_ID,
+    QWEN38_OPTIMIZED_QUALITY_FP16_PUBLIC_MODEL_ID,
+    QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+    QWEN38_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
 )
 
 MTP_KEY_PREFIXES = ("mtp.", "language_model.mtp.")
@@ -56,7 +78,8 @@ _KNOWN_PUBLIC_MODEL_ALIASES = {
     # their first-party repos. Explicit ids only — consistent with the July
     # 2026 contract-match-only identity stance (#57): pasting the id the
     # server displayed into `mtplx serve/run/pull --model` must work.
-    DEFAULT_PUBLIC_MODEL_ID: DEFAULT_HF_MODEL_ID,
+    OPTIMIZED_SPEED_V2_PUBLIC_MODEL_ID: OPTIMIZED_SPEED_V2_HF_MODEL_ID,
+    OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID: OPTIMIZED_SPEED_V1_HF_MODEL_ID,
     DEFAULT_FP16_PUBLIC_MODEL_ID: DEFAULT_FP16_HF_MODEL_ID,
     QUALITY_PUBLIC_MODEL_ID: QUALITY_HF_MODEL_ID,
     QUALITY_FP16_PUBLIC_MODEL_ID: QUALITY_FP16_HF_MODEL_ID,
@@ -67,10 +90,19 @@ _KNOWN_PUBLIC_MODEL_ALIASES = {
     QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID: QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
     QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID: QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID,
     QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID: QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID,
+    QWEN38_BARE_SPEED_PUBLIC_MODEL_ID: QWEN38_BARE_SPEED_HF_MODEL_ID,
+    QWEN38_OPTIMIZED_SPEED_PUBLIC_MODEL_ID: QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID,
+    QWEN38_OPTIMIZED_QUALITY_PUBLIC_MODEL_ID: QWEN38_OPTIMIZED_QUALITY_HF_MODEL_ID,
+    QWEN38_BARE_SPEED_FP16_PUBLIC_MODEL_ID: QWEN38_BARE_SPEED_FP16_HF_MODEL_ID,
+    QWEN38_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID: QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+    QWEN38_OPTIMIZED_QUALITY_FP16_PUBLIC_MODEL_ID: QWEN38_OPTIMIZED_QUALITY_FP16_HF_MODEL_ID,
+    FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID: FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID: FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
     # Artifact-basename aliases (folder-name style).
     "qwen3.5-9b-mtplx-optimized-speed": QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
     "qwen3.5-9b-mtplx-optimized-speed-fp16": QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
-    "qwen3.6-27b-mtplx-optimized-speed": DEFAULT_HF_MODEL_ID,
+    "qwen3.6-27b-mtplx-optimized-speed-v2": OPTIMIZED_SPEED_V2_HF_MODEL_ID,
+    "qwen3.6-27b-mtplx-optimized-speed": OPTIMIZED_SPEED_V1_HF_MODEL_ID,
     "qwen3.6-27b-mtplx-optimized": LEGACY_OPTIMIZED_HF_MODEL_ID,
     "qwen3.6-27b-mtplx-optimized-speed-fp16": DEFAULT_FP16_HF_MODEL_ID,
     "qwen3.6-27b-mtplx-optimized-quality": QUALITY_HF_MODEL_ID,
@@ -79,6 +111,20 @@ _KNOWN_PUBLIC_MODEL_ALIASES = {
     "qwen3.6-35b-a3b-mtplx-optimized-speed-fp16": QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
     "qwen3.6-35b-a3b-mtplx-optimized-balance": QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID,
     "qwen3.6-35b-a3b-mtplx-optimized-balance-fp16": QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID,
+    "qwen3.8-27b-mtplx-bare-speed": QWEN38_BARE_SPEED_HF_MODEL_ID,
+    "qwen3.8-27b-mtplx-optimized-speed": QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID,
+    "qwen3.8-27b-mtplx-bare-speed-fp16": QWEN38_BARE_SPEED_FP16_HF_MODEL_ID,
+    "qwen3.8-27b-mtplx-optimized-speed-fp16": QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+    "qwen3.8-27b-mtplx-optimized-quality-fp16": QWEN38_OPTIMIZED_QUALITY_FP16_HF_MODEL_ID,
+    "qwen3.8-27b-mtplx-optimized-quality": QWEN38_OPTIMIZED_QUALITY_HF_MODEL_ID,
+    # Flash-Next basenames are derived, not hand-copied: this table drifted
+    # from model_catalog and commands/public once already, which broke the
+    # release-notes command `mtplx pull mtplx-flash-next-bare-speed`.
+    # test_public_model_id_alias_tables_agree keeps all three in agreement.
+    Path(FLASH_NEXT_BARE_SPEED_HF_MODEL_ID).name.lower(): FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+    Path(
+        FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID
+    ).name.lower(): FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
 }
 
 
@@ -102,6 +148,53 @@ def _num_mtp_layers(config: dict[str, Any]) -> int:
         or tcfg.get("num_nextn_predict_layers")
         or config.get("num_nextn_predict_layers")
         or 0
+    )
+
+
+def appended_mtp_layer_range(config: dict[str, Any]) -> range:
+    """Layer indices holding an appended-layer MTP head.
+
+    GLM MoE checkpoints ship the MTP head as extra decoder layers starting
+    at ``num_hidden_layers`` (``model.layers.47.*`` for GLM-4.7-Flash),
+    rather than under an ``mtp.`` prefix.  Returns an empty range when the
+    config does not describe that layout.
+    """
+    tcfg = text_config(config)
+    start = int(tcfg.get("num_hidden_layers") or config.get("num_hidden_layers") or 0)
+    count = _num_mtp_layers(config)
+    if start <= 0 or count <= 0:
+        return range(0)
+    return range(start, start + count)
+
+
+def is_mtp_layers_namespace_key(key: str, config: dict[str, Any]) -> bool:
+    """Match an MTP head kept in its own ``model.mtp_layers.N.`` namespace.
+
+    MiMo stores the head neither under an ``mtp.`` prefix nor as an appended
+    decoder layer, but in a separate namespace beside ``model.layers.*``.
+    ``mimo_mtp_patch`` already reads that form, so extraction only has to
+    select the keys; no rewrite is needed.
+    """
+    text = str(key)
+    count = _num_mtp_layers(config)
+    return count > 0 and any(
+        text.startswith(f"model.mtp_layers.{index}.") for index in range(count)
+    )
+
+
+def uses_mtp_layers_namespace(config: dict[str, Any]) -> bool:
+    return _num_mtp_layers(config) > 0
+
+
+def uses_appended_layer_mtp(config: dict[str, Any]) -> bool:
+    return len(appended_mtp_layer_range(config)) > 0
+
+
+def is_appended_layer_mtp_key(key: str, config: dict[str, Any]) -> bool:
+    text = str(key)
+    return any(
+        text.startswith(f"model.layers.{index}.")
+        for index in appended_mtp_layer_range(config)
     )
 
 
@@ -186,6 +279,13 @@ def _mtp_expected_key_set(
     prequantized = isinstance(mtp_quant, dict) and bool(mtp_quant.get("prequantized"))
     quant_policy = str(mtp_quant.get("policy") or "") if isinstance(mtp_quant, dict) else ""
     normalized = {normalize_mtp_key(key) for key in keys}
+    # Every named key set below is the canonical depth-1 template; checkpoints
+    # declaring mtp_num_hidden_layers > 1 replicate the layer keys per index.
+    n_layers = max(_num_mtp_layers(config), 1)
+
+    def _expanded(base: tuple[str, ...]) -> set[str]:
+        return expand_mtp_layer_keys(base, n_layers)
+
     if _is_qwen_moe_mtp_layout(config, normalized):
         if any(".mlp.switch_mlp." in key for key in normalized):
             has_prequantized_aux = any(
@@ -194,7 +294,7 @@ def _mtp_expected_key_set(
             )
             if prequantized or has_prequantized_aux:
                 expected = _expected_prequantized_keys_for_present_aux(
-                    set(EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS),
+                    _expanded(EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS),
                     normalized,
                 )
                 return (
@@ -202,9 +302,10 @@ def _mtp_expected_key_set(
                     len(expected),
                     "prequantized-mlx-affine-qwen-moe-switch-mlx",
                 )
+            expected = _expanded(EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS)
             return (
-                set(EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS),
-                EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_TENSOR_COUNT,
+                expected,
+                len(expected),
                 "bf16-qwen-moe-switch-mlx",
             )
         if _has_numbered_moe_experts(normalized):
@@ -216,42 +317,47 @@ def _mtp_expected_key_set(
                 config,
                 prequantized=prequantized or has_prequantized_aux,
             )
-        if prequantized or normalized == set(EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS):
+        if prequantized or normalized == _expanded(EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS):
+            expected = _expanded(EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS)
             return (
-                set(EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS),
-                EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_TENSOR_COUNT,
+                expected,
+                len(expected),
                 "prequantized-mlx-affine-qwen-moe",
             )
+        expected = _expanded(EXPECTED_QWEN_MOE_MTP_KEYS)
         return (
-            set(EXPECTED_QWEN_MOE_MTP_KEYS),
-            EXPECTED_QWEN_MOE_MTP_TENSOR_COUNT,
+            expected,
+            len(expected),
             "bf16-qwen-moe",
         )
     if prequantized and quant_policy == "all":
+        expected = _expanded(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS)
         return (
-            set(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS),
-            EXPECTED_ALL_PREQUANTIZED_MTP_TENSOR_COUNT,
+            expected,
+            len(expected),
             "prequantized-mlx-affine",
         )
     if prequantized:
+        expected = _expanded(EXPECTED_PREQUANTIZED_MTP_KEYS)
         return (
-            set(EXPECTED_PREQUANTIZED_MTP_KEYS),
-            EXPECTED_PREQUANTIZED_MTP_TENSOR_COUNT,
+            expected,
+            len(expected),
             "prequantized-mlx-affine",
         )
-    if normalized == set(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS):
+    if normalized == _expanded(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS):
         return (
-            set(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS),
-            EXPECTED_ALL_PREQUANTIZED_MTP_TENSOR_COUNT,
+            set(normalized),
+            len(normalized),
             "prequantized-mlx-affine",
         )
-    if normalized == set(EXPECTED_PREQUANTIZED_MTP_KEYS):
+    if normalized == _expanded(EXPECTED_PREQUANTIZED_MTP_KEYS):
         return (
-            set(EXPECTED_PREQUANTIZED_MTP_KEYS),
-            EXPECTED_PREQUANTIZED_MTP_TENSOR_COUNT,
+            set(normalized),
+            len(normalized),
             "prequantized-mlx-affine",
         )
-    return set(EXPECTED_MTP_KEYS), EXPECTED_MTP_TENSOR_COUNT, "bf16"
+    expected = _expanded(EXPECTED_MTP_KEYS)
+    return expected, len(expected), "bf16"
 
 
 def _observed_sidecar_format(sidecar_format: str, tensors: tuple[TensorInfo, ...]) -> str:
@@ -303,6 +409,62 @@ def expected_mtp_file(model_dir: Path | str, config: dict[str, Any] | None = Non
         if candidate.exists():
             return candidate
     return model_path / "mtp.safetensors"
+
+
+def mtp_weights_present_on_disk(
+    model_dir: Path | str, config: dict[str, Any] | None = None
+) -> bool:
+    """Whether a model that declares MTP layers actually ships MTP weights.
+
+    A conversion can declare ``num_nextn_predict_layers`` in the config while
+    dropping the MTP weights themselves (e.g. the DeepSeek-V4-Flash 2bit-DQ
+    build). The runtime uses this probe to tell that benign case (config field
+    only -> degrade to autoregressive) apart from a genuine injection failure
+    (weights present but unusable -> raise).
+
+    Conservative by design: it only returns ``False`` when it can *positively*
+    confirm absence via a shard index that carries no MTP-shaped keys under any
+    known naming convention. A sidecar file, a missing/unreadable index, or any
+    ambiguity returns ``True`` so the existing injection + validation path runs
+    unchanged and a real detection bug on an MTP-bearing model still surfaces.
+    """
+    model_path = Path(model_dir)
+    config = config if config is not None else load_config(model_path)
+
+    # 1. Explicit MTP sidecar file (Qwen/GLM/hy3 external draft head).
+    if expected_mtp_file(model_path, config).exists():
+        return True
+
+    index_path = model_path / "model.safetensors.index.json"
+    if not index_path.exists():
+        # No index to inspect: cannot prove absence, preserve legacy behavior.
+        return True
+    try:
+        weight_map = json.loads(index_path.read_text(encoding="utf-8")).get(
+            "weight_map", {}
+        )
+    except Exception:
+        return True
+    keys = [str(k) for k in weight_map]
+
+    # 2. Namespaced embedded MTP weights ("mtp.*" / "language_model.mtp.*").
+    if any(is_mtp_key(k) for k in keys):
+        return True
+
+    # 3. DeepSeek-style trailing MTP decoder layer(s) appended after the trunk:
+    #    model.layers.{num_hidden_layers + i}.*
+    start = int(
+        text_config(config).get("num_hidden_layers")
+        or config.get("num_hidden_layers")
+        or 0
+    )
+    count = _num_mtp_layers(config)
+    if start and count:
+        wanted = tuple(f"model.layers.{start + i}." for i in range(count))
+        if any(k.startswith(wanted) for k in keys):
+            return True
+
+    return False
 
 
 @dataclass(frozen=True)
@@ -373,6 +535,10 @@ class ModelInspection:
     hidden_size: int | None
     num_hidden_layers: int | None
     vocab_size: int | None
+    num_experts: int | None = None
+    num_experts_per_tok: int | None = None
+    laguna_s_2_1_mlx_4bit_match: bool = False
+    laguna_s_2_1_artifacts_complete: bool = False
     mtp_pattern: str | None = None
     source: str = "local"
     quantization: dict[str, Any] = field(default_factory=dict)
@@ -419,6 +585,10 @@ class ModelInspection:
             "hidden_size": self.hidden_size,
             "num_hidden_layers": self.num_hidden_layers,
             "vocab_size": self.vocab_size,
+            "num_experts": self.num_experts,
+            "num_experts_per_tok": self.num_experts_per_tok,
+            "laguna_s_2_1_mlx_4bit_match": self.laguna_s_2_1_mlx_4bit_match,
+            "laguna_s_2_1_artifacts_complete": self.laguna_s_2_1_artifacts_complete,
             "quantization": self.quantization,
             "sidecars": self.sidecars,
             "model_files": list(self.model_files),
@@ -524,19 +694,31 @@ def _hf_repo_id_from_ref(value: Path | str) -> str | None:
     return None
 
 
-def _hf_download_json(repo_id: str, filename: str) -> tuple[dict[str, Any] | None, str | None, str | None]:
+def _hf_download_json(
+    repo_id: str,
+    filename: str,
+    *,
+    revision: str | None = None,
+) -> tuple[dict[str, Any] | None, str | None, str | None]:
     try:
         from huggingface_hub import hf_hub_download
     except Exception as exc:
         return None, None, f"huggingface_hub is required for HF inspection: {exc}"
+    from mtplx.hf_loader import _call_hub_with_anonymous_fallback, hf_token_for_download
+
     try:
         cache_dir = _hf_download_cache_dir()
         kwargs = {"cache_dir": str(cache_dir)} if cache_dir else {}
-        path = hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-            repo_type="model",
-            **kwargs,
+        path, _token = _call_hub_with_anonymous_fallback(
+            lambda token: hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                repo_type="model",
+                revision=revision,
+                token=token,
+                **kwargs,
+            ),
+            hf_token_for_download(),
         )
     except Exception as exc:
         return None, None, str(exc)
@@ -576,13 +758,28 @@ def _looks_like_missing_hf_file(error: str | None) -> bool:
     )
 
 
-def _hf_list_repo_files(repo_id: str) -> tuple[set[str], str | None]:
+def _hf_list_repo_files(
+    repo_id: str,
+    *,
+    revision: str | None = None,
+) -> tuple[set[str], str | None]:
     try:
         from huggingface_hub import HfApi
     except Exception as exc:
         return set(), f"huggingface_hub is required for HF inspection: {exc}"
+    from mtplx.hf_loader import _call_hub_with_anonymous_fallback, hf_token_for_download
+
     try:
-        return set(HfApi().list_repo_files(repo_id=repo_id, repo_type="model")), None
+        files, _token = _call_hub_with_anonymous_fallback(
+            lambda token: HfApi().list_repo_files(
+                repo_id=repo_id,
+                repo_type="model",
+                revision=revision,
+                token=token,
+            ),
+            hf_token_for_download(),
+        )
+        return set(files), None
     except Exception as exc:
         return set(), str(exc)
 
@@ -594,25 +791,26 @@ def _hf_url(repo_id: str, filename: str) -> str:
 
 
 def _hf_token() -> str | None:
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    if token:
-        return token
-    try:
-        from huggingface_hub import get_token
+    # One token policy for every Hub call MTPLX makes; see hf_token_for_download.
+    from mtplx.hf_loader import hf_token_for_download
 
-        return get_token()
-    except Exception:
-        return None
+    token = hf_token_for_download()
+    return token if isinstance(token, str) and token else None
 
 
 def _hf_fetch_prefix(repo_id: str, filename: str, *, end: int) -> bytes:
-    headers = {"Range": f"bytes=0-{end}", "User-Agent": "mtplx-inspect/0.1"}
-    token = _hf_token()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    request = urllib.request.Request(_hf_url(repo_id, filename), headers=headers)
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return response.read()
+    from mtplx.hf_loader import _call_hub_with_anonymous_fallback
+
+    def fetch(token: str | bool) -> bytes:
+        headers = {"Range": f"bytes=0-{end}", "User-Agent": "mtplx-inspect/0.1"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        request = urllib.request.Request(_hf_url(repo_id, filename), headers=headers)
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.read()
+
+    data, _token = _call_hub_with_anonymous_fallback(fetch, _hf_token() or False)
+    return data
 
 
 def _remote_safetensors_keys(repo_id: str, filename: str) -> tuple[tuple[str, ...], str | None]:
@@ -772,6 +970,11 @@ def _mtp_pattern_from_config(config: dict[str, Any]) -> str | None:
     raw = (
         tcfg.get("mtp_hybrid_override_pattern")
         or config.get("mtp_hybrid_override_pattern")
+        # Official NVIDIA Nemotron-H configs describe the MTP stack as a
+        # block-type name list; it must outrank the backbone-wide fallback
+        # keys or the backbone pattern shadows the MTP stack (issue #341).
+        or tcfg.get("mtp_layers_block_type")
+        or config.get("mtp_layers_block_type")
         or tcfg.get("hybrid_override_pattern")
         or config.get("hybrid_override_pattern")
         or tcfg.get("layers_block_type")
@@ -790,9 +993,54 @@ def _mtp_pattern_from_config(config: dict[str, Any]) -> str | None:
     return str(raw)
 
 
+def _remote_laguna_artifacts_complete(repo_id: str, files: set[str]) -> bool:
+    return bool(
+        repo_id.casefold() == LAGUNA_S_2_1_REPO_ID.casefold()
+        and LAGUNA_S_2_1_REQUIRED_FILES.issubset(files)
+    )
+
+
+def _local_laguna_artifacts_complete(model_path: Path) -> bool:
+    try:
+        source = json.loads(
+            (model_path / ".mtplx-source.json").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if source != {
+        "repo_id": LAGUNA_S_2_1_REPO_ID,
+        "revision": LAGUNA_S_2_1_REVISION,
+    }:
+        return False
+    if laguna_s_2_1_artifact_integrity_errors(model_path):
+        return False
+    try:
+        index = json.loads(
+            (model_path / "model.safetensors.index.json").read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    weight_map = index.get("weight_map") if isinstance(index, dict) else None
+    if not isinstance(weight_map, dict) or not weight_map:
+        return False
+    return set(weight_map.values()) == set(LAGUNA_S_2_1_WEIGHT_SHARDS)
+
+
 def _inspect_hf_model(repo_id: str) -> ModelInspection:
-    files, files_error = _hf_list_repo_files(repo_id)
-    config, config_path, config_error = _hf_download_json(repo_id, "config.json")
+    revision = (
+        LAGUNA_S_2_1_REVISION
+        if repo_id.casefold() == LAGUNA_S_2_1_REPO_ID.casefold()
+        else None
+    )
+    revision_kwargs = {"revision": revision} if revision is not None else {}
+    files, files_error = _hf_list_repo_files(repo_id, **revision_kwargs)
+    config, config_path, config_error = _hf_download_json(
+        repo_id,
+        "config.json",
+        **revision_kwargs,
+    )
     if config is None and "mtplx_pair.json" in files:
         # Assistant-pair bundles (Gemma 4) have no root config.json by
         # design: weights and configs live under target/ and assistant/
@@ -802,10 +1050,14 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
         # preflight reaches the same verdict instead of refusing what
         # the engine can run.
         pair_manifest, _pair_path, _pair_error = _hf_download_json(
-            repo_id, "mtplx_pair.json"
+            repo_id,
+            "mtplx_pair.json",
+            **revision_kwargs,
         )
         target_config, target_path, _target_error = _hf_download_json(
-            repo_id, "target/config.json"
+            repo_id,
+            "target/config.json",
+            **revision_kwargs,
         )
         if pair_manifest is not None and target_config is not None:
             config = dict(target_config)
@@ -820,6 +1072,7 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
     runtime_contract_data, runtime_contract_path, runtime_contract_error = _hf_download_json(
         repo_id,
         "mtplx_runtime.json",
+        **revision_kwargs,
     )
     if runtime_contract_data is None and _looks_like_missing_hf_file(runtime_contract_error):
         runtime_contract_error = None
@@ -901,6 +1154,13 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
         hidden_size=tcfg.get("hidden_size"),
         num_hidden_layers=tcfg.get("num_hidden_layers"),
         vocab_size=tcfg.get("vocab_size"),
+        num_experts=tcfg.get("num_experts"),
+        num_experts_per_tok=tcfg.get("num_experts_per_tok"),
+        laguna_s_2_1_mlx_4bit_match=is_laguna_s_2_1_mlx_4bit_config(config),
+        laguna_s_2_1_artifacts_complete=_remote_laguna_artifacts_complete(
+            repo_id,
+            files,
+        ),
         mtp_pattern=_mtp_pattern_from_config(config),
         quantization=quant,
         sidecars={name: name in files for name in MULTIMODAL_SIDECARS},
@@ -926,6 +1186,10 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
         hidden_size=inspection.hidden_size,
         num_hidden_layers=inspection.num_hidden_layers,
         vocab_size=inspection.vocab_size,
+        num_experts=inspection.num_experts,
+        num_experts_per_tok=inspection.num_experts_per_tok,
+        laguna_s_2_1_mlx_4bit_match=inspection.laguna_s_2_1_mlx_4bit_match,
+        laguna_s_2_1_artifacts_complete=inspection.laguna_s_2_1_artifacts_complete,
         mtp_pattern=inspection.mtp_pattern,
         quantization=inspection.quantization,
         sidecars=inspection.sidecars,
@@ -978,6 +1242,14 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
             hidden_size=tcfg.get("hidden_size"),
             num_hidden_layers=tcfg.get("num_hidden_layers"),
             vocab_size=tcfg.get("vocab_size"),
+            num_experts=tcfg.get("num_experts"),
+            num_experts_per_tok=tcfg.get("num_experts_per_tok"),
+            laguna_s_2_1_mlx_4bit_match=is_laguna_s_2_1_mlx_4bit_config(
+                target_config
+            ),
+            laguna_s_2_1_artifacts_complete=_local_laguna_artifacts_complete(
+                Path(pair["target_model"])
+            ),
             mtp_pattern="assistant-pair",
             quantization=target_quant,
             sidecars={name: False for name in MULTIMODAL_SIDECARS},
@@ -1045,6 +1317,12 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
         hidden_size=tcfg.get("hidden_size"),
         num_hidden_layers=tcfg.get("num_hidden_layers"),
         vocab_size=tcfg.get("vocab_size"),
+        num_experts=tcfg.get("num_experts"),
+        num_experts_per_tok=tcfg.get("num_experts_per_tok"),
+        laguna_s_2_1_mlx_4bit_match=is_laguna_s_2_1_mlx_4bit_config(config),
+        laguna_s_2_1_artifacts_complete=_local_laguna_artifacts_complete(
+            model_path
+        ),
         mtp_pattern=_mtp_pattern_from_config(config),
         quantization=quant,
         sidecars={name: (model_path / name).exists() for name in MULTIMODAL_SIDECARS},
@@ -1065,6 +1343,10 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
         hidden_size=inspection.hidden_size,
         num_hidden_layers=inspection.num_hidden_layers,
         vocab_size=inspection.vocab_size,
+        num_experts=inspection.num_experts,
+        num_experts_per_tok=inspection.num_experts_per_tok,
+        laguna_s_2_1_mlx_4bit_match=inspection.laguna_s_2_1_mlx_4bit_match,
+        laguna_s_2_1_artifacts_complete=inspection.laguna_s_2_1_artifacts_complete,
         mtp_pattern=inspection.mtp_pattern,
         quantization=inspection.quantization,
         sidecars=inspection.sidecars,

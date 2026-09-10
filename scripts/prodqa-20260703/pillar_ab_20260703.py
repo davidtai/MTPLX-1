@@ -9,13 +9,7 @@ then tear down and verify the port is actually free.
 
 Arms alternate A,B,A,B. One summary JSON per pass appended to --output.
 """
-import argparse
-import json
-import subprocess
-import time
-import urllib.request
-import sys
-import os
+import argparse, json, subprocess, time, urllib.request, sys, os
 
 ARMS = {
     "candidate": {

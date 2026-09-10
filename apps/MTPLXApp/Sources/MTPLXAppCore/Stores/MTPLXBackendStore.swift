@@ -9,6 +9,36 @@ public enum PendingModelDownloadLaunchAction: String, Equatable, Sendable {
     case restart
 }
 
+/// What the last app-launched daemon actually got on its command line for
+/// scheduling, plus the Settings selection that produced it.
+///
+/// Issue #398: the app logged only `app_stop_all_invoked` around a restart,
+/// so "my pick never reached the daemon" and "my pick ran and the UI forgot
+/// it" were indistinguishable from the outside. Recording the flags read
+/// back out of the built argv makes the answer readable in the app's own
+/// log pane and in the AIME diagnostics file, and it gives Settings a true
+/// "running now" value to compare the picker against.
+public struct DaemonLaunchScheduling: Equatable, Sendable {
+    public var schedulerMode: String
+    public var batchingPreset: String
+    /// Normalized Performance picker selection at launch time.
+    public var selectedPreset: String
+    /// `mtplx start <target>` surface, or "none" for a bare serve.
+    public var target: String
+
+    public init(
+        schedulerMode: String,
+        batchingPreset: String,
+        selectedPreset: String,
+        target: String
+    ) {
+        self.schedulerMode = schedulerMode
+        self.batchingPreset = batchingPreset
+        self.selectedPreset = selectedPreset
+        self.target = target
+    }
+}
+
 public struct PendingModelDownload: Identifiable, Equatable, Sendable {
     public var id: String
     public var repoID: String
@@ -80,11 +110,11 @@ public enum BenchmarkDaemonReadinessError: Error, Equatable, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .modelDownloadRequired(let model):
-            return "Download \(model) before running the benchmark."
+            return tr("Download %@ before running the benchmark.", model)
         case .startupFailed(let reason):
-            return "Couldn't start MTPLX for the benchmark: \(reason)"
+            return tr("Couldn't start MTPLX for the benchmark: %@", reason)
         case .unreachable(let url):
-            return "Can't reach MTPLX at \(url.absoluteString)."
+            return tr("Can't reach MTPLX at %@.", url.absoluteString)
         }
     }
 }
@@ -102,19 +132,19 @@ public struct ClientHandoffNotice: Equatable, Sendable {
 
         switch result.action {
         case .unavailable:
-            status = "Needs OpenCode Desktop"
-            detail = "MTPLX is running, but OpenCode Desktop was not found at /Applications/OpenCode.app."
+            status = tr("Needs OpenCode Desktop")
+            detail = tr("MTPLX is running, but OpenCode Desktop was not found at /Applications/OpenCode.app.")
             isWarning = true
         case .opened:
-            status = "OpenCode opened"
+            status = tr("OpenCode opened")
             detail = result.detail
             isWarning = false
         case .relaunched:
-            status = "OpenCode reloaded"
+            status = tr("OpenCode reloaded")
             detail = result.detail
             isWarning = false
         case .focused:
-            status = "OpenCode focused"
+            status = tr("OpenCode focused")
             detail = result.detail
             isWarning = false
         }
@@ -133,10 +163,10 @@ public struct ClientHandoffNotice: Equatable, Sendable {
         }
         let detail = result.action == .unavailable
             ? result.detail
-            : "MTPLX opened Terminal, but no Pi agent process was detected. Install Pi, then pick Pi again."
+            : tr("MTPLX opened Terminal, but no Pi agent process was detected. Install Pi, then pick Pi again.")
         return ClientHandoffNotice(
             target: .pi,
-            status: result.action == .unavailable ? "Pi handoff unavailable" : "Pi not detected",
+            status: result.action == .unavailable ? tr("Pi handoff unavailable") : tr("Pi not detected"),
             detail: detail,
             isWarning: true
         )
@@ -156,6 +186,9 @@ public struct ClientHandoffNotice: Equatable, Sendable {
 @MainActor
 public final class MTPLXBackendStore: ObservableObject {
     @Published public private(set) var daemonState: DaemonState = .stopped
+    @Published public private(set) var daemonRestartStatus: DaemonRestartStatus = .idle
+    @Published public private(set) var daemonRestartCount: Int = 0
+    @Published public private(set) var daemonRestartEligibility: DaemonRestartEligibility = .noDaemon
     @Published public private(set) var connectionState: MetricsConnectionState = .idle
     @Published public private(set) var startupPhase: DaemonStartupPhase = .idle
     @Published public private(set) var health: HealthPayload?
@@ -168,6 +201,23 @@ public final class MTPLXBackendStore: ObservableObject {
     @Published public private(set) var sessionBank: SessionBank?
     @Published public private(set) var mem: MemSnapshot?
     @Published public private(set) var thermal: ThermalSnapshot?
+    /// Memory governor telemetry (issue #305): macOS/allocator pressure
+    /// level and the daemon's machine memory plan. 0 / nil until a
+    /// governor-aware daemon reports.
+    @Published public private(set) var memoryPressureLevel: Int = 0
+    /// "macos" or "allocator" — which signal produced the level above.
+    /// nil until a source-aware (2.10+) daemon reports.
+    @Published public private(set) var memoryPressureSource: String?
+    @Published public private(set) var memoryPlan: MemoryPlanStatus?
+    /// Scheduling flags the most recent app-owned daemon launch carried
+    /// (issue #398). nil until this app session has launched a daemon.
+    @Published public private(set) var lastLaunchScheduling: DaemonLaunchScheduling?
+    /// True when the guard's event ring shows caches actually shed within
+    /// the recency window — the banner's "shedding" claim keys off this,
+    /// never off the pressure level alone (a warning-level tick during a
+    /// prefill spike sheds nothing: the guard is edge-triggered, defers
+    /// while busy, and protects the active session).
+    @Published public private(set) var memoryGuardRecentShed: Bool = false
     @Published public private(set) var settings: MutableSettings?
     @Published public private(set) var scheduler: DynamicObject?
     @Published public private(set) var prefillStatus: DynamicObject?
@@ -185,12 +235,18 @@ public final class MTPLXBackendStore: ObservableObject {
     @Published public private(set) var prefillHistory: PrefillHistoryPayload? = nil
     /// `/v1/models` list, populated lazily for the About sheet.
     @Published public private(set) var models: ModelsResponse? = nil
-    /// Number of `.completed` SSE events we've actually observed since
-    /// the current daemon started. The daemon's own
+    /// Number of completed user requests we've actually observed since
+    /// the current daemon started — via `.completed` SSE frames, or via
+    /// a finished request's receipt arriving on the snapshot poller
+    /// (`noteSnapshotCompletionEvidence`). The daemon's own
     /// `lifetime.requestsTotal` counts the model warm-up as a request
     /// (it does emit decode tokens), so we can't trust it to gate "is
-    /// this a real user request?" — we count our own.
+    /// this a real user request?" — we count our own, and warmup-marked
+    /// receipts never tick this.
     @Published public private(set) var observedCompletionCount: Int = 0
+    /// Dedup key for snapshot-derived completion evidence (see
+    /// `noteSnapshotCompletionEvidence`).
+    private var snapshotCompletionFingerprint: String?
     @Published public private(set) var observedUserMetricEventCount: Int = 0
     @Published public private(set) var piTerminalAgentRunning: Bool = false
     @Published public private(set) var piTerminalAgentProcessIDs: [Int] = []
@@ -200,6 +256,9 @@ public final class MTPLXBackendStore: ObservableObject {
     /// One-line banner shown after the configured port was occupied and the
     /// daemon moved to the next free port (persisted to settings).
     @Published public private(set) var portFallbackNotice: String?
+    /// One-line, dismissable banner shown when `settings.json` could not be
+    /// read at launch and was set aside (see `loadPersistedSettings`).
+    @Published public private(set) var settingsRecoveryNotice: SettingsRecoveryNotice?
     @Published public private(set) var pendingModelDownload: PendingModelDownload?
     @Published public private(set) var modelDownloadProgress: DownloadProgressSnapshot?
     @Published public private(set) var modelDownloadFailure: String?
@@ -263,7 +322,10 @@ public final class MTPLXBackendStore: ObservableObject {
         settingsStore.settingsURL
     }
 
-    public private(set) var configuration: MTPLXAppConfiguration
+    // @Published: config-only changes (model swap while stopped, settings
+    // edits without a restart) must invalidate SwiftUI projections — the
+    // picker header label read a stale source indefinitely without this.
+    @Published public private(set) var configuration: MTPLXAppConfiguration
 
     /// Host-supplied hook invoked on the main actor immediately after a
     /// daemon launch reaches `running` for a specific target. The host
@@ -279,6 +341,8 @@ public final class MTPLXBackendStore: ObservableObject {
     private let settingsStore: MTPLXSettingsStore
     private let commandBuilder: MTPLXCommandBuilder
     private let supervisor: DaemonSupervisor
+    /// See `init(browserAuthSession:)`; nil in production.
+    private let browserAuthSession: URLSession?
     private let openCodeIntegration: OpenCodeIntegration
     private let piIntegration: PiIntegration
     private let hermesIntegration: HermesIntegration
@@ -286,12 +350,31 @@ public final class MTPLXBackendStore: ObservableObject {
     private let autoTuner: AutoTuner
     private let runtimeUpdateService: MTPLXRuntimeUpdateService
     private let localFanRestorer: @Sendable () async -> Bool
+    private let fanModeSetter: @Sendable (MTPLXAPIClient, String, Bool, Double?) async throws -> FanModeResponse
+    private let beforePostStartRefresh: @Sendable () async -> Void
+    private let beforeThermalStatusRefresh: @Sendable () async -> Void
+    /// Test seam for the narrow window immediately before a client launcher
+    /// performs external work. Production uses a no-op; lifecycle checks on
+    /// both sides make delayed completions harmless.
+    private let beforeClientHandoffLaunch: @Sendable (LaunchTarget) async -> Void
+    /// Keeps the stale-handoff gate observable without asking package tests to
+    /// start a real AppKit desktop client.
+    private let cancelOpenCodeDesktop: (MTPLXDesktopHandoffIdentity) -> Bool
     private var launchedPiAgentPIDs: Set<Int> = []
+    /// Store-owned terminal launches are reaped by their UUID receipts, never
+    /// by a process-list scan. The PID set remains presentation-only.
+    private var launchedPiHandoffLeases: [UUID: MTPLXTerminalHandoffLease] = [:]
+    private var launchedHermesHandoffLeases: [UUID: MTPLXTerminalHandoffLease] = [:]
+    private var activeClientHandoffID: UUID?
     private var streamTask: Task<Void, Never>?
     private var healthWatchTask: Task<Void, Never>?
+    private var daemonTransportGeneration = 0
     private var modelDownloadTask: Task<Void, Never>?
     private var modelTuneTask: Task<Void, Never>?
     private var lateHealthRecoveryTask: Task<Void, Never>?
+    /// Background refresh of the runtime card; see
+    /// `scheduleRuntimeUpdateStatusRefresh`.
+    private var runtimeUpdateStatusRefreshTask: Task<Void, Never>?
     /// The slow part of stopping the daemon (fan restore + graceful
     /// SIGTERM/reap of the serve child) runs here, detached from the
     /// instant UI flip, so the Stop/Play control isn't frozen for the ~5s
@@ -306,6 +389,10 @@ public final class MTPLXBackendStore: ObservableObject {
     private var fanRestoreRequiredOnStop: Bool = false
     private var activeLaunchID: String?
     private var cancelledLaunchIDs: Set<String> = []
+    private var lastDaemonTarget: LaunchTarget?
+    private var recoveredAutomaticRestartGeneration = 0
+    private var lastAppliedSupervisionRevision = -1
+    private var lastTerminalCleanupLifecycleEpoch = 0
     private let daemonStartupTimeoutSeconds: TimeInterval = 600
 
     public init(
@@ -319,49 +406,186 @@ public final class MTPLXBackendStore: ObservableObject {
         modelDownloader: ModelDownloader = ModelDownloader(),
         autoTuner: AutoTuner = AutoTuner(),
         runtimeUpdateService: MTPLXRuntimeUpdateService? = nil,
-        localFanRestorer: (@Sendable () async -> Bool)? = nil
+        localFanRestorer: (@Sendable () async -> Bool)? = nil,
+        fanModeSetter: (@Sendable (MTPLXAPIClient, String, Bool, Double?) async throws -> FanModeResponse)? = nil,
+        beforePostStartRefresh: (@Sendable () async -> Void)? = nil,
+        beforeThermalStatusRefresh: (@Sendable () async -> Void)? = nil,
+        beforeClientHandoffLaunch: (@Sendable (LaunchTarget) async -> Void)? = nil,
+        openCodeDesktopCanceller: ((MTPLXDesktopHandoffIdentity) -> Bool)? = nil,
+        modelUpdateChecker: (@Sendable () async throws -> [ModelUpdateInfo])? = nil,
+        // Test seam for the browser sign-in ticket request. Production
+        // uses a fresh short-timeout session per hand-off.
+        browserAuthSession: URLSession? = nil
     ) {
         self.configuration = configuration
         self.settingsStore = settingsStore
+        self.browserAuthSession = browserAuthSession
         self.commandBuilder = commandBuilder
         self.supervisor = supervisor
         self.openCodeIntegration = openCodeIntegration
         self.piIntegration = piIntegration
         self.hermesIntegration = hermesIntegration
         self.modelDownloader = modelDownloader
+        self.modelUpdateChecker = modelUpdateChecker
         self.autoTuner = autoTuner
         self.runtimeUpdateService = runtimeUpdateService
             ?? MTPLXRuntimeUpdateService(environment: commandBuilder.environment)
         self.localFanRestorer = localFanRestorer ?? {
             await MTPLXBackendStore.restoreFanModeWithLocalThermalforge()
         }
+        self.fanModeSetter = fanModeSetter ?? { client, mode, requireActualRamp, timeoutS in
+            try await client.setFanMode(
+                mode,
+                requireActualRamp: requireActualRamp,
+                timeoutS: timeoutS
+            )
+        }
+        self.beforePostStartRefresh = beforePostStartRefresh ?? {}
+        self.beforeThermalStatusRefresh = beforeThermalStatusRefresh ?? {}
+        self.beforeClientHandoffLaunch = beforeClientHandoffLaunch ?? { _ in }
+        self.cancelOpenCodeDesktop = openCodeDesktopCanceller
+            ?? { identity in openCodeIntegration.cancelLaunchedDesktop(identity) }
+        self.supervisor.setAutomaticRestartEnabled(configuration.automaticDaemonRestart)
+        self.supervisor.setStatusObserver { [weak self] snapshot in
+            Task { @MainActor [weak self] in
+                self?.applySupervisorSnapshot(snapshot)
+            }
+        }
     }
 
+    /// Load `settings.json`. A file with some bad fields loads with those
+    /// fields at their defaults (each one logged); a file that cannot be
+    /// read at all is set aside beside itself and the app starts from
+    /// defaults with `settingsRecoveryNotice` naming the preserved file, so
+    /// the reset is visible and the user's original bytes survive the next
+    /// save.
     public func loadPersistedSettings() {
-        if var loaded = try? settingsStore.load() {
-            if shouldPromoteStaleOpenCodeTarget(loaded) {
-                loaded.lastLaunchTarget = LaunchTarget.openCode.rawValue
-                try? settingsStore.save(loaded)
-            }
-            configuration = loaded
-            seedLiveSettingsFromConfiguration(loaded)
+        let result = settingsStore.loadWithRecovery()
+        var loaded = result.configuration
+        if shouldPromoteStaleOpenCodeTarget(loaded) {
+            loaded.lastLaunchTarget = LaunchTarget.openCode.rawValue
+            try? settingsStore.save(loaded)
         }
+        configuration = loaded
+        seedLiveSettingsFromConfiguration(loaded)
+        supervisor.setAutomaticRestartEnabled(loaded.automaticDaemonRestart)
+        settingsRecoveryNotice = result.recovery
+        var lines = result.degradedFields.map { issue in
+            "settings: \(issue.path) could not be read (\(issue.reason)); using the default"
+        }
+        switch result.recovery {
+        case .unreadableFileKept(let preservedAt, let reason)?:
+            lines.append(
+                "settings: \(settingsStore.settingsURL.path) could not be read (\(reason)); "
+                    + "kept as \(preservedAt.path) and started from defaults"
+            )
+        case .unreadableFileLeftInPlace(let url, let reason, let moveFailure)?:
+            lines.append(
+                "settings: \(url.path) could not be read (\(reason)) and could not be moved aside "
+                    + "(\(moveFailure)); started from defaults"
+            )
+        case nil:
+            break
+        }
+        guard !lines.isEmpty else { return }
+        Task { [supervisor] in
+            for line in lines {
+                await supervisor.logs.append(line, stream: .system)
+            }
+        }
+    }
+
+    public func dismissSettingsRecoveryNotice() {
+        settingsRecoveryNotice = nil
     }
 
     public func saveSettings(_ next: MTPLXAppConfiguration) throws {
         configuration = next
         seedLiveSettingsFromConfiguration(next)
+        supervisor.setAutomaticRestartEnabled(next.automaticDaemonRestart)
         try settingsStore.save(next)
+    }
+
+    /// Commit a Performance mode pick straight to settings.json.
+    ///
+    /// Issue #398: Mode used to live in the Settings draft behind a Save
+    /// button in a different card, and the tab's `@State` dies whenever the
+    /// user navigates away, so "pick a mode, go start the model" silently
+    /// threw the pick away and the picker was back on Auto. Mode is one
+    /// discrete global, like Appearance and Language, so it saves on
+    /// selection and the next daemon launch reads it from disk. It stays
+    /// restart-required: the running daemon is not touched here.
+    public func applySchedulingPresetSelection(_ raw: String) throws {
+        var next = configuration
+        next.applySchedulingPreset(MTPLXAppConfiguration.schedulingPresetSelection(raw))
+        guard next != configuration else { return }
+        try saveSettings(next)
+    }
+
+    /// Record the scheduling flags a launch is about to hand the daemon
+    /// (issue #398). Read back out of the built argv so the record is what
+    /// actually ran, never what the resolver meant to run.
+    private func recordLaunchScheduling(
+        command: DaemonCommand,
+        configuration: MTPLXAppConfiguration,
+        target: LaunchTarget?,
+        launchID: String
+    ) async {
+        let scheduling = DaemonLaunchScheduling(
+            schedulerMode: MTPLXCommandBuilder.flagValue("--scheduler-mode", in: command.arguments)
+                ?? "unset",
+            batchingPreset: MTPLXCommandBuilder.flagValue("--batching-preset", in: command.arguments)
+                ?? "unset",
+            selectedPreset: MTPLXAppConfiguration.schedulingPresetSelection(
+                configuration.schedulingPreset
+            ),
+            target: target?.rawValue ?? "none"
+        )
+        lastLaunchScheduling = scheduling
+        AIMEDiagnostics.record(
+            "daemon_launch_scheduling",
+            fields: [
+                "scheduler_mode": .string(scheduling.schedulerMode),
+                "batching_preset": .string(scheduling.batchingPreset),
+                "scheduling_preset": .string(scheduling.selectedPreset),
+                "launch_target": .string(scheduling.target),
+                "launch_id": .string(launchID),
+                "memory_limit_gb": .int(configuration.memoryLimitGB ?? 0),
+                "allow_swap": .bool(configuration.allowSwap)
+            ],
+            flushImmediately: true,
+            force: true
+        )
+        await supervisor.logs.append(
+            "launch scheduling: --scheduler-mode \(scheduling.schedulerMode) "
+                + "--batching-preset \(scheduling.batchingPreset) "
+                + "(Settings mode \(scheduling.selectedPreset), target \(scheduling.target))",
+            stream: .system
+        )
     }
 
     public func applyConfiguration(
         _ next: MTPLXAppConfiguration,
         restartIfRunning: Bool = true
     ) async throws {
+        let previousModel = configuration.model
+        let wasDegraded: Bool
+        if case .degraded = daemonState { wasDegraded = true } else { wasDegraded = false }
         let shouldRestart = restartIfRunning && supervisor.isRunning()
         let target = LaunchTarget(rawValue: next.lastLaunchTarget)
         configuration = next
         try settingsStore.save(next)
+        supervisor.setAutomaticRestartEnabled(next.automaticDaemonRestart)
+        if !shouldRestart, restartIfRunning, wasDegraded {
+            // Degraded chrome means the user believes MTPLX is (or should
+            // be) running, but the supervisor no longer tracks a process —
+            // silently persisting the new selection and returning left the
+            // app wedged on "Degraded" until a manual Restart. Route the
+            // swap through the full start path: its port preflight adopts
+            // or replaces an orphaned app-owned daemon in place.
+            await startDaemon(target: target)
+            return
+        }
         guard shouldRestart else { return }
         if promptForModelDownloadIfNeeded(
             configuration: next,
@@ -377,6 +601,8 @@ public final class MTPLXBackendStore: ObservableObject {
         let launchID = UUID().uuidString
         let recoveryTarget = target
         do {
+            supervisor.setAutomaticRestartEnabled(next.automaticDaemonRestart)
+            lastDaemonTarget = target
             try await prepareRuntimeForDaemonStart()
             if target == .openCode {
                 let result = try openCodeIntegration.sync(configuration: next)
@@ -407,12 +633,38 @@ public final class MTPLXBackendStore: ObservableObject {
             healthWatchTask = nil
             connectionState = .connecting
             daemonState = .stopping
+            // The restart's own stop() publishes a terminal snapshot for the
+            // current lifecycle epoch. Claim that epoch first (mirroring
+            // stopDaemon) so passive terminal cleanup can't fire mid-swap —
+            // it was restoring fans to auto and stomping the Stopping chrome
+            // between the old daemon's exit and the new launch.
+            let restartLifecycleEpoch = supervisor.supervisionSnapshot().lifecycleEpoch
+            if restartLifecycleEpoch > 0 {
+                lastTerminalCleanupLifecycleEpoch = max(
+                    lastTerminalCleanupLifecycleEpoch,
+                    restartLifecycleEpoch
+                )
+            }
+            if next.model != previousModel {
+                // New model, new metrics: never render the old daemon's
+                // health/snapshot under the new selection (mirrors
+                // startDaemon's wipe; also lets the header label fall
+                // through to the fresh selection immediately).
+                clearLiveMetricsState()
+            }
             let command = try commandBuilder.buildServeCommand(
                 configuration: next,
                 target: target,
                 launchID: launchID
             )
+            await recordLaunchScheduling(
+                command: command,
+                configuration: next,
+                target: target,
+                launchID: launchID
+            )
             startupPhase = .launching
+            activeLaunchID = launchID
             let startupHealth = try await supervisor.restart(
                 command: command,
                 healthBaseURL: baseURL,
@@ -429,20 +681,55 @@ public final class MTPLXBackendStore: ObservableObject {
             )
             if let startupHealth {
                 health = startupHealth
+                // The daemon was launched with --fan-mode from this exact
+                // configuration; an unverified ramp must not blank the UI
+                // back to the "smart" default the nil mapping implies.
                 currentFanMode = verifiedFanMode(from: startupHealth)
+                    ?? MTPLXFanMode.normalized(next.fanMode).rawValue
                 fanRestoreRequiredOnStop = fanRestoreRequiredOnStop
                     || modeRequiresFanRestore(currentFanMode)
             }
+            let lifecycleEpoch = supervisor.supervisionSnapshot().lifecycleEpoch
             await finishReadyDaemon(
                 target: target,
                 configuration: next,
-                replaceExistingClient: true
+                replaceExistingClient: true,
+                launchID: launchID,
+                lifecycleEpoch: lifecycleEpoch
             )
+            if activeLaunchID == launchID {
+                activeLaunchID = nil
+            }
         } catch {
+            if activeLaunchID == launchID {
+                activeLaunchID = nil
+            }
+            let failedPhase = startupPhase
+            // A failed swap must not leave fans pinned at max with no
+            // daemon running (mirrors the fresh-start failure path).
+            if shouldRestoreFansAfterFailedStartup(phase: failedPhase) {
+                let restored = await restoreFansLocally(
+                    successLog: "fan profile restored after failed model swap"
+                )
+                if !restored {
+                    await supervisor.logs.append(
+                        "fan restore fallback failed after failed model swap",
+                        stream: .system
+                    )
+                }
+            }
             let failureDescription = Self.humanizedStartFailure(
                 error,
                 port: configuration.port
             )
+            if Self.failureIndicatesRuntimeDeathBeforeReady(error) {
+                // The venv may no longer import mlx (torn upgrade / foreign
+                // pip session). Ask the bootstrapper to re-prove imports on
+                // the next launch; it rebuilds the venv if the probe fails.
+                MTPLXRuntimeBootstrapper.requestRuntimeImportRecheck(
+                    environment: commandBuilder.environment
+                )
+            }
             daemonState = .degraded(failureDescription)
             startupPhase = .failed(failureDescription)
             await refreshLogs()
@@ -557,6 +844,8 @@ public final class MTPLXBackendStore: ObservableObject {
         healthWatchTask = nil
         let launchID = UUID().uuidString
         do {
+            supervisor.setAutomaticRestartEnabled(configuration.automaticDaemonRestart)
+            lastDaemonTarget = target
             try await prepareRuntimeForDaemonStart()
             // Pre-flight the configured port before any integration writes
             // its config: adoptable app-owned daemons are left for the
@@ -590,6 +879,12 @@ public final class MTPLXBackendStore: ObservableObject {
                 target: target,
                 launchID: launchID
             )
+            await recordLaunchScheduling(
+                command: command,
+                configuration: configuration,
+                target: target,
+                launchID: launchID
+            )
             daemonState = .starting
             startupPhase = .launching
             activeLaunchID = launchID
@@ -611,13 +906,17 @@ public final class MTPLXBackendStore: ObservableObject {
             if let startupHealth {
                 health = startupHealth
                 currentFanMode = verifiedFanMode(from: startupHealth)
+                    ?? MTPLXFanMode.normalized(configuration.fanMode).rawValue
                 fanRestoreRequiredOnStop = fanRestoreRequiredOnStop
                     || modeRequiresFanRestore(currentFanMode)
             }
+            let lifecycleEpoch = supervisor.supervisionSnapshot().lifecycleEpoch
             await finishReadyDaemon(
                 target: target,
                 configuration: configuration,
-                replaceExistingClient: true
+                replaceExistingClient: true,
+                launchID: launchID,
+                lifecycleEpoch: lifecycleEpoch
             )
             if activeLaunchID == launchID {
                 activeLaunchID = nil
@@ -677,6 +976,14 @@ public final class MTPLXBackendStore: ObservableObject {
                     )
                 }
             }
+            if Self.failureIndicatesRuntimeDeathBeforeReady(error) {
+                // The venv may no longer import mlx (torn upgrade / foreign
+                // pip session). Ask the bootstrapper to re-prove imports on
+                // the next launch; it rebuilds the venv if the probe fails.
+                MTPLXRuntimeBootstrapper.requestRuntimeImportRecheck(
+                    environment: commandBuilder.environment
+                )
+            }
             daemonState = .degraded(failureDescription)
             startupPhase = .failed(failureDescription)
             await refreshLogs()
@@ -699,9 +1006,14 @@ public final class MTPLXBackendStore: ObservableObject {
         target: LaunchTarget?,
         launchID: String
     ) async {
-        let occupant = await PortPreflight.classify(
+        // Issue #409: a foreign-looking occupant is re-probed over the
+        // settle window before the port is moved — a draining MTPLX
+        // daemon (stop/start, or the predecessor of an in-app update)
+        // clears on its own and must never cost the user their port.
+        let occupant = await PortPreflight.classifySettled(
             baseURL: baseURL,
-            apiKey: configuration.apiKey
+            apiKey: configuration.apiKey,
+            settleTimeoutSeconds: portSettleTimeoutSeconds
         )
         let occupantDescription: String
         switch occupant {
@@ -730,11 +1042,11 @@ public final class MTPLXBackendStore: ObservableObject {
                 await supervisor.terminateExternalDaemon(rootPID: pid_t(stalePID))
                 return
             }
-            occupantDescription = "an MTPLX server started outside the app"
+            occupantDescription = tr("an MTPLX server started outside the app")
         case .unauthorized:
-            occupantDescription = "a server requiring a different API key"
+            occupantDescription = tr("a server requiring a different API key")
         case .foreign:
-            occupantDescription = "another app"
+            occupantDescription = tr("another app")
         }
         let occupiedPort = configuration.port
         guard
@@ -751,12 +1063,16 @@ public final class MTPLXBackendStore: ObservableObject {
         configuration = next
         try? settingsStore.save(next)
         portFallbackNotice =
-            "Port \(occupiedPort) was in use by \(occupantDescription). MTPLX now uses port \(freePort)."
+            tr("Port %@ was in use by %@. MTPLX now uses port %@.", String(occupiedPort), occupantDescription, String(freePort))
         await supervisor.logs.append(
             "port preflight: \(occupiedPort) occupied by \(occupantDescription); switched to \(freePort)",
             stream: .system
         )
     }
+
+    /// How long a foreign-looking port is re-probed before it is moved
+    /// (issue #409). Tests shorten it; the product keeps the shared default.
+    var portSettleTimeoutSeconds: TimeInterval = PortPreflight.settleTimeoutSeconds
 
     /// Test seam: run the port pre-flight and report the resulting port and
     /// fallback notice as Sendable values.
@@ -780,9 +1096,10 @@ public final class MTPLXBackendStore: ObservableObject {
         launchID: String
     ) async -> Bool {
         let occupiedPort = configuration.port
-        let occupant = await PortPreflight.classify(
+        let occupant = await PortPreflight.classifySettled(
             baseURL: baseURL,
-            apiKey: configuration.apiKey
+            apiKey: configuration.apiKey,
+            settleTimeoutSeconds: portSettleTimeoutSeconds
         )
         switch occupant {
         case .mtplxServer, .unauthorized, .foreign:
@@ -802,7 +1119,7 @@ public final class MTPLXBackendStore: ObservableObject {
             configuration = next
             try? settingsStore.save(next)
             portFallbackNotice =
-                "Port \(occupiedPort) was busy. MTPLX now uses port \(freePort)."
+                tr("Port %@ was busy. MTPLX now uses port %@.", String(occupiedPort), String(freePort))
             await supervisor.logs.append(
                 "launch hit a port conflict on \(occupiedPort) the probe could not see; switched to \(freePort)",
                 stream: .system
@@ -825,25 +1142,54 @@ public final class MTPLXBackendStore: ObservableObject {
         return false
     }
 
+    /// True when the daemon process itself died before /health became
+    /// ready — the signature of a broken runtime venv (torn mlx upgrade,
+    /// foreign pip session) — as opposed to cancellations, port
+    /// conflicts, or slow model loads. Matches the supervisor's
+    /// "daemon exited before /health became ready" and "daemon exited
+    /// during launch with status N" details.
+    nonisolated static func failureIndicatesRuntimeDeathBeforeReady(_ error: Error) -> Bool {
+        guard !failureIndicatesPortConflict(error) else { return false }
+        if case DaemonSupervisorError.launchFailed(let detail) = error {
+            return detail.lowercased().contains("daemon exited")
+        }
+        return false
+    }
+
     /// Occupant-aware copy for startup failures. Port collisions get a
     /// sentence a user can act on instead of the raw error description.
     nonisolated static func humanizedStartFailure(_ error: Error, port: Int) -> String {
         if case DaemonSupervisorError.portOccupied(_, let launchID) = error {
             if launchID != nil {
-                return "Port \(port) is running another MTPLX server. "
-                    + "Stop it where it was started, or run `mtplx stop --port \(port)` "
-                    + "in Terminal, then press Play."
+                return tr("Port %@ is running another MTPLX server. Stop it where it was started, or run `mtplx stop --port %@` in Terminal, then press Play.", String(port), String(port))
             }
-            return "Port \(port) is held by an MTPLX server started outside the app. "
-                + "Press Ctrl-C in its terminal or run `mtplx stop --port \(port)`, "
-                + "then press Play."
+            return tr("Port %@ is held by an MTPLX server started outside the app. Press Ctrl-C in its terminal or run `mtplx stop --port %@`, then press Play.", String(port), String(port))
         }
         return String(describing: error)
     }
 
+    /// Explicit refresh of the runtime card (About sheet's Check button).
+    /// Reads the installed CLI and the published manifest; the manifest
+    /// fetch is bounded to a few seconds. Nothing on a daemon launch path
+    /// awaits this.
     public func refreshRuntimeUpdateStatus() async {
         runtimeUpdateSnapshot = await runtimeUpdateService.refreshSnapshot()
         runtimeUpdateFailure = nil
+    }
+
+    /// Background refresh of the runtime card. Used at app launch and after
+    /// every launch-path runtime decision so the card reflects the venv the
+    /// launch actually used, without Play, Restart or first launch waiting
+    /// on mtplx.com or on the `mtplx --version` probe. A newer request
+    /// supersedes an in-flight one, and a failure the launch path recorded
+    /// is left in place for the user to read.
+    public func scheduleRuntimeUpdateStatusRefresh() {
+        runtimeUpdateStatusRefreshTask?.cancel()
+        runtimeUpdateStatusRefreshTask = Task { [weak self, runtimeUpdateService] in
+            let snapshot = await runtimeUpdateService.refreshSnapshot()
+            guard !Task.isCancelled, let self else { return }
+            self.runtimeUpdateSnapshot = snapshot
+        }
     }
 
     public func updateRuntimeWithHomebrew() async {
@@ -873,14 +1219,17 @@ public final class MTPLXBackendStore: ObservableObject {
         }
     }
 
+    /// Make sure a runtime exists before spawning the daemon. The decision
+    /// is local (bundled wheel, app-owned venv); the runtime card's
+    /// manifest comparison and version probe run afterwards in the
+    /// background rather than ahead of the launch.
     private func prepareRuntimeForDaemonStart() async throws {
         startupPhase = .launching
+        defer { scheduleRuntimeUpdateStatusRefresh() }
         do {
             _ = try await runtimeUpdateService.prepareRuntimeForLaunch()
-            runtimeUpdateSnapshot = await runtimeUpdateService.refreshSnapshot()
             runtimeUpdateFailure = nil
         } catch {
-            runtimeUpdateSnapshot = await runtimeUpdateService.refreshSnapshot()
             runtimeUpdateFailure = (error as? LocalizedError)?.errorDescription
                 ?? error.localizedDescription
             throw error
@@ -900,6 +1249,9 @@ public final class MTPLXBackendStore: ObservableObject {
         )
     }
 
+    /// The key-in-query sign-in URL. This is the fallback only: it lands
+    /// the API key in browser history, so the open path below asks the
+    /// daemon for a one-time ticket first and uses this when it cannot.
     private func authenticatedBrowserURL(nextPath: String, fallback: URL) -> URL {
         guard let apiKey = configuration.apiKey, !apiKey.isEmpty else {
             return fallback
@@ -917,19 +1269,57 @@ public final class MTPLXBackendStore: ObservableObject {
         return components.url ?? fallback
     }
 
+    /// The URL to hand the browser for `nextPath`. With no key configured
+    /// the plain page URL; with a key, a one-time ticket URL minted by the
+    /// daemon (`POST /mtplx/browser-auth/ticket`, bounded to a few seconds,
+    /// off the main actor) so the key never appears in a URL. If the
+    /// ticket cannot be minted for any reason — an older daemon answering
+    /// 404, a network failure, a timeout — the key-in-query URL is used so
+    /// the button never goes dead.
+    func browserURL(nextPath: String, plain: URL) async -> URL {
+        let fallback = authenticatedBrowserURL(nextPath: nextPath, fallback: plain)
+        guard let apiKey = configuration.apiKey, !apiKey.isEmpty else {
+            return plain
+        }
+        let client = browserAuthSession.map { MTPLXAPIClient(baseURL: baseURL, apiKey: apiKey, session: $0) }
+            ?? MTPLXAPIClient.browserAuthClient(baseURL: baseURL, apiKey: apiKey)
+        do {
+            return try await client.browserAuthTicket(next: nextPath).url
+        } catch {
+            await supervisor.logs.append(
+                "browser sign-in ticket unavailable (\(error)); opening with the key in the URL instead",
+                stream: .system
+            )
+            return fallback
+        }
+    }
+
     /// Open the old browser chat surface in the user's default browser.
     public func openWebChat() {
-        #if canImport(AppKit)
-        AppKit.NSWorkspace.shared.open(webChatURL)
-        #endif
+        Task { [weak self] in
+            guard let self else { return }
+            let url = await self.browserURL(nextPath: "/", plain: self.baseURL)
+            Self.openInBrowser(url)
+        }
     }
 
     /// Open the React live dashboard in the user's default browser.
     /// Exposed for users who explicitly ask for the browser dashboard
     /// (menu bar / About sheet) — no longer wired to a LaunchTarget.
     public func openBrowserDashboard() {
+        Task { [weak self] in
+            guard let self else { return }
+            let url = await self.browserURL(
+                nextPath: "/dashboard/",
+                plain: self.baseURL.appendingPathComponent("dashboard")
+            )
+            Self.openInBrowser(url)
+        }
+    }
+
+    private static func openInBrowser(_ url: URL) {
         #if canImport(AppKit)
-        AppKit.NSWorkspace.shared.open(browserDashboardURL)
+        AppKit.NSWorkspace.shared.open(url)
         #endif
     }
 
@@ -939,13 +1329,24 @@ public final class MTPLXBackendStore: ObservableObject {
         // Show Stopping while the process family is being reaped, then only
         // return to Stopped after the wrapper, model server child, and thermal
         // sidecar have been signalled and verified gone.
+        // This path owns its local client/metrics cleanup. Mark the active
+        // lifecycle before asking the supervisor to stop so its terminal
+        // snapshot cannot run a duplicate passive cleanup afterward.
+        let stoppingLifecycleEpoch = supervisor.supervisionSnapshot().lifecycleEpoch
+        if stoppingLifecycleEpoch > 0 {
+            lastTerminalCleanupLifecycleEpoch = max(
+                lastTerminalCleanupLifecycleEpoch,
+                stoppingLifecycleEpoch
+            )
+        }
         if let launchID = activeLaunchID {
             cancelledLaunchIDs.insert(launchID)
             activeLaunchID = nil
         }
         let shouldWarnIfFanRestoreFails = shouldRestoreFanModeOnStop()
         let startupPID = health?.startup?.pid.map(pid_t.init)
-        let piPIDsToStop = Array(launchedPiAgentPIDs)
+        let piHandoffsToStop = Array(launchedPiHandoffLeases.values)
+        let hermesHandoffsToStop = Array(launchedHermesHandoffLeases.values)
         modelDownloadTask?.cancel()
         modelDownloadTask = nil
         isModelDownloading = false
@@ -955,12 +1356,16 @@ public final class MTPLXBackendStore: ObservableObject {
         healthWatchTask = nil
         streamTask?.cancel()
         streamTask = nil
+        daemonTransportGeneration &+= 1
         launchedPiAgentPIDs.removeAll()
+        launchedPiHandoffLeases.removeAll()
+        launchedHermesHandoffLeases.removeAll()
         piTerminalAgentRunning = false
         piTerminalAgentProcessIDs = []
         piTerminalLaunchCommand = nil
         piTerminalLaunchDetail = nil
         clientHandoffNotice = nil
+        activeClientHandoffID = nil
         daemonState = .stopping
         startupPhase = .idle
         connectionState = .idle
@@ -981,14 +1386,18 @@ public final class MTPLXBackendStore: ObservableObject {
                 )
             }
             await previousTeardown?.value
-            let stoppedHermes = hermesIntegration.stopLaunchedTerminalAgents()
+            let stoppedHermes = hermesHandoffsToStop.reduce(into: 0) { count, lease in
+                if hermesIntegration.cancelTerminalHandoff(lease) { count += 1 }
+            }
             if stoppedHermes > 0 {
                 await supervisor.logs.append(
                     "stopped \(stoppedHermes) Hermes Terminal handoff(s)",
                     stream: .system
                 )
             }
-            let stoppedPi = piIntegration.stopLaunchedAgents(processIDs: piPIDsToStop)
+            let stoppedPi = piHandoffsToStop.reduce(into: 0) { count, lease in
+                if piIntegration.cancelTerminalHandoff(lease) { count += 1 }
+            }
             if stoppedPi > 0 {
                 await supervisor.logs.append(
                     "stopped \(stoppedPi) Pi Terminal handoff(s)",
@@ -1027,11 +1436,187 @@ public final class MTPLXBackendStore: ObservableObject {
         await daemonTeardownTask?.value
     }
 
+    // MARK: - Model-pack updates (Sparkle for models, 2.9.0)
+
+    /// Latest `mtplx models --check` rows. Refreshed on picker open (6 h
+    /// throttle) and on demand; every failure degrades to "no information".
+    @Published public private(set) var modelUpdates: [ModelUpdateInfo] = []
+    /// repo currently being delta-updated, or nil.
+    @Published public private(set) var modelPackUpdatingRepoID: String? = nil
+    /// Human line under the update row ("12.4 MB/s", failure text, ...).
+    @Published public private(set) var modelPackUpdateStatus: String? = nil
+    /// Set when the updated pack is the one the running daemon serves —
+    /// the head swap only applies after a restart.
+    @Published public private(set) var modelPackUpdateNeedsRestart: ModelUpdateInfo? = nil
+    private var lastModelUpdateCheckAt: Date?
+    private var modelPackUpdateTask: Task<Void, Never>?
+    private let modelUpdateChecker: (@Sendable () async throws -> [ModelUpdateInfo])?
+
+    public var availableModelPackUpdates: [ModelUpdateInfo] {
+        modelUpdates.filter(\.isUpdateAvailable)
+    }
+
+    public func refreshModelUpdates(force: Bool = false) async {
+        if !force,
+           let last = lastModelUpdateCheckAt,
+           Date().timeIntervalSince(last) < 6 * 3600 {
+            return
+        }
+        lastModelUpdateCheckAt = Date()
+        do {
+            let rows: [ModelUpdateInfo]
+            if let modelUpdateChecker {
+                rows = try await modelUpdateChecker()
+            } else {
+                rows = try await modelDownloader.checkModelUpdates()
+            }
+            modelUpdates = rows
+        } catch {
+            // Offline or CLI hiccup: keep whatever we knew, never surface
+            // an error for a background freshness check.
+            await supervisor.logs.append(
+                "model update check failed: \(error.localizedDescription)",
+                stream: .system
+            )
+        }
+    }
+
+    /// One-click delta update: rides `mtplx models --update --progress-json`,
+    /// which pins to the published revision, handles legacy cache layouts,
+    /// and skips size-identical files — a re-published MTP head costs the
+    /// head, not the trunk. Serving is untouched until the user restarts.
+    public func updateModelPack(_ update: ModelUpdateInfo) {
+        guard modelPackUpdatingRepoID == nil else { return }
+        modelPackUpdatingRepoID = update.repoID
+        modelPackUpdateStatus = tr("Preparing…")
+        let downloader = modelDownloader
+        // Detached, like every other consumer of `stream`: the baseline
+        // walk stats every file in the pack, and building the stream
+        // resolves the runtime (version probe, wheel fingerprint, a
+        // possible reinstall) and spawns the CLI synchronously inside
+        // AsyncStream's build closure. On the main actor that froze the
+        // window for the Python cold start, or for minutes when the
+        // app-owned venv needed its post-update reinstall.
+        modelPackUpdateTask = Task.detached(priority: .userInitiated) { [weak self, downloader, update] in
+            let startedBytes = update.path.map {
+                Self.directorySizeForUpdateProgress(URL(fileURLWithPath: $0))
+            }
+            let stream = downloader.stream(
+                repo: update.repoID,
+                totalBytes: nil,
+                update: true,
+                sizeProbePath: update.path
+            )
+            var completed = false
+            for await event in stream {
+                guard let self else { return }
+                switch await self.handleModelPackUpdateEvent(event, update: update, startedBytes: startedBytes) {
+                case .proceed:
+                    break
+                case .completed:
+                    completed = true
+                case .abandoned:
+                    return
+                }
+            }
+            await self?.finishModelPackUpdate(update, completed: completed)
+        }
+    }
+
+    private enum ModelPackUpdateEventOutcome {
+        case proceed
+        case completed
+        /// The update was cancelled or replaced while the stream was live;
+        /// its state is no longer this task's to touch.
+        case abandoned
+    }
+
+    private func handleModelPackUpdateEvent(
+        _ event: DownloadEvent,
+        update: ModelUpdateInfo,
+        startedBytes: Int64?
+    ) -> ModelPackUpdateEventOutcome {
+        guard modelPackUpdatingRepoID == update.repoID else { return .abandoned }
+        switch event {
+        case .started, .status:
+            break
+        case .progress(let bytesOnDisk, _, let speed, _):
+            var line = speed > 1024
+                ? "\(Self.formatUpdateBytes(Int64(speed)))/s"
+                : "Syncing…"
+            if let startedBytes, let total = update.updateBytes, total > 0 {
+                let done = max(0, bytesOnDisk - startedBytes)
+                let pct = min(100, Int((Double(done) / Double(total)) * 100))
+                line = tr("%lld%% · %@", pct, line)
+            }
+            modelPackUpdateStatus = line
+        case .stalled(let seconds):
+            modelPackUpdateStatus = tr("Stalled for %llds — still trying", Int(seconds))
+        case .complete:
+            return .completed
+        case .failed(_, let stderrTail):
+            let tail = stderrTail.split(separator: "\n").last.map(String.init)
+            modelPackUpdateStatus = tail ?? tr("Update failed")
+        case .cancelled:
+            modelPackUpdateStatus = nil
+        }
+        return .proceed
+    }
+
+    private func finishModelPackUpdate(_ update: ModelUpdateInfo, completed: Bool) async {
+        modelPackUpdatingRepoID = nil
+        guard completed else { return }
+        modelPackUpdateStatus = nil
+        // The running daemon has the old tensors mapped; flag the
+        // restart affordance when the updated pack is the one it
+        // serves (matched on the served model path).
+        let daemonIsLive: Bool
+        switch daemonState {
+        case .running, .warming: daemonIsLive = true
+        default: daemonIsLive = false
+        }
+        if daemonIsLive,
+           let servedPath = health?.modelPath,
+           let updatedPath = update.path,
+           servedPath == updatedPath || servedPath.hasPrefix(updatedPath + "/") {
+            modelPackUpdateNeedsRestart = update
+        }
+        await refreshModelUpdates(force: true)
+    }
+
+    /// Restart the running daemon so an updated pack's tensors are loaded.
+    public func restartToApplyModelUpdate() async {
+        modelPackUpdateNeedsRestart = nil
+        try? await applyConfiguration(configuration, restartIfRunning: true)
+    }
+
+    private static func formatUpdateBytes(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: bytes)
+    }
+
+    /// Baseline byte count for the pack-update progress line. Walks every
+    /// file in the pack, so it is `nonisolated` and only ever called from
+    /// the detached update task.
+    nonisolated private static func directorySizeForUpdateProgress(_ url: URL) -> Int64 {
+        (try? FileManager.default.subpathsOfDirectory(atPath: url.path))
+            .map { subpaths in
+                subpaths.reduce(Int64(0)) { sum, subpath in
+                    let full = url.appendingPathComponent(subpath).path
+                    let size = (try? FileManager.default.attributesOfItem(atPath: full)[.size] as? Int64) ?? 0
+                    return sum + (size ?? 0)
+                }
+            } ?? 0
+    }
+
     @discardableResult
     public func ensureDaemonReadyForBenchmark() async throws -> HealthPayload {
         if let existing = try? await apiClient.health(), existing.ok {
             health = existing
             currentFanMode = verifiedFanMode(from: existing)
+                ?? currentFanMode
+                ?? MTPLXFanMode.normalized(configuration.fanMode).rawValue
             fanRestoreRequiredOnStop = fanRestoreRequiredOnStop
                 || modeRequiresFanRestore(currentFanMode)
             try await flushPendingLiveSettingsIfNeeded(target: .benchmark)
@@ -1053,6 +1638,8 @@ public final class MTPLXBackendStore: ObservableObject {
         if let ready = try? await apiClient.health(), ready.ok {
             health = ready
             currentFanMode = verifiedFanMode(from: ready)
+                ?? currentFanMode
+                ?? MTPLXFanMode.normalized(configuration.fanMode).rawValue
             fanRestoreRequiredOnStop = fanRestoreRequiredOnStop
                 || modeRequiresFanRestore(currentFanMode)
             try await flushPendingLiveSettingsIfNeeded(target: .benchmark)
@@ -1132,7 +1719,7 @@ public final class MTPLXBackendStore: ObservableObject {
             snapshot.bytesPerSecond = 0
             snapshot.etaSeconds = nil
             snapshot.stalledSeconds = 0
-            snapshot.statusMessage = "Paused"
+            snapshot.statusMessage = tr("Paused")
             modelDownloadProgress = snapshot
         }
     }
@@ -1219,9 +1806,14 @@ public final class MTPLXBackendStore: ObservableObject {
         prefillStatus = nil
         prefillHistory = nil
         thermalStatus = nil
+        memoryPressureLevel = 0
+        memoryPressureSource = nil
+        memoryPlan = nil
+        memoryGuardRecentShed = false
         models = nil
         observedCompletionCount = 0
         observedUserMetricEventCount = 0
+        snapshotCompletionFingerprint = nil
         lastProgressPublishS = 0
         headlineDecode = .absent
         smoothedMetrics = SmoothedMetrics()
@@ -1230,26 +1822,40 @@ public final class MTPLXBackendStore: ObservableObject {
         metricsRequestGeneration &+= 1
     }
 
-    public func refreshStaticState() async throws {
+    public func refreshStaticState(
+        isCurrent: (() -> Bool)? = nil,
+        markUnreachableOnTransportFailure: Bool = true
+    ) async throws {
         let client = apiClient
         do {
             async let health = client.health()
             async let capabilities = client.capabilities()
             async let sessions = client.sessions()
-            self.health = try await health
-            self.capabilities = try await capabilities
-            self.sessions = try await sessions
-            await refreshPrefillHistory()
-            await refreshModels()
-            await refreshLogs()
+            let fetchedHealth = try await health
+            let fetchedCapabilities = try await capabilities
+            let fetchedSessions = try await sessions
+            guard isCurrent?() ?? true else { return }
+            self.health = fetchedHealth
+            self.capabilities = fetchedCapabilities
+            self.sessions = fetchedSessions
+            await refreshPrefillHistory(isCurrent: isCurrent)
+            guard isCurrent?() ?? true else { return }
+            await refreshModels(isCurrent: isCurrent)
+            guard isCurrent?() ?? true else { return }
+            let refreshedLogs = await supervisor.logs.snapshot()
+            guard isCurrent?() ?? true else { return }
+            logs = refreshedLogs
         } catch is DecodingError {
             // The daemon answered; only the app-side schema mapping failed.
             // Never treat a decode bug as a dead daemon (2026-07-06 reap).
             throw MTPLXAPIClientError.invalidResponse
         } catch {
-            markDaemonUnreachableIfNeeded(
-                reason: "MTPLX lost contact with the model server. Start it again."
-            )
+            guard isCurrent?() ?? true else { throw error }
+            if markUnreachableOnTransportFailure {
+                markDaemonUnreachableIfNeeded(
+                    reason: tr("MTPLX lost contact with the model server. Start it again.")
+                )
+            }
             throw error
         }
     }
@@ -1261,7 +1867,7 @@ public final class MTPLXBackendStore: ObservableObject {
             throw MTPLXAPIClientError.invalidResponse
         } catch {
             markDaemonUnreachableIfNeeded(
-                reason: "MTPLX lost contact with live metrics. Start it again."
+                reason: tr("MTPLX lost contact with live metrics. Start it again.")
             )
             throw error
         }
@@ -1269,7 +1875,7 @@ public final class MTPLXBackendStore: ObservableObject {
 
     public func updateLiveSettings(_ next: MutableSettings) async throws {
         let merged = mergedLiveSettingsPatch(next)
-        let livePatch = Self.liveMutableSettingsPatch(from: next)
+        let livePatch = Self.liveSettingsUpdatePatch(from: next)
         // Only the caller's own patch counts as a depth choice; the
         // merged snapshot always carries the daemon's current depth.
         let depthIsExplicitSelection = next.depth != nil
@@ -1314,6 +1920,17 @@ public final class MTPLXBackendStore: ObservableObject {
         if persist && previous != daemonSettings {
             try? persistLiveSettings(daemonSettings)
         }
+    }
+
+    /// The patch a direct live update posts. It is the carried patch plus
+    /// the adaptive depth policy: the policy is live on the daemon that is
+    /// running now, but it is not carried into the next launch (the launch
+    /// arguments own it through `adaptiveDepth`), and a family that owns its
+    /// draft policy rejects the key, so the carry path leaves it out.
+    nonisolated static func liveSettingsUpdatePatch(from settings: MutableSettings) -> MutableSettings {
+        var patch = liveMutableSettingsPatch(from: settings)
+        patch.adaptivePolicy = settings.adaptivePolicy
+        return patch
     }
 
     nonisolated static func liveMutableSettingsPatch(from settings: MutableSettings) -> MutableSettings {
@@ -1361,7 +1978,9 @@ public final class MTPLXBackendStore: ObservableObject {
         pendingLiveSettingsModel = nil
     }
 
-    private func flushFreshLaunchLiveOnlySettingsIfNeeded() async throws {
+    private func flushFreshLaunchLiveOnlySettingsIfNeeded(
+        isCurrent: (() -> Bool)? = nil
+    ) async throws {
         guard let pending = pendingLiveSettings else { return }
         guard pendingLiveSettingsModel == nil || pendingLiveSettingsModel == configuration.model else {
             pendingLiveSettings = nil
@@ -1373,7 +1992,9 @@ public final class MTPLXBackendStore: ObservableObject {
             pendingLiveSettingsModel = nil
             return
         }
-        settings = try await apiClient.updateSettings(liveOnlyPatch)
+        let updatedSettings = try await apiClient.updateSettings(liveOnlyPatch)
+        guard isCurrent?() ?? true else { return }
+        settings = updatedSettings
         liveSettingsModel = configuration.model
         pendingLiveSettings = nil
         pendingLiveSettingsModel = nil
@@ -1587,7 +2208,7 @@ public final class MTPLXBackendStore: ObservableObject {
     private func normalizedReasoningEffort(_ raw: String?) -> String? {
         guard let raw else { return nil }
         switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "auto", "low", "medium", "high":
+        case "auto", "low", "medium", "high", "xhigh":
             return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         default:
             return nil
@@ -1646,7 +2267,7 @@ public final class MTPLXBackendStore: ObservableObject {
         controlField: String
     ) -> Bool {
         switch (family, controlField) {
-        case ("qwen3_5", "depth"), ("qwen3_6", "depth"), ("step", "depth"):
+        case ("qwen3_5", "depth"), ("qwen3_6", "depth"), ("qwen3_8", "depth"), ("step", "depth"):
             return (1...3).contains(value)
         case ("gemma4", "draft_block_size"):
             return (2...8).contains(value)
@@ -1708,22 +2329,329 @@ public final class MTPLXBackendStore: ObservableObject {
         self.sessions = try await apiClient.sessions()
     }
 
-    public func startMetricsStream() {
+    /// Snapshot cadence floor while a chat turn streams. Every snapshot
+    /// is built inside the serving process and fanned out to each
+    /// dashboard observer on the main actor, while the chat surface reads
+    /// its own progress frames; the README's native 500 ms is plenty
+    /// under a live turn.
+    private static let chatStreamingSnapshotIntervalMs = 500
+    private var chatTurnStreaming = false
+
+    private var metricsSnapshotIntervalMs: Int {
+        if configuration.performanceLock { return 1000 }
+        let configured = configuration.streamSnapshotIntervalMs
+        return chatTurnStreaming
+            ? max(configured, Self.chatStreamingSnapshotIntervalMs)
+            : configured
+    }
+
+    /// Chat turn lifecycle hook. Reopens the metrics stream at the
+    /// slower cadence while a turn streams and at the configured cadence
+    /// once it settles; only an open stream is reopened, and it keeps
+    /// `.open` throughout so the status dot never blinks for it.
+    public func setChatTurnStreaming(_ streaming: Bool) {
+        guard chatTurnStreaming != streaming else { return }
+        let previousInterval = metricsSnapshotIntervalMs
+        chatTurnStreaming = streaming
+        guard streamTask != nil,
+              connectionState == .open,
+              metricsSnapshotIntervalMs != previousInterval
+        else { return }
+        startMetricsStream(retainingOpenState: true)
+    }
+
+    public func startMetricsStream(retainingOpenState: Bool = false) {
         streamTask?.cancel()
+        daemonTransportGeneration &+= 1
+        let transportGeneration = daemonTransportGeneration
         let client = MetricsStreamClient(apiClient: apiClient)
-        let interval = configuration.performanceLock ? 1000 : configuration.streamSnapshotIntervalMs
+        let interval = metricsSnapshotIntervalMs
+        // A cadence-only reopen of a healthy stream must not report
+        // `.connecting`: the chrome would flip to "Connecting" and pulse
+        // for a reconnect the user never saw fail.
+        let keepOpen = retainingOpenState && connectionState == .open
         streamTask = Task { [weak self] in
             await client.connect(
                 snapshotIntervalMs: interval,
                 onState: { state in
-                    await MainActor.run { self?.connectionState = state }
+                    await MainActor.run {
+                        guard self?.daemonTransportGeneration == transportGeneration else { return }
+                        if keepOpen, state == .connecting { return }
+                        self?.connectionState = state
+                    }
                 },
                 onEvent: { event in
-                    await MainActor.run { self?.apply(event: event) }
+                    await MainActor.run {
+                        guard self?.daemonTransportGeneration == transportGeneration else { return }
+                        self?.apply(event: event)
+                    }
                 }
             )
         }
         startDaemonHealthWatchdog()
+    }
+
+    func applySupervisorSnapshot(_ snapshot: DaemonSupervisionSnapshot) {
+        // The supervisor invokes its callback serially, but this store must
+        // hop onto MainActor. Ignore an older Task that arrives after a newer
+        // snapshot rather than moving the visible state backwards.
+        guard snapshot.revision > lastAppliedSupervisionRevision else { return }
+        lastAppliedSupervisionRevision = snapshot.revision
+        // Status observers run after the supervisor releases its lock, so a
+        // terminal callback from lifecycle N can arrive while lifecycle N+1
+        // is already running. Revision order alone cannot distinguish that
+        // case; never let an older lifecycle mutate or tear down the live
+        // store state for the current daemon.
+        let currentSupervisorSnapshot = supervisor.supervisionSnapshot()
+        guard snapshot.lifecycleEpoch >= currentSupervisorSnapshot.lifecycleEpoch else {
+            return
+        }
+        daemonRestartStatus = snapshot.restartStatus
+        daemonRestartCount = snapshot.restartCount
+        daemonRestartEligibility = snapshot.restartEligibility
+
+        switch snapshot.restartStatus {
+        case .scheduled:
+            daemonState = .crashed({
+                if case .crashed(let status) = snapshot.state { return status }
+                return nil
+            }())
+            startupPhase = .failed("MTPLX crashed; automatic restart is scheduled.")
+            connectionState = .connecting
+        case .restarting:
+            daemonState = .starting
+            startupPhase = .launching
+            connectionState = .connecting
+        case .runningAfterRestart(let attempt):
+            daemonState = .running
+            startupPhase = .ready
+            guard snapshot.recoveryGeneration > recoveredAutomaticRestartGeneration else { return }
+            recoveredAutomaticRestartGeneration = snapshot.recoveryGeneration
+            Task { @MainActor [weak self] in
+                await self?.recoverAfterAutomaticRestart(attempt: attempt)
+            }
+        case .exhausted(let attempts, let status):
+            cleanupTerminalDaemonSessionIfNeeded(
+                lifecycleEpoch: snapshot.lifecycleEpoch,
+                terminalState: .crashed(status),
+                terminalStartupPhase: .failed(
+                    tr("MTPLX crashed repeatedly; automatic recovery stopped after %lld attempts.", attempts)
+                ),
+                terminalConnectionState: .failed(tr("Automatic restart circuit breaker is open."))
+            )
+        case .idle:
+            // Normal startup phases remain owned by the explicit start path.
+            // Terminal transitions must still mirror so a clean exit becomes
+            // visible as .stopped instead of leaving stale .running chrome.
+            switch snapshot.state {
+            case .stopped:
+                // Observers run outside the supervisor lock, so a newer
+                // terminal snapshot can legitimately arrive before its prior
+                // running snapshot. Lifecycle epochs make this idempotent
+                // without depending on callback arrival order; epoch zero is
+                // only the initial/no-daemon state and must never clear live
+                // store state.
+                guard snapshot.lifecycleEpoch > lastTerminalCleanupLifecycleEpoch
+                else { break }
+                cleanupTerminalDaemonSessionIfNeeded(
+                    lifecycleEpoch: snapshot.lifecycleEpoch,
+                    terminalState: .stopped,
+                    terminalStartupPhase: .idle,
+                    terminalConnectionState: .idle
+                )
+            case .crashed:
+                if case .crashed(let status) = snapshot.state {
+                    cleanupTerminalDaemonSessionIfNeeded(
+                        lifecycleEpoch: snapshot.lifecycleEpoch,
+                        terminalState: .crashed(status),
+                        terminalStartupPhase: .failed("MTPLX crashed and is no longer running."),
+                        terminalConnectionState: .failed("MTPLX crashed and is no longer running.")
+                    )
+                }
+            case .starting, .warming, .running, .degraded, .stopping:
+                break
+            }
+        }
+    }
+
+    private func cleanupTerminalDaemonSessionIfNeeded(
+        lifecycleEpoch: Int,
+        terminalState: DaemonState,
+        terminalStartupPhase: DaemonStartupPhase,
+        terminalConnectionState: MetricsConnectionState
+    ) {
+        let currentSupervisorSnapshot = supervisor.supervisionSnapshot()
+        guard lifecycleEpoch >= currentSupervisorSnapshot.lifecycleEpoch else { return }
+        guard lifecycleEpoch > lastTerminalCleanupLifecycleEpoch else { return }
+        lastTerminalCleanupLifecycleEpoch = lifecycleEpoch
+        // A daemon can exit cleanly or terminally crash without the user
+        // pressing Stop. Mirror the local teardown, but never call
+        // supervisor.stop() here: this is a notification from that supervisor
+        // and re-entry would race it.
+        if activeLaunchID != nil {
+            // This is a terminal supervisor outcome, not an explicit user
+            // Stop. Clear the ID so post-start work can no longer claim the
+            // launch, but do not mark it user-cancelled: a run failure must
+            // still surface as a visible failed/degraded startup.
+            activeLaunchID = nil
+        }
+        let shouldRestoreFans = shouldRestoreFansAfterTerminalExit()
+        let piHandoffsToStop = Array(launchedPiHandoffLeases.values)
+        let hermesHandoffsToStop = Array(launchedHermesHandoffLeases.values)
+        healthWatchTask?.cancel()
+        healthWatchTask = nil
+        streamTask?.cancel()
+        streamTask = nil
+        daemonTransportGeneration &+= 1
+        lateHealthRecoveryTask?.cancel()
+        lateHealthRecoveryTask = nil
+        launchedPiAgentPIDs.removeAll()
+        // Keep exact ownership until the asynchronous terminal gate proves
+        // this remains a true terminal exit. Automatic recovery returns at
+        // that gate, and a later explicit Stop must still be able to reap the
+        // client it originally launched.
+        piTerminalAgentRunning = false
+        piTerminalAgentProcessIDs = []
+        piTerminalLaunchCommand = nil
+        piTerminalLaunchDetail = nil
+        clientHandoffNotice = nil
+        activeClientHandoffID = nil
+        connectionState = terminalConnectionState
+        startupPhase = terminalStartupPhase
+        daemonState = terminalState
+        clearLiveMetricsState()
+
+        // Client terminal handoffs do not automatically exit just because the
+        // daemon did. Reap them through the same serialized path as explicit
+        // Stop, but do not call supervisor.stop(): this method is itself
+        // running in response to that supervisor's termination notification.
+        let previousTeardown = daemonTeardownTask
+        daemonTeardownTask = Task { @MainActor [self] in
+            await previousTeardown?.value
+            // A new lifecycle waits for this teardown before starting. Keep
+            // this second gate for delayed terminal callbacks: an old
+            // callback must never reset a newer daemon's fan policy.
+            let terminalLifecycleIsCurrent = {
+                let latest = self.supervisor.supervisionSnapshot()
+                // A greater epoch has already claimed the store. A smaller
+                // epoch only occurs in synthetic observer-order tests, where
+                // this terminal cleanup remains the most recent real session.
+                guard latest.lifecycleEpoch <= lifecycleEpoch else { return false }
+                guard latest.lifecycleEpoch == lifecycleEpoch else { return true }
+                switch latest.restartStatus {
+                case .scheduled, .restarting, .runningAfterRestart:
+                    return false
+                case .idle, .exhausted:
+                    return true
+                }
+            }
+            guard terminalLifecycleIsCurrent() else { return }
+            if shouldRestoreFans {
+                let restored = await restoreFansLocally(
+                    successLog: "fan profile restored locally after daemon exit",
+                    isCurrent: terminalLifecycleIsCurrent
+                )
+                guard terminalLifecycleIsCurrent() else { return }
+                if !restored {
+                    currentFanMode = nil
+                    await supervisor.logs.append(
+                        "fan restore fallback failed after daemon exit; check ThermalForge status",
+                        stream: .system
+                    )
+                }
+            }
+            // Remove only the snapshot we are about to reap. A new lifecycle
+            // may have acquired a different lease while this teardown waited.
+            for lease in hermesHandoffsToStop {
+                launchedHermesHandoffLeases.removeValue(forKey: lease.handoffID)
+            }
+            for lease in piHandoffsToStop {
+                launchedPiHandoffLeases.removeValue(forKey: lease.handoffID)
+            }
+            let stoppedHermes = hermesHandoffsToStop.reduce(into: 0) { count, lease in
+                if hermesIntegration.cancelTerminalHandoff(lease) { count += 1 }
+            }
+            if stoppedHermes > 0 {
+                await supervisor.logs.append(
+                    "stopped \(stoppedHermes) Hermes Terminal handoff(s) after daemon exit",
+                    stream: .system
+                )
+            }
+            let stoppedPi = piHandoffsToStop.reduce(into: 0) { count, lease in
+                if piIntegration.cancelTerminalHandoff(lease) { count += 1 }
+            }
+            if stoppedPi > 0 {
+                await supervisor.logs.append(
+                    "stopped \(stoppedPi) Pi Terminal handoff(s) after daemon exit",
+                    stream: .system
+                )
+            }
+            await refreshLogs()
+        }
+    }
+
+    var hasActiveDaemonTransportForTesting: Bool {
+        streamTask != nil || healthWatchTask != nil
+    }
+
+    /// Records the processes created by the Pi Terminal handoff. Kept as one
+    /// operation so lifecycle cleanup can safely snapshot and reap them.
+    func recordLaunchedPiAgentProcessIDs(_ processIDs: [Int]) {
+        launchedPiAgentPIDs.formUnion(processIDs)
+        piTerminalAgentRunning = !launchedPiAgentPIDs.isEmpty
+        piTerminalAgentProcessIDs = Array(launchedPiAgentPIDs).sorted()
+    }
+
+    /// Registers the real ownership receipt and its presentation PID as one
+    /// operation. Package tests use this narrow seam to exercise lifecycle
+    /// cleanup without inventing a Terminal process discovery fixture.
+    func recordLaunchedPiTerminalHandoffLease(_ lease: MTPLXTerminalHandoffLease) {
+        launchedPiHandoffLeases[lease.handoffID] = lease
+        recordLaunchedPiAgentProcessIDs([lease.processID])
+    }
+
+    /// Hermes has no Pi-style presentation state, but it still needs the
+    /// exact receipt retained across automatic daemon recovery.
+    func recordLaunchedHermesTerminalHandoffLease(_ lease: MTPLXTerminalHandoffLease) {
+        launchedHermesHandoffLeases[lease.handoffID] = lease
+    }
+
+    var terminalHandoffLeaseIDsForTesting: Set<UUID> {
+        Set(launchedPiHandoffLeases.keys).union(launchedHermesHandoffLeases.keys)
+    }
+
+    /// Package tests can exercise transport-failure policy without starting a
+    /// real server just to drive the visible running state.
+    func setDaemonStateForTesting(_ state: DaemonState) {
+        daemonState = state
+    }
+
+    private func recoverAfterAutomaticRestart(attempt: Int) async {
+        let snapshot = supervisor.supervisionSnapshot()
+        guard case .runningAfterRestart(let activeAttempt) = snapshot.restartStatus,
+              activeAttempt == attempt,
+              snapshot.lifecycleEpoch > 0
+        else { return }
+        await supervisor.logs.append(
+            "app observed automatic daemon recovery (attempt \(attempt)); reconnecting metrics",
+            stream: .system
+        )
+        // The supervisor has already passed its restart health check. One
+        // immediate refresh miss is not confirmation that this daemon died;
+        // the normal watchdog owns that decision with its two-miss policy.
+        await beforePostStartRefresh()
+        guard daemonSessionIsCurrent(
+            lifecycleEpoch: snapshot.lifecycleEpoch,
+            launchID: nil,
+            recoveryGeneration: snapshot.recoveryGeneration
+        ) else { return }
+        _ = await refreshPostStartState(
+            target: lastDaemonTarget,
+            configuration: configuration,
+            lifecycleEpoch: snapshot.lifecycleEpoch,
+            recoveryGeneration: snapshot.recoveryGeneration
+        )
+        await refreshLogs()
     }
 
     public func markDaemonUnreachable(reason: String) {
@@ -1748,6 +2676,7 @@ public final class MTPLXBackendStore: ObservableObject {
 
     private func startDaemonHealthWatchdog() {
         healthWatchTask?.cancel()
+        let watchdogTransportGeneration = daemonTransportGeneration
         let probeClient = MTPLXAPIClient.livenessProbe(
             baseURL: baseURL,
             apiKey: configuration.apiKey
@@ -1759,17 +2688,27 @@ public final class MTPLXBackendStore: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
                 guard let self, !Task.isCancelled else { return }
+                guard self.daemonTransportGeneration == watchdogTransportGeneration else { return }
                 guard self.shouldProbeDaemonHealth else {
                     consecutiveMisses = 0
                     continue
                 }
-                switch await probeClient.livenessWithinDeadline(
+                let liveness = await probeClient.livenessWithinDeadline(
                     seconds: Self.watchdogProbeDeadlineSeconds
-                ) {
+                )
+                guard !Task.isCancelled,
+                      self.daemonTransportGeneration == watchdogTransportGeneration
+                else { return }
+                switch liveness {
                 case .healthy(let health) where health.ok:
                     consecutiveMisses = 0
                     self.health = health
+                    // Keep the last-known mode when a probe can't verify:
+                    // blanking here flipped the fan toggle to the "smart"
+                    // nil-default every 3 s on daemons without a receipt.
                     self.currentFanMode = self.verifiedFanMode(from: health)
+                        ?? self.currentFanMode
+                        ?? MTPLXFanMode.normalized(self.configuration.fanMode).rawValue
                     continue
                 case .healthy:
                     // Answered but self-reported not-ok: treat as a miss so a
@@ -1783,6 +2722,7 @@ public final class MTPLXBackendStore: ObservableObject {
                     // because one /health field stopped matching Codable).
                     consecutiveMisses = 0
                     if !loggedUndecodable {
+                        guard self.daemonTransportGeneration == watchdogTransportGeneration else { return }
                         loggedUndecodable = true
                         let excerpt = String(detail.prefix(300))
                         await self.supervisor.logs.append(
@@ -1796,6 +2736,7 @@ public final class MTPLXBackendStore: ObservableObject {
                     // configuration problem, never grounds to reap.
                     consecutiveMisses = 0
                     if !loggedUndecodable {
+                        guard self.daemonTransportGeneration == watchdogTransportGeneration else { return }
                         loggedUndecodable = true
                         await self.supervisor.logs.append(
                             "health probe rejected with 401/403; daemon is alive, check the API key in Settings",
@@ -1808,8 +2749,9 @@ public final class MTPLXBackendStore: ObservableObject {
                 }
                 consecutiveMisses += 1
                 guard consecutiveMisses >= 2 else { continue }
+                guard self.daemonTransportGeneration == watchdogTransportGeneration else { return }
                 self.markDaemonUnreachableIfNeeded(
-                    reason: "MTPLX lost contact with the model server. Start it again."
+                    reason: tr("MTPLX lost contact with the model server. Start it again.")
                 )
                 return
             }
@@ -1956,7 +2898,7 @@ public final class MTPLXBackendStore: ObservableObject {
                 snapshot.stalledSeconds = seconds
                 snapshot.bytesPerSecond = 0
                 snapshot.etaSeconds = nil
-                snapshot.statusMessage = "Waiting on Hugging Face"
+                snapshot.statusMessage = tr("Waiting on Hugging Face")
                 modelDownloadProgress = snapshot
             }
         case .complete(let bytes, let path):
@@ -1971,7 +2913,7 @@ public final class MTPLXBackendStore: ObservableObject {
                     isComplete: false,
                     statusMessage: "Incomplete"
                 )
-                modelDownloadFailure = "Download finished, but the model folder is missing required MTPLX files. Press Retry to resume the Hugging Face download."
+                modelDownloadFailure = tr("Download finished, but files the source repo ships are still missing from the model folder. Press Retry to resume the Hugging Face download.")
                 isModelDownloading = false
                 modelDownloadTask = nil
                 return
@@ -2014,7 +2956,7 @@ public final class MTPLXBackendStore: ObservableObject {
                 snapshot.bytesPerSecond = 0
                 snapshot.etaSeconds = nil
                 snapshot.stalledSeconds = 0
-                snapshot.statusMessage = "Paused"
+                snapshot.statusMessage = tr("Paused")
                 modelDownloadProgress = snapshot
             }
         }
@@ -2025,7 +2967,7 @@ public final class MTPLXBackendStore: ObservableObject {
         modelTuneTask?.cancel()
         modelTuneFailure = nil
         modelTuneResult = nil
-        modelTuneStatusMessage = "Preparing max fans and loading model"
+        modelTuneStatusMessage = tr("Preparing max fans and loading model")
         modelTuneCandidatesLanded = [:]
         isModelTuning = true
         let tuner = autoTuner
@@ -2079,12 +3021,12 @@ public final class MTPLXBackendStore: ObservableObject {
         case .installingFanControl(let message):
             modelTuneStatusMessage = message
         case .started:
-            modelTuneStatusMessage = "Preparing max fans and loading model"
+            modelTuneStatusMessage = tr("Preparing max fans and loading model")
         case .candidateLanded(let result):
             modelTuneStatusMessage = nil
             modelTuneCandidatesLanded[result.candidate] = result
         case .completed(let result):
-            modelTuneStatusMessage = "Saved"
+            modelTuneStatusMessage = tr("Saved")
             modelTuneResult = result
             for entry in result.allCandidates {
                 modelTuneCandidatesLanded[entry.candidate] = entry
@@ -2103,7 +3045,7 @@ public final class MTPLXBackendStore: ObservableObject {
             }
         case .failed(_, let stderrTail):
             modelTuneStatusMessage = nil
-            modelTuneFailure = stderrTail.isEmpty ? "Tuning failed." : stderrTail
+            modelTuneFailure = stderrTail.isEmpty ? tr("Tuning failed.") : stderrTail
             isModelTuning = false
             modelTuneTask = nil
         case .cancelled:
@@ -2221,20 +3163,18 @@ public final class MTPLXBackendStore: ObservableObject {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let lower = trimmed.lowercased()
         if lower.contains("401") || lower.contains("403") || lower.contains("gated") || lower.contains("private") {
-            return "This Hugging Face repo is private or gated. Set HF_TOKEN or HUGGING_FACE_HUB_TOKEN, then try again."
+            return tr("This Hugging Face repo is private or gated. Set HF_TOKEN or HUGGING_FACE_HUB_TOKEN, then try again.")
         }
         if lower.contains("no space left") || lower.contains("not enough free disk") {
-            return "There is not enough free disk space to finish this download."
+            return tr("There is not enough free disk space to finish this download.")
         }
         if lower.contains("timed out") || lower.contains("network") || lower.contains("connection") {
             if MTPLXAppConfiguration.hfMirrorEnvironment(configuration.hfEndpoint) == nil {
-                return "The download could not reach Hugging Face. Check the network connection and try again. "
-                    + "If huggingface.co is blocked on your network, set an HF download mirror in "
-                    + "Settings under Advanced, for example https://hf-mirror.com."
+                return tr("The download could not reach Hugging Face. Check the network connection and try again. If huggingface.co is blocked on your network, set an HF download mirror in Settings under Advanced, for example https://hf-mirror.com.")
             }
-            return "The download could not reach Hugging Face. Check the network connection and try again."
+            return tr("The download could not reach Hugging Face. Check the network connection and try again.")
         }
-        return trimmed.isEmpty ? "Download failed. Try again." : trimmed
+        return trimmed.isEmpty ? tr("Download failed. Try again.") : trimmed
     }
 
     private func fanMode(for configuration: MTPLXAppConfiguration) -> MTPLXFanMode {
@@ -2266,32 +3206,51 @@ public final class MTPLXBackendStore: ObservableObject {
     /// pre-set the mode so the UI flips immediately; on failure
     /// `currentFanMode` is rolled back to the previous state.
     public func setFanMode(_ mode: String) async throws {
+        try await setFanMode(mode, isCurrent: nil)
+    }
+
+    /// Lifecycle-scoped variant used only by post-start verification.  The
+    /// public fan control intentionally remains usable outside a daemon
+    /// lifecycle; this path must instead discard a late API result rather
+    /// than persisting or rolling back over newer settings.
+    func setFanMode(
+        _ mode: String,
+        isCurrent: (() -> Bool)?
+    ) async throws {
+        guard isCurrent?() ?? true else { return }
         let previous = currentFanMode
         let previousConfiguration = configuration
         let fanMode = MTPLXFanMode.normalized(mode)
         let canonicalMode = fanMode.rawValue
         if !canApplyFanModeLive {
+            guard isCurrent?() ?? true else { return }
             var next = configuration
             next.fanMode = canonicalMode
             next.pinFansAtMaxOnStart = fanMode == .max
+            guard isCurrent?() ?? true else { return }
             try saveSettings(next)
+            guard isCurrent?() ?? true else { return }
             currentFanMode = nil
             fanRestoreRequiredOnStop = false
             return
         }
         do {
-            let result = try await apiClient.setFanMode(
+            let result = try await fanModeSetter(
+                apiClient,
                 canonicalMode,
-                requireActualRamp: fanMode == .max,
-                timeoutS: fanMode == .max ? 25 : nil
+                fanMode == .max,
+                fanMode == .max ? 25 : nil
             )
+            guard isCurrent?() ?? true else { return }
             currentFanMode = MTPLXFanMode.normalized(result.currentMode ?? canonicalMode).rawValue
             fanRestoreRequiredOnStop = modeRequiresFanRestore(currentFanMode)
             var next = configuration
             next.fanMode = currentFanMode ?? canonicalMode
             next.pinFansAtMaxOnStart = MTPLXFanMode.normalized(next.fanMode) == .max
+            guard isCurrent?() ?? true else { return }
             try saveSettings(next)
         } catch {
+            guard isCurrent?() ?? true else { return }
             currentFanMode = previous
             configuration = previousConfiguration
             throw error
@@ -2300,9 +3259,12 @@ public final class MTPLXBackendStore: ObservableObject {
 
     /// Pull thermal detection + current mode + fan summary. Used after
     /// daemon start so `FanModeToggle` can decide whether to render.
-    public func refreshThermalStatus() async {
-        thermalStatus = try? await apiClient.thermalStatus()
-        if let mode = thermalStatus?.values["current_mode"]?.stringValue, !mode.isEmpty {
+    public func refreshThermalStatus(isCurrent: (() -> Bool)? = nil) async {
+        await beforeThermalStatusRefresh()
+        let fetchedThermalStatus = try? await apiClient.thermalStatus()
+        guard isCurrent?() ?? true else { return }
+        thermalStatus = fetchedThermalStatus
+        if let mode = fetchedThermalStatus?.values["current_mode"]?.stringValue, !mode.isEmpty {
             currentFanMode = MTPLXFanMode.normalized(mode).rawValue
             fanRestoreRequiredOnStop = modeRequiresFanRestore(currentFanMode)
         }
@@ -2335,9 +3297,38 @@ public final class MTPLXBackendStore: ObservableObject {
         }
     }
 
+    /// Passive terminal cleanup must restore a verified or configured max
+    /// startup ramp too. Unlike an explicit Stop, do not infer this from the
+    /// default smart preference alone: no daemon-owned max ramp may have
+    /// happened in that case, and a terminal callback must not create a new
+    /// hardware side effect just because the app exited.
+    private func shouldRestoreFansAfterTerminalExit() -> Bool {
+        if fanRestoreRequiredOnStop || modeRequiresFanRestore(currentFanMode) {
+            return true
+        }
+        if health?.thermal?.actualRampVerified == true {
+            return true
+        }
+        if let mode = thermalStatus?.values["current_mode"]?.stringValue?.lowercased(),
+           mode == "max" || mode == "performance" {
+            return true
+        }
+        // This also covers a stale post-start fan response that physically
+        // succeeded but was intentionally not allowed to mutate store state.
+        return requiresStartupFanRamp(configuration)
+    }
+
     @discardableResult
-    private func restoreFansLocally(successLog: String) async -> Bool {
+    private func restoreFansLocally(
+        successLog: String,
+        isCurrent: (() -> Bool)? = nil
+    ) async -> Bool {
+        guard isCurrent?() ?? true else { return false }
         let restored = await localFanRestorer()
+        // The physical restore may have completed while a newer daemon was
+        // starting. Do not let this terminal lifecycle change its fan state,
+        // warning, or log presentation after that handoff.
+        guard isCurrent?() ?? true else { return false }
         if restored {
             fanRestoreRequiredOnStop = false
             currentFanMode = MTPLXFanMode.default.rawValue
@@ -2479,155 +3470,461 @@ public final class MTPLXBackendStore: ObservableObject {
         )
     }
 
-    private func finishReadyDaemon(
+    func finishReadyDaemon(
         target: LaunchTarget?,
         configuration: MTPLXAppConfiguration,
-        replaceExistingClient: Bool
+        replaceExistingClient: Bool,
+        launchID: String?,
+        lifecycleEpoch: Int
     ) async {
+        guard daemonSessionIsCurrent(
+            lifecycleEpoch: lifecycleEpoch,
+            launchID: launchID,
+            recoveryGeneration: nil
+        ) else { return }
         daemonState = .running
         startupPhase = .ready
-        await launchClientHandoff(
+        let handoffCompleted = await launchClientHandoff(
             target: target,
             configuration: configuration,
-            replaceExisting: replaceExistingClient
+            replaceExisting: replaceExistingClient,
+            lifecycleEpoch: lifecycleEpoch,
+            launchID: launchID
         )
-        await refreshPostStartState(target: target, configuration: configuration)
+        guard handoffCompleted else { return }
+        await beforePostStartRefresh()
+        guard daemonSessionIsCurrent(
+            lifecycleEpoch: lifecycleEpoch,
+            launchID: launchID,
+            recoveryGeneration: nil
+        ) else { return }
+        _ = await refreshPostStartState(
+            target: target,
+            configuration: configuration,
+            lifecycleEpoch: lifecycleEpoch,
+            recoveryGeneration: nil
+        )
     }
 
     private func launchClientHandoff(
         target: LaunchTarget?,
         configuration: MTPLXAppConfiguration,
-        replaceExisting: Bool
-    ) async {
-        if target == .hermes {
-            await launchHermesTerminalHandoff(
-                configuration: configuration,
-                replaceExisting: replaceExisting
+        replaceExisting: Bool,
+        lifecycleEpoch: Int,
+        launchID: String?
+    ) async -> Bool {
+        guard daemonSessionIsCurrent(
+            lifecycleEpoch: lifecycleEpoch,
+            launchID: launchID,
+            recoveryGeneration: nil
+        ) else { return false }
+        let isCurrent = {
+            self.daemonSessionIsCurrent(
+                lifecycleEpoch: lifecycleEpoch,
+                launchID: launchID,
+                recoveryGeneration: nil
             )
         }
+        if target == .hermes {
+            let handoffID = UUID()
+            guard await launchHermesTerminalHandoff(
+                configuration: configuration,
+                replaceExisting: replaceExisting,
+                isCurrent: isCurrent,
+                handoffID: handoffID
+            ) else { return false }
+        }
         if target == .openCode {
-            let desktop = await openCodeIntegration.reloadDesktopAfterDaemonReady()
-            clientHandoffNotice = ClientHandoffNotice.openCode(result: desktop)
+            let handoffID = UUID()
+            guard isCurrent() else { return false }
+            await beforeClientHandoffLaunch(.openCode)
+            guard isCurrent() else { return false }
+            let desktop = await openCodeIntegration.reloadDesktopAfterDaemonReady(isCurrent: isCurrent)
+            guard continueOpenCodeHandoff(desktop, handoffID: handoffID, isCurrent: isCurrent) else {
+                return false
+            }
+            let notice = ClientHandoffNotice.openCode(result: desktop)
+            guard continueOpenCodeHandoff(desktop, handoffID: handoffID, isCurrent: isCurrent) else {
+                return false
+            }
+            clientHandoffNotice = notice
+            activeClientHandoffID = handoffID
+            guard continueOpenCodeHandoff(desktop, handoffID: handoffID, isCurrent: isCurrent) else {
+                return false
+            }
             await supervisor.logs.append(
                 "OpenCode Desktop handoff \(desktop.action.rawValue): \(desktop.detail)",
                 stream: .system
             )
+            guard continueOpenCodeHandoff(desktop, handoffID: handoffID, isCurrent: isCurrent) else {
+                return false
+            }
         }
         if target == .pi {
-            await launchPiTerminalHandoff(
+            let handoffID = UUID()
+            guard await launchPiTerminalHandoff(
                 configuration: configuration,
-                replaceExisting: replaceExisting
-            )
+                replaceExisting: replaceExisting,
+                isCurrent: isCurrent,
+                handoffID: handoffID
+            ) else { return false }
         }
+        guard isCurrent() else { return false }
         onDaemonReady?(target)
+        return isCurrent()
     }
 
     private func refreshPostStartState(
         target: LaunchTarget?,
-        configuration: MTPLXAppConfiguration
-    ) async {
+        configuration: MTPLXAppConfiguration,
+        lifecycleEpoch: Int,
+        recoveryGeneration: Int?
+    ) async -> Bool {
+        guard daemonSessionIsCurrent(
+            lifecycleEpoch: lifecycleEpoch,
+            launchID: nil,
+            recoveryGeneration: recoveryGeneration
+        ) else { return false }
         do {
-            try await refreshStaticState()
+            try await refreshStaticState(isCurrent: {
+                self.daemonSessionIsCurrent(
+                    lifecycleEpoch: lifecycleEpoch,
+                    launchID: nil,
+                    recoveryGeneration: recoveryGeneration
+                )
+            }, markUnreachableOnTransportFailure: recoveryGeneration == nil)
         } catch {
             await supervisor.logs.append(
                 "post-start state refresh failed: \(String(describing: error))",
                 stream: .system
             )
         }
+        guard daemonSessionIsCurrent(
+            lifecycleEpoch: lifecycleEpoch,
+            launchID: nil,
+            recoveryGeneration: recoveryGeneration
+        ) else { return false }
         do {
-            try await flushFreshLaunchLiveOnlySettingsIfNeeded()
+            try await flushFreshLaunchLiveOnlySettingsIfNeeded(isCurrent: {
+                self.daemonSessionIsCurrent(
+                    lifecycleEpoch: lifecycleEpoch,
+                    launchID: nil,
+                    recoveryGeneration: recoveryGeneration
+                )
+            })
         } catch {
             await supervisor.logs.append(
                 "post-start settings sync failed: \(String(describing: error))",
                 stream: .system
             )
         }
-        startMetricsStream()
-        await refreshThermalStatus()
+        guard daemonSessionIsCurrent(
+            lifecycleEpoch: lifecycleEpoch,
+            launchID: nil,
+            recoveryGeneration: recoveryGeneration
+        ) else { return false }
+        guard await startMetricsAndRefreshThermal(
+            lifecycleEpoch: lifecycleEpoch,
+            recoveryGeneration: recoveryGeneration
+        ) else { return false }
         do {
-            try await verifyPinnedFansAfterStartup(configuration: configuration)
+            try await verifyPinnedFansAfterStartup(
+                configuration: configuration,
+                isCurrent: {
+                    self.daemonSessionIsCurrent(
+                        lifecycleEpoch: lifecycleEpoch,
+                        launchID: nil,
+                        recoveryGeneration: recoveryGeneration
+                    )
+                }
+            )
         } catch {
+            guard daemonSessionIsCurrent(
+                lifecycleEpoch: lifecycleEpoch,
+                launchID: nil,
+                recoveryGeneration: recoveryGeneration
+            ) else { return false }
             startupPhase = .ready
             await supervisor.logs.append(
                 "post-start fan verification failed: \(String(describing: error))",
                 stream: .system
             )
         }
+        return daemonSessionIsCurrent(
+            lifecycleEpoch: lifecycleEpoch,
+            launchID: nil,
+            recoveryGeneration: recoveryGeneration
+        )
     }
 
-    private func verifyPinnedFansAfterStartup(configuration: MTPLXAppConfiguration) async throws {
+    func startMetricsAndRefreshThermal(
+        lifecycleEpoch: Int,
+        recoveryGeneration: Int?
+    ) async -> Bool {
+        guard daemonSessionIsCurrent(
+            lifecycleEpoch: lifecycleEpoch,
+            launchID: nil,
+            recoveryGeneration: recoveryGeneration
+        ) else { return false }
+        startMetricsStream()
+        let startedTransportGeneration = daemonTransportGeneration
+        await refreshThermalStatus(isCurrent: {
+            self.daemonSessionIsCurrent(
+                lifecycleEpoch: lifecycleEpoch,
+                launchID: nil,
+                recoveryGeneration: recoveryGeneration
+            )
+        })
+        guard daemonSessionIsCurrent(
+            lifecycleEpoch: lifecycleEpoch,
+            launchID: nil,
+            recoveryGeneration: recoveryGeneration
+        ) else {
+            // A newer lifecycle may have started its own stream while this
+            // lifecycle awaited thermal status. Only cancel the stream whose
+            // generation we created.
+            if daemonTransportGeneration == startedTransportGeneration {
+                streamTask?.cancel()
+                streamTask = nil
+                daemonTransportGeneration &+= 1
+            }
+            return false
+        }
+        return true
+    }
+
+    private func daemonSessionIsCurrent(
+        lifecycleEpoch: Int,
+        launchID: String?,
+        recoveryGeneration: Int?
+    ) -> Bool {
+        let snapshot = supervisor.supervisionSnapshot()
+        guard snapshot.lifecycleEpoch == lifecycleEpoch,
+              snapshot.state == .running
+        else { return false }
+        if let launchID,
+           (activeLaunchID != launchID || cancelledLaunchIDs.contains(launchID)) {
+            return false
+        }
+        if let recoveryGeneration,
+           snapshot.recoveryGeneration != recoveryGeneration {
+            return false
+        }
+        return true
+    }
+
+    private func verifyPinnedFansAfterStartup(
+        configuration: MTPLXAppConfiguration,
+        isCurrent: @escaping () -> Bool
+    ) async throws {
         guard requiresStartupFanRamp(configuration) else { return }
+        guard isCurrent() else { return }
         startupPhase = .rampingFans
-        try await setFanMode(MTPLXFanMode.max.rawValue)
-        await refreshThermalStatus()
+        try await setFanMode(MTPLXFanMode.max.rawValue, isCurrent: isCurrent)
+        guard isCurrent() else { return }
+        await refreshThermalStatus(isCurrent: isCurrent)
+        guard isCurrent() else { return }
         startupPhase = .ready
     }
 
     private func launchHermesTerminalHandoff(
         configuration: MTPLXAppConfiguration,
-        replaceExisting: Bool
-    ) async {
+        replaceExisting: Bool,
+        isCurrent: @escaping () -> Bool,
+        handoffID: UUID
+    ) async -> Bool {
+        guard isCurrent() else { return false }
         if replaceExisting {
-            let stopped = hermesIntegration.stopLaunchedTerminalAgents()
+            let stopped = launchedHermesHandoffLeases.values.reduce(into: 0) { count, lease in
+                if hermesIntegration.cancelTerminalHandoff(lease) { count += 1 }
+            }
+            launchedHermesHandoffLeases.removeAll()
+            guard isCurrent() else { return false }
             if stopped > 0 {
+                guard isCurrent() else { return false }
                 await supervisor.logs.append(
                     "stopped \(stopped) previous Hermes Terminal handoff(s)",
                     stream: .system
                 )
+                guard isCurrent() else { return false }
             }
-        } else if hermesIntegration.hasLaunchedTerminalAgent() {
-            return
+        } else if !launchedHermesHandoffLeases.isEmpty {
+            return isCurrent()
         }
 
         // Desktop-first (2026-07-16): the built Hermes Desktop app is the
         // default handoff, matching the OpenCode card's flow; CLI-only
         // installs keep the Terminal path.
-        let launch = await hermesIntegration.launch(configuration: configuration)
-        clientHandoffNotice = ClientHandoffNotice.hermes(result: launch)
+        guard isCurrent() else { return false }
+        await beforeClientHandoffLaunch(.hermes)
+        guard isCurrent() else { return false }
+        let launch = await hermesIntegration.launch(
+            configuration: configuration,
+            isCurrent: isCurrent
+        )
+        guard isCurrent() else {
+            reapStaleHermesHandoff(launch, handoffID: handoffID)
+            return false
+        }
+        if let lease = launch.terminalHandoffLease {
+            recordLaunchedHermesTerminalHandoffLease(lease)
+        }
+        if let notice = ClientHandoffNotice.hermes(result: launch) {
+            guard isCurrent() else {
+                reapStaleHermesHandoff(launch, handoffID: handoffID)
+                return false
+            }
+            clientHandoffNotice = notice
+            activeClientHandoffID = handoffID
+        }
+        guard isCurrent() else {
+            reapStaleHermesHandoff(launch, handoffID: handoffID)
+            return false
+        }
         await supervisor.logs.append(
             "Hermes handoff \(launch.action.rawValue): \(launch.detail)",
             stream: .system
         )
+        guard isCurrent() else {
+            reapStaleHermesHandoff(launch, handoffID: handoffID)
+            return false
+        }
+        return true
     }
 
     private func launchPiTerminalHandoff(
         configuration: MTPLXAppConfiguration,
-        replaceExisting: Bool
-    ) async {
-        if replaceExisting && !launchedPiAgentPIDs.isEmpty {
-            let stopped = piIntegration.stopLaunchedAgents(processIDs: Array(launchedPiAgentPIDs))
+        replaceExisting: Bool,
+        isCurrent: @escaping () -> Bool,
+        handoffID: UUID
+    ) async -> Bool {
+        guard isCurrent() else { return false }
+        if replaceExisting && !launchedPiHandoffLeases.isEmpty {
+            let stopped = launchedPiHandoffLeases.values.reduce(into: 0) { count, lease in
+                if piIntegration.cancelTerminalHandoff(lease) { count += 1 }
+            }
+            launchedPiHandoffLeases.removeAll()
             launchedPiAgentPIDs.removeAll()
             piTerminalAgentRunning = false
             piTerminalAgentProcessIDs = []
             if stopped > 0 {
+                guard isCurrent() else { return false }
                 await supervisor.logs.append(
                     "stopped \(stopped) previous Pi Terminal handoff(s)",
                     stream: .system
                 )
+                guard isCurrent() else { return false }
             }
-        } else if !replaceExisting && !launchedPiAgentPIDs.isEmpty {
-            return
+        } else if !replaceExisting && !launchedPiHandoffLeases.isEmpty {
+            return isCurrent()
         }
 
-        let launch = piIntegration.launchInTerminal(configuration: configuration)
-        launchedPiAgentPIDs.formUnion(launch.launchedProcessIDs)
-        piTerminalAgentRunning = !launchedPiAgentPIDs.isEmpty
-        piTerminalAgentProcessIDs = Array(launchedPiAgentPIDs).sorted()
+        guard isCurrent() else { return false }
+        await beforeClientHandoffLaunch(.pi)
+        guard isCurrent() else { return false }
+        let launch = await piIntegration.launchInTerminal(
+            configuration: configuration,
+            isCurrent: isCurrent
+        )
+        guard isCurrent() else {
+            reapStalePiHandoff(launch, handoffID: handoffID)
+            return false
+        }
+        if let lease = launch.terminalHandoffLease {
+            recordLaunchedPiTerminalHandoffLease(lease)
+        }
+        if launch.terminalHandoffLease == nil {
+            recordLaunchedPiAgentProcessIDs(launch.launchedProcessIDs)
+        }
         piTerminalLaunchCommand = launch.command
         piTerminalLaunchDetail = launch.detail
         clientHandoffNotice = ClientHandoffNotice.pi(result: launch)
+        activeClientHandoffID = handoffID
+        guard isCurrent() else {
+            reapStalePiHandoff(launch, handoffID: handoffID)
+            return false
+        }
         await supervisor.logs.append(
             "Pi handoff \(launch.action.rawValue): \(launch.detail)",
             stream: .system
         )
+        guard isCurrent() else {
+            reapStalePiHandoff(launch, handoffID: handoffID)
+            return false
+        }
+        return true
     }
 
-    public func refreshPrefillHistory() async {
-        prefillHistory = try? await apiClient.prefillHistory()
+    private func clearClientHandoffNotice(for handoffID: UUID) {
+        guard activeClientHandoffID == handoffID else { return }
+        clientHandoffNotice = nil
+        activeClientHandoffID = nil
     }
 
-    public func refreshModels() async {
-        models = try? await apiClient.models()
+    private func reapStaleHermesHandoff(
+        _ launch: HermesLaunchResult,
+        handoffID: UUID
+    ) {
+        if let lease = launch.terminalHandoffLease {
+            _ = hermesIntegration.cancelTerminalHandoff(lease)
+            launchedHermesHandoffLeases.removeValue(forKey: lease.handoffID)
+        } else if let identity = launch.desktopHandoffIdentity {
+            _ = hermesIntegration.cancelLaunchedDesktop(identity)
+        }
+        clearClientHandoffNotice(for: handoffID)
+    }
+
+    @discardableResult
+    func continueOpenCodeHandoff(
+        _ launch: OpenCodeDesktopResult,
+        handoffID: UUID,
+        isCurrent: () -> Bool
+    ) -> Bool {
+        guard isCurrent() else {
+            reapStaleOpenCodeHandoff(launch, handoffID: handoffID)
+            return false
+        }
+        return true
+    }
+
+    private func reapStaleOpenCodeHandoff(
+        _ launch: OpenCodeDesktopResult,
+        handoffID: UUID
+    ) {
+        if let identity = launch.launchedDesktopIdentity {
+            _ = cancelOpenCodeDesktop(identity)
+        }
+        clearClientHandoffNotice(for: handoffID)
+    }
+
+    private func reapStalePiHandoff(
+        _ launch: PiLaunchResult,
+        handoffID: UUID
+    ) {
+        if let lease = launch.terminalHandoffLease {
+            _ = piIntegration.cancelTerminalHandoff(lease)
+            launchedPiHandoffLeases.removeValue(forKey: lease.handoffID)
+            launchedPiAgentPIDs.remove(lease.processID)
+        }
+        piTerminalAgentRunning = !launchedPiAgentPIDs.isEmpty
+        piTerminalAgentProcessIDs = Array(launchedPiAgentPIDs).sorted()
+        if activeClientHandoffID == handoffID {
+            piTerminalLaunchCommand = nil
+            piTerminalLaunchDetail = nil
+            clearClientHandoffNotice(for: handoffID)
+        }
+    }
+
+    public func refreshPrefillHistory(isCurrent: (() -> Bool)? = nil) async {
+        let fetchedPrefillHistory = try? await apiClient.prefillHistory()
+        guard isCurrent?() ?? true else { return }
+        prefillHistory = fetchedPrefillHistory
+    }
+
+    public func refreshModels(isCurrent: (() -> Bool)? = nil) async {
+        let fetchedModels = try? await apiClient.models()
+        guard isCurrent?() ?? true else { return }
+        models = fetchedModels
     }
 
     /// Up-to-date `MTPLXAPIClient` derived from the current
@@ -2652,7 +3949,15 @@ public final class MTPLXBackendStore: ObservableObject {
     }
 
     private func scheduleLateHealthRecovery(launchID: String, target: LaunchTarget?) {
-        guard supervisor.isRunning() else { return }
+        // Never guard this on supervisor.isRunning(): the failed-start path
+        // reaps the wrapper (nulling the supervisor's process handles)
+        // BEFORE the error reaches the caller that schedules this recovery,
+        // so that guard was false on every scheduling and the whole recovery
+        // was dead code — "Degraded" became terminal. The daemon (or its
+        // orphaned model-server child, which inherits --app-launch-id) can
+        // still come up healthy on the configured port; the wait below is
+        // identity-checked against this launch, so adopting is safe and
+        // probing an empty port is cheap.
         lateHealthRecoveryTask?.cancel()
         lateHealthRecoveryTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -2673,12 +3978,16 @@ public final class MTPLXBackendStore: ObservableObject {
                 guard !Task.isCancelled else { return }
                 self.health = recoveredHealth
                 self.currentFanMode = self.verifiedFanMode(from: recoveredHealth)
+                    ?? MTPLXFanMode.normalized(self.configuration.fanMode).rawValue
                 self.fanRestoreRequiredOnStop = self.fanRestoreRequiredOnStop
                     || self.modeRequiresFanRestore(self.currentFanMode)
+                let lifecycleEpoch = self.supervisor.supervisionSnapshot().lifecycleEpoch
                 await self.finishReadyDaemon(
                     target: target,
                     configuration: self.configuration,
-                    replaceExistingClient: true
+                    replaceExistingClient: true,
+                    launchID: nil,
+                    lifecycleEpoch: lifecycleEpoch
                 )
             } catch {
                 guard !Task.isCancelled else { return }
@@ -2701,11 +4010,24 @@ public final class MTPLXBackendStore: ObservableObject {
         // cleanly when a new request_id / session_id arrives, and a
         // latest-less snapshot no longer wipes the live readout.
         if let incoming = snapshot.latest, shouldAcceptSnapshotLatest(snapshot) {
-            let merged = Self.mergeLatestValues(existing: latest?.values ?? [:],
-                                                incoming: incoming.values)
-            let mergedLatest = MetricsLatest(values: merged)
-            latest = mergedLatest
-            updateSmoothedMetrics(mergedLatest)
+            // A warmup row (startup pass or the daemon's idle warm ladder)
+            // must never replace a real request's receipt: daemons without
+            // the ring-side fix publish ladder rungs into snapshot
+            // `latest`, and this merge was quietly swapping the user's
+            // finished-request counters (acceptance above all) for the
+            // rung's. Merge a warmup row only when we hold nothing better.
+            let incomingIsWarmup = incoming.values["warmup"]?.boolValue == true
+            let existingIsReal = latest.map { $0.values["warmup"]?.boolValue != true } ?? false
+            if !(incomingIsWarmup && existingIsReal) {
+                let merged = Self.mergeLatestValues(existing: latest?.values ?? [:],
+                                                    incoming: incoming.values)
+                let mergedLatest = MetricsLatest(values: merged)
+                latest = mergedLatest
+                updateSmoothedMetrics(mergedLatest)
+                if snapshot.inFlight.isEmpty {
+                    noteSnapshotCompletionEvidence(mergedLatest)
+                }
+            }
         }
         rolling = snapshot.rolling
         inFlight = snapshot.inFlight
@@ -2716,6 +4038,13 @@ public final class MTPLXBackendStore: ObservableObject {
         sessionBank = snapshot.sessionBank
         mem = snapshot.mem
         thermal = snapshot.thermal
+        memoryPressureLevel = snapshot.memoryPressureLevel ?? 0
+        memoryPressureSource = snapshot.memoryPressureSource
+        memoryPlan = snapshot.memoryPlan
+        memoryGuardRecentShed = Self.guardShedRecently(
+            snapshot.memoryGuardEvents,
+            now: Date().timeIntervalSince1970
+        )
         if daemonState == .running || supervisor.isRunning() {
             adoptDaemonSettings(snapshot.settings, persist: true)
         } else {
@@ -2802,6 +4131,10 @@ public final class MTPLXBackendStore: ObservableObject {
             // safely replace `latest`.
             let envelope = MetricsLatest(values: payload.values["envelope"]?.objectValue ?? payload.values)
             latest = envelope
+            // Prime the snapshot-evidence dedup key so the next idle
+            // poll does not count this same request a second time.
+            snapshotCompletionFingerprint = Self.completionFingerprint(of: envelope.values)
+                ?? snapshotCompletionFingerprint
             // Snap the smoothed metrics to the request's exact final
             // values, then freeze them so subsequent idle snapshot polls
             // can't keep nudging acceptance/cached upward after the
@@ -2897,6 +4230,23 @@ public final class MTPLXBackendStore: ObservableObject {
         guard now - lastProgressPublishS >= intervalS else { return false }
         lastProgressPublishS = now
         return true
+    }
+
+    /// A shed within this window keeps the banner's "shedding" copy honest
+    /// across snapshot polls; past it, an elevated level with a quiet ring
+    /// downgrades to the tight-memory copy.
+    nonisolated static let memoryGuardShedRecencyS: Double = 120
+
+    nonisolated static func guardShedRecently(
+        _ events: [MemoryGuardEvent]?,
+        now: Double
+    ) -> Bool {
+        guard let events, !events.isEmpty else { return false }
+        return events.contains { event in
+            guard event.didShed else { return false }
+            guard let ts = event.ts else { return false }
+            return now - ts <= memoryGuardShedRecencyS
+        }
     }
 
     private static func hasActivePrefill(_ request: InFlightRequest) -> Bool {
@@ -3084,6 +4434,45 @@ public final class MTPLXBackendStore: ObservableObject {
             return false
         }
         return snapshot.inFlight.contains { $0.requestId == incomingRequestID }
+    }
+
+    /// Identity of a finished, non-warmup request receipt, or nil when the
+    /// row is warmup / has no completed decode. `request_id` when present;
+    /// otherwise a composite of fields that are stable for one finished
+    /// request and virtually never collide across two (warmup rows and
+    /// some lanes publish `request_id: null`).
+    nonisolated static func completionFingerprint(of values: [String: JSONValue]) -> String? {
+        guard values["warmup"]?.boolValue != true else { return nil }
+        guard let completion = values["completion_tokens"]?.doubleValue,
+              completion > 0 else { return nil }
+        if let requestID = values["request_id"]?.stringValue, !requestID.isEmpty {
+            return requestID
+        }
+        let parts = [
+            "session_id", "completion_tokens", "prompt_tokens", "ttft_s",
+            "decode_tok_s",
+        ].map { key in
+            values[key].map(String.init(describing:)) ?? ""
+        }
+        return parts.joined(separator: "|")
+    }
+
+    /// Completion evidence from the snapshot poller. `observedCompletionCount`
+    /// historically ticked only on `.completed` SSE frames, but the stream
+    /// has no replay: a frame missed during a reconnect (long generations)
+    /// or finished before we attached left the Live tab's gates at zero
+    /// forever — "engine finished decoding but acceptance still shows the
+    /// placeholder" — even though every snapshot poll was already carrying
+    /// the finished request's counters. Snapshot `latest` is the daemon's
+    /// most recent completed request, so a non-warmup completed row observed
+    /// while nothing is in flight is completion evidence of the same rank as
+    /// a stream frame; the fingerprint keeps idle polls from re-counting the
+    /// same request.
+    private func noteSnapshotCompletionEvidence(_ mergedLatest: MetricsLatest) {
+        guard let fingerprint = Self.completionFingerprint(of: mergedLatest.values) else { return }
+        guard fingerprint != snapshotCompletionFingerprint else { return }
+        snapshotCompletionFingerprint = fingerprint
+        observedCompletionCount += 1
     }
 
     private static func prefillPhase(in payload: DynamicObject) -> String? {

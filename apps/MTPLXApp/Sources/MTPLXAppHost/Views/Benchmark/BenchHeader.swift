@@ -22,6 +22,7 @@ struct BenchHeader: View {
     let startTitle: String
     let startIcon: String
     let startEnabled: Bool
+    let performanceLock: Bool
     /// Rendered content width of the panel, threaded down so the header can
     /// reflow gracefully instead of letting its CTA cluster get crushed and
     /// wrap. The controls (CTAs / settings / close) are rigid; the branding
@@ -58,7 +59,7 @@ struct BenchHeader: View {
                 Spacer(minLength: 12)
             }
             ctaCluster
-            InferenceParamsButton()
+            InferenceParamsButton(performanceLock: performanceLock)
             closeButton
         }
     }
@@ -80,9 +81,9 @@ struct BenchHeader: View {
                 }
         }
         .buttonStyle(.plain)
-        .help("Close (Esc). The run keeps going — press Cmd+B to bring it back.")
-        .accessibilityLabel("Close benchmark")
-        .accessibilityHint("Hides this view. The run keeps going. Press Cmd+B to reopen.")
+        .help(tr("Close (Esc). The run keeps going — press Cmd+B to bring it back."))
+        .accessibilityLabel(tr("Close benchmark"))
+        .accessibilityHint(tr("Hides this view. The run keeps going. Press Cmd+B to reopen."))
     }
 
     /// 44pt hero chip with state-tinted glyph. Default tint is the
@@ -116,7 +117,7 @@ struct BenchHeader: View {
 
     private var titleStack: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text("AIME 2026")
+            Text(tr("AIME 2026"))
                 .font(.system(size: 17, weight: .heavy, design: .rounded))
                 .foregroundStyle(Brand.typeBody)
                 .lineLimit(1)
@@ -134,11 +135,11 @@ struct BenchHeader: View {
     private var statsCluster: some View {
         HStack(alignment: .center, spacing: 18) {
             BenchHeaderStat(
-                label: "ELAPSED",
+                label: tr("ELAPSED"),
                 value: formattedElapsed
             )
             BenchHeaderStat(
-                label: "RESOLVED",
+                label: tr("RESOLVED"),
                 value: total > 0 ? "\(resolved) / \(total)" : "—"
             )
             BenchHeaderStat(
@@ -148,7 +149,7 @@ struct BenchHeader: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            "Elapsed \(formattedElapsed), \(resolved) of \(total) resolved, \(trailingStatLabel.lowercased()) \(accuracyLabel)"
+            tr("Elapsed %@, %lld of %lld resolved, %@ %@", formattedElapsed, resolved, total, trailingStatLabel.lowercased(), accuracyLabel)
         )
     }
 
@@ -157,7 +158,7 @@ struct BenchHeader: View {
             switch state {
             case .idle, .done, .cancelled, .error:
                 BenchPrimaryCTA(
-                    title: "Quick Check",
+                    title: tr("Quick Check"),
                     icon: "bolt.fill",
                     style: .secondary,
                     isDanger: false,
@@ -175,7 +176,7 @@ struct BenchHeader: View {
                 )
             case .running:
                 BenchPrimaryCTA(
-                    title: pausePending ? "Pausing…" : "Pause",
+                    title: pausePending ? tr("Pausing…") : tr("Pause"),
                     icon: "pause.fill",
                     isDanger: false,
                     isEnabled: !pausePending && !skipPending,
@@ -183,7 +184,7 @@ struct BenchHeader: View {
                     action: onPause
                 )
                 BenchPrimaryCTA(
-                    title: skipPending ? "Skipping…" : "Skip",
+                    title: skipPending ? tr("Skipping…") : tr("Skip"),
                     icon: "forward.end.fill",
                     isDanger: false,
                     isEnabled: !skipPending,
@@ -191,7 +192,7 @@ struct BenchHeader: View {
                     action: onSkip
                 )
                 BenchPrimaryCTA(
-                    title: "Cancel",
+                    title: tr("Cancel"),
                     icon: "xmark",
                     isDanger: true,
                     isEnabled: true,
@@ -200,7 +201,7 @@ struct BenchHeader: View {
                 )
             case .paused:
                 BenchPrimaryCTA(
-                    title: "Resume",
+                    title: tr("Resume"),
                     icon: "play.fill",
                     isDanger: false,
                     isEnabled: true,
@@ -208,7 +209,7 @@ struct BenchHeader: View {
                     action: onResume
                 )
                 BenchPrimaryCTA(
-                    title: "Cancel",
+                    title: tr("Cancel"),
                     icon: "xmark",
                     isDanger: true,
                     isEnabled: true,
@@ -236,20 +237,20 @@ struct BenchHeader: View {
 
     private var accuracyLabel: String {
         if state == .cancelled {
-            return "\(score) correct"
+            return tr("%lld correct", score)
         }
         guard let accuracy else { return "—" }
         return percentFormatter.string(from: NSNumber(value: accuracy)) ?? "—"
     }
 
     private var trailingStatLabel: String {
-        state == .cancelled ? "SCORE" : "ACCURACY"
+        state == .cancelled ? tr("SCORE") : tr("ACCURACY")
     }
 
     private var subtitle: String {
         let runLabel = total > 0 && total < 30
-            ? "\(total)-problem Quick Check"
-            : "30 competition problems"
+            ? tr("%lld-problem Quick Check", total)
+            : tr("30 competition problems")
         let stateLabel: String = {
             switch state {
             case .idle:
@@ -261,7 +262,7 @@ struct BenchHeader: View {
             case .cancelled:
                 return "cancelled"
             case .error:
-                return "needs review"
+                return tr("needs review")
             }
         }()
         return "\(runLabel), \(stateLabel)"

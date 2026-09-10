@@ -9,8 +9,10 @@ the fans. The sidecar:
   2. Polls the parent PID every ``poll_seconds``.
   3. The moment the parent is gone (any cause: clean exit, SIGINT,
      SIGTERM, SIGHUP, SIGKILL, OOM, terminal closed, kernel panic
-     followed by reboot — well, except that last one), it runs
-     ``sudo -n <thermalforge-path> auto`` and exits.
+     followed by reboot — well, except that last one), it restores Auto
+     only if its ownership token still matches the global Max marker.
+     A newer MTPLX process can therefore take over without the old
+     watchdog undoing the new Max pin.
 
 This is the only piece of the crash-safety machinery that handles
 SIGKILL of the parent. The signal-handler / atexit path covers
@@ -21,6 +23,12 @@ away".
 The sidecar runs as the unprivileged user and relies on the
 ``/etc/sudoers.d/mtplx-thermalforge`` NOPASSWD rule installed by
 ``mtplx max --install`` to do its restore without a password.
+
+A restore only counts once the fan rows report the automatic curve again
+(#201); the Max marker is cleared on a verified restore only, so a wedged
+daemon that answers "ok" without touching the fans leaves the marker for
+the next ``mtplx start`` to recover from. Because stdio is detached, the
+outcome is appended to ``~/.mtplx/logs/thermal-sidecar.log``.
 """
 
 from __future__ import annotations
@@ -31,7 +39,39 @@ import subprocess
 import sys
 import time
 
-from mtplx.thermal import _daemon_socket_send
+from mtplx.thermal import (
+    _daemon_socket_send,
+    _max_marker_lock,
+    _max_marker_owned_by,
+    wait_for_auto_fans,
+)
+
+# The sidecar fires once and has nowhere to retry from, so it waits a little
+# longer than the in-process path for the daemon to act.
+RESTORE_VERIFY_TIMEOUT_S = 5.0
+SUDO_AUTO_TIMEOUT_S = 20.0
+
+
+def _log_path() -> str:
+    return os.path.expanduser("~/.mtplx/logs/thermal-sidecar.log")
+
+
+def _log(message: str) -> None:
+    """Append one timestamped line to the sidecar log.
+
+    The sidecar's stdio points at /dev/null, so this file is the only place
+    a failed restore can be reported. Writing the log is itself best-effort:
+    there is nowhere further to report a log that cannot be written.
+    """
+
+    path = _log_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            handle.write(f"{stamp} pid={os.getpid()} {message}\n")
+    except OSError:
+        pass
 
 
 def _detach_from_terminal() -> None:
@@ -80,31 +120,59 @@ def _parent_alive(pid: int) -> bool:
         return False
 
 
-def _restore_fans(binary: str) -> int:
-    """Restore Apple-auto fans and return an exit code.
+def _restore_fans(binary: str) -> tuple[bool, str]:
+    """Restore Apple-auto fans and prove it.
+
+    Returns ``(verified, detail)``: ``detail`` names the path that restored the
+    fans, or lists every attempt and why it did not count.
 
     Prefer the ThermalForge daemon socket: it resets fans as root without sudo
-    and, unlike ``thermalforge auto``, never quits the menu bar app. Fall back
-    to ``sudo -n <binary> auto`` when no daemon is reachable. ``sudo -n`` never
-    prompts, so it succeeds immediately (NOPASSWD active) or fails fast — either
-    way the sidecar exits, having made its attempt.
+    and, unlike ``thermalforge auto``, never quits the menu bar app. Its "ok"
+    reply is believed only once the fan rows report auto (#201); otherwise
+    fall through to ``sudo -n <binary> auto``, which never prompts, and hold
+    that to the same proof.
     """
 
+    reasons: list[str] = []
     reset = _daemon_socket_send("auto")
-    if reset is not None and reset["ok"]:
-        return 0
+    if reset is None:
+        reasons.append("no daemon socket")
+    elif not reset["ok"]:
+        reasons.append(f"daemon replied {reset.get('response') or 'nothing'!r}")
+    elif wait_for_auto_fans(timeout_s=RESTORE_VERIFY_TIMEOUT_S):
+        return True, "daemon socket"
+    else:
+        reasons.append(
+            "daemon replied ok but the fans did not report auto within "
+            f"{RESTORE_VERIFY_TIMEOUT_S:g}s"
+        )
 
+    cli = f"sudo -n {binary} auto"
     try:
         proc = subprocess.run(
             ["sudo", "-n", binary, "auto"],
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=20,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=SUDO_AUTO_TIMEOUT_S,
         )
-        return proc.returncode
-    except Exception:
-        return 1
+    except subprocess.TimeoutExpired:
+        reasons.append(f"{cli} did not finish within {SUDO_AUTO_TIMEOUT_S:g}s")
+        return False, "; ".join(reasons)
+    except OSError as exc:
+        reasons.append(f"{cli} could not run: {exc}")
+        return False, "; ".join(reasons)
+    if proc.returncode != 0:
+        said = (proc.stderr or proc.stdout or "").strip()
+        reasons.append(f"{cli} exited {proc.returncode}" + (f": {said}" if said else ""))
+        return False, "; ".join(reasons)
+    if wait_for_auto_fans(timeout_s=RESTORE_VERIFY_TIMEOUT_S):
+        return True, cli
+    reasons.append(
+        f"{cli} exited 0 but the fans did not report auto within {RESTORE_VERIFY_TIMEOUT_S:g}s"
+    )
+    return False, "; ".join(reasons)
 
 
 def _clear_marker(marker_path: str | None) -> None:
@@ -117,11 +185,46 @@ def _clear_marker(marker_path: str | None) -> None:
         pass
 
 
+def _restore_owned_fans(
+    binary: str,
+    marker_path: str | None,
+    owner_token: str | None,
+) -> int:
+    """Restore only while this sidecar still owns the global Max lease.
+
+    The marker is cleared only after the restore is verified; an unverified
+    attempt leaves it in place so the next ``mtplx start`` recovers the fans,
+    and the reason is written to the sidecar log.
+    """
+
+    with _max_marker_lock(marker_path):
+        if not _max_marker_owned_by(marker_path, owner_token):
+            return 0
+        try:
+            verified, detail = _restore_fans(binary)
+        except Exception as exc:  # last resort: a detached process has no other channel
+            verified, detail = False, f"{type(exc).__name__}: {exc}"
+        if verified:
+            _clear_marker(marker_path)
+            _log(f"fans restored to auto via {detail}; marker cleared")
+            return 0
+        _log(
+            "fan restore NOT verified, marker kept so the next mtplx start "
+            f"recovers the fans ({marker_path or 'no marker'}): {detail}"
+        )
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--parent-pid", type=int, required=True)
     parser.add_argument("--binary", required=True, help="Path to thermalforge CLI")
     parser.add_argument("--marker", default=None, help="Marker file to delete after restore")
+    parser.add_argument(
+        "--owner-token",
+        default=None,
+        help="Opaque marker lease; prevents an old sidecar restoring a newer session",
+    )
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--max-lifetime-seconds", type=float, default=24 * 3600.0,
                         help="Hard ceiling on sidecar lifetime; ensures we eventually die even on bugs")
@@ -132,10 +235,11 @@ def main(argv: list[str] | None = None) -> int:
 
     while True:
         if not _parent_alive(args.parent_pid):
-            rc = _restore_fans(args.binary)
-            if rc == 0:
-                _clear_marker(args.marker)
-            return rc
+            return _restore_owned_fans(
+                args.binary,
+                args.marker,
+                args.owner_token,
+            )
         if (time.time() - started_at) > args.max_lifetime_seconds:
             return 0
         try:

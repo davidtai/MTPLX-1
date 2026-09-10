@@ -12,12 +12,26 @@ import os
 import time
 import weakref
 from dataclasses import asdict, dataclass, field
+from functools import partial
 from typing import Any
 
 import mlx.core as mx
 
 from .attention_context import attention_phase
 from .gdn_capture import resolve_gdn_capture_backend
+
+
+def _prepare_fixed_m4_materialized(
+    prepare_aux,
+    cache,
+    input_ids,
+    _host_input_ids,
+    _completion_tokens,
+    _committed_count,
+):
+    """Adapt the materialized PLE route to the fixed-M4 host-input contract."""
+
+    return prepare_aux(input_ids, cache)
 
 
 @dataclass
@@ -351,6 +365,16 @@ def _accepts_capture_backend(runtime: Any) -> bool:
     return "capture_backend" in signature.parameters
 
 
+def _accepts_runtime_keyword(runtime: Any, name: str) -> bool:
+    import inspect
+
+    try:
+        signature = inspect.signature(runtime.forward_ar_capture)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return name in signature.parameters
+
+
 def cache_has_python_offsets(cache: Any) -> bool:
     for entry in cache or []:
         if entry is None:
@@ -577,6 +601,238 @@ class TensorOffsetKVCache:
         return entry
 
 
+class TensorOffsetQSACache:
+    """Fixed-capacity Qwen4 QSA state for compiled target verification.
+
+    QSA owns five graph leaves: attention keys, attention values, the logical
+    token offset, raw index keys, and pooled index keys.  The logical pooled
+    length is always ``offset // ratio`` and therefore does not need a second
+    mutable offset.  All buffers are granted once when the verifier bank is
+    constructed; the enabled path only performs fixed-shape slice updates.
+    """
+
+    fixed_capacity = True
+    step = 256
+
+    def __init__(
+        self,
+        kv: TensorOffsetKVCache,
+        raw_keys: mx.array,
+        pooled: mx.array,
+        *,
+        compress_ratio: int,
+        rows_gather: bool = False,
+        rows_gather_kv_m4: Any,
+        rows_gather_enabled: bool = False,
+        rows_gather_min_context: int = 0,
+        fused_rows_gather_kv_m4: bool = False,
+    ) -> None:
+        self.kv = kv
+        self.raw_keys = raw_keys
+        self.pooled = pooled
+        self.ratio = max(1, int(compress_ratio))
+        self.step = int(getattr(kv, "step", 256))
+        self.fixed_rows_gather = bool(rows_gather)
+        self.rows_gather_kv_m4 = rows_gather_kv_m4
+        self.rows_gather_enabled = bool(rows_gather_enabled)
+        self.rows_gather_min_context = max(0, int(rows_gather_min_context))
+        self.fused_rows_gather_kv_m4 = bool(fused_rows_gather_kv_m4)
+
+    @staticmethod
+    def _fixed_bank(value: mx.array, capacity: int, axis: int) -> mx.array:
+        current = int(value.shape[axis])
+        if current == capacity:
+            return value
+        if current > capacity:
+            slices = [slice(None)] * value.ndim
+            slices[axis] = slice(0, capacity)
+            return value[tuple(slices)]
+        shape = list(value.shape)
+        shape[axis] = capacity - current
+        return mx.concatenate(
+            [value, mx.zeros(tuple(shape), dtype=value.dtype)], axis=axis
+        )
+
+    @classmethod
+    def from_qsa_cache(
+        cls, entry: Any, *, reserve_tokens: int
+    ) -> "TensorOffsetQSACache":
+        reserve_tokens = max(1, int(reserve_tokens))
+        offset = int(entry.offset)
+        ratio = max(1, int(entry.ratio))
+        if entry.raw_keys is None or entry.pooled is None:
+            raise ValueError("QSA index state is empty")
+        if entry.kv.keys is None or entry.kv.values is None:
+            raise ValueError("QSA attention state is empty")
+
+        logical_capacity = offset + reserve_tokens
+        raw_capacity = ((logical_capacity + ratio - 1) // ratio) * ratio
+        pooled_capacity = raw_capacity // ratio
+
+        kv = TensorOffsetKVCache.from_kv_cache(
+            entry.kv, reserve_tokens=reserve_tokens
+        )
+        kv.keys = cls._fixed_bank(kv.keys, raw_capacity, 2)
+        kv.values = cls._fixed_bank(kv.values, raw_capacity, 2)
+        raw = cls._fixed_bank(entry.raw_keys, raw_capacity, 1)
+        pooled = cls._fixed_bank(entry.pooled, pooled_capacity, 1)
+        from .models.qwen4_exp import (
+            _qsa_gather_enabled,
+            _qsa_gather_min_context,
+        )
+
+        rows_gather_enabled = _qsa_gather_enabled()
+        rows_gather_min_context = _qsa_gather_min_context()
+        rows_gather = rows_gather_enabled and offset >= rows_gather_min_context
+        rows_gather_kv_m4 = entry.rows_gather_kv_m4
+        fused_rows_gather_kv_m4 = _env_enabled("MTPLX_QSA_M4_FUSED_KV_GATHER")
+        if fused_rows_gather_kv_m4:
+            expected_shape = (1, 2, raw_capacity, 256)
+            if not _env_enabled("MTPLX_QWEN4_FIXED_M4_VERIFY"):
+                raise RuntimeError(
+                    "QSA fused K/V gather requires the fixed-M4 verifier"
+                )
+            if not rows_gather_enabled or ratio != 4:
+                raise RuntimeError(
+                    "QSA fused K/V gather requires the fixed rows-gather ratio-4 lane"
+                )
+            if (
+                tuple(kv.keys.shape) != expected_shape
+                or tuple(kv.values.shape) != expected_shape
+                or kv.keys.dtype != mx.bfloat16
+                or kv.values.dtype != mx.bfloat16
+            ):
+                raise RuntimeError(
+                    "QSA fused K/V gather requires BF16 "
+                    "[1,2,capacity,256] cache ownership"
+                )
+            if rows_gather:
+                from .kernels.qwen4_qsa_m4_fused_kv_gather import (
+                    bind_qwen4_qsa_m4_fused_kv_gather,
+                )
+
+                rows_gather_kv_m4 = bind_qwen4_qsa_m4_fused_kv_gather(
+                    capacity=raw_capacity
+                )
+
+        return cls(
+            kv,
+            raw,
+            pooled,
+            compress_ratio=ratio,
+            rows_gather=rows_gather,
+            rows_gather_kv_m4=rows_gather_kv_m4,
+            rows_gather_enabled=rows_gather_enabled,
+            rows_gather_min_context=rows_gather_min_context,
+            fused_rows_gather_kv_m4=fused_rows_gather_kv_m4,
+        )
+
+    @property
+    def capacity(self) -> int:
+        return int(self.raw_keys.shape[1])
+
+    def ensure_capacity(self, needed: int) -> bool:
+        """Grow this installed QSA generation without changing its offset."""
+
+        raw_capacity = (
+            (max(1, int(needed)) + self.ratio - 1) // self.ratio
+        ) * self.ratio
+        if raw_capacity <= self.capacity:
+            return False
+        pooled_capacity = raw_capacity // self.ratio
+        self.kv.keys = self._fixed_bank(self.kv.keys, raw_capacity, 2)
+        self.kv.values = self._fixed_bank(self.kv.values, raw_capacity, 2)
+        self.raw_keys = self._fixed_bank(self.raw_keys, raw_capacity, 1)
+        self.pooled = self._fixed_bank(self.pooled, pooled_capacity, 1)
+        self.kv._granted = True
+        self.kv.growth_after_grant = False
+        if self.fixed_rows_gather and self.fused_rows_gather_kv_m4:
+            from .kernels.qwen4_qsa_m4_fused_kv_gather import (
+                bind_qwen4_qsa_m4_fused_kv_gather,
+            )
+
+            self.rows_gather_kv_m4 = bind_qwen4_qsa_m4_fused_kv_gather(
+                capacity=raw_capacity
+            )
+        return True
+
+    def activate_rows_gather(self, logical_end: int) -> bool:
+        """Install the construction-validated sparse route at its threshold."""
+
+        if (
+            self.fixed_rows_gather
+            or not self.rows_gather_enabled
+            or int(logical_end) < self.rows_gather_min_context
+        ):
+            return False
+        self.fixed_rows_gather = True
+        if self.fused_rows_gather_kv_m4:
+            from .kernels.qwen4_qsa_m4_fused_kv_gather import (
+                bind_qwen4_qsa_m4_fused_kv_gather,
+            )
+
+            self.rows_gather_kv_m4 = bind_qwen4_qsa_m4_fused_kv_gather(
+                capacity=self.capacity
+            )
+        return True
+
+    @property
+    def offset(self):
+        return self.kv.offset
+
+    @property
+    def pooled_len(self):
+        return self.kv.offset // self.ratio
+
+    @property
+    def state_leaves(self) -> list[mx.array]:
+        return [*self.kv.cache, self.raw_keys, self.pooled]
+
+    def pooled_f32_view(self, nb: int) -> mx.array:
+        """fp32-transposed [1, 1, D, nb] view of the fixed pooled bank.
+
+        The stock QSACache keeps a lockstep mirror for allocation hygiene;
+        the fixed bank has static capacity and lives inside one compiled
+        trace, so the cast is a single graph node and needs no mirror.
+        """
+        return mx.swapaxes(self.pooled.astype(mx.float32), 1, 2)[:, None][..., :nb]
+
+    def write_raw(self, keys: mx.array) -> None:
+        self.raw_keys = mx.slice_update(
+            self.raw_keys, keys, self.kv.offset, axes=(1,)
+        )
+
+    def write_pooled(self, blocks: mx.array, nb_start, nb_total) -> None:
+        del nb_total
+        self.pooled = mx.slice_update(
+            self.pooled, blocks, nb_start, axes=(1,)
+        )
+
+    def size(self) -> int:
+        return self.kv.size()
+
+    def is_trimmable(self) -> bool:
+        return True
+
+    def trim(self, n: int) -> int:
+        return self.kv.trim(n)
+
+    @property
+    def nbytes(self) -> int:
+        return int(self.kv.nbytes + self.raw_keys.nbytes + self.pooled.nbytes)
+
+    def demote(self):
+        from .models.qwen4_exp import QSACache
+
+        offset = self.kv.size()
+        entry = QSACache(self.ratio)
+        entry.kv = self.kv.demote()
+        entry.raw_keys = self.raw_keys
+        entry.pooled = self.pooled
+        entry.pooled_len = min(int(self.pooled.shape[1]), offset // self.ratio)
+        return entry
+
+
 def promote_kv_cache_offsets(
     cache: Any,
     *,
@@ -605,16 +861,41 @@ def promote_kv_cache_offsets(
     for idx, entry in enumerate(cache):
         if entry is None:
             continue
+        if isinstance(entry, TensorOffsetQSACache):
+            continue
         if isinstance(entry, TensorOffsetKVCache):
             entry.ensure_capacity(entry.size() + reserve_tokens)
+            continue
+        try:
+            from .models.qwen4_exp import QSACache
+        except Exception:  # pragma: no cover - optional model import
+            QSACache = None
+        if QSACache is not None and isinstance(entry, QSACache):
+            try:
+                cache[idx] = TensorOffsetQSACache.from_qsa_cache(
+                    entry,
+                    reserve_tokens=(
+                        initial_reserve_tokens
+                        if initial_reserve_tokens is not None
+                        else reserve_tokens
+                    ),
+                )
+            except (TypeError, ValueError):
+                failures["auxiliary_qsa_state"] = (
+                    failures.get("auxiliary_qsa_state", 0) + 1
+                )
+                continue
+            promoted += 1
             continue
         if preserve_paged:
             try:
                 from .cache_state import (
+                    TensorOffsetQuantizedPagedKVCache,
                     TensorOffsetVllmMetalPagedKVCache,
                     VllmMetalPagedKVCache,
                 )
             except Exception:  # pragma: no cover - import guard for minimal test envs
+                TensorOffsetQuantizedPagedKVCache = None
                 TensorOffsetVllmMetalPagedKVCache = None
                 VllmMetalPagedKVCache = None
             if (
@@ -626,12 +907,38 @@ def promote_kv_cache_offsets(
                         failures.get("empty_paged_kv_cache", 0) + 1
                     )
                     continue
-                if getattr(entry, "turboquant", False) or getattr(entry, "kv_quant", False):
-                    # The tensor-offset adapter only understands plain bf16/fp16
-                    # pages; promoting quantized pages would corrupt them.
+                if getattr(entry, "turboquant", False):
+                    # TurboQuant pages depend on the external vLLM-Metal ops;
+                    # no adapter understands them. Keep the eager refusal.
                     failures["quantized_paged_kv_cache"] = (
                         failures.get("quantized_paged_kv_cache", 0) + 1
                     )
+                    continue
+                if getattr(entry, "kv_quant", False):
+                    # kv_quant pages promote to the quantized adapter
+                    # (head-major banks + fp32 scale planes, stable leaf
+                    # shapes/dtypes for the compiled graph). Fail-closed:
+                    # geometry the packed-quant kernel refuses, or the env
+                    # kill-switch, keeps the historical eager refusal.
+                    if not _env_enabled(
+                        "MTPLX_GRAPHBANK_QUANTIZED_PAGED", default=True
+                    ):
+                        failures["quantized_paged_kv_cache"] = (
+                            failures.get("quantized_paged_kv_cache", 0) + 1
+                        )
+                        continue
+                    if (
+                        TensorOffsetQuantizedPagedKVCache is None
+                        or not TensorOffsetQuantizedPagedKVCache.promotable(entry)
+                    ):
+                        failures["quantized_paged_kv_geometry"] = (
+                            failures.get("quantized_paged_kv_geometry", 0) + 1
+                        )
+                        continue
+                    cache[idx] = TensorOffsetQuantizedPagedKVCache.from_paged_cache(
+                        entry
+                    )
+                    promoted += 1
                     continue
                 cache[idx] = TensorOffsetVllmMetalPagedKVCache.from_paged_cache(entry)
                 promoted += 1
@@ -717,6 +1024,12 @@ def cache_array_tree(cache: Any) -> list[Any]:
 
 VERIFY_SPEC_KIND_FULL_ATTN = "fa"
 VERIFY_SPEC_KIND_GDN = "gdn"
+VERIFY_SPEC_KIND_QSA = "qsa"
+
+# Fixed-M4 replay install receipts printed so far in this process (the first
+# few installs announce their auxiliary route; the request report carries it
+# for every request).
+_FIXED_M4_INSTALL_RECEIPTS = 0
 
 TAPE_CAPTURE_KEYS = ("conv_states", "conv_out", "g", "state_in", "tape")
 STANDARD_CAPTURE_KEYS = ("conv_states", "states")
@@ -726,19 +1039,94 @@ _UNSUPPORTED_CAPTURE_BACKENDS = {
 }
 
 
-# One ladder walk per process: the shader cache it primes is process-global
-# (and OS-persistent), so re-walking on every per-generation bank instance
-# would be pure waste.
+# Prewarm one-shot (F6, 2026-08-16). The shader/pipeline cache the ladder
+# primes is process-global (and OS-persistent), so re-walking buckets that
+# are already warm is pure waste — but the OLD one-shot boolean was spent by
+# the FIRST compiled dispatch of the process, which is normally the 16-token
+# boot warmup: its tiny cache clamped the walk (min paged capacity) and the
+# deeper buckets then paid their ~1s compile inside the first MEASURED
+# benchmark row. `_PREWARM_DONE` now means "no future walk can add
+# coverage" (walk reached the router ceiling, or the cache is structurally
+# ladder-free); until then, the first dispatch of each generation retries
+# the walk and extends it with whatever new buckets the current cache
+# capacity allows, skipping buckets already recorded in
+# `_PREWARMED_BUCKETS`. A retry with nothing new to walk is a few python
+# comparisons — no compiles, no kernel work.
 _PREWARM_DONE = False
+
+# Buckets already walked this process, keyed
+# (runtime id, verify length, hidden variant, bucket). A recycled runtime
+# id after a model swap can only SKIP a warmup walk (perf miss, never a
+# correctness risk — the compiled callables themselves are guarded by the
+# weakref check in _shared_or_new_verify_step).
+_PREWARMED_BUCKETS: set[tuple[int, int, str, int]] = set()
+
+# Importable prewarm truth for /health (read defensively via getattr).
+# "done": no further walk can add coverage; "buckets": bucket sizes warmed
+# this process; "walks": ladder walks that executed; "last_report": the most
+# recent walk report (same shape as CompiledVerifyBank.stats["prewarm"]).
+prewarm_status: dict[str, Any] = {
+    "done": False,
+    "buckets": [],
+    "walks": 0,
+    "last_report": None,
+}
+
+# Importable compiled-verify degradation truth for /health (F23a).
+# "permanent_eager" tracks the most recently constructed bank (flipped True
+# by any later runtime flip); "reason"/"flipped_at" keep the LAST flip
+# forensics (sticky across requests); "flip_count" counts permanent flips
+# process-wide (construction-gate flips count once per distinct reason, not
+# once per request); "transient_exception_count" counts per-call exception
+# fallbacks that did NOT flip the bank.
+compiled_verify_status: dict[str, Any] = {
+    "mode": None,
+    "permanent_eager": False,
+    "reason": None,
+    "flipped_at": None,
+    "flip_count": 0,
+    "transient_exception_count": 0,
+}
+
+_PERMANENT_EAGER_LOGGED: set[str] = set()
+
+
+def _record_permanent_eager(reason: str, *, once: bool = False) -> None:
+    """Record (and log once per distinct reason) a permanent-eager flip.
+
+    ``once=True`` marks deterministic construction-time flips (per-model
+    quant gate): the first bank records and logs; subsequent per-request
+    banks only re-assert ``permanent_eager`` without inflating the count.
+    """
+    already_logged = reason in _PERMANENT_EAGER_LOGGED
+    compiled_verify_status["permanent_eager"] = True
+    if once and already_logged:
+        return
+    compiled_verify_status["reason"] = reason
+    compiled_verify_status["flipped_at"] = time.time()
+    compiled_verify_status["flip_count"] = (
+        int(compiled_verify_status.get("flip_count", 0)) + 1
+    )
+    if not already_logged:
+        _PERMANENT_EAGER_LOGGED.add(reason)
+        try:
+            print(
+                "[mtplx] compiled-verify permanent-eager: "
+                + reason
+                + " (verify runs the eager path from here)",
+                flush=True,
+            )
+        except Exception:
+            pass
 
 # Process-global compiled verify callables, keyed by
 # (runtime id, capture backend, state spec, verify length, hidden variant,
 # bucket). The bank is per-generation; without sharing, every request pays a
-# fresh trace. Values are (compiled_fn, trace_host) where trace_host["bank"]
-# is re-pointed to the live bank before each dispatch so internal retraces
+# fresh trace. Values are (compiled_fn, trace_host, runtime_ref), where the
+# host's WEAK bank reference is re-pointed before each dispatch so retraces
 # (mx.compile re-traces on leaf-shape changes) always use live scratch
 # containers. See CompiledVerifyBank._shared_or_new_verify_step.
-_SHARED_VERIFY_STEPS: dict[tuple, tuple[Any, dict[str, Any]]] = {}
+_SHARED_VERIFY_STEPS: dict[tuple, tuple[Any, dict[str, Any], Any]] = {}
 
 
 def _prewarm_enabled() -> bool:
@@ -781,10 +1169,12 @@ def _owned_state_env_active(name: str) -> bool:
 def build_verify_state_spec(cache: Any) -> tuple[list[tuple[int, str, int]] | None, str | None]:
     """Ordered (layer_idx, kind, n_leaves) spec over the cache list.
 
-    Full-attention tensor-offset entries contribute their three ``cache[0..2]``
-    leaves; GDN ``ArraysCache`` entries contribute their two slots.  ``None``
-    entries contribute nothing.  Any other container makes the cache
-    non-compilable and returns ``(None, reason)``.
+    Full-attention tensor-offset entries contribute every slot of their
+    ``cache`` list (three for plain KV/paged adapters, five for the
+    quantized paged adapter — payloads, offset, scale planes); GDN
+    ``ArraysCache`` entries contribute their two slots.  ``None`` entries
+    contribute nothing.  Any other container makes the cache non-compilable
+    and returns ``(None, reason)``.
     """
     try:
         from mlx_lm.models.cache import ArraysCache
@@ -799,26 +1189,34 @@ def build_verify_state_spec(cache: Any) -> tuple[list[tuple[int, str, int]] | No
     for idx, entry in enumerate(cache or []):
         if entry is None:
             continue
+        if isinstance(entry, TensorOffsetQSACache):
+            spec.append((idx, VERIFY_SPEC_KIND_QSA, 5))
+            continue
         if isinstance(entry, TensorOffsetKVCache) or (
             TensorOffsetVllmMetalPagedKVCache is not None
             and isinstance(entry, TensorOffsetVllmMetalPagedKVCache)
         ):
-            spec.append((idx, VERIFY_SPEC_KIND_FULL_ATTN, 3))
+            spec.append((idx, VERIFY_SPEC_KIND_FULL_ATTN, len(entry.cache)))
             continue
         if ArraysCache is not None and isinstance(entry, ArraysCache):
-            if len(entry.cache) != 2:
+            if len(entry.cache) not in (2, 4):
                 return None, f"unsupported_container:ArraysCache[{len(entry.cache)}]"
-            spec.append((idx, VERIFY_SPEC_KIND_GDN, 2))
+            n_leaves = len(entry.cache)
+            if n_leaves == 4 and any(leaf is None for leaf in entry.cache):
+                return None, "unsupported_container:ArraysCache[partial_ple]"
+            spec.append((idx, VERIFY_SPEC_KIND_GDN, n_leaves))
             continue
         return None, f"unsupported_container:{type(entry).__name__}"
     return spec, None
 
 
 def _paged_kernel_bucket_eligible(entry: Any, length: int, bucket: int) -> bool:
-    """Best-effort eager mirror of sdpa_2pass_paged_tail_dynamic_offset gates.
+    """Best-effort eager mirror of the compiled paged-attention kernel gates.
 
-    A miss here is a performance decision, not a correctness one: inside the
-    compiled function the kernel declining simply routes to the pure dense
+    Plain adapters mirror ``sdpa_2pass_paged_tail_dynamic_offset``; the
+    quantized adapter mirrors ``sdpa_gqa_packed_tail_quant``. A miss here is
+    a performance decision, not a correctness one: inside the compiled
+    function the kernel declining simply routes to the pure dense
     ``cache.state`` math, which stays trace-safe.
     """
     key_cache = entry.cache[0]
@@ -827,6 +1225,31 @@ def _paged_kernel_bucket_eligible(entry: Any, length: int, bucket: int) -> bool:
         return False
     if not mx.metal.is_available():
         return False
+    try:
+        from .cache_state import TensorOffsetQuantizedPagedKVCache
+    except Exception:  # pragma: no cover - import guard for minimal test envs
+        TensorOffsetQuantizedPagedKVCache = None
+    if TensorOffsetQuantizedPagedKVCache is not None and isinstance(
+        entry, TensorOffsetQuantizedPagedKVCache
+    ):
+        # Packed-quant kernel gates (head-major banks): two query banks cap
+        # the verify window at 8 rows; payload dtype must match the bits;
+        # head dims come from the adapter's own metadata. GQA legality
+        # (32 * factor <= 1024) needs the query head count and stays a
+        # per-call kernel gate inside the graph.
+        if length > 8:
+            return False
+        bits = int(entry.kv_bits)
+        expect_kv = mx.int8 if bits == 8 else mx.uint8
+        if key_cache.dtype != expect_kv or value_cache.dtype != expect_kv:
+            return False
+        head_dim = int(entry.head_dims[0])
+        if head_dim not in (64, 128, 256) or int(entry.head_dims[1]) != head_dim:
+            return False
+        from .kernels.sdpa_gqa_packed_quant import _static_blocks
+
+        blocks = _static_blocks(int(entry.capacity), int(bucket) or None)
+        return blocks > 0 and blocks % 32 == 0
     if key_cache.dtype not in (mx.bfloat16, mx.float16):
         return False
     if key_cache.dtype != value_cache.dtype:
@@ -957,13 +1380,74 @@ def _compiled_verify_donation_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def _batch_paged_offsets_enabled() -> bool:
+    """Batch-materialize paged-KV offsets before the bucket walk (#318 port).
+
+    ``TensorOffsetVllmMetalPagedKVCache.size()`` does ``mx.eval(cache[2])``
+    per entry, so after a trim/rollback (offsets left lazy) the bucket walk
+    forces one serial host sync per full-attention entry.  Evaluating every
+    offset in one ``mx.eval`` first turns N syncs into one; ``mx.eval``
+    cannot change values, so the result is exact by construction.  Neutral
+    on non-trimming workloads (offsets already materialized).  Ported from
+    grzracz PR #318 with the env read hoisted out of the hot call.  Default
+    ON since the night-20260822 round-4 ruling (n=4 counterbalanced ABBA
+    blend +2.7% mean, byte-identity held greedy+sampled); "0" opts out.
+    """
+    import os
+
+    raw = str(os.environ.get("MTPLX_BATCH_PAGED_OFFSETS", "1")).strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+_BATCH_PAGED_OFFSETS = _batch_paged_offsets_enabled()
+
+# Long-context fence for the #318 default (night-20260822 quad: the trio
+# stack measured −2.9%/−2.7% at 16k/32k while short/mid rungs blend
+# +2.5..+9.8). generation's per-request prebind sets this from the shared
+# MTPLX_GREEDY_TRIO_MAX_CONTEXT fence; requests that never prebind (batch
+# lane) keep the last-set/default value — that lane pays at most the
+# pre-#318 serial-sync behavior, never a correctness change.
+from contextvars import ContextVar
+
+_PAGED_OFFSETS_CONTEXT_OK: ContextVar[bool] = ContextVar(
+    "mtplx_paged_offsets_context_ok", default=True
+)
+
+
+def set_paged_offsets_context_ok(allowed: bool):
+    """Per-request fence stamp from generation's trio prebind."""
+    return _PAGED_OFFSETS_CONTEXT_OK.set(bool(allowed))
+
+
+def paged_offsets_context_ok() -> bool:
+    """Read the current request's fence stamp (receipts/trace)."""
+    return _PAGED_OFFSETS_CONTEXT_OK.get()
+
+
+def _ccopy_bank_max_len() -> int:
+    """Ceiling for extended-window (context-copy block) compiled dispatch.
+
+    Copy blocks are proposed at their native ladder lengths (block 8-32 ->
+    T=9-33); the bank verifies them one-shot so the trajectory is byte-equal
+    to the eager copy lane (v1's cap-to-bank-window changed the proposal and
+    was falsified as a net win, MEASUREMENTS 2026-08-25 12:05). Default 33
+    covers the full default ladder; longer custom MTPLX_CONTEXT_COPY_K
+    proposals fall back eager per call.
+    """
+    raw = os.environ.get("MTPLX_CCOPY_BANK_MAX_LEN", "").strip()
+    try:
+        return max(1, int(raw)) if raw else 33
+    except ValueError:
+        return 33
+
+
 def _compiled_verify_growth_reserve() -> int:
     """Dense-leaf growth headroom granted at first promotion (tokens).
 
     Sized so a typical agent tool round (40-500 generated tokens) completes
     inside one stable leaf shape: one trace per (length, capacity) class,
     zero mid-round retraces. Long generations exceed the grant and demote to
-    eager for the request remainder, which measured flat vs eager-only.
+    eager for the request remainder.
     """
 
     raw = str(os.environ.get("MTPLX_COMPILED_VERIFY_GROWTH_RESERVE", "512")).strip()
@@ -971,6 +1455,98 @@ def _compiled_verify_growth_reserve() -> int:
         return max(0, int(raw))
     except (TypeError, ValueError):
         return 512
+
+
+def _fixed_m4_initial_growth_reserve() -> int:
+    """Construction-time reserve for the strict Qwen4 fixed-M4 lane."""
+
+    if "MTPLX_COMPILED_VERIFY_GROWTH_RESERVE" in os.environ:
+        return _compiled_verify_growth_reserve()
+    return 1024
+
+
+_FIXED_M4_MAX_GROWTH_TOKENS = 16384
+
+
+def _next_fixed_m4_growth_tokens(current: int) -> int:
+    """Next construction-owned grant for an overrun fixed-M4 generation."""
+
+    current = max(1, int(current))
+    return min(
+        current * 2,
+        max(current, _FIXED_M4_MAX_GROWTH_TOKENS),
+    )
+
+
+def _fixed_m4_capacity_growth(
+    *,
+    capacity: int,
+    required_end: int,
+    growth_tokens: int,
+    capacity_limit: int | None,
+) -> tuple[int, int]:
+    """Resolve one host-boundary capacity transition and its next grant."""
+
+    next_capacity = max(
+        int(required_end),
+        int(capacity) + max(1, int(growth_tokens)),
+    )
+    if capacity_limit is not None:
+        next_capacity = max(
+            int(required_end),
+            min(next_capacity, int(capacity_limit)),
+        )
+    return next_capacity, _next_fixed_m4_growth_tokens(growth_tokens)
+
+
+def _post_restore_eager_rounds() -> int:
+    """Verify rounds routed eager after a large session-bank restore (opt-in).
+
+    A restored cache (clone or bank reference lease) arrives with exact-size
+    KV buffers, so the first compiled-route promotion ensure_capacity ->
+    mx.concatenate's the restored KV per full-attention layer before the
+    round can run. Deferring the first round(s) to eager moves that copy off
+    the TTFT path; promotion happens one round later, mid-stream.
+
+    DEFAULT 0 (off). Clean-room A/B 2026-08-06 (4k restore, fresh server):
+    the promotion copy measured sub-milliseconds at 4k context (the 08-05
+    turbo warm anomaly was dominated by first-shape-in-process compile
+    traces plus postcommit stacking, not the copy), while the deferral's
+    eager->compiled transition introduced one novel verify-shape trace
+    (~100-200ms once per process). Net: no receipt that the deferral helps
+    at agent-scale contexts, one measured cost. The copy grows linearly
+    with restored context (~2 GB at 32k), so the lever may still pay at
+    16k+ restores — enable via env and gate before flipping any default.
+    """
+
+    raw = os.environ.get(
+        "MTPLX_COMPILED_VERIFY_POST_RESTORE_EAGER_ROUNDS", ""
+    ).strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _post_restore_min_tokens() -> int:
+    """Restored-prefix size below which the post-restore deferral stays off.
+
+    Small restores copy little (a 512-token prefix is ~tens of MB across the
+    full-attention layers); the deferral only earns its round for mid/long
+    contexts where the concatenate cost is user-visible.
+    """
+
+    raw = os.environ.get(
+        "MTPLX_COMPILED_VERIFY_POST_RESTORE_MIN_TOKENS", ""
+    ).strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 2048
+    return 2048
 
 
 def _runtime_trunk_quant_bits(runtime: Any) -> int | None:
@@ -1104,15 +1680,59 @@ class CompiledVerifyBank:
         runtime: Any,
         *,
         max_verify_len: int | None = None,
+        request_max_tokens: int | None = None,
         capture_backend: str | None = None,
         parity: bool = False,
         parity2: bool = False,
+        restored_tokens: int = 0,
     ) -> None:
         self.runtime = runtime
         if max_verify_len is None:
             raw = os.environ.get("MTPLX_COMPILED_VERIFY_MAX_LEN", "").strip()
             max_verify_len = int(raw) if raw else 6
         self.max_verify_len = int(max_verify_len)
+        self.request_max_tokens = (
+            None if request_max_tokens is None else max(0, int(request_max_tokens))
+        )
+        self.speculative_headroom = (
+            self.max_verify_len if self.request_max_tokens is not None else 0
+        )
+        self.strict_no_fallback = bool(
+            getattr(runtime, "qwen4_fixed_m4_compiled_verify", False)
+        )
+        # Generic banks let the request budget only TIGHTEN the reserve; it
+        # never raises it past the env ceiling. Server requests default max_tokens to the
+        # whole remaining context window (~262k on a 256k model), and
+        # granting that verbatim made every request materialize a
+        # multi-gigabyte KV reserve across all promoted leaves at first
+        # promotion: +17 GB active / 44 GB peak, decode opening at ~13 tok/s
+        # for the first ~150 tokens of every turn, and 8.8x commit cost
+        # (2.4.0 short-turn regression, root-caused 2026-07-31). A bounded
+        # grant restores the growth-demotion contract below: agent-length
+        # rounds run fully compiled, longer generations demote to eager for
+        # the request remainder (measured flat vs eager-only). Explicit
+        # small budgets still reserve exactly budget + one speculative
+        # window; raise MTPLX_COMPILED_VERIFY_GROWTH_RESERVE to widen the
+        # stable-capacity generation. The construction-owned Qwen4 fixed-M4
+        # lane has its own 1K default, then grows and reinstalls its graph at
+        # capacity boundaries instead of demoting to eager. An explicit env
+        # reserve remains authoritative for both lanes.
+        reserve_ceiling = (
+            _fixed_m4_initial_growth_reserve()
+            if self.strict_no_fallback
+            else _compiled_verify_growth_reserve()
+        )
+        self.growth_reserve_tokens = (
+            min(
+                self.request_max_tokens + self.speculative_headroom,
+                max(
+                    reserve_ceiling,
+                    self.max_verify_len,
+                ),
+            )
+            if self.request_max_tokens is not None
+            else reserve_ceiling
+        )
         self.capture_backend = resolve_gdn_capture_backend(capture_backend)
         self.parity = bool(parity)
         self.parity2 = bool(parity2)
@@ -1121,11 +1741,52 @@ class CompiledVerifyBank:
                 "CompiledVerifyBank: parity and parity2 are mutually exclusive"
             )
         self.permanent_eager = False
+        self.permanent_eager_reason: str | None = None
+        compiled_verify_status["mode"] = (
+            "parity" if self.parity else ("parity2" if self.parity2 else "on")
+        )
+        compiled_verify_status["permanent_eager"] = False
         if not parity and not parity2 and not _compiled_verify_bits_gate_ok(runtime):
-            # Per-model promotion gate: only 4-bit affine trunks measured a
-            # win; q8 (Optimized-Quality) measured -15/-18% and stays eager.
+            # Per-model promotion gate: 4-bit and 8-bit affine trunks engage
+            # (both parity2-validated; q8's early -15/-18% reading predated
+            # the 2.4.0 compiled stack — measured 2026-07-31: q8 304/304
+            # compiled, 0 fallbacks, 41.3 tok/s at league parity). Unmeasured
+            # quantizations (e.g. the 6-bit 9B) stay eager.
             self.permanent_eager = True
+            self.permanent_eager_reason = (
+                f"quant_bits_gate:bits={_runtime_trunk_quant_bits(runtime)}"
+            )
+            _record_permanent_eager(self.permanent_eager_reason, once=True)
         self._capture_accepts_backend = _accepts_capture_backend(runtime)
+        capture_layout = getattr(runtime, "_mtplx_capture_layout", None)
+        self._capture_layout_override = (
+            None
+            if capture_layout is None
+            else tuple(str(name) for name in capture_layout)
+        )
+        self._extra_capture_layout = tuple(
+            (int(layer_index), tuple(str(name) for name in names))
+            for layer_index, names in tuple(
+                getattr(runtime, "_mtplx_capture_extra_layout", ()) or ()
+            )
+        )
+        prepare_aux = getattr(runtime, "prepare_compiled_verify_aux", None)
+        self._prepare_compiled_aux = prepare_aux if callable(prepare_aux) else None
+        build_fixed_aux = getattr(runtime, "build_fixed_m4_compiled_verify_aux", None)
+        self._build_fixed_m4_aux = (
+            build_fixed_aux if callable(build_fixed_aux) else None
+        )
+        commit_captures = getattr(runtime, "commit_compiled_verify_captures", None)
+        self._commit_compiled_captures = (
+            commit_captures if callable(commit_captures) else None
+        )
+        self._runtime_accepts_compiled_aux = _accepts_runtime_keyword(
+            runtime, "compiled_aux"
+        )
+        if self._prepare_compiled_aux is not None and not self._runtime_accepts_compiled_aux:
+            raise TypeError(
+                "compiled verify auxiliary preparation requires a compiled_aux input"
+            )
         self._compiled: dict[tuple[int, str, int], Any] = {}
         self._spec: list[tuple[int, str, int]] | None = None
         self._shadow: list[Any] | None = None
@@ -1133,18 +1794,43 @@ class CompiledVerifyBank:
         self._gdn_meta_cache: dict[int, dict[str, int] | None] = {}
         self._exception_failures = 0
         self._held_state_refs: list = []
-        # Growth-budget demotion (2026-07-03): dense leaves that outgrow the
-        # capacity granted at first promotion would retrace the compiled graph
-        # on every 256-token step (measured: 5 retraces per 1.3k-token answer,
-        # one 9.5s first-compile stall mid-generation at 7k). Once the request
-        # exhausts its growth budget the bank stays eager for the rest of the
-        # generation: agent-length rounds (<= ~500 tokens) run fully compiled,
-        # long chat generations pay zero retraces and zero padded-mask tax.
+        # The Qwen4 fixed-M4 lane installs one construction-owned replay plan
+        # after prompt prefill.  Production calls then bypass the generic
+        # eligibility, promotion, bucket, shadow, and fallback machinery.
+        # Parity modes intentionally stay on the generic dispatcher because
+        # they need its eager comparison paths.
+        self._fixed_m4_dispatch: dict[str, Any] | None = None
+        # Generic lanes demote when dense leaves outgrow the initial grant.
+        # The fixed-M4 lane instead performs explicit capacity-generation
+        # transitions while keeping its installed direct route.
         self._growth_demoted = False
+        # Per-call dispatch receipt.  Aggregate counters answer "how often";
+        # these fields answer the more important Route Tape question: which
+        # path served the most recent call.  Keep this on the bank so callers
+        # never have to infer execution from counter deltas.
+        self.last_dispatch_kind = "not_run"
+        self.last_fallback_reason: str | None = None
+        self.last_fallback_transition = False
+        self._growth_budget_fallback_reported = False
         self._dense_capacity_grant: dict[int, int] | None = None
+        # Post-restore warmup: a session-bank restore hands this generation
+        # exact-size KV buffers, so the first promotion concatenate-copies the
+        # whole restored context (see _post_restore_eager_rounds). Parity
+        # modes keep full compiled coverage for the exactness harnesses.
+        self._post_restore_eager_remaining = (
+            _post_restore_eager_rounds()
+            if (
+                int(restored_tokens or 0) >= _post_restore_min_tokens()
+                and not parity
+                and not parity2
+                and not self.strict_no_fallback
+            )
+            else 0
+        )
         self.stats: dict[str, Any] = {
             "calls": 0,
             "compiled_calls": 0,
+            "extended_calls": 0,
             "fallback_calls": 0,
             "fallback_reasons": {},
             "buckets": {},
@@ -1156,9 +1842,381 @@ class CompiledVerifyBank:
             "parity2_calls": 0,
             "parity2_divergent_calls": 0,
             "parity2_first_divergence": None,
+            "growth_demotions": 0,
+            "growth_handoff_materializations": 0,
+            "growth_handoff_state_leaves": 0,
+            "growth_handoff_materialize_time_s": 0.0,
+            "fixed_m4_capacity_transitions": 0,
+            "fixed_m4_route_transitions": 0,
         }
 
     # -- public API ---------------------------------------------------------
+
+    def last_dispatch_route(self, compiled_route: str = "compiled_bank") -> str:
+        """Return the actual route taken by the most recent public call."""
+        if self.last_dispatch_kind == "eager":
+            return f"bank_eager:{self.last_fallback_reason or 'unknown'}"
+        if self.last_dispatch_kind == "compiled":
+            return compiled_route
+        return "not_run"
+
+    def install_fixed_m4(
+        self,
+        cache: Any,
+        *,
+        prompt_ids,
+        hidden_variant: str | None,
+    ) -> None:
+        """Install the exact Qwen4 physical-M4 replay once after prefill."""
+
+        if not self.strict_no_fallback:
+            raise ValueError("fixed-M4 installation requires the Qwen4 runtime route")
+        if self.parity or self.parity2:
+            raise ValueError("fixed-M4 direct replay is disabled in parity modes")
+
+        class _M4Shape:
+            shape = (1, 4)
+
+        reason = self._fallback_reason(_M4Shape(), cache, True)
+        if reason is not None:
+            raise RuntimeError(f"qwen4 fixed-M4 installation refused: {reason}")
+        bucket = self._resolve_bucket(cache, 4)
+        if bucket != 0:
+            raise RuntimeError(
+                f"qwen4 fixed-M4 installation requires dense state; bucket={bucket}"
+            )
+        self._ensure_shadow(cache)
+        state_plan = tuple(
+            (kind, cache[idx], n_leaves)
+            for idx, kind, n_leaves in self._spec or ()
+        )
+        if not state_plan or any(
+            kind not in (VERIFY_SPEC_KIND_QSA, VERIFY_SPEC_KIND_GDN)
+            for kind, _entry, _n in state_plan
+        ):
+            raise RuntimeError("qwen4 fixed-M4 installation found unsupported state")
+        qsa_entries = tuple(
+            entry for kind, entry, _n in state_plan if kind == VERIFY_SPEC_KIND_QSA
+        )
+        if not qsa_entries:
+            raise RuntimeError("qwen4 fixed-M4 installation found no QSA state")
+        route_key = int(all(entry.fixed_rows_gather for entry in qsa_entries))
+        key = (4, str(hidden_variant or ""), route_key)
+        fn = self._compiled.get(key)
+        if fn is None:
+            fn = self._shared_or_new_verify_step(key, 4, hidden_variant)
+            self._compiled[key] = fn
+        pending_route_thresholds = tuple(
+            entry.rows_gather_min_context
+            for entry in qsa_entries
+            if entry.rows_gather_enabled and not entry.fixed_rows_gather
+        )
+
+        capture_plan = []
+        capture_pos = 0
+        for idx, names in self._extra_capture_layout:
+            capture_plan.append((cache[idx], capture_pos, len(names)))
+            capture_pos += len(names)
+
+        boundary = _compiled_verify_boundary()
+        if self._build_fixed_m4_aux is not None and boundary in ("both", "pre"):
+            prepare_aux = self._build_fixed_m4_aux(cache, prompt_ids)
+            aux_route = "staged_sidecar"
+            aux_inputs = "host_ledger"
+        else:
+            prepare_aux = partial(
+                _prepare_fixed_m4_materialized,
+                self._prepare_compiled_aux,
+                cache,
+            )
+            aux_route = "materialized"
+            aux_inputs = "device_history"
+        from .models.qwen4_exp import _qsa_stock_rows_gather_kv
+
+        kv_gather = (
+            "fused_m4"
+            if any(
+                kind == VERIFY_SPEC_KIND_QSA
+                and entry.rows_gather_kv_m4 is not _qsa_stock_rows_gather_kv
+                for kind, entry, _n in state_plan
+            )
+            else "stock"
+        )
+        initial_growth_tokens = max(
+            self.max_verify_len,
+            self.growth_reserve_tokens,
+        )
+        capacity_limit = (
+            None
+            if self.request_max_tokens is None
+            else (
+                len(prompt_ids)
+                + self.request_max_tokens
+                + self.speculative_headroom
+            )
+        )
+        self._fixed_m4_dispatch = {
+            "fn": fn,
+            "prepare_aux": prepare_aux,
+            "aux_route": aux_route,
+            "aux_inputs": aux_inputs,
+            "kv_gather": kv_gather,
+            "state_plan": state_plan,
+            "state_leaves": sum(n for _kind, _entry, n in state_plan),
+            "capture_plan": tuple(capture_plan),
+            "capture_leaves": capture_pos,
+            "boundary": boundary,
+            "base_offset": len(prompt_ids),
+            "capacity": min(entry.capacity for entry in qsa_entries),
+            "growth_tokens": _next_fixed_m4_growth_tokens(
+                initial_growth_tokens
+            ),
+            "capacity_limit": capacity_limit,
+            "hidden_variant": hidden_variant,
+            "qsa_entries": qsa_entries,
+            "route_transition_at": (
+                min(pending_route_thresholds)
+                if pending_route_thresholds
+                else None
+            ),
+            "donate": (
+                _compiled_verify_donation_enabled()
+                and boundary in ("both", "post")
+            ),
+        }
+        # Engagement receipt (counters law): the request report carries the
+        # bound auxiliary route (to_dict -> compiled_verify.fixed_m4) and the
+        # first installs per process announce it in the serve log, so an A/B
+        # can prove the staged sidecar lane ran rather than the materialized
+        # PLE embedding.
+        global _FIXED_M4_INSTALL_RECEIPTS
+        if _FIXED_M4_INSTALL_RECEIPTS < 3:
+            _FIXED_M4_INSTALL_RECEIPTS += 1
+            print(
+                "[qwen4-fixed-M4-verify] replay installed: "
+                f"aux={aux_route} inputs={aux_inputs} boundary={boundary} "
+                f"donate={self._fixed_m4_dispatch['donate']} kv_gather={kv_gather}",
+                flush=True,
+            )
+
+    def reserve_fixed_m4_window(
+        self,
+        cache: Any,
+        *,
+        committed_count: int | None = None,
+        window_tokens: int = 4,
+    ) -> None:
+        """Reserve every target write into an installed fixed-capacity bank.
+
+        D1/D2 and copy windows use these same buffers even when their forward
+        runs eager. They must renew capacity before writing, too. Generation
+        supplies its host ledger to avoid a device sync; standalone callers
+        without that ledger use the live cache offset. Generic banks are
+        unchanged. Keep four rows reserved for a possible lazy bonus write.
+        """
+
+        dispatch = self._fixed_m4_dispatch
+        if dispatch is None:
+            return
+        logical_start = (
+            int(dispatch["base_offset"]) + max(0, int(committed_count))
+            if committed_count is not None
+            else dispatch["qsa_entries"][0].size()
+        )
+        required_end = logical_start + max(4, int(window_tokens))
+        capacity_needed = required_end > int(dispatch["capacity"])
+        route_transition_at = dispatch["route_transition_at"]
+        route_needed = (
+            route_transition_at is not None
+            and required_end >= int(route_transition_at)
+        )
+        if not capacity_needed and not route_needed:
+            return
+
+        qsa_entries = dispatch["qsa_entries"]
+        capacity_changed = False
+        next_growth_tokens = int(dispatch["growth_tokens"])
+        if capacity_needed:
+            next_capacity, next_growth_tokens = _fixed_m4_capacity_growth(
+                capacity=int(dispatch["capacity"]),
+                required_end=required_end,
+                growth_tokens=int(dispatch["growth_tokens"]),
+                capacity_limit=dispatch["capacity_limit"],
+            )
+            for entry in qsa_entries:
+                capacity_changed = (
+                    entry.ensure_capacity(next_capacity) or capacity_changed
+                )
+        route_changed = False
+        if route_needed:
+            for entry in qsa_entries:
+                route_changed = (
+                    entry.activate_rows_gather(required_end) or route_changed
+                )
+            pending_route_thresholds = tuple(
+                entry.rows_gather_min_context
+                for entry in qsa_entries
+                if entry.rows_gather_enabled and not entry.fixed_rows_gather
+            )
+            dispatch["route_transition_at"] = (
+                min(pending_route_thresholds)
+                if pending_route_thresholds
+                else None
+            )
+        if not capacity_changed and not route_changed:
+            return
+
+        self._clear_shadow_leaf_refs()
+        self._held_state_refs.clear()
+        self._shadow = None
+        self._shadow_signature = None
+        self._ensure_shadow(cache)
+        route_key = int(all(entry.fixed_rows_gather for entry in qsa_entries))
+        key = (4, str(dispatch["hidden_variant"] or ""), route_key)
+        fn = self._compiled.get(key)
+        if fn is None:
+            fn = self._shared_or_new_verify_step(
+                key,
+                4,
+                dispatch["hidden_variant"],
+            )
+            self._compiled[key] = fn
+        dispatch["fn"] = fn
+        dispatch["capacity"] = min(entry.capacity for entry in qsa_entries)
+        if capacity_changed:
+            dispatch["growth_tokens"] = next_growth_tokens
+            self.stats["fixed_m4_capacity_transitions"] += 1
+        if route_changed:
+            # Receipt refresh: the rows-gather activation may have bound the
+            # fused kernel, so the request report must not keep carrying the
+            # install-time gather label.
+            from .models.qwen4_exp import _qsa_stock_rows_gather_kv
+
+            dispatch["kv_gather"] = (
+                "fused_m4"
+                if any(
+                    entry.rows_gather_kv_m4 is not _qsa_stock_rows_gather_kv
+                    for entry in qsa_entries
+                )
+                else "stock"
+            )
+            self.stats["fixed_m4_route_transitions"] += 1
+
+    def _forward_installed_fixed_m4(
+        self,
+        input_ids,
+        host_input_ids,
+        completion_tokens,
+        committed_count: int,
+        cache: Any,
+    ):
+        dispatch = self._fixed_m4_dispatch
+        assert dispatch is not None
+        self.reserve_fixed_m4_window(
+            cache,
+            committed_count=committed_count,
+        )
+        boundary = dispatch["boundary"]
+        donate = dispatch["donate"]
+        if donate:
+            self._clear_shadow_leaf_refs()
+
+        state_in: list[Any] = []
+        for kind, entry, n_leaves in dispatch["state_plan"]:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                state_in.extend(
+                    (
+                        entry.kv.cache[0],
+                        entry.kv.cache[1],
+                        entry.kv.cache[2],
+                        entry.raw_keys,
+                        entry.pooled,
+                    )
+                )
+            else:
+                state_in.extend(entry.cache[:n_leaves])
+
+        compiled_aux = dispatch["prepare_aux"](
+            input_ids,
+            host_input_ids,
+            completion_tokens,
+            committed_count,
+        )
+        if boundary in ("both", "pre"):
+            mx.async_eval(compiled_aux, *state_in)
+        outputs = dispatch["fn"](input_ids, compiled_aux, *state_in)
+
+        capture_end = 2 + dispatch["capture_leaves"]
+        logits, hidden = outputs[:2]
+        captures_flat = outputs[2:capture_end]
+        state_out = outputs[capture_end:]
+
+        if not donate and boundary in ("both", "post"):
+            mx.async_eval(*outputs)
+            self._held_state_refs.clear()
+        elif not donate:
+            self._held_state_refs.append(state_in)
+            if len(self._held_state_refs) > 3:
+                self._held_state_refs.pop(0)
+
+        state_pos = 0
+        for kind, entry, n_leaves in dispatch["state_plan"]:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                entry.kv.cache[0] = state_out[state_pos]
+                entry.kv.cache[1] = state_out[state_pos + 1]
+                entry.kv.cache[2] = state_out[state_pos + 2]
+                entry.raw_keys = state_out[state_pos + 3]
+                entry.pooled = state_out[state_pos + 4]
+                for slot in range(len(entry.kv.rollback_state)):
+                    entry.kv.rollback_state[slot] = None
+            else:
+                for slot in range(n_leaves):
+                    entry.cache[slot] = state_out[state_pos + slot]
+            state_pos += n_leaves
+
+        for entry, start, count in dispatch["capture_plan"]:
+            entry._mtplx_verify_rows = tuple(captures_flat[start : start + 6])
+            if count > 6:
+                entry._mtplx_verify_ple = tuple(
+                    captures_flat[start + 6 : start + count]
+                )
+
+        if donate:
+            state_in = None
+            self._held_state_refs.clear()
+            mx.async_eval(*outputs)
+
+        # Route Tape receipt (main contract): the installed replay is a
+        # compiled dispatch, so last_dispatch_route() reports it as such.
+        self.last_dispatch_kind = "compiled"
+        self.last_fallback_reason = None
+        self.last_fallback_transition = False
+        self.stats["compiled_calls"] += 1
+        self.stats["buckets"]["0"] = self.stats["buckets"].get("0", 0) + 1
+        return logits, hidden, {}
+
+    def forward_fixed_m4(
+        self,
+        input_ids,
+        *,
+        host_input_ids,
+        completion_tokens,
+        committed_count: int,
+        cache,
+        return_hidden: bool = True,
+        hidden_variant: str | None = None,
+    ):
+        """Run the installed physical-M4 route with host-owned n-gram inputs."""
+
+        del return_hidden, hidden_variant
+        self.stats["calls"] += 1
+        return self._forward_installed_fixed_m4(
+            input_ids,
+            host_input_ids,
+            completion_tokens,
+            committed_count,
+            cache,
+        )
 
     def forward_ar_capture(
         self,
@@ -1167,40 +2225,127 @@ class CompiledVerifyBank:
         cache=None,
         return_hidden: bool = True,
         hidden_variant: str | None = None,
+        extended_window: bool = False,
+        committed_count: int | None = None,
     ):
+        """Compiled verify dispatch.
+
+        ``extended_window`` (context-copy block rounds, 2026-08-26 v2) admits
+        lengths above ``max_verify_len`` up to ``MTPLX_CCOPY_BANK_MAX_LEN``.
+        The extended lane changes ROUTING only, never the request's memory
+        contract: the speculative reserve stays keyed to ``max_verify_len``,
+        a dense-capacity preflight refuses (falls back eager) instead of
+        growing a granted KV leaf, and paged capacity overflow falls back as
+        before.  ``_paged_ineligibility`` is skipped for extended lengths:
+        that gate is a performance router for windows whose eager alternative
+        is cheap, while a block round's eager alternative costs ~380 ms flat
+        at long context (MEASUREMENTS 2026-08-25 11:26) — inside the traced
+        graph the paged kernel declining is shape-deterministic and routes to
+        the same dense math the eager forward takes at the same T, so
+        exactness is unaffected either way.
+        """
         global _PREWARM_DONE
+        if self._fixed_m4_dispatch is not None:
+            self.stats["calls"] += 1
+            self.reserve_fixed_m4_window(
+                cache,
+                committed_count=committed_count,
+                window_tokens=_decode_length(input_ids),
+            )
+            if _decode_length(input_ids) == 4:
+                # Without host-owned n-gram inputs (any caller other than the
+                # generation loop's forward_fixed_m4 entrypoint, for example a
+                # bank-routed copy block of the same width) the installed
+                # replay cannot run. Main's bank contract is to refuse
+                # internally and take the identical runtime forward, so route
+                # the call eager and let the Route Tape show it.
+                self.last_dispatch_kind = "eager"
+                self.last_fallback_reason = "fixed_m4_host_inputs_missing"
+                self.last_fallback_transition = False
+                return self._runtime_forward(
+                    input_ids,
+                    cache=cache,
+                    return_hidden=return_hidden,
+                    hidden_variant=hidden_variant,
+                )
+            # Shorter adaptive windows take the normal family capture route.
+            # Not a fallback (no counter), but the Route Tape must still
+            # see that this call ran eager through the bank.
+            self.last_dispatch_kind = "eager"
+            self.last_fallback_reason = "fixed_m4_short_window"
+            self.last_fallback_transition = False
+            return self._runtime_forward(
+                input_ids,
+                cache=cache,
+                return_hidden=return_hidden,
+                hidden_variant=hidden_variant,
+            )
         if (
             not _PREWARM_DONE
             and not self.parity
             and not self.parity2
+            and not extended_window
             and _prewarm_enabled()
         ):
-            # First compiled dispatch of the process (normally the startup
-            # warmup generation): walk the PAGED bucket ladder once so those
-            # graphs (and their Metal pipelines) exist before any user-facing
-            # generation — paged bucket crossings were the bulk of the −28%
-            # unrouted long-form cost (MEASUREMENTS 2026-07-02). On the dense
-            # path this is a deliberate no-op ("no_paged_entries"): dense KV
+            # First compiled dispatch of a generation while coverage is
+            # incomplete (the first one of the process is normally the
+            # startup warmup generation): walk the PAGED bucket ladder so
+            # those graphs (and their Metal pipelines) exist before any
+            # user-facing generation — paged bucket crossings were the bulk
+            # of the −28% unrouted long-form cost (MEASUREMENTS 2026-07-02).
+            # On the dense path this is a deliberate no-op
+            # ("no_paged_entries", marks the walk complete): dense KV
             # retraces every 256 tokens of growth (5 traces per 1.3k-token
             # chat answer, measured 2026-07-02 21:25) and pre-walking ~24
             # shape classes to 6k is startup-prohibitive — the designed fix
             # there is pow2-bucketized dense leaves, not a longer prewarm.
-            _PREWARM_DONE = True
-            report = self.prewarm_ladder(
-                cache, input_ids, hidden_variant=hidden_variant
-            )
-            self.stats["prewarm"] = report
+            # F6 (2026-08-16): a walk CLAMPED by the current cache's paged
+            # capacity (the 16-token boot warmup) no longer spends the
+            # one-shot — later generations with more capacity (the server
+            # warmup ladder rungs) extend the walk over the still-missing
+            # buckets, so their compiles land in warmup, not in measured
+            # rows. The walk is best-effort by design: a failure is
+            # recorded visibly and the organic dispatch below handles the
+            # same condition through its own fallback accounting.
             try:
-                import json as _json
-
-                print(
-                    "[mtplx] compiled-verify prewarm " + _json.dumps(report),
-                    flush=True,
+                report = self.prewarm_ladder(
+                    cache, input_ids, hidden_variant=hidden_variant
                 )
-            except Exception:
-                pass
+            except Exception as exc:  # visible, never fatal (see docstring)
+                report = {
+                    "buckets": [],
+                    "skipped": [f"walk_error:{type(exc).__name__}"],
+                    "elapsed_s": 0.0,
+                    "complete": False,
+                }
+            self.stats["prewarm"] = report
+            _PREWARM_DONE = bool(report.get("complete"))
+            prewarm_status["done"] = _PREWARM_DONE
+            prewarm_status["walks"] = int(prewarm_status.get("walks", 0)) + 1
+            prewarm_status["last_report"] = report
+            prewarm_status["buckets"] = sorted(
+                {bucket for _rt, _len, _var, bucket in _PREWARMED_BUCKETS}
+            )
+            if report.get("buckets") or int(prewarm_status["walks"]) == 1:
+                # One line per walk that actually compiled something (plus
+                # the first walk of the process); silent no-op retries stay
+                # off the console.
+                try:
+                    import json as _json
+
+                    print(
+                        "[mtplx] compiled-verify prewarm " + _json.dumps(report),
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+        self.last_dispatch_kind = "compiled"
+        self.last_fallback_reason = None
+        self.last_fallback_transition = False
         self.stats["calls"] += 1
-        reason = self._fallback_reason(input_ids, cache, return_hidden)
+        reason = self._fallback_reason(
+            input_ids, cache, return_hidden, extended_window=extended_window
+        )
         if reason is not None:
             return self._fallback(
                 input_ids,
@@ -1232,15 +2377,18 @@ class CompiledVerifyBank:
                     hidden_variant=hidden_variant,
                     reason="context_above_threshold",
                 )
-            ineligible = self._paged_ineligibility(cache, length, bucket)
-            if ineligible is not None:
-                return self._fallback(
-                    input_ids,
-                    cache=cache,
-                    return_hidden=return_hidden,
-                    hidden_variant=hidden_variant,
-                    reason=ineligible,
-                )
+            if not (extended_window and length > self.max_verify_len):
+                # Extended block windows skip this performance router (see
+                # the method docstring); every other call keeps it verbatim.
+                ineligible = self._paged_ineligibility(cache, length, bucket)
+                if ineligible is not None:
+                    return self._fallback(
+                        input_ids,
+                        cache=cache,
+                        return_hidden=return_hidden,
+                        hidden_variant=hidden_variant,
+                        reason=ineligible,
+                    )
             self._ensure_shadow(cache)
             self._apply_bucket(cache, bucket)
             # Boundary policy (experiment knob, 2026-07-02 sprint):
@@ -1286,9 +2434,21 @@ class CompiledVerifyBank:
                     hidden_variant=hidden_variant,
                     reason="empty_state_leaf",
                 )
+            compiled_aux = (
+                self._prepare_compiled_aux(input_ids, cache)
+                if self._prepare_compiled_aux is not None
+                else None
+            )
             if boundary in ("both", "pre"):
-                mx.async_eval(*state_in)
-            outputs = fn(input_ids, *state_in)
+                mx.async_eval(
+                    *((compiled_aux,) if compiled_aux is not None else ()),
+                    *state_in,
+                )
+            outputs = (
+                fn(input_ids, compiled_aux, *state_in)
+                if compiled_aux is not None
+                else fn(input_ids, *state_in)
+            )
             logits, hidden, captures_flat, state_out = self._unpack_outputs(outputs)
             if donate:
                 # A2.1 commit-first ownership handoff — commit + schedule
@@ -1311,8 +2471,15 @@ class CompiledVerifyBank:
                     self._held_state_refs.pop(0)
         except Exception as exc:
             self._exception_failures += 1
+            compiled_verify_status["transient_exception_count"] = (
+                int(compiled_verify_status.get("transient_exception_count", 0)) + 1
+            )
             if self._exception_failures >= 3:
                 self.permanent_eager = True
+                self.permanent_eager_reason = (
+                    f"exception_streak:{type(exc).__name__}"
+                )
+                _record_permanent_eager(self.permanent_eager_reason)
             return self._fallback(
                 input_ids,
                 cache=cache,
@@ -1322,6 +2489,8 @@ class CompiledVerifyBank:
             )
         self._exception_failures = 0
         self.stats["compiled_calls"] += 1
+        if extended_window and length > self.max_verify_len:
+            self.stats["extended_calls"] += 1
         bucket_key = str(int(bucket))
         self.stats["buckets"][bucket_key] = self.stats["buckets"].get(bucket_key, 0) + 1
         captures = self._rebuild_captures(captures_flat)
@@ -1330,6 +2499,7 @@ class CompiledVerifyBank:
                 input_ids,
                 cache=cache,
                 hidden_variant=hidden_variant,
+                compiled_aux=compiled_aux,
                 state_in=state_in,
                 compiled_logits=logits,
                 compiled_hidden=hidden,
@@ -1341,6 +2511,7 @@ class CompiledVerifyBank:
                 input_ids,
                 cache=cache,
                 hidden_variant=hidden_variant,
+                compiled_aux=compiled_aux,
                 bucket=int(bucket),
                 compiled_logits=logits,
                 compiled_hidden=hidden,
@@ -1348,6 +2519,8 @@ class CompiledVerifyBank:
                 compiled_state_out=state_out,
             )
         self._mirror_commit(cache, state_out)
+        if self._commit_compiled_captures is not None:
+            self._commit_compiled_captures(cache, captures)
         if donate:
             # A2.1 commit-first ownership handoff: the real cache is already
             # rebound to the output leaves, so dropping the dispatcher's
@@ -1386,8 +2559,23 @@ class CompiledVerifyBank:
         to its natural value before returning. Failures are recorded per
         bucket and never flip ``permanent_eager`` — a bucket that cannot
         prewarm simply pays its organic compile later.
+
+        ``report["complete"]`` is the one-shot verdict (F6): True when no
+        future walk could add coverage (the ladder reached the router
+        ceiling, or the cache is structurally ladder-free), False when the
+        walk was clamped by the current cache's paged capacity or skipped
+        for a transient reason — the trigger then retries on a later
+        generation whose cache reaches further. Buckets warmed by earlier
+        walks are skipped (``report["already"]``), so a retry with nothing
+        new to add costs a few python comparisons.
         """
-        report: dict[str, Any] = {"buckets": [], "skipped": [], "elapsed_s": 0.0}
+        report: dict[str, Any] = {
+            "buckets": [],
+            "skipped": [],
+            "already": [],
+            "elapsed_s": 0.0,
+            "complete": False,
+        }
         started = time.perf_counter()
 
         def _finish() -> dict[str, Any]:
@@ -1395,9 +2583,14 @@ class CompiledVerifyBank:
             return report
 
         if self.permanent_eager:
+            # Structural for this process/model (quant gate) or already a
+            # terminal degradation — nothing a later walk could add.
             report["skipped"].append("permanent_eager")
+            report["complete"] = True
             return _finish()
-        reason = self._fallback_reason(input_ids, cache, True)
+        reason = self._fallback_reason(
+            input_ids, cache, True, consume_post_restore=False
+        )
         if reason is not None:
             report["skipped"].append(reason)
             return _finish()
@@ -1411,6 +2604,9 @@ class CompiledVerifyBank:
             report["skipped"].append(
                 "capacity_overflow" if natural is None else "no_paged_entries"
             )
+            # Dense caches have no paged bucket ladder by design (see the
+            # trigger comment): the walk is complete, not clamped.
+            report["complete"] = natural is not None
             return _finish()
         boundary = (
             int(max_context)
@@ -1431,6 +2627,13 @@ class CompiledVerifyBank:
                 cap = int(entry.capacity)
                 min_capacity = cap if min_capacity is None else min(min_capacity, cap)
         ceiling = _next_pow2(boundary + length + 512)
+        if int(natural) > ceiling:
+            # This call's context is already above the compiled-verify
+            # router: every dispatch of this generation falls back per call
+            # ("context_above_threshold"), so walking (and compiling) its
+            # bucket would burn ~1s on a graph no compiled row can use.
+            report["skipped"].append("context_above_router")
+            return _finish()
         ladder: list[int] = []
         bucket = int(natural)
         while True:
@@ -1443,21 +2646,45 @@ class CompiledVerifyBank:
             if bucket >= ceiling:
                 break
             bucket *= 2
+        # Complete = the ladder reached the router ceiling. A walk clamped
+        # below it by min_capacity leaves the one-shot unspent so a later,
+        # larger cache (server warmup ladder rungs) extends the coverage.
+        report["complete"] = bool(ladder) and int(ladder[-1]) >= ceiling
+        variant_key = str(hidden_variant or "")
+        runtime_id = id(self.runtime)
+        pending = [
+            bucket
+            for bucket in ladder
+            if (runtime_id, length, variant_key, int(bucket))
+            not in _PREWARMED_BUCKETS
+        ]
+        report["already"] = [
+            int(bucket) for bucket in ladder if bucket not in pending
+        ]
+        if not pending:
+            return _finish()
         self._ensure_shadow(cache)
         state_in = self._read_state_leaves(cache)
         if state_in is None:
             report["skipped"].append("empty_state_leaf")
+            report["complete"] = False
             return _finish()
-        for bucket in ladder:
+        for bucket in pending:
             if self._paged_ineligibility(cache, length, bucket) is not None:
                 report["skipped"].append(f"b{bucket}:paged_kernel_ineligible")
                 continue
             try:
                 self._apply_bucket(cache, bucket)
-                key = (length, str(hidden_variant or ""), int(bucket))
+                key = (length, variant_key, int(bucket))
                 fn = self._compiled.get(key)
                 if fn is None:
-                    fn = mx.compile(self._make_verify_step(length, hidden_variant))
+                    # Shared-registry compile (F6): a bare per-bank
+                    # mx.compile primed the Metal pipelines but kept the
+                    # trace private to the warmup bank, so the first real
+                    # request at the same shapes re-traced every bucket
+                    # (~1s each) inside its measured row. The shared step
+                    # is exactly what organic dispatch consults.
+                    fn = self._shared_or_new_verify_step(key, length, hidden_variant)
                     self._compiled[key] = fn
                 bucket_started = time.perf_counter()
                 outputs = fn(input_ids, *state_in)
@@ -1471,6 +2698,7 @@ class CompiledVerifyBank:
                         "s": round(time.perf_counter() - bucket_started, 3),
                     }
                 )
+                _PREWARMED_BUCKETS.add((runtime_id, length, variant_key, int(bucket)))
             except Exception as exc:
                 report["skipped"].append(f"b{bucket}:{type(exc).__name__}")
         try:
@@ -1480,6 +2708,153 @@ class CompiledVerifyBank:
         except Exception:
             pass
         return _finish()
+
+    def prewarm_extended_lengths(
+        self,
+        cache: Any,
+        lengths: list[int],
+        *,
+        hidden_variant: str | None = None,
+    ) -> dict[str, Any]:
+        """Trace the extended (context-copy block) windows ahead of use.
+
+        Optional, driven by ``MTPLX_CCOPY_BANK_PREWARM`` at the ccopy site.
+        Without it the first block round per (length, bucket) pays the fresh
+        ``mx.compile`` trace organically — once per PROCESS (shared traces),
+        which was the recurring-looking "~240 ms/call" in the 8-round v1 cell
+        (one ~1s first-trace amortized over 8 rounds; the dispatch layer
+        itself re-clones nothing, probe receipts 2026-08-26). A/B cells that
+        time steady-state block rounds should enable this so first-trace cost
+        lands in warmup, not in a measured row.
+
+        Same firewall economics as ``prewarm_ladder``: the compiled function
+        is pure, outputs are dropped and never mirror-committed, so the live
+        cache is untouched. The dry run cannot donate its input buffers (the
+        real cache still holds every leaf), so each traced length transiently
+        materializes one copy of the full-attn KV set — the same one-time
+        copy the first organic call of a generation pays.
+        """
+        report: dict[str, Any] = {"lengths": [], "skipped": [], "elapsed_s": 0.0}
+        started = time.perf_counter()
+
+        def _finish() -> dict[str, Any]:
+            report["elapsed_s"] = round(time.perf_counter() - started, 3)
+            self.stats["extended_prewarm"] = report
+            return report
+
+        if self.permanent_eager or self.parity or self.parity2:
+            report["skipped"].append("bank_mode")
+            return _finish()
+        ceiling = max(self.max_verify_len, _ccopy_bank_max_len())
+        variant_key = str(hidden_variant or "")
+        runtime_id = id(self.runtime)
+        for length in sorted({int(item) for item in lengths}):
+            if length <= self.max_verify_len or length > ceiling:
+                report["skipped"].append(f"m{length}:outside_extended_window")
+                continue
+            probe = mx.zeros((1, length), dtype=mx.int32)
+            reason = self._fallback_reason(
+                probe,
+                cache,
+                True,
+                consume_post_restore=False,
+                extended_window=True,
+            )
+            if reason is not None:
+                report["skipped"].append(f"m{length}:{reason}")
+                continue
+            try:
+                bucket = self._resolve_bucket(cache, length)
+                if bucket is None:
+                    report["skipped"].append(f"m{length}:capacity_overflow")
+                    continue
+                if (
+                    runtime_id,
+                    length,
+                    variant_key,
+                    int(bucket),
+                ) in _PREWARMED_BUCKETS:
+                    report["skipped"].append(f"m{length}:already")
+                    continue
+                self._ensure_shadow(cache)
+                self._apply_bucket(cache, bucket)
+                state_in = self._read_state_leaves(cache)
+                if state_in is None:
+                    report["skipped"].append(f"m{length}:empty_state_leaf")
+                    continue
+                key = (length, variant_key, int(bucket))
+                fn = self._compiled.get(key)
+                if fn is None:
+                    fn = self._shared_or_new_verify_step(key, length, hidden_variant)
+                    self._compiled[key] = fn
+                length_started = time.perf_counter()
+                outputs = fn(probe, *state_in)
+                mx.eval(*outputs)
+                report["lengths"].append(
+                    {
+                        "m": int(length),
+                        "bucket": int(bucket),
+                        "s": round(time.perf_counter() - length_started, 3),
+                    }
+                )
+                _PREWARMED_BUCKETS.add((runtime_id, length, variant_key, int(bucket)))
+            except Exception as exc:
+                report["skipped"].append(f"m{length}:{type(exc).__name__}")
+        try:
+            # Politeness restore (mirrors prewarm_ladder): an eager forward
+            # between this walk and the next dispatch should see a natural
+            # static ceiling, not the last extended length's. Any ceiling
+            # >= offset + T is topology-valid, and dispatch re-applies its
+            # own bucket before every compiled call.
+            restored = self._resolve_bucket(cache, 1)
+            if restored:
+                self._apply_bucket(cache, restored)
+        except Exception:
+            pass
+        return _finish()
+
+    def _materialize_growth_handoff_state(self, cache: Any) -> int:
+        """Settle compiled state before the eager tail takes ownership.
+
+        Compiled dispatch schedules every output asynchronously. Merely
+        replacing the tensor-offset cache containers leaves their KV and
+        recurrent leaves attached to that deferred graph. The eager tail then
+        inherits the compiled dependency chain, so long generations pay the
+        old work through later verify-output evaluations instead of crossing a
+        clean ownership boundary.
+
+        Growth demotion is a once-per-request transition. Evaluate the current
+        state exactly once here, while the compiled state spec is still valid,
+        then let ``demote`` replace the containers and release compiled refs.
+        """
+        state = self._read_state_leaves(cache)
+        if state is None:
+            raise RuntimeError(
+                "compiled verify growth handoff has incomplete cache state"
+            )
+        leaves: list[mx.array] = []
+        seen: set[int] = set()
+        for leaf in state:
+            if not isinstance(leaf, mx.array):
+                continue
+            identity = id(leaf)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            leaves.append(leaf)
+        started = time.perf_counter()
+        if leaves:
+            mx.eval(*leaves)
+        self.stats["growth_handoff_materializations"] = (
+            int(self.stats.get("growth_handoff_materializations", 0)) + 1
+        )
+        self.stats["growth_handoff_state_leaves"] = (
+            int(self.stats.get("growth_handoff_state_leaves", 0)) + len(leaves)
+        )
+        self.stats["growth_handoff_materialize_time_s"] = float(
+            self.stats.get("growth_handoff_materialize_time_s", 0.0)
+        ) + (time.perf_counter() - started)
+        return len(leaves)
 
     def demote(self, cache: Any) -> int:
         """Restore stock containers for every tensor-offset adapter in place.
@@ -1493,7 +2868,10 @@ class CompiledVerifyBank:
             TensorOffsetVllmMetalPagedKVCache = None
         count = 0
         for idx, entry in enumerate(cache or []):
-            if isinstance(entry, TensorOffsetKVCache):
+            if isinstance(entry, TensorOffsetQSACache):
+                cache[idx] = entry.demote()
+                count += 1
+            elif isinstance(entry, TensorOffsetKVCache):
                 cache[idx] = entry.demote()
                 count += 1
             elif TensorOffsetVllmMetalPagedKVCache is not None and isinstance(
@@ -1505,6 +2883,8 @@ class CompiledVerifyBank:
             self.stats["demotions"] += count
             # Container identity changed; compiled closures bound the old
             # shadow, which no longer mirrors the cache list.
+            self._clear_shadow_leaf_refs()
+            self._held_state_refs.clear()
             self._shadow = None
             self._shadow_signature = None
             self._spec = None
@@ -1524,18 +2904,51 @@ class CompiledVerifyBank:
         else:
             data["mode"] = "parity" if self.parity else "on"
         data["max_verify_len"] = self.max_verify_len
+        data["request_max_tokens"] = self.request_max_tokens
+        data["speculative_headroom"] = self.speculative_headroom
+        data["growth_reserve_tokens"] = self.growth_reserve_tokens
         data["capture_backend"] = self.capture_backend
         data["permanent_eager"] = self.permanent_eager
+        data["permanent_eager_reason"] = getattr(
+            self, "permanent_eager_reason", None
+        )
         data["compiled_entry_count"] = len(self._compiled)
         data["compiled_keys"] = [
             f"m{length}:{variant or 'default'}:b{bucket}"
             for length, variant, bucket in sorted(self._compiled)
         ]
+        dispatch = self._fixed_m4_dispatch
+        if dispatch is not None:
+            data["fixed_m4"] = {
+                "installed": True,
+                "aux_route": dispatch["aux_route"],
+                "aux_inputs": dispatch["aux_inputs"],
+                "kv_gather": dispatch["kv_gather"],
+                "boundary": dispatch["boundary"],
+                "donate": bool(dispatch["donate"]),
+                "state_leaves": int(dispatch["state_leaves"]),
+                "capture_leaves": int(dispatch["capture_leaves"]),
+                # Growth receipts: the installed bank's prompt offset, its
+                # current QSA capacity and the next grant. Read together with
+                # the fixed_m4_capacity_transitions counter they prove that a
+                # request outgrew its first grant and stayed on the lane.
+                "base_offset": int(dispatch["base_offset"]),
+                "capacity": int(dispatch["capacity"]),
+                "growth_tokens": int(dispatch["growth_tokens"]),
+            }
         return data
 
     # -- dispatch preconditions ----------------------------------------------
 
-    def _fallback_reason(self, input_ids, cache, return_hidden: bool) -> str | None:
+    def _fallback_reason(
+        self,
+        input_ids,
+        cache,
+        return_hidden: bool,
+        *,
+        consume_post_restore: bool = True,
+        extended_window: bool = False,
+    ) -> str | None:
         if self.permanent_eager:
             return "permanent_eager"
         if not return_hidden:
@@ -1548,8 +2961,38 @@ class CompiledVerifyBank:
         length = int(shape[1])
         if length < 1:
             return "invalid_length"
-        if length > self.max_verify_len:
+        window_ceiling = (
+            max(self.max_verify_len, _ccopy_bank_max_len())
+            if extended_window
+            else self.max_verify_len
+        )
+        if length > window_ceiling:
             return "length_outside_bank"
+        if extended_window and length > self.max_verify_len:
+            # Dense-capacity preflight: an extended window must never grow a
+            # granted dense KV leaf (`promote_kv_cache_offsets` below would
+            # call `ensure_capacity(size + length)` and flip
+            # `growth_after_grant`). When the window cannot fit the grant,
+            # run the SAME once-per-request growth-demotion transition the
+            # MTP lane runs at grant exhaustion — the MTP top-up would trip
+            # it within `max_verify_len` tokens anyway — so the eager
+            # fallback verifies against stock containers that grow natively.
+            # (Falling back onto the still-granted adapter would overflow
+            # its fixed buffer inside `update_and_fetch`; the route-off
+            # eager lane shares that narrow dense-edge exposure today.)
+            for entry in cache or []:
+                if not isinstance(entry, TensorOffsetKVCache):
+                    continue
+                if entry.keys is None:
+                    continue
+                if entry.size() + length > int(entry.keys.shape[2]):
+                    self._growth_demoted = True
+                    self.stats["growth_demotions"] = (
+                        int(self.stats.get("growth_demotions", 0)) + 1
+                    )
+                    self._materialize_growth_handoff_state(cache)
+                    self.demote(cache)
+                    return "block_window_capacity"
         if self.capture_backend in _UNSUPPORTED_CAPTURE_BACKENDS:
             return "unsupported_capture_backend"
         if _owned_state_env_active("MTPLX_OWNED_ATTN_KV"):
@@ -1562,11 +3005,20 @@ class CompiledVerifyBank:
             # Cache was demoted back to stock entries when the growth budget
             # tripped; the plain eager path owns the rest of this request.
             return "growth_budget_exhausted"
+        if self._post_restore_eager_remaining > 0:
+            # Keep the restored cache unpromoted for the first round(s) so the
+            # O(context) ensure_capacity copy lands after the first token is
+            # already on the wire, not inside warm TTFT. Non-consuming probes
+            # (prewarm eligibility) must not tick the counter — and must still
+            # skip, or the probe itself would promote and pay the copy.
+            if consume_post_restore:
+                self._post_restore_eager_remaining -= 1
+            return "post_restore_warmup"
         promoted, failures = promote_kv_cache_offsets(
             cache,
             reserve_tokens=length,
             preserve_paged=True,
-            initial_reserve_tokens=max(length, _compiled_verify_growth_reserve()),
+            initial_reserve_tokens=max(length, self.growth_reserve_tokens),
         )
         self.stats["promoted"] += promoted
         for entry in cache:
@@ -1582,11 +3034,14 @@ class CompiledVerifyBank:
                 self.stats["growth_demotions"] = (
                     int(self.stats.get("growth_demotions", 0)) + 1
                 )
+                self._materialize_growth_handoff_state(cache)
                 self.demote(cache)
                 return "growth_budget_exhausted"
         if failures:
             if "quantized_paged_kv_cache" in failures:
                 return "quantized_paged_kv"
+            if "quantized_paged_kv_geometry" in failures:
+                return "quantized_paged_kv_geometry"
             return "promotion_failure:" + ",".join(sorted(failures))
         if cache_has_python_offsets(cache):
             return "python_cache_offsets"
@@ -1602,6 +3057,24 @@ class CompiledVerifyBank:
 
     def _resolve_bucket(self, cache: Any, length: int) -> int | None:
         """Static paged-attention ceiling for this call, or None on overflow."""
+        if _BATCH_PAGED_OFFSETS and _PAGED_OFFSETS_CONTEXT_OK.get():
+            # One eval for every paged offset instead of a serial sync per
+            # entry inside size() below (#318; helper docstring has the
+            # mechanism). Mirrors this loop's own iteration exactly.
+            paged_offsets = []
+            for spec_idx, spec_kind, _n in self._spec or []:
+                if spec_kind != VERIFY_SPEC_KIND_FULL_ATTN:
+                    continue
+                spec_entry = cache[spec_idx]
+                if not hasattr(spec_entry, "capacity"):
+                    continue
+                entry_state = getattr(spec_entry, "cache", None)
+                if isinstance(entry_state, (list, tuple)) and len(entry_state) > 2:
+                    entry_offset = entry_state[2]
+                    if isinstance(entry_offset, mx.array):
+                        paged_offsets.append(entry_offset)
+            if paged_offsets:
+                mx.eval(*paged_offsets)
         max_needed = 0
         min_capacity: int | None = None
         for idx, kind, _n in self._spec or []:
@@ -1675,18 +3148,52 @@ class CompiledVerifyBank:
         signature = self._container_signature(cache)
         if self._shadow is not None and signature == self._shadow_signature:
             return
-        from .cache_state import TensorOffsetVllmMetalPagedKVCache
+        from .cache_state import (
+            TensorOffsetQuantizedPagedKVCache,
+            TensorOffsetVllmMetalPagedKVCache,
+        )
 
         shadow: list[Any] = [None] * len(cache)
         for idx, kind, _n in self._spec or []:
             entry = cache[idx]
-            if kind == VERIFY_SPEC_KIND_FULL_ATTN:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                kv = TensorOffsetKVCache(
+                    entry.kv.cache[0],
+                    entry.kv.cache[1],
+                    entry.kv.cache[2],
+                    step=entry.kv.step,
+                )
+                twin = TensorOffsetQSACache(
+                    kv,
+                    entry.raw_keys,
+                    entry.pooled,
+                    compress_ratio=entry.ratio,
+                    rows_gather=entry.fixed_rows_gather,
+                    rows_gather_kv_m4=entry.rows_gather_kv_m4,
+                    rows_gather_enabled=entry.rows_gather_enabled,
+                    rows_gather_min_context=entry.rows_gather_min_context,
+                    fused_rows_gather_kv_m4=entry.fused_rows_gather_kv_m4,
+                )
+            elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
                 if isinstance(entry, TensorOffsetKVCache):
                     twin = TensorOffsetKVCache(
                         entry.cache[0],
                         entry.cache[1],
                         entry.cache[2],
                         step=entry.step,
+                    )
+                elif isinstance(entry, TensorOffsetQuantizedPagedKVCache):
+                    twin = TensorOffsetQuantizedPagedKVCache(
+                        key_cache=entry.cache[0],
+                        value_cache=entry.cache[1],
+                        offset=entry.cache[2],
+                        key_scale_cache=entry.cache[3],
+                        value_scale_cache=entry.cache[4],
+                        block_size=entry.block_size,
+                        num_blocks=entry.num_blocks,
+                        kv_quant_config=entry.kv_quant_config,
+                        source_dtypes=entry.source_dtypes,
+                        head_dims=entry.head_dims,
                     )
                 else:
                     twin = TensorOffsetVllmMetalPagedKVCache(
@@ -1728,13 +3235,24 @@ class CompiledVerifyBank:
         if not _env_enabled("MTPLX_COMPILED_VERIFY_SHARED_TRACES", default=True):
             return mx.compile(self._make_verify_step(length, hidden_variant))
         spec_sig = tuple(self._spec or [])
+        from .attention_context import exact_verify_required
+
         global_key = (
             id(self.runtime),
             self.capture_backend,
+            self._capture_layout_override,
+            self._extra_capture_layout,
+            self._prepare_compiled_aux is not None,
             spec_sig,
             int(length),
             str(hidden_variant or ""),
             int(key[2]),
+            # Kernel-route dimension: a trace compiled under the sampled
+            # (vk/nax) verify route bakes those kernels into the graph; a
+            # greedy (t<=0, stock-route) request must never replay it, and
+            # vice versa. Without this key a t=0.6 request's shared trace
+            # would silently serve a t=0 request with non-exact kernels.
+            bool(exact_verify_required()),
         )
         entry = _SHARED_VERIFY_STEPS.get(global_key)
         if entry is not None:
@@ -1742,14 +3260,26 @@ class CompiledVerifyBank:
             # id() can be recycled after a model swap frees the old runtime;
             # a stale callable would replay graphs bound to freed weights.
             if runtime_ref() is self.runtime:
-                host["bank"] = self
+                host["bank_ref"] = weakref.ref(self)
                 return fn
             _SHARED_VERIFY_STEPS.pop(global_key, None)
-        host = {"bank": self}
+        # Programs may outlive requests. Keeping the bank here also keeps its
+        # shadow KV and traced state alive after the request/session is gone.
+        # The dispatch owns the bank; the process cache owns only the program.
+        host = {"bank_ref": weakref.ref(self)}
         fn = mx.compile(
             self._make_verify_step(length, hidden_variant, trace_host=host)
         )
-        _SHARED_VERIFY_STEPS[global_key] = (fn, host, weakref.ref(self.runtime))
+        def release_program(reference, *, key=global_key):
+            # Compiled graphs may hold weight arrays even after their Python
+            # runtime is gone. Drop them at unload, not only on id() reuse.
+            entry = _SHARED_VERIFY_STEPS.get(key)
+            if entry is not None and entry[2] is reference:
+                _SHARED_VERIFY_STEPS.pop(key, None)
+
+        _SHARED_VERIFY_STEPS[global_key] = (
+            fn, host, weakref.ref(self.runtime, release_program)
+        )
         return fn
 
     def _make_verify_step(
@@ -1760,16 +3290,20 @@ class CompiledVerifyBank:
     ):
         spec = list(self._spec or [])
         layout = self._capture_layout()
-        bank = self
-        static_host = {"bank": self}
+        static_host = {"bank_ref": weakref.ref(self)}
         host = trace_host if trace_host is not None else static_host
 
-        del bank
-
-        def verify_step(input_ids, *state_in):
+        def verify_step(input_ids, *args):
             # Python body executes at trace time only; replays skip it.
-            live = host["bank"]
+            live = host["bank_ref"]()
+            if live is None:
+                raise RuntimeError("compiled verifier traced without a live request bank")
             shadow = live._shadow
+            if live._prepare_compiled_aux is not None:
+                compiled_aux, *state_in = args
+            else:
+                compiled_aux = None
+                state_in = args
             live.stats["traces"] += 1
             if _decode_length(input_ids) != length:
                 raise ValueError("compiled verify length mismatch")
@@ -1779,16 +3313,22 @@ class CompiledVerifyBank:
             pos = 0
             for idx, kind, n_leaves in spec:
                 entry = shadow[idx]
-                if kind == VERIFY_SPEC_KIND_FULL_ATTN:
-                    entry.cache[0] = state_in[pos]
-                    entry.cache[1] = state_in[pos + 1]
-                    entry.cache[2] = state_in[pos + 2]
-                    entry.rollback_state[0] = None
-                    entry.rollback_state[1] = None
-                    entry.rollback_state[2] = None
+                if kind == VERIFY_SPEC_KIND_QSA:
+                    entry.kv.cache[0] = state_in[pos]
+                    entry.kv.cache[1] = state_in[pos + 1]
+                    entry.kv.cache[2] = state_in[pos + 2]
+                    entry.raw_keys = state_in[pos + 3]
+                    entry.pooled = state_in[pos + 4]
+                    for slot in range(len(entry.kv.rollback_state)):
+                        entry.kv.rollback_state[slot] = None
+                elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
+                    for slot in range(n_leaves):
+                        entry.cache[slot] = state_in[pos + slot]
+                    for slot in range(len(entry.rollback_state)):
+                        entry.rollback_state[slot] = None
                 else:
-                    entry.cache[0] = state_in[pos]
-                    entry.cache[1] = state_in[pos + 1]
+                    for slot in range(n_leaves):
+                        entry.cache[slot] = state_in[pos + slot]
                 pos += n_leaves
             # (2) The existing runtime forward, on shadow containers only.
             with attention_phase("decode_verify"):
@@ -1797,6 +3337,7 @@ class CompiledVerifyBank:
                     cache=shadow,
                     return_hidden=True,
                     hidden_variant=hidden_variant,
+                    compiled_aux=compiled_aux,
                 )
             logits, hidden, captures = result
             # (3) Read every leaf back out and return it explicitly.
@@ -1807,18 +3348,26 @@ class CompiledVerifyBank:
                 layer_capture = captures[idx]
                 for key_name in layout:
                     captures_flat.append(layer_capture[key_name])
+            for idx, names in live._extra_capture_layout:
+                layer_capture = captures[idx]
+                for key_name in names:
+                    captures_flat.append(layer_capture[key_name])
             state_out: list[Any] = []
             for idx, kind, _n in spec:
                 entry = shadow[idx]
-                if kind == VERIFY_SPEC_KIND_FULL_ATTN:
-                    state_out.extend((entry.cache[0], entry.cache[1], entry.cache[2]))
+                if kind == VERIFY_SPEC_KIND_QSA:
+                    state_out.extend(entry.state_leaves)
+                elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
+                    state_out.extend(entry.cache[slot] for slot in range(_n))
                 else:
-                    state_out.extend((entry.cache[0], entry.cache[1]))
+                    state_out.extend(entry.cache[slot] for slot in range(_n))
             return (logits, hidden, *captures_flat, *state_out)
 
         return verify_step
 
     def _capture_layout(self) -> tuple[str, ...]:
+        if self._capture_layout_override is not None:
+            return self._capture_layout_override
         if self.capture_backend == "linear_gdn_from_conv_tape":
             return TAPE_CAPTURE_KEYS
         return STANDARD_CAPTURE_KEYS
@@ -1829,6 +3378,7 @@ class CompiledVerifyBank:
         n_captures = sum(
             len(layout) for _idx, kind, _n in spec if kind == VERIFY_SPEC_KIND_GDN
         )
+        n_captures += sum(len(names) for _idx, names in self._extra_capture_layout)
         n_state = sum(n for _idx, _kind, n in spec)
         expected = 2 + n_captures + n_state
         if len(outputs) != expected:
@@ -1856,6 +3406,11 @@ class CompiledVerifyBank:
             if self.capture_backend == "linear_gdn_from_conv_tape":
                 layer_capture["gdn_meta"] = self._gdn_meta(idx)
             captures[idx] = layer_capture
+        for idx, names in self._extra_capture_layout:
+            layer_capture = captures.setdefault(idx, {})
+            for key_name in names:
+                layer_capture[key_name] = captures_flat[pos]
+                pos += 1
         return captures
 
     def _gdn_meta(self, layer_idx: int) -> dict[str, int] | None:
@@ -1881,10 +3436,12 @@ class CompiledVerifyBank:
         leaves: list[Any] = []
         for idx, kind, _n in self._spec or []:
             entry = cache[idx]
-            if kind == VERIFY_SPEC_KIND_FULL_ATTN:
-                layer_leaves = (entry.cache[0], entry.cache[1], entry.cache[2])
+            if kind == VERIFY_SPEC_KIND_QSA:
+                layer_leaves = tuple(entry.state_leaves)
+            elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
+                layer_leaves = tuple(entry.cache[slot] for slot in range(_n))
             else:
-                layer_leaves = (entry.cache[0], entry.cache[1])
+                layer_leaves = tuple(entry.cache[slot] for slot in range(_n))
             if any(leaf is None for leaf in layer_leaves):
                 return None
             leaves.extend(layer_leaves)
@@ -1894,18 +3451,24 @@ class CompiledVerifyBank:
         pos = 0
         for idx, kind, n_leaves in self._spec or []:
             entry = cache[idx]
-            if kind == VERIFY_SPEC_KIND_FULL_ATTN:
-                entry.cache[0] = state_out[pos]
-                entry.cache[1] = state_out[pos + 1]
-                entry.cache[2] = state_out[pos + 2]
+            if kind == VERIFY_SPEC_KIND_QSA:
+                entry.kv.cache[0] = state_out[pos]
+                entry.kv.cache[1] = state_out[pos + 1]
+                entry.kv.cache[2] = state_out[pos + 2]
+                entry.raw_keys = state_out[pos + 3]
+                entry.pooled = state_out[pos + 4]
+                for slot in range(len(entry.kv.rollback_state)):
+                    entry.kv.rollback_state[slot] = None
+            elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
+                for slot in range(n_leaves):
+                    entry.cache[slot] = state_out[pos + slot]
                 # Cleared rollback forces trim() onto the offset-only branch,
                 # which is the correct reject semantics for a batched verify.
-                entry.rollback_state[0] = None
-                entry.rollback_state[1] = None
-                entry.rollback_state[2] = None
+                for slot in range(len(entry.rollback_state)):
+                    entry.rollback_state[slot] = None
             else:
-                entry.cache[0] = state_out[pos]
-                entry.cache[1] = state_out[pos + 1]
+                for slot in range(n_leaves):
+                    entry.cache[slot] = state_out[pos + slot]
             pos += n_leaves
 
     def _clear_shadow_leaf_refs(self) -> None:
@@ -1921,6 +3484,14 @@ class CompiledVerifyBank:
         """
         for entry in self._shadow or []:
             if entry is None:
+                continue
+            if isinstance(entry, TensorOffsetQSACache):
+                for slot in range(len(entry.kv.cache)):
+                    entry.kv.cache[slot] = None
+                for slot in range(len(entry.kv.rollback_state)):
+                    entry.kv.rollback_state[slot] = None
+                entry.raw_keys = None
+                entry.pooled = None
                 continue
             cache_list = getattr(entry, "cache", None)
             if isinstance(cache_list, list):
@@ -1940,7 +3511,13 @@ class CompiledVerifyBank:
         cache,
         return_hidden: bool,
         hidden_variant: str | None,
+        compiled_aux=None,
     ):
+        kwargs = (
+            {"compiled_aux": compiled_aux}
+            if self._runtime_accepts_compiled_aux
+            else {}
+        )
         if self._capture_accepts_backend:
             return self.runtime.forward_ar_capture(
                 input_ids,
@@ -1948,12 +3525,14 @@ class CompiledVerifyBank:
                 return_hidden=return_hidden,
                 hidden_variant=hidden_variant,
                 capture_backend=self.capture_backend,
+                **kwargs,
             )
         return self.runtime.forward_ar_capture(
             input_ids,
             cache=cache,
             return_hidden=return_hidden,
             hidden_variant=hidden_variant,
+            **kwargs,
         )
 
     def _fallback(
@@ -1965,10 +3544,25 @@ class CompiledVerifyBank:
         hidden_variant: str | None,
         reason: str,
     ):
-        self.stats["fallback_calls"] += 1
-        self.stats["fallback_reasons"][reason] = (
-            self.stats["fallback_reasons"].get(reason, 0) + 1
+        if self.strict_no_fallback:
+            raise RuntimeError(f"qwen4 fixed-M4 verifier refused: {reason}")
+        self.last_dispatch_kind = "eager"
+        self.last_fallback_reason = reason
+        growth_transition = (
+            reason == "growth_budget_exhausted"
+            and not self._growth_budget_fallback_reported
         )
+        self.last_fallback_transition = growth_transition
+        self.stats["fallback_calls"] += 1
+        # Growth exhaustion is a one-way request state, not a fresh failure
+        # on every eager tail round.  Count its transition once while keeping
+        # fallback_calls as the honest per-call total.
+        if reason != "growth_budget_exhausted" or growth_transition:
+            self.stats["fallback_reasons"][reason] = (
+                self.stats["fallback_reasons"].get(reason, 0) + 1
+            )
+        if growth_transition:
+            self._growth_budget_fallback_reported = True
         return self._runtime_forward(
             input_ids,
             cache=cache,
@@ -1982,6 +3576,7 @@ class CompiledVerifyBank:
         *,
         cache,
         hidden_variant: str | None,
+        compiled_aux,
         state_in: list[Any],
         compiled_logits,
         compiled_hidden,
@@ -1996,14 +3591,17 @@ class CompiledVerifyBank:
                 cache=cache,
                 return_hidden=True,
                 hidden_variant=hidden_variant,
+                compiled_aux=compiled_aux,
             )
         eager_state = []
         for idx, kind, _n in self._spec or []:
             entry = cache[idx]
-            if kind == VERIFY_SPEC_KIND_FULL_ATTN:
-                eager_state.extend((entry.cache[0], entry.cache[1], entry.cache[2]))
+            if kind == VERIFY_SPEC_KIND_QSA:
+                eager_state.extend(entry.state_leaves)
+            elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
+                eager_state.extend(entry.cache[slot] for slot in range(_n))
             else:
-                eager_state.extend((entry.cache[0], entry.cache[1]))
+                eager_state.extend(entry.cache[slot] for slot in range(_n))
         reference = self._named_outputs(eager_logits, eager_hidden, eager_captures, eager_state)
         candidate = self._named_outputs(
             compiled_logits, compiled_hidden, compiled_captures, compiled_state_out
@@ -2020,6 +3618,7 @@ class CompiledVerifyBank:
         *,
         cache,
         hidden_variant: str | None,
+        compiled_aux,
         bucket: int,
         compiled_logits,
         compiled_hidden,
@@ -2050,16 +3649,19 @@ class CompiledVerifyBank:
                 cache=clone,
                 return_hidden=True,
                 hidden_variant=hidden_variant,
+                compiled_aux=compiled_aux,
             )
         # Compiled is authoritative: the live stream advances on compiled state.
         self._mirror_commit(cache, compiled_state_out)
         clone_state: list[Any] = []
         for idx, kind, _n in self._spec or []:
             entry = clone[idx]
-            if kind == VERIFY_SPEC_KIND_FULL_ATTN:
-                clone_state.extend((entry.cache[0], entry.cache[1], entry.cache[2]))
+            if kind == VERIFY_SPEC_KIND_QSA:
+                clone_state.extend(entry.state_leaves)
+            elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
+                clone_state.extend(entry.cache[slot] for slot in range(_n))
             else:
-                clone_state.extend((entry.cache[0], entry.cache[1]))
+                clone_state.extend(entry.cache[slot] for slot in range(_n))
         reference = self._named_outputs(
             eager_logits, eager_hidden, eager_captures, clone_state
         )
@@ -2084,18 +3686,52 @@ class CompiledVerifyBank:
         writes (functional slice_updates and slot reassignments) can never
         interact with the buffers the compiled-authoritative stream holds.
         """
-        from .cache_state import TensorOffsetVllmMetalPagedKVCache
+        from .cache_state import (
+            TensorOffsetQuantizedPagedKVCache,
+            TensorOffsetVllmMetalPagedKVCache,
+        )
 
         clone: list[Any] = [None] * len(cache)
         for idx, kind, _n in self._spec or []:
             entry = cache[idx]
-            if kind == VERIFY_SPEC_KIND_FULL_ATTN:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                kv = TensorOffsetKVCache(
+                    _copy_state_leaf(entry.kv.cache[0]),
+                    _copy_state_leaf(entry.kv.cache[1]),
+                    _copy_state_leaf(entry.kv.cache[2]),
+                    step=entry.kv.step,
+                )
+                twin = TensorOffsetQSACache(
+                    kv,
+                    _copy_state_leaf(entry.raw_keys),
+                    _copy_state_leaf(entry.pooled),
+                    compress_ratio=entry.ratio,
+                    rows_gather=entry.fixed_rows_gather,
+                    rows_gather_kv_m4=entry.rows_gather_kv_m4,
+                    rows_gather_enabled=entry.rows_gather_enabled,
+                    rows_gather_min_context=entry.rows_gather_min_context,
+                    fused_rows_gather_kv_m4=entry.fused_rows_gather_kv_m4,
+                )
+            elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
                 if isinstance(entry, TensorOffsetKVCache):
                     twin = TensorOffsetKVCache(
                         _copy_state_leaf(entry.cache[0]),
                         _copy_state_leaf(entry.cache[1]),
                         _copy_state_leaf(entry.cache[2]),
                         step=entry.step,
+                    )
+                elif isinstance(entry, TensorOffsetQuantizedPagedKVCache):
+                    twin = TensorOffsetQuantizedPagedKVCache(
+                        key_cache=_copy_state_leaf(entry.cache[0]),
+                        value_cache=_copy_state_leaf(entry.cache[1]),
+                        offset=_copy_state_leaf(entry.cache[2]),
+                        key_scale_cache=_copy_state_leaf(entry.cache[3]),
+                        value_scale_cache=_copy_state_leaf(entry.cache[4]),
+                        block_size=entry.block_size,
+                        num_blocks=entry.num_blocks,
+                        kv_quant_config=entry.kv_quant_config,
+                        source_dtypes=entry.source_dtypes,
+                        head_dims=entry.head_dims,
                     )
                 else:
                     twin = TensorOffsetVllmMetalPagedKVCache(
@@ -2112,7 +3748,7 @@ class CompiledVerifyBank:
                     twin.static_max_offset = int(bucket)
             else:
                 twin = type(entry)(len(entry.cache))
-                for slot, leaf in enumerate(entry.cache):
+                for slot, leaf in enumerate(entry.cache[:_n]):
                     twin[slot] = _copy_state_leaf(leaf)
             clone[idx] = twin
         return clone

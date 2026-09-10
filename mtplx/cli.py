@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import platform
@@ -10,8 +11,10 @@ import shutil
 import sys
 from pathlib import Path
 
+from .batching.state import SchedulerMode
 from .constants import DEFAULT_RUNTIME_MODEL_DIR
 from .fan_mode import FAN_MODE_CHOICES
+from .mtp_batch_numerics import MTP_BATCH_NUMERICS_CHOICES
 from .profiles import (
     DEFAULT_HF_MODEL_ID,
     DEFAULT_MODEL_ID,
@@ -22,6 +25,7 @@ from .profiles import (
     list_profiles,
     resolve_profile_name,
 )
+from .reasoning_effort import REASONING_EFFORT_CHOICES
 from .runtime_options import canonicalize_flag_tokens, normalize_paged_kv_quantization
 from .version import DISPLAY_VERSION, __version__
 
@@ -76,17 +80,24 @@ NATIVE_MTP_60_MODEL = DEFAULT_MODEL_ID
 
 
 PUBLIC_COMMANDS = (
-    ("start", "Interactive setup → chat (model · mode · web/CLI/Pi/OpenCode/Swival)"),
-    ("tune", "Find the fastest AR/D1/D2/D3 depth for this Mac"),
+    (
+        "start",
+        "Interactive setup → chat (model · mode · web/CLI/Pi/OpenCode/Swival/Hermes/Dashboard)",
+    ),
+    ("tune", "Find the fastest AR/MTP draft depth for this Mac (AR, D1-D8)"),
     ("help", "Detailed help; `help commands` / `help flags` / `help <name>`"),
     ("setup", "Prepare config and the model cache"),
     ("quickstart", "Run the local OpenAI/Anthropic server"),
-    ("connect", "Copy settings for Open WebUI or Claude Code"),
+    ("serve", "Start the local server with an explicit model and mode"),
+    ("connect", "Copy settings for Open WebUI, Claude Code, OpenCode, or Swival"),
     ("ask", "Ask the verified local model once"),
+    ("run", "Run one verified completion from an argument, a flag, or a pipe"),
+    ("chat", "Run one native-MTP chat generation as a smoke check"),
     ("status", "Check install, model, and integration health"),
     ("stop", "Stop the MTPLX daemon answering on a port"),
     ("settings", "Get or set live daemon settings"),
     ("inspect", "Check whether a model is MTPLX-compatible"),
+    ("trace", "Diagnose coding sessions: timelines, TPS curves, autopsies, live status"),
     ("forge", "Forge, verify, brand, discover, and publish MTP models"),
     ("hardware", "Inspect Apple Silicon / MLX acceleration eligibility"),
     ("models", "List models in the local MTPLX cache"),
@@ -96,7 +107,10 @@ ADVANCED_COMMANDS = {
     "Benchmark and QA": (
         ("bench *", "Nightly gates, no-fan runs, envelope compare"),
         ("qa *", "Exactness and distribution gates"),
-        ("profile *", "Dispatch, thermal, compile, and eval attribution"),
+        (
+            "profile *",
+            "Compile audit; dispatch/thermal/eval-attribution need the research workspace",
+        ),
     ),
     "Support": (
         ("doctor --deep", "Deep install and integration checks"),
@@ -109,6 +123,14 @@ ADVANCED_COMMANDS = {
         ("models", "List local cached models"),
         ("model architectures", "Architecture support matrix"),
         ("model publish-check", "HF staging readiness"),
+    ),
+    "Server and scripting": (
+        ("list", "List locally cached models"),
+        ("remove", "Remove a cached model (confirms first; --yes to skip)"),
+        ("config *", "Show or edit the MTPLX user config"),
+        ("env", "Reproducible environment snapshot"),
+        ("dashboard", "Open the live dashboard against a running server"),
+        ("integrate *", "Print client integration settings"),
     ),
     "Kernel Lab": (
         ("debug hotpath", "Next verify-cycle boundary map"),
@@ -169,7 +191,9 @@ def _ascii_banner() -> str:
 
 
 def _shell_banner_already_shown() -> bool:
-    value = os.environ.get("MTPLX_SHELL_BANNER_SHOWN") or os.environ.get("MTPLX_NO_BANNER")
+    value = os.environ.get("MTPLX_SHELL_BANNER_SHOWN") or os.environ.get(
+        "MTPLX_NO_BANNER"
+    )
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -179,11 +203,27 @@ def _help_banner_prefix() -> str:
     return f"{_ascii_banner()}\n\n"
 
 
+def _version_string() -> str:
+    """Text printed by ``mtplx --version``.
+
+    The parenthetical exists to disambiguate a marketing/display version from
+    the packaged one. When they are the same string it disambiguates nothing
+    and "mtplx 2.10.0 (2.10.0)" just reads like a bug, so only print it when
+    the two actually differ.
+    """
+
+    if DISPLAY_VERSION == __version__:
+        return f"mtplx {DISPLAY_VERSION}"
+    return f"mtplx {DISPLAY_VERSION} ({__version__})"
+
+
 def _format_public_help() -> str:
     command_lines = "\n".join(
         f"  {_command_cell(name, 12)} {summary}" for name, summary in PUBLIC_COMMANDS
     )
-    version_line = _muted(f"v{DISPLAY_VERSION}  ·  Native MTP speculative decoding on Apple Silicon")
+    version_line = _muted(
+        f"v{DISPLAY_VERSION}  ·  Native MTP speculative decoding on Apple Silicon"
+    )
     footer = _muted(
         "more: `mtplx help <command>` · `mtplx help advanced` · `mtplx --help` · `mtplx --version`"
     )
@@ -200,7 +240,7 @@ def _format_public_help() -> str:
   mtplx start opencode --port 18083    Configure OpenCode Desktop for MTPLX-owned generation
   mtplx start swival --port 18084      Print Swival generic-provider command
   mtplx start hermes --port 18085      Launch Hermes Agent against MTPLX
-  mtplx quickstart --profile sustained --port 8000  API server only, no chat
+  mtplx quickstart --port 8000         API server only, no chat
 
   {footer}
 """
@@ -213,14 +253,17 @@ def _format_advanced_help() -> str:
         sections.extend(
             f"  {_command_cell(command, 28)} {summary}" for command, summary in commands
         )
-    return f"""{_heading("MTPLX advanced tools")}
+    return (
+        f"""{_heading("MTPLX advanced tools")}
 
 Usage: mtplx <command> [options]
 
 Commands suffixed with * have subcommands. Run `mtplx help <command>` for details.
 The everyday path is start first. Servers, integrations, QA, and kernels live here when needed.
 
-""" + "\n".join(sections) + """
+"""
+        + "\n".join(sections)
+        + """
 
 Examples:
   mtplx bench nightly --json --dry-run
@@ -230,6 +273,7 @@ Examples:
 
 Docs: README.md
 """
+    )
 
 
 def _format_start_help() -> str:
@@ -241,7 +285,7 @@ On later runs it offers "same as last time?" so the chat is one keypress away.
 
 What gets asked:
   1. Model — your configured model, the verified default, custom HF, or local
-  2. Mode  — Sustained, Turbo, Sustained Max, or Burst (Stable remains available via --profile safe)
+  2. Mode  — Auto (recommended; Turbo auto-selects for the quantized flagships), Sustained, Sustained Max, or Burst (Stable remains available via --profile safe)
   3. Where — Web UI (default), terminal CLI, Pi, OpenCode Desktop, Swival, or Hermes
 
 Power-user shortcuts (any of these skip the onboarding wizard):
@@ -277,7 +321,9 @@ Inside terminal chat:
   /mtp off         Switch the next turn to target-only AR generation
   /mtp on          Switch the next turn back to MTP without reloading
   /stats           Print the last response stats again
-  /speed           Run a 192-token comparison sample
+  /speed           Run a 192-token speed sample
+  /reasoning on|off|auto
+                   Control reasoning for the next turns
   /exit            Quit
 
 Aliases:
@@ -287,6 +333,8 @@ Aliases:
   `opencode`, `oc`      -> OpenCode Desktop coding-agent connection
   `swival`, `sv`        -> Swival generic-provider connection
   `hermes`              -> Hermes Agent with terminal/file/web/browser/messaging tools
+  `dashboard`, `live`   -> live engine dashboard
+  (hyphenated forms like `open-webui`, `open-code`, `hermes-agent` also work)
 """
 
 
@@ -328,14 +376,14 @@ def _format_verbose_help() -> str:
   mtplx start                       Open the local chat in your browser
   mtplx start cli                   Chat in this terminal instead
   mtplx start --download            Pull the verified model from Hugging Face
-  mtplx quickstart --profile sustained --port 8000  Run the API server only
+  mtplx quickstart --port 8000      Run the API server only
   mtplx connect openwebui           Print Open WebUI integration settings
   mtplx ask "Write a tiny FastAPI app"
-  mtplx inspect Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed
+  mtplx inspect Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed
 
 {_heading("Help subtopics")}
 
-  mtplx help commands         Every command across the consumer + advanced surface
+  mtplx help commands         The consumer + advanced command reference (`help flags` lists every flag)
   mtplx help flags            Every flag, grouped by command
   mtplx help advanced         Benchmarks, QA, publishing, and kernel tools
   mtplx help <command>        Detailed flags for one command (argparse view)
@@ -358,14 +406,18 @@ def _format_commands_help() -> str:
             f"  {_command_cell(command, 28)} {summary}" for command, summary in commands
         )
         advanced_sections.append("")
-    return f"""{_heading("MTPLX commands")}
+    return (
+        f"""{_heading("MTPLX commands")}
 
 {_heading("Consumer commands")}
 {public_lines}
 
-""" + "\n".join(advanced_sections) + f"""
-  {_muted("Run `mtplx help <command>` for flags on any command above.")}
 """
+        + "\n".join(advanced_sections)
+        + f"""
+  {_muted("Run `mtplx <command> --help` for flags on any command above (works for multi-word commands too).")}
+"""
+    )
 
 
 def _format_flags_help() -> str:
@@ -384,13 +436,19 @@ def _format_flags_help() -> str:
     for sub in parser._actions:
         if not isinstance(sub, argparse._SubParsersAction):
             continue
-        for command_name, sub_parser in sorted(sub.choices.items(), key=lambda item: item[0]):
-            command_section = _flag_section_for_subparser(command_name, sub_parser, depth=0)
+        for command_name, sub_parser in sorted(
+            sub.choices.items(), key=lambda item: item[0]
+        ):
+            command_section = _flag_section_for_subparser(
+                command_name, sub_parser, depth=0
+            )
             if command_section:
                 sections.extend(command_section)
                 sections.append("")
 
-    sections.append(_muted("  Run `mtplx help <command>` for the argparse view of one command."))
+    sections.append(
+        _muted("  Run `mtplx help <command>` for the argparse view of one command.")
+    )
     return "\n".join(sections) + "\n"
 
 
@@ -405,7 +463,14 @@ def _flag_entries_for_action(action: argparse.Action) -> list[str]:
         action,
         (argparse._StoreAction, argparse._AppendAction),
     ):
-        if not isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction, argparse._CountAction)):
+        if not isinstance(
+            action,
+            (
+                argparse._StoreTrueAction,
+                argparse._StoreFalseAction,
+                argparse._CountAction,
+            ),
+        ):
             metavar = " " + (action.metavar or action.dest.upper())
     summary = (action.help or "").replace("\n", " ").strip()
     line = f"{flags}{metavar}"
@@ -426,7 +491,9 @@ def _flag_section_for_subparser(
     nested_sections: list[list[str]] = []
     for action in sub_parser._actions:
         if isinstance(action, argparse._SubParsersAction):
-            for nested_name, nested_parser in sorted(action.choices.items(), key=lambda item: item[0]):
+            for nested_name, nested_parser in sorted(
+                action.choices.items(), key=lambda item: item[0]
+            ):
                 nested = _flag_section_for_subparser(
                     f"{command_name} {nested_name}",
                     nested_parser,
@@ -481,8 +548,14 @@ def _parser_command_names(parser: argparse.ArgumentParser) -> set[str]:
     return set()
 
 
-def _print_unknown_command(command: str) -> int:
+def _print_unknown_command(command: str, known: set[str] | None = None) -> int:
     print(f"Unknown command: {_command(command)}\n")
+    # Match against every registered subcommand, not just the curated help
+    # lists: a typo of a lab command deserves the same nudge as a typo of
+    # `status`. One suggestion only — a wall of near-misses is noise.
+    suggestions = difflib.get_close_matches(command, sorted(known or ()), n=1)
+    if suggestions:
+        print(f"Did you mean {_command(suggestions[0])}?\n")
     print("Try:")
     for name, summary in PUBLIC_COMMANDS:
         print(f"  mtplx {_command_cell(name, 10)} {summary}")
@@ -496,6 +569,16 @@ def _comma_floats(value: str) -> tuple[float, ...]:
         raise argparse.ArgumentTypeError("expected comma-separated floats")
     try:
         return tuple(float(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _comma_ints(value: str) -> tuple[int, ...]:
+    parts = [part.strip() for part in value.split(",") if part.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError("expected comma-separated ints")
+    try:
+        return tuple(int(part) for part in parts)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
@@ -519,7 +602,9 @@ def _kv_quant_arg(value: str) -> str:
     return normalized
 
 
-def _add_reasoning_arg(parser: argparse.ArgumentParser, *, default: str | None = None) -> None:
+def _add_reasoning_arg(
+    parser: argparse.ArgumentParser, *, default: str | None = None
+) -> None:
     parser.add_argument(
         "--reasoning",
         choices=["auto", "on", "off"],
@@ -533,9 +618,12 @@ def _add_reasoning_arg(parser: argparse.ArgumentParser, *, default: str | None =
 def _add_reasoning_effort_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--reasoning-effort",
-        choices=["auto", "low", "medium", "high"],
+        choices=list(REASONING_EFFORT_CHOICES),
         default="auto",
-        help="Reasoning effort for models that expose levels, such as Step-3.7 Flash.",
+        help=(
+            "Reasoning effort for models that expose levels, such as Qwen 3.8 "
+            "(xhigh/medium/low, MTPLX coding default medium) or Step-3.7 Flash."
+        ),
     )
 
 
@@ -546,9 +634,10 @@ def _add_preserve_thinking_arg(parser: argparse.ArgumentParser) -> None:
         default="auto",
         help=(
             "Reasoning-history policy for Qwen chat-template history. scoped keeps "
-            "reasoning only inside the active agent round (Qwen's trained contract); "
-            "on preserves all; off strips all. Default auto resolves to scoped for "
-            "checkpoint-capable templates."
+            "reasoning only inside the active agent round (Qwen 3.6's trained "
+            "contract); on preserves all; off strips all. Default auto resolves to "
+            "scoped for checkpoint-capable templates, except Qwen 3.8, whose "
+            "trained contract preserves thinking by default."
         ),
     )
     parser.add_argument(
@@ -620,14 +709,61 @@ def _add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
     add_expert_streaming_args(parser)
 
 
-SCHEDULER_MODE_CHOICES = (
-    "serial",
-    "cooperative",
-    "ar_batch",
-    "mtp_cohort_experimental",
-)
+# Single source of truth is the SchedulerMode enum (mtplx.batching.state is
+# MLX/FastAPI-free, so the CLI can import it without dragging in the server).
+SCHEDULER_MODE_CHOICES = tuple(mode.value for mode in SchedulerMode)
 BATCHING_PRESET_CHOICES = ("solo", "latency", "agent", "throughput")
-ADAPTIVE_POLICY_CHOICES = ("none", "streak", "expected_value")
+ADAPTIVE_POLICY_CHOICES = ("none", "streak", "expected_value", "cost")
+
+
+def _add_ngram_prewarm_args(parser: argparse.ArgumentParser) -> None:
+    """The n-gram table pre-read, declared once for both flows.
+
+    A VALUE option, not a boolean: on a 128 GB Mac the ~85 GB of wired
+    weights and a 32 GB table do not both fit alongside the KV cache, so the
+    interesting answer is usually "as much as fits", not yes/no.  `auto` is
+    that answer.  `--no-ngram-prewarm` is kept as the spelling for `off`.
+
+    `default=None` (not `"auto"`) because the flag has an environment
+    counterpart, MTPLX_NGRAM_PREWARM: an argparse default would be
+    indistinguishable from the user typing the flag, and the CLI would
+    silently overrule every shell-set value.
+    """
+
+    parser.add_argument(
+        "--ngram-prewarm",
+        metavar="auto|all|off|GiB",
+        default=None,
+        help=(
+            "How much of the streamed n-gram table to read into the page "
+            "cache at model load. auto (default) warms as much as fits: "
+            "min(table, free - KV reservation - 6 GiB margin). all reads the "
+            "whole table (~2.5 s at ~12 GiB/s for 30 GiB); a bare number is a "
+            "budget in GiB; off serves at the as-found page-cache rate. Cold "
+            "sidecar rows are demand faults at ~1.4 GiB/s and cost 56 vs 68.8 "
+            "tok/s on decode. Environment: MTPLX_NGRAM_PREWARM, which this "
+            "flag overrides."
+        ),
+    )
+    parser.add_argument(
+        "--no-ngram-prewarm",
+        dest="ngram_prewarm",
+        action="store_const",
+        const="off",
+        help="Alias for --ngram-prewarm off.",
+    )
+    parser.add_argument(
+        "--ngram-prewarm-order",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Row-hotness file (.npy of int64 row ids, most-gathered first) "
+            "deciding WHICH rows a partial pre-read warms. Defaults to "
+            "<model>/ngram-hotness.npy when present, else the file prefix is "
+            "read sequentially. Build one with "
+            "the PR #391 harness ngram_row_hotness.py."
+        ),
+    )
 
 
 def _add_batching_args(parser: argparse.ArgumentParser) -> None:
@@ -641,7 +777,10 @@ def _add_batching_args(parser: argparse.ArgumentParser) -> None:
             "the batched-AR lane end to end on prefill-heavy concurrent "
             "loads because MTP decode is ~4x faster per stream); ar_batch "
             "opts concurrent requests into the batched AR decode lane, "
-            "which wins on decode-heavy many-client loads."
+            "which wins on decode-heavy many-client loads. hyper serves ONE "
+            "request at a time (extra requests queue FIFO like serial) and "
+            "reserves batch width for self-speculative rows of that request; "
+            "at width 1 it rides the exact serial path."
         ),
     )
     parser.add_argument(
@@ -649,6 +788,12 @@ def _add_batching_args(parser: argparse.ArgumentParser) -> None:
         choices=BATCHING_PRESET_CHOICES,
         default="latency",
         help="Concurrent batching preset for coding-agent/server UX.",
+    )
+    parser.add_argument(
+        "--mtp-batch-numerics",
+        choices=MTP_BATCH_NUMERICS_CHOICES,
+        default="throughput",
+        help="Qwen MTP route: fast B8, balanced B8, or serial B1-exact.",
     )
     parser.add_argument("--max-active-requests", type=_positive_int)
     parser.add_argument("--decode-batch-max", type=_positive_int)
@@ -700,7 +845,17 @@ def _add_paged_kv_quant_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Paged KV cache quantization mode. off is default; q8/q4 opt into "
-            "the same runtime switch used by the app when the selected model supports it."
+            "the same runtime switch used by the app when the selected model "
+            "supports it. Contract: decode-memory feature routed once per "
+            "request from its starting offset. q8 at/past the two-pass "
+            "threshold (default 1024 tokens) decodes through the inline-"
+            "dequant kernel with no bf16 working copy; below it q8 keeps a "
+            "context-sized bf16 working mirror, so its memory win starts at "
+            "the threshold. q4 keeps no mirror and, at/past the same threshold, "
+            "decodes through the packed-quant kernel; unsupported shapes use "
+            "bounded chunked dequantization. Prefill runs unquantized (peak prefill "
+            "memory unchanged) and compiled-verify/dense-two-pass fast paths "
+            "detach while active."
         ),
     )
 
@@ -771,7 +926,9 @@ def cmd_hardware_public(args: argparse.Namespace) -> int:
         return 0
     print("MTPLX hardware inspect")
     print(f"chip: {payload.get('chip') or 'unknown'}")
-    print(f"Apple Silicon generation: {payload.get('apple_silicon_generation') or 'unknown'}")
+    print(
+        f"Apple Silicon generation: {payload.get('apple_silicon_generation') or 'unknown'}"
+    )
     print(f"macOS: {payload.get('macos_version') or 'unknown'}")
     print(f"MLX: {payload.get('mlx_version') or 'not installed'}")
     print(f"Python: {payload.get('python_version')} ({payload.get('machine')})")
@@ -780,7 +937,11 @@ def cmd_hardware_public(args: argparse.Namespace) -> int:
         "M5 TensorOps eligible: "
         f"{str(bool(payload.get('m5_neural_accelerator_eligible'))).lower()}"
     )
-    print("hardware acceleration confirmed: false")
+    # `hardware_acceleration_confirmed` is False here because nothing profiles
+    # it (the JSON carries the reason: "not_profiled"). Printing a bare "false"
+    # to a human reads as "your Mac failed a check", which is not what the
+    # field means. The JSON document keeps both fields unchanged.
+    print("acceleration profile: not measured by this command")
     for warning in payload.get("warnings") or []:
         print(f"warning: {warning}")
     return 0
@@ -912,6 +1073,12 @@ def cmd_forge_public(args: argparse.Namespace) -> int:
     return handler(args)
 
 
+def cmd_trace_public(args: argparse.Namespace) -> int:
+    from .commands.trace import cmd_trace as handler
+
+    return handler(args)
+
+
 def _cmd_env(args: argparse.Namespace) -> int:
     from .env import collect_environment
 
@@ -970,14 +1137,15 @@ def _cmd_init(args: argparse.Namespace) -> int:
         "release": platform.release(),
         "machine": platform.machine(),
         "is_macos": platform.system() == "Darwin",
-        "is_apple_silicon": platform.system() == "Darwin" and platform.machine() == "arm64",
+        "is_apple_silicon": platform.system() == "Darwin"
+        and platform.machine() == "arm64",
     }
     profile = get_profile(args.profile)
     commands = {
         "doctor": "mtplx doctor --json",
         "pull": f"mtplx pull {args.model}",
         "inspect": f"mtplx inspect {args.model} --json",
-        "run": f"mtplx run \"hello\" --model {args.model}",
+        "run": f'mtplx run "hello" --model {args.model}',
         "serve": f"mtplx serve --model {args.model}",
     }
     report = {
@@ -1057,12 +1225,19 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_profiles(args: argparse.Namespace) -> int:
-    payload = {"default": DEFAULT_PROFILE_NAME, "profiles": list_profiles()}
+    payload = {
+        "default": DEFAULT_PROFILE_NAME,
+        "flagship_default": "turbo",
+        "profiles": list_profiles(),
+    }
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
     print(f"library default: {DEFAULT_PROFILE_NAME}")
-    print("start default: sustained")
+    print(
+        "start/serve default: resolves per model — turbo for the quantized "
+        "27B/9B flagships and the Flash-Next packs, sustained otherwise"
+    )
     for profile in payload["profiles"]:
         print(f"{profile['name']}: {profile['summary']}")
     return 0
@@ -1077,7 +1252,7 @@ def _cmd_setup(args: argparse.Namespace) -> int:
             "config_path": str(config_path),
             "next_steps": [
                 "mtplx status",
-                "mtplx quickstart --profile sustained --port 8000",
+                "mtplx quickstart --port 8000",
                 "mtplx connect openwebui",
             ],
         }
@@ -1087,7 +1262,7 @@ def _cmd_setup(args: argparse.Namespace) -> int:
             print("MTPLX setup")
             print(f"config already exists: {config_path}")
             print("next: mtplx status")
-            print("next: mtplx quickstart --profile sustained --port 8000")
+            print("next: mtplx quickstart --port 8000")
             print("Use --force to rewrite the config.")
         return 0
     args.write = True
@@ -1096,7 +1271,7 @@ def _cmd_setup(args: argparse.Namespace) -> int:
 
 def _cmd_connect(args: argparse.Namespace) -> int:
     if not args.integration:
-        server_command = f"mtplx quickstart --profile sustained --host {args.host} --port {args.port}"
+        server_command = f"mtplx quickstart --host {args.host} --port {args.port}"
         payload = {
             "action": "connect",
             "integrations": [
@@ -1137,15 +1312,62 @@ def _cmd_connect(args: argparse.Namespace) -> int:
     return cmd_integrate_public(args)
 
 
+BENCH_ACTIONS = (
+    ("run", "Decode benchmark on a prompt suite (--suite, --max-tokens)"),
+    ("context", "Alias of run"),
+    ("tune", "Find the fastest MTP depth for the current model"),
+    ("aime", "Run the AIME reasoning benchmark against a running server"),
+    ("prefill-ladder", "Prompt-processing speed across context sizes"),
+    ("nightly", "Full regression gate: speed, exactness, quality"),
+    ("suite", "Run the nightly task set now (--quick for the compact set)"),
+    ("compare", "Compare two envelopes (--before/--after) or models (--models)"),
+    ("serve", "Smoke-check a running server's health and metrics"),
+    ("reference", "Print the diagnostic reference-floor plan (not a product gate)"),
+    ("reference-vllm", "Capture a remote vLLM reference run over SSH"),
+)
+
+
+def _format_bench_actions_help() -> str:
+    rows = "\n".join(
+        f"  {_command_cell(action, 16)} {summary}" for action, summary in BENCH_ACTIONS
+    )
+    return (
+        f"""{_heading("MTPLX bench")}
+
+Usage: mtplx bench <action> [options]
+
+Actions:
+{rows}
+
+Examples:
+  mtplx bench run --suite flappy --max-tokens 10000 --no-fanmax
+  mtplx bench nightly --json --dry-run
+
+Run `mtplx bench --help` for every flag.
+"""
+    )
+
+
 def _cmd_bench(args: argparse.Namespace) -> int:
     if getattr(args, "bench_action", None):
         return cmd_bench_public(args)
     if args.profile:
         return _cmd_bench_profile(args)
+    if not (getattr(args, "_cli_flags", None) or set()):
+        # A bare `mtplx bench` is someone asking what bench can do, not a
+        # request to run the legacy manifest scaffold from wherever they
+        # happen to be standing. List the actions and stop.
+        print(_format_bench_actions_help())
+        return 0
     from .benchmarks.runners.harness import run_manifest_only
     from .benchmarks.schema import BenchmarkConfig, now_run_id
+    from .kpi.runtime_kpis import prompt_suite_path
 
-    out = Path(args.output) if args.output else Path("outputs") / f"{now_run_id(args.backend)}.jsonl"
+    out = (
+        Path(args.output)
+        if args.output
+        else Path("outputs") / f"{now_run_id(args.backend)}.jsonl"
+    )
     config = BenchmarkConfig(
         backend=args.backend,
         model_path=args.model,
@@ -1161,26 +1383,29 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     )
     if args.backend != "manifest":
         raise SystemExit("Only backend=manifest is implemented in this scaffold gate")
-    records = run_manifest_only(args.prompts, config, out)
+    records = run_manifest_only(prompt_suite_path(args.prompts), config, out)
     print(json.dumps({"records": len(records), "output": str(out)}, indent=2))
     return 0
 
 
-def _suite_to_prompts(suite: str | None, fallback: str) -> str:
-    if suite is None:
-        return fallback
-    suites = {
-        "default": "mtplx/benchmarks/prompts/default.jsonl",
-        "long_code": "mtplx/benchmarks/prompts/long_code.jsonl",
-        "calibration_coding": "mtplx/benchmarks/prompts/calibration_coding.jsonl",
-    }
-    if suite not in suites:
-        raise SystemExit(f"unknown benchmark suite: {suite}")
-    return suites[suite]
+def _suite_to_prompts(suite: str | None, fallback: str | None) -> str:
+    """Resolve `--suite` (or the `--prompts` fallback) to a packaged suite file.
+
+    Suites live inside the installed package, so this goes through the one
+    suite table in ``mtplx.kpi.runtime_kpis`` and never through the current
+    directory.
+    """
+
+    from .kpi.runtime_kpis import prompt_suite_path
+
+    return prompt_suite_path(suite or fallback)
 
 
 def _cmd_bench_profile(args: argparse.Namespace) -> int:
-    from .benchmarks.runners.mtp_depth_sweep import run_mtp_depth_sweep, write_depth_sweep
+    from .benchmarks.runners.mtp_depth_sweep import (
+        run_mtp_depth_sweep,
+        write_depth_sweep,
+    )
     from .benchmarks.runners.preflight import run_preflight
     from .benchmarks.schema import now_run_id
     from .artifacts import inspect_model
@@ -1191,7 +1416,29 @@ def _cmd_bench_profile(args: argparse.Namespace) -> int:
     profile = get_profile(args.profile)
     if profile.name != "performance-cold":
         raise SystemExit(f"unknown benchmark profile: {args.profile}")
-    model_arg = NATIVE_MTP_60_MODEL if args.model == str(DEFAULT_RUNTIME_MODEL_DIR) else args.model
+    # Every accepted flag is honored or refused loudly — never silently
+    # discarded (#285: four configs once produced byte-identical runs).
+    if getattr(args, "stock_ar", False):
+        raise SystemExit(
+            "--stock-ar is not available on the depth-sweep harness (it always "
+            "loads the MTP runtime); use --harness direct-http for stock AR, or "
+            "--generation-mode ar here for a target-only AR baseline."
+        )
+    requested_harness = getattr(args, "harness", None)
+    if requested_harness not in (None, "", "depth-sweep"):
+        raise SystemExit(
+            f"--harness {requested_harness!r} is not supported with "
+            "--profile performance-cold; the profile runs the depth-sweep "
+            "harness"
+        )
+    ar_baseline = getattr(args, "generation_mode", None) == "ar"
+    # requested_depths / requested_seed resolve below via the shared bench
+    # helpers so both harness routes agree on defaults (#285).
+    model_arg = (
+        NATIVE_MTP_60_MODEL
+        if args.model == str(DEFAULT_RUNTIME_MODEL_DIR)
+        else args.model
+    )
     runtime_contract = None
     try:
         compatibility = inspect_model(model_arg).to_dict().get("compatibility") or {}
@@ -1208,10 +1455,20 @@ def _cmd_bench_profile(args: argparse.Namespace) -> int:
             min_free_gib=args.min_free_gib,
         )
         if not preflight["clean"]:
-            print(json.dumps({"profile": profile.name, "preflight": preflight}, indent=2, sort_keys=True))
+            print(
+                json.dumps(
+                    {"profile": profile.name, "preflight": preflight},
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
             return 2
     prompts = _suite_to_prompts(args.suite, args.prompts)
-    out = Path(args.output) if args.output else Path("outputs") / f"{now_run_id(profile.name)}.json"
+    out = (
+        Path(args.output)
+        if args.output
+        else Path("outputs") / f"{now_run_id(profile.name)}.json"
+    )
     fallback_draft_lm_head = (
         None
         if profile.draft_lm_head is None
@@ -1223,7 +1480,9 @@ def _cmd_bench_profile(args: argparse.Namespace) -> int:
     )
     try:
         if runtime_contract is None:
-            compatibility = inspect_model(model_arg).to_dict().get("compatibility") or {}
+            compatibility = (
+                inspect_model(model_arg).to_dict().get("compatibility") or {}
+            )
             runtime_contract = compatibility.get("runtime_contract")
         draft_lm_head = draft_lm_head_spec_from_runtime_contract(
             runtime_contract,
@@ -1233,39 +1492,70 @@ def _cmd_bench_profile(args: argparse.Namespace) -> int:
     except Exception:
         draft_lm_head = fallback_draft_lm_head
         draft_sampler = None
+    # #285: honor the user's sweep knobs. depths/seed/compare-ar were
+    # hardcoded ("3"/0/False) while the CLI accepted the flags — reuse the
+    # same resolution helpers as `mtplx bench run --harness depth-sweep` so
+    # both routes agree on defaults (depths "3", seed 0) when nothing is
+    # passed.
+    from .commands.public import _benchmark_seed, _depths_for_bench_run
+
+    requested_depths = _depths_for_bench_run(args)
+    requested_seed = _benchmark_seed(
+        args, runtime_profile="native_mtp_60_cold", harness="depth-sweep"
+    )
     result = run_mtp_depth_sweep(
         model_arg,
         prompts,
-        depths="3",
-        temperature=0.6,
-        top_p=0.95,
-        top_k=20,
+        depths=requested_depths,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
         max_tokens=192 if args.max_tokens == 128 else args.max_tokens,
-        seed=0,
+        seed=requested_seed,
         limit=args.limit,
         enable_thinking=False,
-        compare_ar=False,
+        compare_ar=ar_baseline or bool(getattr(args, "compare_ar", False)),
+        ar_only=ar_baseline,
         mtp_hidden_variant="post_norm",
         mtp_cache_policy="persistent",
         mtp_history_policy="committed",
         min_speculative_depth=1,
         verify_strategy="capture_commit",
         verify_core="linear-gdn-from-conv-tape",
-        draft_lm_head_bits=(None if draft_lm_head is None else int(draft_lm_head["bits"])),
-        draft_lm_head_group_size=(64 if draft_lm_head is None else int(draft_lm_head["group_size"])),
-        draft_lm_head_mode=("affine" if draft_lm_head is None else str(draft_lm_head["mode"])),
-        draft_temperature=(
-            None if draft_sampler is None else float(draft_sampler["temperature"])
+        draft_lm_head_bits=(
+            None if draft_lm_head is None else int(draft_lm_head["bits"])
         ),
-        draft_top_p=None if draft_sampler is None else float(draft_sampler["top_p"]),
-        draft_top_k=None if draft_sampler is None else int(draft_sampler["top_k"]),
+        draft_lm_head_group_size=(
+            64 if draft_lm_head is None else int(draft_lm_head["group_size"])
+        ),
+        draft_lm_head_mode=(
+            "affine" if draft_lm_head is None else str(draft_lm_head["mode"])
+        ),
+        draft_temperature=(
+            args.draft_temperature
+            if args.draft_temperature is not None
+            else None if draft_sampler is None else float(draft_sampler["temperature"])
+        ),
+        draft_top_p=(
+            args.draft_top_p
+            if args.draft_top_p is not None
+            else None if draft_sampler is None else float(draft_sampler["top_p"])
+        ),
+        draft_top_k=(
+            args.draft_top_k
+            if args.draft_top_k is not None
+            else None if draft_sampler is None else int(draft_sampler["top_k"])
+        ),
     )
     result["profile"] = {
         **profile.to_dict(),
         "fast_path_env": {**profile.env_dict(), **runtime_env_overrides},
         "model": model_arg,
         "model_id": model_arg,
-        "depth": 3,
+        "depths": requested_depths,
+        "seed": requested_seed,
+        "ar_baseline": ar_baseline,
+        "compare_ar": ar_baseline or bool(getattr(args, "compare_ar", False)),
         "verify_strategy": "capture_commit",
         "verify_core": "linear-gdn-from-conv-tape",
         "draft_lm_head": draft_lm_head,
@@ -1276,7 +1566,11 @@ def _cmd_bench_profile(args: argparse.Namespace) -> int:
     }
     out.parent.mkdir(parents=True, exist_ok=True)
     write_depth_sweep(out, result)
-    print(json.dumps({"profile": profile.name, "output": str(out)}, indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {"profile": profile.name, "output": str(out)}, indent=2, sort_keys=True
+        )
+    )
     return 0
 
 
@@ -1324,7 +1618,10 @@ def _cmd_verify_ratio(args: argparse.Namespace) -> int:
 
 
 def _cmd_verify_profile(args: argparse.Namespace) -> int:
-    from .benchmarks.runners.verify_profile import run_verify_profile, write_verify_profile
+    from .benchmarks.runners.verify_profile import (
+        run_verify_profile,
+        write_verify_profile,
+    )
 
     lengths = [int(x.strip()) for x in args.lengths.split(",") if x.strip()]
     result = run_verify_profile(
@@ -1343,7 +1640,10 @@ def _cmd_verify_profile(args: argparse.Namespace) -> int:
 
 
 def _cmd_verify_qmm_probe(args: argparse.Namespace) -> int:
-    from .benchmarks.runners.verify_qmm_probe import run_verify_qmm_probe, write_verify_qmm_probe
+    from .benchmarks.runners.verify_qmm_probe import (
+        run_verify_qmm_probe,
+        write_verify_qmm_probe,
+    )
 
     result = run_verify_qmm_probe(
         args.model,
@@ -1364,7 +1664,10 @@ def _cmd_verify_qmm_probe(args: argparse.Namespace) -> int:
 
 
 def _cmd_multi_qmv_probe(args: argparse.Namespace) -> int:
-    from .benchmarks.runners.multi_qmv_probe import run_multi_qmv_probe, write_multi_qmv_probe
+    from .benchmarks.runners.multi_qmv_probe import (
+        run_multi_qmv_probe,
+        write_multi_qmv_probe,
+    )
 
     result = run_multi_qmv_probe(
         args.model,
@@ -1382,7 +1685,10 @@ def _cmd_multi_qmv_probe(args: argparse.Namespace) -> int:
 
 
 def _cmd_batch_equivalence(args: argparse.Namespace) -> int:
-    from .benchmarks.runners.batch_equivalence import run_batch_equivalence, write_batch_equivalence
+    from .benchmarks.runners.batch_equivalence import (
+        run_batch_equivalence,
+        write_batch_equivalence,
+    )
 
     result = run_batch_equivalence(
         args.model,
@@ -1448,7 +1754,10 @@ def _cmd_mtp1_greedy_gate(args: argparse.Namespace) -> int:
 
 
 def _cmd_mtp1_sampler_smoke(args: argparse.Namespace) -> int:
-    from .benchmarks.runners.mtp1_sampler_smoke import run_mtp1_sampler_smoke, write_sampler_smoke
+    from .benchmarks.runners.mtp1_sampler_smoke import (
+        run_mtp1_sampler_smoke,
+        write_sampler_smoke,
+    )
 
     result = run_mtp1_sampler_smoke(
         args.model,
@@ -1475,16 +1784,16 @@ def _cmd_mtp1_sampler_smoke(args: argparse.Namespace) -> int:
         write_sampler_smoke(args.output, result)
     print(json.dumps(result, indent=2, sort_keys=True))
     failures = [
-        v
-        for row in result["rows"]
-        for v in row["validations"]
-        if not v["passed"]
+        v for row in result["rows"] for v in row["validations"] if not v["passed"]
     ]
     return 0 if not failures else 2
 
 
 def _cmd_mtp_depth_sweep(args: argparse.Namespace) -> int:
-    from .benchmarks.runners.mtp_depth_sweep import run_mtp_depth_sweep, write_depth_sweep
+    from .benchmarks.runners.mtp_depth_sweep import (
+        run_mtp_depth_sweep,
+        write_depth_sweep,
+    )
 
     result = run_mtp_depth_sweep(
         args.model,
@@ -1554,7 +1863,10 @@ def _cmd_mtp_depth_sweep(args: argparse.Namespace) -> int:
 
 
 def _cmd_mtp_chain_probe(args: argparse.Namespace) -> int:
-    from .benchmarks.runners.mtp_chain_probe import run_mtp_chain_probe, write_mtp_chain_probe
+    from .benchmarks.runners.mtp_chain_probe import (
+        run_mtp_chain_probe,
+        write_mtp_chain_probe,
+    )
 
     result = run_mtp_chain_probe(
         args.model,
@@ -1585,7 +1897,10 @@ def _cmd_mtp_chain_probe(args: argparse.Namespace) -> int:
 
 
 def _cmd_mtp_tree_probe(args: argparse.Namespace) -> int:
-    from .benchmarks.runners.mtp_tree_probe import run_mtp_tree_probe, write_mtp_tree_probe
+    from .benchmarks.runners.mtp_tree_probe import (
+        run_mtp_tree_probe,
+        write_mtp_tree_probe,
+    )
 
     result = run_mtp_tree_probe(
         args.model,
@@ -1614,7 +1929,10 @@ def _cmd_mtp_tree_probe(args: argparse.Namespace) -> int:
 
 
 def _cmd_mtp_depth_grid(args: argparse.Namespace) -> int:
-    from .benchmarks.runners.mtp_depth_grid import run_mtp_depth_policy_grid, write_depth_grid
+    from .benchmarks.runners.mtp_depth_grid import (
+        run_mtp_depth_policy_grid,
+        write_depth_grid,
+    )
 
     result = run_mtp_depth_policy_grid(
         args.model,
@@ -1687,6 +2005,7 @@ def _cmd_mtp_adaptive(args: argparse.Namespace) -> int:
         limit=args.limit,
         enable_thinking=False if args.disable_thinking else None,
         compare_ar=args.compare_ar,
+        compare_static=args.compare_static,
         mtp_hidden_variant=args.mtp_hidden_variant,
         mtp_cache_policy=args.mtp_cache_policy,
         mtp_history_policy=args.mtp_history_policy,
@@ -1700,10 +2019,7 @@ def _cmd_mtp_adaptive(args: argparse.Namespace) -> int:
         write_adaptive(args.output, result)
     print(json.dumps(result, indent=2, sort_keys=True))
     failures = [
-        v
-        for row in result["rows"]
-        for v in row["validations"]
-        if not v["passed"]
+        v for row in result["rows"] for v in row["validations"] if not v["passed"]
     ]
     return 0 if not failures else 2
 
@@ -1804,10 +2120,29 @@ def _cmd_truth_report(args: argparse.Namespace) -> int:
         keep_going=not args.fail_fast,
     )
     output_dir = Path(args.output_dir)
-    output_json = Path(args.output_json) if args.output_json else output_dir / f"{result['run_id']}.json"
-    output_md = Path(args.output_md) if args.output_md else output_dir / f"{result['run_id']}.md"
+    output_json = (
+        Path(args.output_json)
+        if args.output_json
+        else output_dir / f"{result['run_id']}.json"
+    )
+    output_md = (
+        Path(args.output_md)
+        if args.output_md
+        else output_dir / f"{result['run_id']}.md"
+    )
     write_truth_report(output_json, output_md, result)
-    print(json.dumps({"json": str(output_json), "markdown": str(output_md), "passed": result["passed"], "claim_label": result["claim_label"]}, indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "json": str(output_json),
+                "markdown": str(output_md),
+                "passed": result["passed"],
+                "claim_label": result["claim_label"],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
     if args.strict_preflight and not result["preflight"].get("clean"):
         return 2
     return 0 if result["passed"] else 2
@@ -1867,7 +2202,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version",
         action="version",
-        version=f"mtplx {DISPLAY_VERSION} ({__version__})",
+        version=_version_string(),
     )
     sub = parser.add_subparsers(dest="command", required=True)
     default_model = DEFAULT_HF_MODEL_ID
@@ -1877,10 +2212,12 @@ def build_parser() -> argparse.ArgumentParser:
     help_p.set_defaults(func=lambda args: _print_help_topic(args.topic, parser))
 
     advanced_p = sub.add_parser("advanced", help=argparse.SUPPRESS)
-    advanced_p.set_defaults(func=lambda _args: (print(_format_advanced_help()) or 0))
+    advanced_p.set_defaults(func=lambda _args: print(_format_advanced_help()) or 0)
 
     hardware_p = sub.add_parser("hardware", help="Inspect local Apple Silicon hardware")
-    hardware_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    hardware_p.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
     hardware_p.set_defaults(func=cmd_hardware_public, hardware_action="inspect")
     hardware_sub = hardware_p.add_subparsers(dest="hardware_action")
     hardware_inspect_p = hardware_sub.add_parser(
@@ -1893,7 +2230,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_flow_p = sub.add_parser(
         "start",
         help="Interactive setup → chat (model · mode · web/CLI/Pi/OpenCode/Swival/Hermes/Dashboard)",
-        usage="mtplx start [cli|web|pi|opencode|swival|hermes|dashboard] [--fresh] [--max] [--profile sustained] [--model PATH_OR_REPO] [--prompt TEXT]",
+        usage="mtplx start [cli|web|pi|opencode|swival|hermes|dashboard] [--fresh] [--max] [--profile NAME] [--model PATH_OR_REPO] [--prompt TEXT]",
         description="Walk through model / mode / surface in three quick steps, then chat. Returning users get a 'same as last time?' prompt. Use --fresh to redo the onboarding, or pass any of --model / --profile / --max / cli|web|pi|opencode|swival|hermes|dashboard to skip it entirely.",
     )
     start_flow_p.add_argument(
@@ -1926,18 +2263,31 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip the 'same as last time?' prompt and walk through the full onboarding again",
     )
-    start_flow_p.add_argument("--model", help="Verified model path or Hugging Face repo id")
+    start_flow_p.add_argument(
+        "--model", help="Verified model path or Hugging Face repo id"
+    )
     start_flow_p.add_argument("--cache-dir")
     start_flow_p.add_argument(
         "--profile",
-        type=_profile_arg, metavar=_PROFILE_METAVAR,
+        type=_profile_arg,
+        metavar=_PROFILE_METAVAR,
         default=DEFAULT_PROFILE_NAME,
-        help="Runtime profile. Default resolves per model: Turbo for the quantized 27B and 9B flagships (the app's launch rule), Sustained otherwise. An explicit value always wins. Use --profile performance-cold --max for Burst.",
+        help="Runtime profile. Default resolves per model: Turbo for the quantized 27B/9B flagships and the Qwen 3.8 Flash-Next packs (the app's launch rule), Sustained otherwise. An explicit value always wins. Use --profile performance-cold --max for Burst.",
     )
-    start_flow_p.add_argument("--download", action="store_true", help="Download the selected/default model if it is missing")
-    start_flow_p.add_argument("--yes", action="store_true", help="Use defaults without interactive model prompts")
+    start_flow_p.add_argument(
+        "--download",
+        action="store_true",
+        help="Download the selected/default model if it is missing",
+    )
+    start_flow_p.add_argument(
+        "--yes",
+        action="store_true",
+        help="Use defaults without interactive model prompts",
+    )
     start_flow_p.add_argument("--unsafe-force-unverified", action="store_true")
-    start_flow_p.add_argument("--prompt", help="Run one prompt and exit instead of entering the chat loop")
+    start_flow_p.add_argument(
+        "--prompt", help="Run one prompt and exit instead of entering the chat loop"
+    )
     start_flow_p.add_argument("--system", help="Optional system prompt")
     start_flow_p.add_argument(
         "--max-tokens",
@@ -1948,8 +2298,18 @@ def build_parser() -> argparse.ArgumentParser:
     start_flow_p.add_argument("--temperature", type=float, default=0.6)
     start_flow_p.add_argument("--top-p", type=float, default=0.95)
     start_flow_p.add_argument("--top-k", type=int, default=20)
-    start_flow_p.add_argument("--default-presence-penalty", dest="default_presence_penalty", type=float, default=0.0)
-    start_flow_p.add_argument("--default-frequency-penalty", dest="default_frequency_penalty", type=float, default=0.0)
+    start_flow_p.add_argument(
+        "--default-presence-penalty",
+        dest="default_presence_penalty",
+        type=float,
+        default=0.0,
+    )
+    start_flow_p.add_argument(
+        "--default-frequency-penalty",
+        dest="default_frequency_penalty",
+        type=float,
+        default=0.0,
+    )
     start_flow_p.add_argument("--depth", type=int, default=3)
     _add_mtp_toggle_args(start_flow_p)
     start_flow_p.add_argument("--seed", type=int, default=0)
@@ -1957,22 +2317,73 @@ def build_parser() -> argparse.ArgumentParser:
     _add_reasoning_effort_arg(start_flow_p)
     _add_preserve_thinking_arg(start_flow_p)
     _add_bridge_prompt_args(start_flow_p)
-    start_flow_p.add_argument("--no-stats", action="store_false", dest="show_stats", default=True, help="Hide speed stats after responses")
-    start_flow_p.add_argument("--host", default="127.0.0.1", help="Open WebUI server host for `mtplx start openwebui`")
-    start_flow_p.add_argument("--port", type=int, default=8000, help="Server port for `mtplx start`; OpenCode examples use 18083 to avoid browser-chat collisions")
-    start_flow_p.add_argument("--model-id", default=DEFAULT_PUBLIC_MODEL_ID, help="Model id to select in Open WebUI")
-    start_flow_p.add_argument("--api-key", help="Optional API key for non-localhost Open WebUI serving")
-    start_flow_p.add_argument("--api-key-file", help="Read the API key from a local file instead of argv/env")
-    start_flow_p.add_argument("--warmup-tokens", type=int, default=16, help="Warmup tokens for Open WebUI server startup")
-    start_flow_p.add_argument("--stream-interval", type=int, default=1, help="Streaming chunk size for Open WebUI server")
+    start_flow_p.add_argument(
+        "--no-stats",
+        action="store_false",
+        dest="show_stats",
+        default=True,
+        help="Hide speed stats after responses",
+    )
+    start_flow_p.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Open WebUI server host for `mtplx start openwebui`",
+    )
+    start_flow_p.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Server port for `mtplx start`; OpenCode examples use 18083 to avoid browser-chat collisions",
+    )
+    start_flow_p.add_argument(
+        "--model-id",
+        default=DEFAULT_PUBLIC_MODEL_ID,
+        help="Model id to select in Open WebUI",
+    )
+    start_flow_p.add_argument(
+        "--api-key", help="Optional API key for non-localhost Open WebUI serving"
+    )
+    start_flow_p.add_argument(
+        "--api-key-file", help="Read the API key from a local file instead of argv/env"
+    )
+    start_flow_p.add_argument(
+        "--warmup-tokens",
+        type=int,
+        default=16,
+        help="Warmup tokens for Open WebUI server startup",
+    )
+    start_flow_p.add_argument(
+        "--stream-interval",
+        type=int,
+        default=1,
+        help="Streaming chunk size for Open WebUI server",
+    )
     _add_batching_args(start_flow_p)
+    _add_ngram_prewarm_args(start_flow_p)
     _add_ssd_session_cache_args(start_flow_p)
     _add_paged_kv_quant_args(start_flow_p)
     _add_adaptive_args(start_flow_p)
-    start_flow_p.add_argument("--rate-limit", type=int, default=0, help="Server request rate limit for Open WebUI path")
-    start_flow_p.add_argument("--max-response-tokens", type=int, help="Server response token cap for Open WebUI path")
-    start_flow_p.add_argument("--reasoning-parser", default="qwen3", help="Reasoning parser for Open WebUI server streaming")
-    start_flow_p.add_argument("--strict-warmup", action="store_true", help="Fail Open WebUI startup if warmup fails")
+    start_flow_p.add_argument(
+        "--rate-limit",
+        type=int,
+        default=0,
+        help="Server request rate limit for Open WebUI path",
+    )
+    start_flow_p.add_argument(
+        "--max-response-tokens",
+        type=int,
+        help="Server response token cap for Open WebUI path",
+    )
+    start_flow_p.add_argument(
+        "--reasoning-parser",
+        default="qwen3",
+        help="Reasoning parser for Open WebUI server streaming",
+    )
+    start_flow_p.add_argument(
+        "--strict-warmup",
+        action="store_true",
+        help="Fail Open WebUI startup if warmup fails",
+    )
     start_flow_p.add_argument(
         "--strict-fast-path",
         action="store_true",
@@ -1980,7 +2391,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_fan_mode_args(
         start_flow_p,
-        max_help="Compatibility alias for --fan-mode max; with the start default this is Sustained Max",
+        max_help="Compatibility alias for --fan-mode max; combined with the sustained profile this is Sustained Max",
     )
     start_flow_p.add_argument(
         "--max-idle-min",
@@ -2006,27 +2417,67 @@ def build_parser() -> argparse.ArgumentParser:
             "dashboard's fan panel updates live. Off by default."
         ),
     )
-    start_flow_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON for --dry-run")
-    start_flow_p.add_argument("--dry-run", action="store_true", help="Show what start will do without loading MLX")
+    start_flow_p.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON for --dry-run"
+    )
+    start_flow_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what start will do without loading MLX",
+    )
     start_flow_p.set_defaults(func=cmd_quickstart_public)
 
-    setup_p = sub.add_parser("setup", help="Set up MTPLX with a friendly guided default")
+    setup_p = sub.add_parser(
+        "setup", help="Set up MTPLX with a friendly guided default"
+    )
     setup_p.add_argument("--config", default="~/.mtplx/config.toml")
-    setup_p.add_argument("--model", default=DEFAULT_HF_MODEL_ID, help="Default verified model repo id or path")
-    setup_p.add_argument("--model-dir", help="Model cache directory; defaults to MTPLX_MODEL_DIR or ~/.mtplx/models")
-    setup_p.add_argument("--profile", type=_profile_arg, metavar=_PROFILE_METAVAR, default=DEFAULT_PROFILE_NAME)
+    setup_p.add_argument(
+        "--model",
+        default=DEFAULT_HF_MODEL_ID,
+        help="Default verified model repo id or path",
+    )
+    setup_p.add_argument(
+        "--model-dir",
+        help="Model cache directory; defaults to MTPLX_MODEL_DIR or ~/.mtplx/models",
+    )
+    setup_p.add_argument(
+        "--profile",
+        type=_profile_arg,
+        metavar=_PROFILE_METAVAR,
+        default=DEFAULT_PROFILE_NAME,
+    )
     setup_p.add_argument("--thermal-control", choices=("auto", "none"), default="auto")
-    setup_p.add_argument("--download", action="store_true", help="Download the selected model into the cache")
-    setup_p.add_argument("--force", action="store_true", help="Rewrite config even when it already exists")
-    setup_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    setup_p.add_argument("--dry-run", action="store_true", help="Show setup actions without writing files")
+    setup_p.add_argument(
+        "--download",
+        action="store_true",
+        help="Download the selected model into the cache",
+    )
+    setup_p.add_argument(
+        "--force",
+        action="store_true",
+        help="Rewrite config even when it already exists",
+    )
+    setup_p.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    setup_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show setup actions without writing files",
+    )
     setup_p.set_defaults(func=_cmd_setup)
 
     status_p = sub.add_parser("status", help="Check whether MTPLX is ready to run")
     status_p.add_argument("--project-root", default=".")
     status_p.add_argument("--model-cache")
-    status_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    status_p.add_argument("--deep", action="store_true", help="Include launchers, config, staging, release, and integration checks")
+    status_p.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    status_p.add_argument(
+        "--deep",
+        action="store_true",
+        help="Include launchers, config, staging, release, and integration checks",
+    )
     status_p.set_defaults(func=cmd_doctor)
 
     stop_p = sub.add_parser("stop", help="Stop the running MTPLX server")
@@ -2043,7 +2494,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=10.0,
         help="Seconds to wait after SIGTERM before escalating to SIGKILL.",
     )
-    stop_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    stop_p.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
     stop_p.set_defaults(func=cmd_stop_public)
 
     settings_p = sub.add_parser(
@@ -2064,17 +2517,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     settings_p.add_argument("--host", default="127.0.0.1")
     settings_p.add_argument("--port", type=int, default=8000)
-    settings_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    settings_p.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
     settings_p.set_defaults(func=cmd_settings_public)
 
-    ask_p = sub.add_parser("ask", help="Ask the verified local MTPLX model one question")
+    ask_p = sub.add_parser(
+        "ask", help="Ask the verified local MTPLX model one question"
+    )
     ask_p.add_argument("prompt_arg", nargs="?", help="Prompt text")
     ask_p.add_argument("--model", default=default_model)
     ask_p.add_argument("--cache-dir")
-    ask_p.add_argument("--profile", type=_profile_arg, metavar=_PROFILE_METAVAR, default=DEFAULT_PROFILE_NAME)
+    ask_p.add_argument(
+        "--profile",
+        type=_profile_arg,
+        metavar=_PROFILE_METAVAR,
+        default=DEFAULT_PROFILE_NAME,
+    )
     ask_p.add_argument("--unsafe-force-unverified", action="store_true")
-    ask_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
-    ask_p.add_argument("--prompt", help="Prompt text, as an alternative to the positional prompt")
+    ask_p.add_argument(
+        "--yes", action="store_true", help="Confirm unsafe non-interactive actions"
+    )
+    ask_p.add_argument(
+        "--prompt", help="Prompt text, as an alternative to the positional prompt"
+    )
     ask_p.add_argument("--system", help="Optional system prompt")
     ask_p.add_argument(
         "--max-tokens",
@@ -2089,9 +2555,19 @@ def build_parser() -> argparse.ArgumentParser:
     _add_mtp_toggle_args(ask_p)
     ask_p.add_argument("--seed", type=int, default=0)
     _add_reasoning_arg(ask_p)
-    ask_p.add_argument("--stats", action="store_false", dest="quiet", default=True, help="Show the MTPLX stats footer")
+    _add_reasoning_effort_arg(ask_p)
+    ask_p.add_argument(
+        "--stats",
+        action="store_false",
+        dest="quiet",
+        default=True,
+        help="Show the MTPLX stats footer",
+    )
     ask_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    ask_p.add_argument("--expect-python", action="store_true")
+    ask_p.add_argument(
+        "--expect-python", action="store_true",
+        help="Validate the final answer as Python, allowing one enclosing code fence",
+    )
     _add_fan_mode_args(
         ask_p,
         max_help="Compatibility alias for --fan-mode max for this run",
@@ -2111,16 +2587,76 @@ def build_parser() -> argparse.ArgumentParser:
         help="Download a Hugging Face model before starting if it is not cached",
     )
     quickstart_server_p.add_argument(
+        "--agent-rewrites",
+        choices=["on", "off"],
+        default=None,
+        help=(
+            "Agent transcript rewriting: unset = passthrough (default), "
+            "on = legacy rewrite machinery, off = hard passthrough guarantee."
+        ),
+    )
+    quickstart_server_p.add_argument(
         "--profile",
-        type=_profile_arg, metavar=_PROFILE_METAVAR,
+        type=_profile_arg,
+        metavar=_PROFILE_METAVAR,
         default=DEFAULT_PROFILE_NAME,
-        help="Runtime profile. Default resolves per model (Turbo for the quantized 27B and 9B flagships, Sustained otherwise); use --profile performance-cold --max for Burst.",
+        help="Runtime profile. Default resolves per model (Turbo for the quantized 27B/9B flagships and the Flash-Next packs, Sustained otherwise); use --profile performance-cold --max for Burst.",
     )
     quickstart_server_p.add_argument("--unsafe-force-unverified", action="store_true")
-    quickstart_server_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
-    quickstart_server_p.add_argument("--host", default="127.0.0.1")
+    quickstart_server_p.add_argument(
+        "--yes", action="store_true", help="Confirm unsafe non-interactive actions"
+    )
+    quickstart_server_p.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help=(
+            "Bind address. Default 127.0.0.1 is this Mac only; 0.0.0.0 shares "
+            "the API with other devices and VM guests (requires an API key — "
+            "add --api-key-file ~/.mtplx/api-key to generate one)"
+        ),
+    )
     quickstart_server_p.add_argument("--port", type=int, default=8000)
     quickstart_server_p.add_argument("--model-id", default=DEFAULT_PUBLIC_MODEL_ID, help="Served OpenAI model id; defaults to the loaded artifact identity")
+    quickstart_server_p.add_argument(
+        "--embedding-model",
+        action="append",
+        default=[],
+        metavar="REF[=SERVED_ID]",
+        help="Serve REF on /v1/embeddings (repeatable). Loaded on first request.",
+    )
+    quickstart_server_p.add_argument(
+        "--reranker-model",
+        action="append",
+        default=[],
+        metavar="REF[=SERVED_ID]",
+        help="Serve REF on /v1/rerank (repeatable). The same REF in both roles loads once.",
+    )
+    quickstart_server_p.add_argument(
+        "--retrieval-max-resident",
+        type=int,
+        default=2,
+        help="How many retrieval models stay in memory; least-recently-used are unloaded",
+    )
+    quickstart_server_p.add_argument(
+        "--retrieval-idle-timeout",
+        type=float,
+        default=0.0,
+        help="Unload retrieval models after this many idle seconds (0 = never)",
+    )
+    quickstart_server_p.add_argument(
+        "--retrieval-max-tokens",
+        type=int,
+        default=0,
+        help="Truncate retrieval inputs to this many tokens (0 = per-model default)",
+    )
+    quickstart_server_p.add_argument(
+        "--retrieval-trust-remote-code",
+        action="store_true",
+        help=(
+            "Allow retrieval checkpoints that ship their own Python "
+            "(jina-style model.py/rerank.py) to execute it; off by default"
+        ),
+    )
     quickstart_server_p.add_argument("--dry-run", action="store_true", help="Preview the server launch command without loading MLX")
     quickstart_server_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON for --dry-run and errors")
     quickstart_server_p.add_argument("--depth", type=int, default=3)
@@ -2130,19 +2666,56 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Require Bearer or X-API-Key auth. Required for non-localhost binds.",
     )
-    quickstart_server_p.add_argument("--api-key-file", help="Read the API key from a local file instead of argv/env.")
-    quickstart_server_p.add_argument("--rate-limit", type=int, default=0, help="Requests per minute per client/API key. Use 0 to disable.")
-    quickstart_server_p.add_argument("--stream-interval", type=int, default=1, help="Committed-token batch size per chat SSE chunk.")
+    quickstart_server_p.add_argument(
+        "--api-key-file",
+        help=(
+            "Read the API key from a local file instead of argv/env. "
+            "A missing file is created with a fresh key (printed once)."
+        ),
+    )
+    quickstart_server_p.add_argument(
+        "--rate-limit",
+        type=int,
+        default=0,
+        help="Requests per minute per client/API key. Use 0 to disable.",
+    )
+    quickstart_server_p.add_argument(
+        "--stream-interval",
+        type=int,
+        default=1,
+        help="Committed-token batch size per chat SSE chunk.",
+    )
     _add_batching_args(quickstart_server_p)
     _add_ssd_session_cache_args(quickstart_server_p)
     _add_paged_kv_quant_args(quickstart_server_p)
     _add_adaptive_args(quickstart_server_p)
-    quickstart_server_p.add_argument("--max-tokens", dest="max_response_tokens", type=int, help="Default server-side response-token ceiling.")
-    quickstart_server_p.add_argument("--default-temperature", dest="temperature", type=float, default=0.6)
-    quickstart_server_p.add_argument("--default-top-p", dest="top_p", type=float, default=0.95)
-    quickstart_server_p.add_argument("--default-top-k", "--top-k", dest="top_k", type=int, default=20)
-    quickstart_server_p.add_argument("--default-presence-penalty", dest="default_presence_penalty", type=float, default=0.0)
-    quickstart_server_p.add_argument("--default-frequency-penalty", dest="default_frequency_penalty", type=float, default=0.0)
+    quickstart_server_p.add_argument(
+        "--max-tokens",
+        dest="max_response_tokens",
+        type=int,
+        help="Default server-side response-token ceiling.",
+    )
+    quickstart_server_p.add_argument(
+        "--default-temperature", dest="temperature", type=float, default=0.6
+    )
+    quickstart_server_p.add_argument(
+        "--default-top-p", dest="top_p", type=float, default=0.95
+    )
+    quickstart_server_p.add_argument(
+        "--default-top-k", "--top-k", dest="top_k", type=int, default=20
+    )
+    quickstart_server_p.add_argument(
+        "--default-presence-penalty",
+        dest="default_presence_penalty",
+        type=float,
+        default=0.0,
+    )
+    quickstart_server_p.add_argument(
+        "--default-frequency-penalty",
+        dest="default_frequency_penalty",
+        type=float,
+        default=0.0,
+    )
     quickstart_server_p.add_argument("--draft-temperature", type=float)
     quickstart_server_p.add_argument("--draft-top-p", type=float)
     quickstart_server_p.add_argument("--draft-top-k", type=int)
@@ -2150,7 +2723,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_reasoning_effort_arg(quickstart_server_p)
     quickstart_server_p.add_argument(
         "--reasoning-parser",
-        choices=["qwen3", "step3p5", "gemma4", "none"],
+        choices=["qwen3", "step3p5", "gemma4", "poolside_v1", "none"],
         default="qwen3",
     )
     _add_preserve_thinking_arg(quickstart_server_p)
@@ -2172,18 +2745,31 @@ def build_parser() -> argparse.ArgumentParser:
         quickstart_server_p,
         max_help=(
             "Compatibility alias for --fan-mode max for the server lifetime; "
-            "with the quickstart default this is Sustained Max"
+            "combined with the sustained profile this is Sustained Max"
         ),
     )
-    quickstart_server_p.add_argument("--open-browser", action="store_true", help="Open the local browser chat after the server starts")
+    quickstart_server_p.add_argument(
+        "--open-browser",
+        action="store_true",
+        help="Open the local browser chat after the server starts",
+    )
     quickstart_server_p.add_argument(
         "--max-idle-min",
         type=int,
         default=15,
         help="Minutes of chat inactivity before --max drops fans back to auto (default: 15; ramps back up on next request)",
     )
-    quickstart_server_p.add_argument("--warmup-tokens", type=int, default=16, help="Startup warmup generation length. Use 0 to disable.")
-    quickstart_server_p.add_argument("--strict-warmup", action="store_true", help="Fail server startup if the warmup pass fails.")
+    quickstart_server_p.add_argument(
+        "--warmup-tokens",
+        type=int,
+        default=16,
+        help="Startup warmup generation length. Use 0 to disable.",
+    )
+    quickstart_server_p.add_argument(
+        "--strict-warmup",
+        action="store_true",
+        help="Fail server startup if the warmup pass fails.",
+    )
     quickstart_server_p.add_argument(
         "--strict-fast-path",
         action="store_true",
@@ -2191,16 +2777,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     quickstart_server_p.set_defaults(func=cmd_serve_public)
 
-    connect_p = sub.add_parser("connect", help="Show client setup for Open WebUI, Claude Code, OpenCode, or Swival")
-    connect_p.add_argument("integration", nargs="?", choices=["openwebui", "claude-code", "opencode", "swival"])
+    connect_p = sub.add_parser(
+        "connect",
+        help="Show client setup for Open WebUI, Claude Code, OpenCode, or Swival",
+    )
+    connect_p.add_argument(
+        "integration",
+        nargs="?",
+        choices=["openwebui", "claude-code", "opencode", "swival"],
+    )
     connect_p.add_argument("--host", default="127.0.0.1")
     connect_p.add_argument("--port", type=int, default=8000)
     connect_p.add_argument("--model-id", default=DEFAULT_PUBLIC_MODEL_ID)
     connect_p.add_argument("--api-key-env", default="MTPLX_API_KEY")
-    connect_p.add_argument("--docker", action="store_true", help="Include the Dockerized Open WebUI host.docker.internal command")
+    connect_p.add_argument(
+        "--docker",
+        action="store_true",
+        help="Include the Dockerized Open WebUI host.docker.internal command",
+    )
     connect_p.add_argument("--webui-port", type=int, default=3000)
-    connect_p.add_argument("--single-user", action="store_true", help="Emit WEBUI_AUTH=False for a new single-user Open WebUI data volume")
-    connect_p.add_argument("--api-key", default="mtplx-local", help="OpenAI-compatible API key value for generated Docker command")
+    connect_p.add_argument(
+        "--single-user",
+        action="store_true",
+        help="Emit WEBUI_AUTH=False for a new single-user Open WebUI data volume",
+    )
+    connect_p.add_argument(
+        "--api-key",
+        default="mtplx-local",
+        help="OpenAI-compatible API key value for generated Docker command",
+    )
     connect_p.add_argument("--smoke", action="store_true")
     connect_p.add_argument("--timeout", type=float, default=5.0)
     connect_p.add_argument("--context-window", type=int, default=262144)
@@ -2209,41 +2814,118 @@ def build_parser() -> argparse.ArgumentParser:
 
     openwebui_p = sub.add_parser("openwebui", help="Open WebUI integration helpers")
     openwebui_sub = openwebui_p.add_subparsers(dest="openwebui_action", required=True)
-    openwebui_docker_p = openwebui_sub.add_parser("docker-command", help="Print the production Open WebUI Docker command")
+    openwebui_docker_p = openwebui_sub.add_parser(
+        "docker-command", help="Print the production Open WebUI Docker command"
+    )
     openwebui_docker_p.add_argument("--mtplx-port", type=int, default=8000)
     openwebui_docker_p.add_argument("--webui-port", type=int, default=3000)
-    openwebui_docker_p.add_argument("--single-user", action="store_true", help="Add WEBUI_AUTH=False for a fresh single-user volume")
+    openwebui_docker_p.add_argument(
+        "--single-user",
+        action="store_true",
+        help="Add WEBUI_AUTH=False for a fresh single-user volume",
+    )
     openwebui_docker_p.add_argument("--api-key", default="mtplx-local")
     openwebui_docker_p.add_argument("--json", action="store_true")
     openwebui_docker_p.set_defaults(func=cmd_openwebui_public)
 
-    models_p = sub.add_parser("models", help="List locally cached MTPLX models")
+    models_p = sub.add_parser(
+        "models",
+        help="List locally cached MTPLX models; check for and apply pack updates",
+    )
     models_p.add_argument("--cache-dir")
-    models_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    models_p.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    models_p.add_argument(
+        "--check",
+        action="store_true",
+        help="Compare cached packs against published revisions (network)",
+    )
+    models_p.add_argument(
+        "--update",
+        nargs="*",
+        metavar="REPO",
+        default=None,
+        help=(
+            "Update model packs in place (delta download). With no REPO, "
+            "updates every pack that has a newer published revision."
+        ),
+    )
+    models_p.add_argument(
+        "--progress-json",
+        action="store_true",
+        help="With --update: emit pull-style JSON progress events (one per line)",
+    )
+    models_p.add_argument(
+        "--installed-path",
+        help="With one --update REPO: update this exact installed pack directory",
+    )
     models_p.set_defaults(func=cmd_list_public)
 
     env_p = sub.add_parser("env", help="Print reproducible environment snapshot")
     env_p.add_argument("--project-root", default=".")
     env_p.set_defaults(func=_cmd_env)
 
-    doctor_p = sub.add_parser("doctor", help="Check MTPLX CLI, model, thermal, and tool environment")
-    doctor_p.add_argument("topic", nargs="?", choices=["opencode", "pi", "android-studio"], help="Optional focused doctor target")
+    doctor_p = sub.add_parser(
+        "doctor", help="Check MTPLX CLI, model, thermal, and tool environment"
+    )
+    doctor_p.add_argument(
+        "topic",
+        nargs="?",
+        choices=["opencode", "pi", "android-studio"],
+        help="Optional focused doctor target",
+    )
     doctor_p.add_argument("--project-root", default=".")
     doctor_p.add_argument("--host", default="127.0.0.1")
-    doctor_p.add_argument("--port", type=int, default=8008)
+    doctor_p.add_argument(
+        "--port",
+        type=int,
+        default=8008,
+        help=(
+            "Port for the topic bridge checks (opencode/pi/android-studio; "
+            "default 8008). When passed explicitly it also aims the MTPLX "
+            "server checks, which otherwise probe the shipped default :8000."
+        ),
+    )
     doctor_p.add_argument("--base-url")
-    doctor_p.add_argument("--smc-path", default=os.environ.get("MTPLX_SMC_PATH") or shutil.which("smc") or "")
-    doctor_p.add_argument("--sovereign-path", default=os.environ.get("MTPLX_SOVEREIGN_PATH") or shutil.which("sovereign") or "")
+    doctor_p.add_argument(
+        "--smc-path",
+        default=os.environ.get("MTPLX_SMC_PATH") or shutil.which("smc") or "",
+    )
+    doctor_p.add_argument(
+        "--sovereign-path",
+        default=os.environ.get("MTPLX_SOVEREIGN_PATH")
+        or shutil.which("sovereign")
+        or "",
+    )
     doctor_p.add_argument("--model-cache")
-    doctor_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    doctor_p.add_argument("--deep", action="store_true", help="Include launchers, config, staging, release, and integration checks")
-    doctor_p.add_argument("--summary", action="store_true", help="Print a compact check summary")
-    doctor_p.add_argument("--bundle", action="store_true", help="Write a redacted doctor bundle under ~/.mtplx/reports")
+    doctor_p.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    doctor_p.add_argument(
+        "--deep",
+        action="store_true",
+        help="Include launchers, config, staging, release, and integration checks",
+    )
+    doctor_p.add_argument(
+        "--summary", action="store_true", help="Print a compact check summary"
+    )
+    doctor_p.add_argument(
+        "--bundle",
+        action="store_true",
+        help="Write a redacted doctor bundle under ~/.mtplx/reports",
+    )
     doctor_p.add_argument("--output-dir", help="Directory for --bundle output")
-    doctor_p.add_argument("--include-paths", action="store_true", help="Keep local paths in --bundle output")
+    doctor_p.add_argument(
+        "--include-paths",
+        action="store_true",
+        help="Keep local paths in --bundle output",
+    )
     doctor_p.set_defaults(func=cmd_doctor)
 
-    tune_p = sub.add_parser("tune", help="Find the fastest AR/MTP draft control for this Mac")
+    tune_p = sub.add_parser(
+        "tune", help="Find the fastest AR/MTP draft control for this Mac"
+    )
     tune_p.add_argument("--model", default=default_model)
     tune_p.add_argument("--cache-dir")
     tune_p.add_argument(
@@ -2251,50 +2933,245 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Comma-separated MTP depths or Gemma draft blocks to compare against AR",
     )
-    tune_p.add_argument("--max-tokens", type=int, default=512)
+    tune_p.add_argument("--max-tokens", type=int, default=512,
+                        help="Per-case upper bound; the prompt suite's token budget also applies")
     tune_p.add_argument("--limit", type=int, default=1)
     tune_p.add_argument("--seed", type=int, default=0)
     tune_p.add_argument("--run-id")
     tune_p.add_argument("--output-dir")
     tune_p.add_argument("--output")
-    tune_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    tune_p.add_argument("--verbose", action="store_true", help="Show verify and acceptance details")
-    tune_p.add_argument("--dry-run", action="store_true", help="Show candidate commands without loading MLX")
-    tune_p.add_argument("--no-save", action="store_true", help="Do not save the winning depth")
-    tune_p.add_argument("--retune", action="store_true", help="Ignore saved tuning and measure again")
+    tune_p.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    tune_p.add_argument(
+        "--verbose", action="store_true", help="Show verify and acceptance details"
+    )
+    tune_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show candidate commands without loading MLX",
+    )
+    tune_p.add_argument(
+        "--no-save", action="store_true", help="Do not save the winning depth"
+    )
+    tune_p.add_argument(
+        "--retune", action="store_true", help="Ignore saved tuning and measure again"
+    )
     tune_p.add_argument("--unsafe-force-unverified", action="store_true")
-    tune_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
-    tune_p.add_argument("--temperature", type=float, default=0.6, help=argparse.SUPPRESS)
+    tune_p.add_argument(
+        "--yes", action="store_true", help="Confirm unsafe non-interactive actions"
+    )
+    tune_p.add_argument(
+        "--require-max-fans",
+        action="store_true",
+        help="Fail before tuning if verified max-fan mode cannot start.",
+    )
+    tune_p.add_argument(
+        "--temperature", type=float, default=0.6, help=argparse.SUPPRESS
+    )
     tune_p.add_argument("--top-p", type=float, default=0.95, help=argparse.SUPPRESS)
     tune_p.add_argument("--top-k", type=int, default=20, help=argparse.SUPPRESS)
-    tune_p.add_argument("--base-hidden-variant", choices=["pre_norm", "post_norm"], help="Target-model hidden contract; defaults to mtplx_runtime.json")
-    tune_p.add_argument("--mtp-hidden-variant", help="MTP recursive hidden contract; defaults to mtplx_runtime.json")
-    tune_p.add_argument("--concat-order", choices=["embedding_hidden", "hidden_embedding"], help="MTP fc concat order; defaults to mtplx_runtime.json")
-    tune_p.add_argument("--mtp-cache-policy", choices=["persistent", "fresh"], default="persistent", help=argparse.SUPPRESS)
-    tune_p.add_argument("--mtp-history-policy", choices=["auto", "committed", "full", "last-window", "last_window", "cycle", "none"], default="committed", help=argparse.SUPPRESS)
+    tune_p.add_argument(
+        "--base-hidden-variant",
+        choices=["pre_norm", "post_norm"],
+        help="Target-model hidden contract; defaults to mtplx_runtime.json",
+    )
+    tune_p.add_argument(
+        "--mtp-hidden-variant",
+        help="MTP recursive hidden contract; defaults to mtplx_runtime.json",
+    )
+    tune_p.add_argument(
+        "--concat-order",
+        choices=["embedding_hidden", "hidden_embedding"],
+        help="MTP fc concat order; defaults to mtplx_runtime.json",
+    )
+    tune_p.add_argument(
+        "--mtp-cache-policy",
+        choices=["persistent", "fresh"],
+        default="persistent",
+        help=argparse.SUPPRESS,
+    )
+    tune_p.add_argument(
+        "--mtp-history-policy",
+        choices=[
+            "auto",
+            "committed",
+            "full",
+            "last-window",
+            "last_window",
+            "cycle",
+            "none",
+        ],
+        default="committed",
+        help=argparse.SUPPRESS,
+    )
     tune_p.add_argument("--draft-temperature", type=float, help=argparse.SUPPRESS)
-    tune_p.add_argument("--draft-core", choices=["stock", "device-d2", "device"], default="stock", help=argparse.SUPPRESS)
+    tune_p.add_argument(
+        "--draft-core",
+        choices=["stock", "device-d2", "device"],
+        default="stock",
+        help=argparse.SUPPRESS,
+    )
     tune_p.add_argument("--draft-top-p", type=float, help=argparse.SUPPRESS)
     tune_p.add_argument("--draft-top-k", type=int, help=argparse.SUPPRESS)
     tune_p.add_argument("--prompt-suite", help=argparse.SUPPRESS)
-    tune_p.add_argument("--profile", type=_profile_arg, metavar=_PROFILE_METAVAR, default="performance-cold", help=argparse.SUPPRESS)
-    tune_p.add_argument("--_candidate", choices=["ar", "1", "2", "3", "4", "5", "6", "7", "8"], dest="_tune_candidate", help=argparse.SUPPRESS)
-    tune_p.add_argument("--_candidate-output", dest="_tune_candidate_output", help=argparse.SUPPRESS)
+    tune_p.add_argument(
+        "--profile",
+        type=_profile_arg,
+        metavar=_PROFILE_METAVAR,
+        # No parser default: tune's profile resolves like serve's launch
+        # rule (per-model turbo for the flagships) so depth is measured
+        # under the kernels the launch profile actually uses. An explicit
+        # --profile always wins.
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    tune_p.add_argument(
+        "--_candidate",
+        choices=["ar", "1", "2", "3", "4", "5", "6", "7", "8"],
+        dest="_tune_candidate",
+        help=argparse.SUPPRESS,
+    )
+    tune_p.add_argument(
+        "--_candidate-output", dest="_tune_candidate_output", help=argparse.SUPPRESS
+    )
     tune_p.set_defaults(func=cmd_tune_public)
 
     report_p = sub.add_parser("report", help="Create a redacted MTPLX support bundle")
     report_p.add_argument("--project-root", default=".")
-    report_p.add_argument("--smc-path", default=os.environ.get("MTPLX_SMC_PATH") or shutil.which("smc") or "")
-    report_p.add_argument("--sovereign-path", default=os.environ.get("MTPLX_SOVEREIGN_PATH") or shutil.which("sovereign") or "")
+    report_p.add_argument(
+        "--smc-path",
+        default=os.environ.get("MTPLX_SMC_PATH") or shutil.which("smc") or "",
+    )
+    report_p.add_argument(
+        "--sovereign-path",
+        default=os.environ.get("MTPLX_SOVEREIGN_PATH")
+        or shutil.which("sovereign")
+        or "",
+    )
     report_p.add_argument("--model-cache")
     report_p.add_argument("--output-dir", help="Directory for the report bundle")
-    report_p.add_argument("--include-paths", action="store_true", help="Keep local paths in the report")
-    report_p.add_argument("--deep", action="store_true", default=True, help="Include deep integration checks")
-    report_p.add_argument("--summary", action="store_true", help="Print compact check summary instead of JSON")
-    report_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    report_p.add_argument(
+        "--include-paths", action="store_true", help="Keep local paths in the report"
+    )
+    report_p.add_argument(
+        "--deep",
+        action="store_true",
+        default=True,
+        help="Include deep integration checks",
+    )
+    report_p.add_argument(
+        "--summary",
+        action="store_true",
+        help="Print compact check summary instead of JSON",
+    )
+    report_p.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
     report_p.set_defaults(func=cmd_doctor, bundle=True)
 
-    inspect_public_p = sub.add_parser("inspect", help="Inspect a model and auto-check MTP support")
+    trace_p = sub.add_parser(
+        "trace",
+        help="Diagnose agent/coding sessions: join serve receipts, flight samples, and OpenCode history",
+    )
+    trace_sub = trace_p.add_subparsers(dest="trace_action", required=True)
+
+    def _trace_common(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--port",
+            type=int,
+            default=None,
+            help="serve port (default: newest request log)",
+        )
+        p.add_argument(
+            "--db",
+            default=os.path.expanduser("~/.local/share/opencode/opencode.db"),
+            help="opencode.db path",
+        )
+        p.add_argument("--json", action="store_true", help="machine-readable output")
+
+        p.add_argument("--request-log", help="explicit request JSONL, including its rotation files")
+        p.add_argument("--flight-log", help="explicit flight JSONL, including its rotation files")
+        p.add_argument("--pi-session", help="Pi session JSONL instead of the OpenCode database")
+        p.add_argument("--hermes-db", help="Hermes state.db instead of the OpenCode database")
+        p.add_argument("--hermes-log", help="Hermes agent.log for API tokens and completion times")
+        p.add_argument("--ar-tok-s", type=float, help="measured AR decode TPS for the same hardware, model and workload; never a default estimate")
+
+    trace_sessions_p = trace_sub.add_parser(
+        "sessions", help="List recent OpenCode sessions with server-request matches"
+    )
+    _trace_common(trace_sessions_p)
+    trace_sessions_p.add_argument("--limit", type=int, default=15)
+    trace_sessions_p.set_defaults(func=cmd_trace_public)
+
+    trace_session_p = trace_sub.add_parser(
+        "session",
+        help="Per-turn timeline for one session (cache, TPS, postcommit, canon, pathology flags)",
+    )
+    _trace_common(trace_session_p)
+    trace_session_p.add_argument(
+        "session", nargs="?", default="latest", help="ses_... id, substring, or 'latest'"
+    )
+    trace_session_p.set_defaults(func=cmd_trace_public)
+
+    trace_request_p = trace_sub.add_parser(
+        "request", help="Deep-dive one request receipt + per-second flight curve"
+    )
+    _trace_common(trace_request_p)
+    trace_request_p.add_argument(
+        "request",
+        nargs="?",
+        default="latest",
+        help="request_id substring, receipt index, or 'latest'",
+    )
+    trace_request_p.add_argument(
+        "--all", action="store_true", help="show every receipt field"
+    )
+    trace_request_p.set_defaults(func=cmd_trace_public)
+
+    trace_autopsy_p = trace_sub.add_parser(
+        "autopsy",
+        help="Extract + analyze a turn's reasoning (loop metrics, dup paragraphs, dump to file)",
+    )
+    _trace_common(trace_autopsy_p)
+    trace_autopsy_p.add_argument("session", nargs="?", default="latest")
+    trace_autopsy_p.add_argument(
+        "--turn",
+        type=int,
+        default=None,
+        help="1-based assistant turn (default: biggest think)",
+    )
+    trace_autopsy_p.set_defaults(func=cmd_trace_public)
+
+    trace_live_p = trace_sub.add_parser(
+        "live", help="Live in-flight status from the serve flight endpoint"
+    )
+    _trace_common(trace_live_p)
+    trace_live_p.add_argument(
+        "--watch", action="store_true", help="poll continuously"
+    )
+    trace_live_p.add_argument("--interval", type=float, default=2.0)
+    trace_live_p.set_defaults(func=cmd_trace_public)
+
+    trace_report_p = trace_sub.add_parser(
+        "report",
+        help="Self-contained HTML report with historical graphs for a session",
+    )
+    _trace_common(trace_report_p)
+    trace_report_p.add_argument("session", nargs="?", default="latest")
+    trace_report_p.add_argument(
+        "--out",
+        default=None,
+        help="output HTML path (default: ~/.mtplx/metrics/reports/<ses>.html)",
+    )
+    trace_report_p.add_argument(
+        "--open", action="store_true", help="open in browser when written"
+    )
+    trace_report_p.set_defaults(func=cmd_trace_public)
+
+    inspect_public_p = sub.add_parser(
+        "inspect", help="Inspect a model and auto-check MTP support"
+    )
     inspect_public_p.add_argument(
         "model_args",
         nargs="*",
@@ -2310,7 +3187,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Always exit 0 after printing the compatibility verdict.",
     )
     inspect_public_p.set_defaults(strict_exit_code=True)
-    inspect_public_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    inspect_public_p.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
     inspect_public_p.set_defaults(func=cmd_inspect_model_public)
 
     forge_p = sub.add_parser(
@@ -2323,21 +3202,33 @@ def build_parser() -> argparse.ArgumentParser:
         "probe",
         help="Classify a Forge source without downloading full weights",
     )
-    forge_probe_p.add_argument("source", help="Hugging Face repo, HF URL, or local path")
-    forge_probe_p.add_argument("--json", action="store_true", help="Emit machine-readable probe result")
+    forge_probe_p.add_argument(
+        "source", help="Hugging Face repo, HF URL, or local path"
+    )
+    forge_probe_p.add_argument(
+        "--json", action="store_true", help="Emit machine-readable probe result"
+    )
     forge_probe_p.set_defaults(func=cmd_forge_public)
 
     forge_build_p = forge_sub.add_parser(
         "build",
         help="Download/convert/verify/brand a local MTPLX artifact",
     )
-    forge_build_p.add_argument("--repo", required=True, help="Source Hugging Face repo, HF URL, or local path")
+    forge_build_p.add_argument(
+        "--repo", required=True, help="Source Hugging Face repo, HF URL, or local path"
+    )
     forge_build_p.add_argument("--out", required=True, help="Progress output root")
     forge_build_p.add_argument("--run-id", required=True, help="Run id under --out")
     forge_build_p.add_argument("--recipe", required=True, help="Forge recipe JSON")
-    forge_build_p.add_argument("--branded-name", required=True, help="Local MTPLX artifact name")
-    forge_build_p.add_argument("--max", action="store_true", help="Opt into max-fan verification")
-    forge_build_p.add_argument("--max-tokens", type=int, default=2048, help="Verification response budget")
+    forge_build_p.add_argument(
+        "--branded-name", required=True, help="Local MTPLX artifact name"
+    )
+    forge_build_p.add_argument(
+        "--max", action="store_true", help="Opt into max-fan verification"
+    )
+    forge_build_p.add_argument(
+        "--max-tokens", type=int, default=2048, help="Verification response budget"
+    )
     forge_build_p.add_argument("--suite", help="Verification prompt suite")
     forge_build_p.add_argument(
         "--dtype",
@@ -2358,9 +3249,13 @@ def build_parser() -> argparse.ArgumentParser:
         "discover",
         help="Search Hugging Face for MTPLX-branded models",
     )
-    forge_discover_p.add_argument("--json", action="store_true", help="Emit machine-readable cards")
+    forge_discover_p.add_argument(
+        "--json", action="store_true", help="Emit machine-readable cards"
+    )
     forge_discover_p.add_argument("--query", help="Search text; defaults to MTPLX")
-    forge_discover_p.add_argument("--limit", type=int, default=20)
+    # 100 = the engine's per-call cap and the app wall's page size; 20 hid
+    # everything below the download-rank fold (same trap as the old wall).
+    forge_discover_p.add_argument("--limit", type=int, default=100)
     forge_discover_p.add_argument("--offset", type=int, default=0)
     forge_discover_p.set_defaults(func=cmd_forge_public)
 
@@ -2368,9 +3263,15 @@ def build_parser() -> argparse.ArgumentParser:
         "publish",
         help="Upload a local Forge artifact to Hugging Face",
     )
-    forge_publish_p.add_argument("--path", required=True, help="Local forged model directory")
-    forge_publish_p.add_argument("--repo", required=True, help="Destination owner/name repo")
-    forge_publish_p.add_argument("--visibility", choices=("public", "private"), required=True)
+    forge_publish_p.add_argument(
+        "--path", required=True, help="Local forged model directory"
+    )
+    forge_publish_p.add_argument(
+        "--repo", required=True, help="Destination owner/name repo"
+    )
+    forge_publish_p.add_argument(
+        "--visibility", choices=("public", "private"), required=True
+    )
     forge_publish_p.add_argument("--license", required=True, help="SPDX license id")
     forge_publish_p.add_argument("--out", required=True, help="Progress output root")
     forge_publish_p.add_argument("--run-id", required=True, help="Run id under --out")
@@ -2397,6 +3298,19 @@ def build_parser() -> argparse.ArgumentParser:
     forge_verify_p.add_argument("--max", action="store_true")
     forge_verify_p.add_argument("--max-tokens", type=int, default=2048)
     forge_verify_p.add_argument("--suite", help="Verification prompt suite")
+    forge_verify_p.add_argument(
+        "--stamp",
+        action="store_true",
+        help=(
+            "After the rows pass, write/update the pack's mtplx_runtime.json "
+            "in place (the first-load smoke baseline that clears the "
+            "'unverified' marker) — no rebuild or copy"
+        ),
+    )
+    forge_verify_p.add_argument(
+        "--source-repo",
+        help="Provenance for --stamp: the upstream repo this pack was converted from",
+    )
     forge_verify_p.set_defaults(func=cmd_forge_public)
 
     forge_cancel_p = forge_sub.add_parser(
@@ -2406,23 +3320,53 @@ def build_parser() -> argparse.ArgumentParser:
     forge_cancel_p.add_argument("run_id")
     forge_cancel_p.set_defaults(func=cmd_forge_public)
 
-    init_p = sub.add_parser("init", help="Initialize MTPLX user config without importing MLX")
+    init_p = sub.add_parser(
+        "init", help="Initialize MTPLX user config without importing MLX"
+    )
     init_p.add_argument("--config", default="~/.mtplx/config.toml")
-    init_p.add_argument("--model", default=DEFAULT_HF_MODEL_ID, help="Default verified model repo id or path")
-    init_p.add_argument("--model-dir", help="Model cache directory; defaults to MTPLX_MODEL_DIR or ~/.mtplx/models")
-    init_p.add_argument("--profile", type=_profile_arg, metavar=_PROFILE_METAVAR, default=DEFAULT_PROFILE_NAME)
+    init_p.add_argument(
+        "--model",
+        default=DEFAULT_HF_MODEL_ID,
+        help="Default verified model repo id or path",
+    )
+    init_p.add_argument(
+        "--model-dir",
+        help="Model cache directory; defaults to MTPLX_MODEL_DIR or ~/.mtplx/models",
+    )
+    init_p.add_argument(
+        "--profile",
+        type=_profile_arg,
+        metavar=_PROFILE_METAVAR,
+        default=DEFAULT_PROFILE_NAME,
+    )
     init_p.add_argument("--thermal-control", choices=("auto", "none"), default="auto")
-    init_p.add_argument("--download", action="store_true", help="Download the selected model into the cache")
-    init_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    init_p.add_argument("--dry-run", action="store_true", help="Show init actions without writing files")
-    init_p.add_argument("--write", action="store_true", help="Write the initial config file")
+    init_p.add_argument(
+        "--download",
+        action="store_true",
+        help="Download the selected model into the cache",
+    )
+    init_p.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    init_p.add_argument(
+        "--dry-run", action="store_true", help="Show init actions without writing files"
+    )
+    init_p.add_argument(
+        "--write", action="store_true", help="Write the initial config file"
+    )
     init_p.set_defaults(func=_cmd_init)
 
-    profiles_p = sub.add_parser("profiles", help="List MTPLX runtime profiles without importing MLX")
-    profiles_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    profiles_p = sub.add_parser(
+        "profiles", help="List MTPLX runtime profiles without importing MLX"
+    )
+    profiles_p.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
     profiles_p.set_defaults(func=_cmd_profiles)
 
-    pull_p = sub.add_parser("pull", help="Download a Hugging Face model into the MTPLX cache")
+    pull_p = sub.add_parser(
+        "pull", help="Download a Hugging Face model into the MTPLX cache"
+    )
     pull_p.add_argument(
         "model",
         nargs="?",
@@ -2431,30 +3375,54 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pull_p.add_argument("--cache-dir")
     pull_p.add_argument("--revision")
-    pull_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    pull_p.add_argument("--progress-json", action="store_true", help="Emit newline-delimited JSON progress events")
+    pull_p.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    pull_p.add_argument(
+        "--progress-json",
+        action="store_true",
+        help="Emit newline-delimited JSON progress events",
+    )
     pull_p.set_defaults(func=cmd_pull_public)
 
     list_p = sub.add_parser("list", help="List locally cached MTPLX models")
     list_p.add_argument("--cache-dir")
-    list_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    list_p.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
     list_p.set_defaults(func=cmd_list_public)
 
     remove_p = sub.add_parser("remove", help="Remove a locally cached MTPLX model")
-    remove_p.add_argument("model", help="Hugging Face repo id, URL, or cached safe name")
+    remove_p.add_argument(
+        "model", help="Hugging Face repo id, URL, or cached safe name"
+    )
     remove_p.add_argument("--cache-dir")
     remove_p.add_argument("--missing-ok", action="store_true")
-    remove_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    remove_p.add_argument(
+        "--yes", action="store_true", help="Skip the delete confirmation prompt"
+    )
+    remove_p.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
     remove_p.set_defaults(func=cmd_remove_public)
 
     run_p = sub.add_parser("run", help="Run a one-shot verified MTPLX completion")
     run_p.add_argument("prompt_arg", nargs="?", help="Prompt text")
     run_p.add_argument("--model", default=default_model)
     run_p.add_argument("--cache-dir")
-    run_p.add_argument("--profile", type=_profile_arg, metavar=_PROFILE_METAVAR, default=DEFAULT_PROFILE_NAME)
+    run_p.add_argument(
+        "--profile",
+        type=_profile_arg,
+        metavar=_PROFILE_METAVAR,
+        default=DEFAULT_PROFILE_NAME,
+    )
     run_p.add_argument("--unsafe-force-unverified", action="store_true")
-    run_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
-    run_p.add_argument("--prompt", help="Prompt text, as an alternative to the positional prompt")
+    run_p.add_argument(
+        "--yes", action="store_true", help="Confirm unsafe non-interactive actions"
+    )
+    run_p.add_argument(
+        "--prompt", help="Prompt text, as an alternative to the positional prompt"
+    )
     run_p.add_argument("--system", help="Optional system prompt")
     run_p.add_argument(
         "--max-tokens",
@@ -2470,9 +3438,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_expert_streaming_args(run_p)
     run_p.add_argument("--seed", type=int, default=0)
     _add_reasoning_arg(run_p)
+    _add_reasoning_effort_arg(run_p)
     run_p.add_argument("--quiet", action="store_true", help="Hide the stats footer")
     run_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    run_p.add_argument("--expect-python", action="store_true")
+    run_p.add_argument(
+        "--expect-python", action="store_true",
+        help="Validate the final answer as Python, allowing one enclosing code fence",
+    )
     _add_fan_mode_args(
         run_p,
         max_help="Compatibility alias for --fan-mode max for this run",
@@ -2482,9 +3454,16 @@ def build_parser() -> argparse.ArgumentParser:
     chat_p = sub.add_parser("chat", help="Run one native-MTP chat smoke generation")
     chat_p.add_argument("--model", default=default_model)
     chat_p.add_argument("--cache-dir")
-    chat_p.add_argument("--profile", type=_profile_arg, metavar=_PROFILE_METAVAR, default=DEFAULT_PROFILE_NAME)
+    chat_p.add_argument(
+        "--profile",
+        type=_profile_arg,
+        metavar=_PROFILE_METAVAR,
+        default=DEFAULT_PROFILE_NAME,
+    )
     chat_p.add_argument("--unsafe-force-unverified", action="store_true")
-    chat_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
+    chat_p.add_argument(
+        "--yes", action="store_true", help="Confirm unsafe non-interactive actions"
+    )
     chat_p.add_argument("--prompt", required=True)
     chat_p.add_argument(
         "--max-tokens",
@@ -2500,15 +3479,23 @@ def build_parser() -> argparse.ArgumentParser:
     _add_expert_streaming_args(chat_p)
     chat_p.add_argument("--seed", type=int, default=0)
     _add_reasoning_arg(chat_p)
-    chat_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    chat_p.add_argument("--expect-python", action="store_true")
+    _add_reasoning_effort_arg(chat_p)
+    chat_p.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    chat_p.add_argument(
+        "--expect-python", action="store_true",
+        help="Validate the final answer as Python, allowing one enclosing code fence",
+    )
     _add_fan_mode_args(
         chat_p,
         max_help="Compatibility alias for --fan-mode max for this run",
     )
     chat_p.set_defaults(func=cmd_chat_public)
 
-    serve_p = sub.add_parser("serve", help="Choose model/mode, then start the OpenAI-compatible MTPLX server")
+    serve_p = sub.add_parser(
+        "serve", help="Choose model/mode, then start the OpenAI-compatible MTPLX server"
+    )
     serve_p.add_argument("--model", default=default_model)
     serve_p.add_argument("--cache-dir")
     serve_p.add_argument(
@@ -2518,7 +3505,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve_p.add_argument(
         "--profile",
-        type=_profile_arg, metavar=_PROFILE_METAVAR,
+        type=_profile_arg,
+        metavar=_PROFILE_METAVAR,
         default=DEFAULT_PROFILE_NAME,
         help=(
             "Runtime profile. Default resolves per model: Turbo for the "
@@ -2528,9 +3516,37 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     serve_p.add_argument("--unsafe-force-unverified", action="store_true")
-    serve_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
-    serve_p.add_argument("--host", default="127.0.0.1")
+    serve_p.add_argument(
+        "--agent-rewrites",
+        choices=["on", "off"],
+        default=None,
+        help=(
+            "Agent transcript rewriting. Unset (default) is passthrough: no "
+            "tool-result compaction, no injected steering contracts, no "
+            "heuristic toolset filtering; per-feature MTPLX_*_COMPACT_"
+            "THRESHOLD_CHARS env limits can re-enable individual compactors. "
+            "on restores the full legacy rewrite machinery. off is a hard "
+            "passthrough guarantee that also overrides per-feature env opt-ins."
+        ),
+    )
+    serve_p.add_argument(
+        "--yes", action="store_true", help="Confirm unsafe non-interactive actions"
+    )
+    serve_p.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help=(
+            "Bind address. Default 127.0.0.1 is this Mac only; 0.0.0.0 shares "
+            "the API with other devices and VM guests (requires an API key — "
+            "add --api-key-file ~/.mtplx/api-key to generate one)"
+        ),
+    )
     serve_p.add_argument("--port", type=int, default=8000)
+    serve_p.add_argument(
+        "--no-auth",
+        action="store_true",
+        help="Disable API-key auth for localhost binds (non-localhost still requires a key)",
+    )
     serve_p.add_argument("--depth", type=int, default=3)
     _add_mtp_toggle_args(serve_p)
     _add_expert_streaming_args(serve_p)
@@ -2563,7 +3579,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Require Bearer or X-API-Key auth. Required for non-localhost binds.",
     )
-    serve_p.add_argument("--api-key-file", help="Read the API key from a local file instead of argv/env.")
+    serve_p.add_argument(
+        "--api-key-file",
+        help=(
+            "Read the API key from a local file instead of argv/env. "
+            "A missing file is created with a fresh key (printed once)."
+        ),
+    )
     serve_p.add_argument(
         "--rate-limit",
         type=int,
@@ -2577,6 +3599,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Committed-token batch size per chat SSE chunk.",
     )
     _add_batching_args(serve_p)
+    _add_ngram_prewarm_args(serve_p)
     _add_ssd_session_cache_args(serve_p)
     _add_paged_kv_quant_args(serve_p)
     _add_adaptive_args(serve_p)
@@ -2591,11 +3614,53 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         help="Override context window. Default reads the model/tokenizer config.",
     )
-    serve_p.add_argument("--default-temperature", "--temperature", dest="temperature", type=float, default=0.6)
-    serve_p.add_argument("--default-top-p", "--top-p", dest="top_p", type=float, default=0.95)
-    serve_p.add_argument("--default-top-k", "--top-k", dest="top_k", type=int, default=20)
-    serve_p.add_argument("--default-presence-penalty", dest="default_presence_penalty", type=float, default=0.0)
-    serve_p.add_argument("--default-frequency-penalty", dest="default_frequency_penalty", type=float, default=0.0)
+    serve_p.add_argument(
+        "--stream-stall-deadline-s",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Fail a stream whose model owner makes no progress for this many "
+            "seconds; 0 turns the watchdog off. Default: "
+            "$MTPLX_STREAM_STALL_DEADLINE_S or 300 (issue #448). The app "
+            "passes its Stall watchdog setting through this flag."
+        ),
+    )
+    serve_p.add_argument(
+        "--allow-swap",
+        action="store_true",
+        help=(
+            "Serve past this machine's memory fit: the default window is the "
+            "model's own maximum and prompts past the fit are admitted instead "
+            "of refused with 507. Expect swap and slow decode there. "
+            "MTPLX_ALLOW_SWAP=1 does the same for launchers without flags."
+        ),
+    )
+    serve_p.add_argument(
+        "--default-temperature",
+        "--temperature",
+        dest="temperature",
+        type=float,
+        default=0.6,
+    )
+    serve_p.add_argument(
+        "--default-top-p", "--top-p", dest="top_p", type=float, default=0.95
+    )
+    serve_p.add_argument(
+        "--default-top-k", "--top-k", dest="top_k", type=int, default=20
+    )
+    serve_p.add_argument(
+        "--default-presence-penalty",
+        dest="default_presence_penalty",
+        type=float,
+        default=0.0,
+    )
+    serve_p.add_argument(
+        "--default-frequency-penalty",
+        dest="default_frequency_penalty",
+        type=float,
+        default=0.0,
+    )
     serve_p.add_argument("--draft-temperature", type=float)
     serve_p.add_argument("--draft-top-p", type=float)
     serve_p.add_argument("--draft-top-k", type=int)
@@ -2637,17 +3702,63 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve_p.add_argument("--mtp-quant-bits", type=int)
     serve_p.add_argument("--mtp-quant-group-size", type=int, default=64)
-    serve_p.add_argument("--mtp-quant-mode", choices=["affine", "symmetric"], default="affine")
+    serve_p.add_argument(
+        "--mtp-quant-mode", choices=["affine", "symmetric"], default="affine"
+    )
     _add_reasoning_arg(serve_p)
     _add_reasoning_effort_arg(serve_p)
     serve_p.add_argument(
         "--reasoning-parser",
-        choices=["qwen3", "step3p5", "gemma4", "none"],
+        choices=["qwen3", "step3p5", "gemma4", "poolside_v1", "none"],
         default="qwen3",
     )
     _add_preserve_thinking_arg(serve_p)
     _add_bridge_prompt_args(serve_p)
-    serve_p.add_argument("--model-id", default=DEFAULT_PUBLIC_MODEL_ID, help="Served OpenAI model id; defaults to the loaded artifact identity")
+    serve_p.add_argument(
+        "--model-id",
+        default=DEFAULT_PUBLIC_MODEL_ID,
+        help="Served OpenAI model id; defaults to the loaded artifact identity",
+    )
+    serve_p.add_argument(
+        "--embedding-model",
+        action="append",
+        default=[],
+        metavar="REF[=SERVED_ID]",
+        help="Serve REF on /v1/embeddings (repeatable). Loaded on first request.",
+    )
+    serve_p.add_argument(
+        "--reranker-model",
+        action="append",
+        default=[],
+        metavar="REF[=SERVED_ID]",
+        help="Serve REF on /v1/rerank (repeatable). The same REF in both roles loads once.",
+    )
+    serve_p.add_argument(
+        "--retrieval-max-resident",
+        type=int,
+        default=2,
+        help="How many retrieval models stay in memory; least-recently-used are unloaded",
+    )
+    serve_p.add_argument(
+        "--retrieval-idle-timeout",
+        type=float,
+        default=0.0,
+        help="Unload retrieval models after this many idle seconds (0 = never)",
+    )
+    serve_p.add_argument(
+        "--retrieval-max-tokens",
+        type=int,
+        default=0,
+        help="Truncate retrieval inputs to this many tokens (0 = per-model default)",
+    )
+    serve_p.add_argument(
+        "--retrieval-trust-remote-code",
+        action="store_true",
+        help=(
+            "Allow retrieval checkpoints that ship their own Python "
+            "(jina-style model.py/rerank.py) to execute it; off by default"
+        ),
+    )
     serve_p.add_argument(
         "--no-stats-footer",
         action="store_false",
@@ -2676,7 +3787,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--app-launch-id",
         help="Opaque native-app launch id echoed by /health for daemon ownership checks.",
     )
-    serve_p.add_argument("--open-browser", action="store_true", help="Open the local browser chat after the server starts")
+    serve_p.add_argument(
+        "--open-browser",
+        action="store_true",
+        help="Open the local browser chat after the server starts",
+    )
     serve_p.add_argument(
         "--warmup-tokens",
         type=int,
@@ -2695,7 +3810,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve_p.set_defaults(func=cmd_serve_public)
 
-    preflight_p = sub.add_parser("bench-preflight", help="Check benchmark contamination before speed runs")
+    preflight_p = sub.add_parser(
+        "bench-preflight", help="Check benchmark contamination before speed runs"
+    )
     preflight_p.add_argument("--project-root", default=".")
     preflight_p.add_argument("--top-limit", type=int, default=12)
     preflight_p.add_argument("--cpu-threshold", type=float, default=25.0)
@@ -2714,7 +3831,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Always exit 0 after printing the compatibility verdict.",
     )
     inspect_p.set_defaults(strict_exit_code=True)
-    inspect_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    inspect_p.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
     inspect_p.set_defaults(func=_cmd_inspect_model)
 
     bench_p = sub.add_parser("bench", help="Run benchmark harness")
@@ -2734,14 +3853,16 @@ def build_parser() -> argparse.ArgumentParser:
             "reference",
             "reference-vllm",
         ],
-        help="Public benchmark action. Omit for legacy benchmark flags.",
+        help="Benchmark action; a bare `mtplx bench` lists them.",
     )
     bench_p.add_argument("--backend", default="manifest")
     bench_p.add_argument(
         "--profile",
         choices=(*PROFILE_CHOICES, "native-mtp-60"),
         help=(
-            "Runtime profile for product benchmark actions. Defaults to Sustained for context runs; "
+            "Runtime profile for product benchmark actions. Default follows the launch rule: "
+            "Turbo for the quantized 27B/9B flagships and the Flash-Next packs across every suite; Sustained otherwise "
+            "(context and long-generation suites stay Sustained for non-flagship models); "
             "native-mtp-60 is a legacy alias for performance-cold."
         ),
     )
@@ -2764,11 +3885,25 @@ def build_parser() -> argparse.ArgumentParser:
             "multiturn-flappy",
         ],
     )
-    bench_p.add_argument("--strict", action="store_true", help="Run clean-preflight before profile benchmarks")
-    bench_p.add_argument("--strict-cold", action="store_true", help="Enforce cold 55 tok/s regression gate")
-    bench_p.add_argument("--no-fanmax", action="store_true", help="Mark run as no-fan product candidate")
-    bench_p.add_argument("--fanmax", action="store_true", help="Mark run as fan-controlled diagnostic")
-    bench_p.add_argument("--max", action="store_true", dest="fanmax", help="Alias for --fanmax")
+    bench_p.add_argument(
+        "--strict",
+        action="store_true",
+        help="Run clean-preflight before profile benchmarks",
+    )
+    bench_p.add_argument(
+        "--strict-cold",
+        action="store_true",
+        help="Enforce the cold 59 tok/s regression gate",
+    )
+    bench_p.add_argument(
+        "--no-fanmax", action="store_true", help="Mark run as no-fan product candidate"
+    )
+    bench_p.add_argument(
+        "--fanmax", action="store_true", help="Mark run as fan-controlled diagnostic"
+    )
+    bench_p.add_argument(
+        "--max", action="store_true", dest="fanmax", help="Alias for --fanmax"
+    )
     bench_p.add_argument(
         "--generation-mode",
         choices=["mtp", "ar"],
@@ -2781,7 +3916,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Diagnostic benchmark mode: AR with no MTP sidecar loaded.",
     )
     bench_p.add_argument("--unsafe-force-unverified", action="store_true")
-    bench_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
+    bench_p.add_argument(
+        "--yes", action="store_true", help="Confirm unsafe non-interactive actions"
+    )
     bench_p.add_argument("--dry-run", action="store_true")
     bench_p.add_argument(
         "--quick",
@@ -2806,17 +3943,23 @@ def build_parser() -> argparse.ArgumentParser:
     bench_p.add_argument("--models", nargs="+")
     bench_p.add_argument("--record-champion", action="store_true")
     bench_p.add_argument("--champion", default=DEFAULT_HF_MODEL_ID)
-    bench_p.add_argument("--references", nargs="+", default=["stock_mlx_lm", "llama_cpp"])
+    bench_p.add_argument(
+        "--references", nargs="+", default=["stock_mlx_lm", "llama_cpp"]
+    )
     bench_p.add_argument("--url", default="http://127.0.0.1:8000")
     bench_p.add_argument("--port", type=int, default=8041)
     bench_p.add_argument("--turns", type=int, default=5)
     bench_p.add_argument("--capture-dispatch", action="store_true")
     bench_p.add_argument("--ssh-host", default="mtplx-3090")
-    bench_p.add_argument("--remote-phase-dir", default="/home/youssof/ai/mtplx-phase1-v4-20260429-012151")
+    bench_p.add_argument(
+        "--remote-phase-dir", default="/home/youssof/ai/mtplx-phase1-v4-20260429-012151"
+    )
     bench_p.add_argument("--remote-venv", default="/home/youssof/ai/vllm-venv")
     bench_p.add_argument("--remote-run-script", default="run_nsys_server_capture.sh")
     bench_p.add_argument("--remote-mode", choices=["no-mtp", "mtp5"], default="mtp5")
-    bench_p.add_argument("--remote-capture-kind", choices=["offline", "server"], default="offline")
+    bench_p.add_argument(
+        "--remote-capture-kind", choices=["offline", "server"], default="offline"
+    )
     bench_p.add_argument("--remote-port", type=int, default=8065)
     bench_p.add_argument("--remote-timeout-s", type=int, default=3600)
     bench_p.add_argument("--remote-output-dir")
@@ -2824,17 +3967,46 @@ def build_parser() -> argparse.ArgumentParser:
     bench_p.add_argument("--min-free-gib", type=float, default=25.0)
     bench_p.add_argument("--model", default=default_model)
     bench_p.add_argument("--cache-dir")
-    bench_p.add_argument("--prompts", default="mtplx/benchmarks/prompts/default.jsonl")
+    bench_p.add_argument(
+        "--prompts",
+        help="Prompt suite name or .jsonl path; defaults to the packaged default suite",
+    )
     bench_p.add_argument("--output")
     bench_p.add_argument("--out", dest="output", help="Alias for --output")
-    bench_p.add_argument("--json", action="store_true", help="Accepted for friendly scripts; benchmark commands already print JSON")
-    bench_p.add_argument("--verbose", action="store_true", help="Show detailed tuner diagnostics where supported")
-    bench_p.add_argument("--no-save", action="store_true", help="Do not save tuner recommendations")
-    bench_p.add_argument("--retune", action="store_true", help="Ignore saved tuner results where supported")
-    bench_p.add_argument("--no-telemetry", action="store_true", help="Disable bench tune power telemetry for cleaner speed comparison")
-    bench_p.add_argument("--before", help="Baseline envelope or nightly summary for bench compare")
-    bench_p.add_argument("--after", help="Candidate envelope or nightly summary for bench compare")
-    bench_p.add_argument("--strict-exactness", action="store_true", help="Require exactness gate pass in envelope compare mode")
+    bench_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Accepted for friendly scripts; benchmark commands already print JSON",
+    )
+    bench_p.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show detailed tuner diagnostics where supported",
+    )
+    bench_p.add_argument(
+        "--no-save", action="store_true", help="Do not save tuner recommendations"
+    )
+    bench_p.add_argument(
+        "--retune",
+        action="store_true",
+        help="Ignore saved tuner results where supported",
+    )
+    bench_p.add_argument(
+        "--no-telemetry",
+        action="store_true",
+        help="Disable bench tune power telemetry for cleaner speed comparison",
+    )
+    bench_p.add_argument(
+        "--before", help="Baseline envelope or nightly summary for bench compare"
+    )
+    bench_p.add_argument(
+        "--after", help="Candidate envelope or nightly summary for bench compare"
+    )
+    bench_p.add_argument(
+        "--strict-exactness",
+        action="store_true",
+        help="Require exactness gate pass in envelope compare mode",
+    )
     bench_p.add_argument("--cold-regression-tolerance-pct", type=float, default=2.0)
     bench_p.add_argument("--nightly-exactness-contexts", default="64,2048,6144,10240")
     bench_p.add_argument("--temperature", type=float, default=0.6)
@@ -2892,7 +4064,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bench_p.add_argument(
         "--prefill-layout",
-        choices=("profile", "contiguous-then-repage", "contiguous-dense-decode", "paged"),
+        choices=(
+            "profile",
+            "contiguous-then-repage",
+            "contiguous-dense-decode",
+            "paged",
+        ),
         default="profile",
         help=(
             "Override MTPLX_SUSTAINED_PREFILL_LAYOUT for bench prefill-ladder. "
@@ -2918,7 +4095,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bench_p.add_argument(
         "--mtp-history-policy",
-        choices=("auto", "committed", "full", "last-window", "last_window", "cycle", "none"),
+        choices=(
+            "auto",
+            "committed",
+            "full",
+            "last-window",
+            "last_window",
+            "cycle",
+            "none",
+        ),
         help="Diagnostic override for MTPLX_MTP_HISTORY_POLICY after profile env is applied.",
     )
     bench_p.add_argument(
@@ -2988,9 +4173,7 @@ def build_parser() -> argparse.ArgumentParser:
             "logits-first-committed-slice",
             "logits_first_committed_slice",
         ),
-        help=(
-            "Diagnostic label for verify hidden handling in prefill-ladder JSON."
-        ),
+        help=("Diagnostic label for verify hidden handling in prefill-ladder JSON."),
     )
     bench_p.add_argument(
         "--no-batch-target-arrays",
@@ -3043,7 +4226,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     qa_p = sub.add_parser("qa", help="Run MTPLX correctness gates")
     qa_sub = qa_p.add_subparsers(dest="qa_action", required=True)
-    qa_exact_p = qa_sub.add_parser("exactness", help="Run full Phase 0H paged-verifier exactness")
+    qa_exact_p = qa_sub.add_parser(
+        "exactness", help="Run full Phase 0H paged-verifier exactness"
+    )
     qa_exact_p.add_argument("--model", default=default_model)
     qa_exact_p.add_argument("--contexts", default="64,2048,6144,10240")
     qa_exact_p.add_argument("--prompt-suite")
@@ -3055,7 +4240,9 @@ def build_parser() -> argparse.ArgumentParser:
     qa_exact_p.add_argument("--exactness-partition-size", type=int, default=512)
     qa_exact_p.add_argument("--output")
     qa_exact_p.set_defaults(func=cmd_qa_public)
-    qa_dist_p = qa_sub.add_parser("distribution", help="Run distribution-level exactness smoke across suites")
+    qa_dist_p = qa_sub.add_parser(
+        "distribution", help="Run distribution-level exactness smoke across suites"
+    )
     qa_dist_p.add_argument("--model", default=default_model)
     qa_dist_p.add_argument("--reference-stack", default="stock_mlx_lm_ar")
     qa_dist_p.add_argument("--suite", default="distribution-smoke")
@@ -3070,16 +4257,22 @@ def build_parser() -> argparse.ArgumentParser:
     qa_dist_p.add_argument("--output-dir")
     qa_dist_p.set_defaults(func=cmd_qa_public)
 
-    profile_public_p = sub.add_parser("profile", help="Profile dispatch, thermal, and compile behavior")
+    profile_public_p = sub.add_parser(
+        "profile", help="Profile dispatch, thermal, and compile behavior"
+    )
     profile_sub = profile_public_p.add_subparsers(dest="profile_action", required=True)
-    profile_dispatch_p = profile_sub.add_parser("dispatch", help="Analyze or prepare dispatch-count profiling")
+    profile_dispatch_p = profile_sub.add_parser(
+        "dispatch", help="Analyze or prepare dispatch-count profiling"
+    )
     profile_dispatch_p.add_argument("--model", default=default_model)
     profile_dispatch_p.add_argument("--suite", default="flappy")
     profile_dispatch_p.add_argument("--max-tokens", type=int, default=2048)
     profile_dispatch_p.add_argument("--trace")
     profile_dispatch_p.add_argument("--output-dir")
     profile_dispatch_p.set_defaults(func=cmd_profile_public)
-    profile_thermal_p = profile_sub.add_parser("thermal", help="Run SMC Atlas / powermetrics thermal profile")
+    profile_thermal_p = profile_sub.add_parser(
+        "thermal", help="Run SMC Atlas / powermetrics thermal profile"
+    )
     profile_thermal_p.add_argument("--model", default=default_model)
     profile_thermal_p.add_argument("--suite", default="flappy")
     profile_thermal_p.add_argument("--max-tokens", type=int, default=10000)
@@ -3088,9 +4281,13 @@ def build_parser() -> argparse.ArgumentParser:
     profile_thermal_p.add_argument("--output-dir")
     profile_thermal_p.add_argument("--dry-run", action="store_true")
     profile_thermal_p.set_defaults(func=cmd_profile_public)
-    profile_compile_p = profile_sub.add_parser("compile-audit", help="Audit mx.compile as a measured lever")
+    profile_compile_p = profile_sub.add_parser(
+        "compile-audit", help="Audit mx.compile as a measured lever"
+    )
     profile_compile_p.add_argument("--model", default=default_model)
-    profile_compile_p.add_argument("--prompts", default="mtplx/benchmarks/prompts/long_code.jsonl")
+    profile_compile_p.add_argument(
+        "--prompts", default="mtplx/benchmarks/prompts/long_code.jsonl"
+    )
     profile_compile_p.add_argument("--prompt-index", type=int, default=0)
     profile_compile_p.add_argument("--prefill-chunks", default="128,256,512,1024")
     profile_compile_p.add_argument("--depths", default="3,4")
@@ -3098,11 +4295,15 @@ def build_parser() -> argparse.ArgumentParser:
     profile_compile_p.add_argument("--repeats", type=int, default=2)
     profile_compile_p.add_argument("--warmup", type=int, default=1)
     profile_compile_p.add_argument("--verify-core", default="linear-gdn-from-conv-tape")
-    profile_compile_p.add_argument("--exactness-attention-impl", default="mlx_vector_paged")
+    profile_compile_p.add_argument(
+        "--exactness-attention-impl", default="mlx_vector_paged"
+    )
     profile_compile_p.add_argument("--exactness-block-size", type=int, default=16)
     profile_compile_p.add_argument("--exactness-num-blocks", type=int, default=1024)
     profile_compile_p.add_argument("--exactness-no-partitioned", action="store_true")
-    profile_compile_p.add_argument("--exactness-partition-threshold", type=int, default=2048)
+    profile_compile_p.add_argument(
+        "--exactness-partition-threshold", type=int, default=2048
+    )
     profile_compile_p.add_argument("--exactness-partition-size", type=int, default=512)
     profile_compile_p.add_argument("--skip-prefill", action="store_true")
     profile_compile_p.add_argument("--skip-verify", action="store_true")
@@ -3141,7 +4342,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     thermal_p = sub.add_parser("thermal", help="Thermal diagnostic helpers")
     thermal_sub = thermal_p.add_subparsers(dest="thermal_action", required=True)
-    fanmax_p = thermal_sub.add_parser("fanmax-run", help="Run a diagnostic with both fans pinned to max")
+    fanmax_p = thermal_sub.add_parser(
+        "fanmax-run", help="Run a diagnostic with both fans pinned to max"
+    )
     fanmax_p.add_argument("--model", default=default_model)
     fanmax_p.add_argument("--suite", default="flappy")
     fanmax_p.add_argument("--max-tokens", type=int, default=10000)
@@ -3150,39 +4353,104 @@ def build_parser() -> argparse.ArgumentParser:
     fanmax_p.add_argument("--dry-run", action="store_true")
     fanmax_p.set_defaults(func=cmd_thermal_public)
 
-    max_p = sub.add_parser("max", help="Opt-in fan profile control via ThermalForge or TG Pro")
+    max_p = sub.add_parser(
+        "max", help="Opt-in fan profile control via ThermalForge or TG Pro"
+    )
     max_group = max_p.add_mutually_exclusive_group(required=True)
-    max_group.add_argument("--on", dest="max_action", action="store_const", const="performance", help="Set the Performance fan profile")
-    max_group.add_argument("--max", dest="max_action", action="store_const", const="max", help="Set the Max fan profile")
-    max_group.add_argument("--off", dest="max_action", action="store_const", const="silent", help="Restore the Silent fan profile")
-    max_group.add_argument("--status", dest="max_action", action="store_const", const="status", help="Show thermal-control status")
-    max_group.add_argument("--install", dest="max_action", action="store_const", const="install", help="Auto-install MTPLX's private ThermalForge source build")
-    max_group.add_argument("--grant-sudo", dest="max_action", action="store_const", const="grant_sudo", help="Install the passwordless sudoers rule for thermalforge (run once if --install was done before this feature existed)")
-    max_group.add_argument("--revoke-sudo", dest="max_action", action="store_const", const="revoke_sudo", help="Remove the mtplx-thermalforge sudoers rule")
+    max_group.add_argument(
+        "--on",
+        dest="max_action",
+        action="store_const",
+        const="performance",
+        help="Set the Performance fan profile",
+    )
+    max_group.add_argument(
+        "--max",
+        dest="max_action",
+        action="store_const",
+        const="max",
+        help="Set the Max fan profile",
+    )
+    max_group.add_argument(
+        "--off",
+        dest="max_action",
+        action="store_const",
+        const="silent",
+        help="Restore the Silent fan profile",
+    )
+    max_group.add_argument(
+        "--status",
+        dest="max_action",
+        action="store_const",
+        const="status",
+        help="Show thermal-control status",
+    )
+    max_group.add_argument(
+        "--install",
+        dest="max_action",
+        action="store_const",
+        const="install",
+        help="Auto-install MTPLX's private ThermalForge source build",
+    )
+    max_group.add_argument(
+        "--grant-sudo",
+        dest="max_action",
+        action="store_const",
+        const="grant_sudo",
+        help="Install the passwordless sudoers rule for thermalforge (run once if --install was done before this feature existed)",
+    )
+    max_group.add_argument(
+        "--revoke-sudo",
+        dest="max_action",
+        action="store_const",
+        const="revoke_sudo",
+        help="Remove the mtplx-thermalforge sudoers rule",
+    )
     max_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    max_p.add_argument("--dry-run", action="store_true", help="Show the command without changing fan state")
-    max_p.add_argument("--no-daemon", action="store_true", help="Skip the one-time `sudo thermalforge install` daemon setup")
+    max_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the command without changing fan state",
+    )
+    max_p.add_argument(
+        "--no-daemon",
+        action="store_true",
+        help="Skip the one-time `sudo thermalforge install` daemon setup",
+    )
     max_p.set_defaults(func=cmd_max_public)
 
     debug_p = sub.add_parser("debug", help="Create redacted support/debug artifacts")
     debug_sub = debug_p.add_subparsers(dest="debug_action", required=True)
-    debug_bundle_p = debug_sub.add_parser("bundle", help="Create a redacted debug bundle")
+    debug_bundle_p = debug_sub.add_parser(
+        "bundle", help="Create a redacted debug bundle"
+    )
     debug_bundle_p.add_argument("--run-id")
     debug_bundle_p.add_argument("--output-dir")
     debug_bundle_p.add_argument("--project-root", default=".")
     debug_bundle_p.add_argument("--model-cache")
     debug_bundle_p.add_argument("--url", default="http://127.0.0.1:8000")
     debug_bundle_p.set_defaults(func=cmd_debug_public)
-    debug_hotpath_p = debug_sub.add_parser("hotpath", help="Audit verifier hot-path kernel and sync boundaries")
+    debug_hotpath_p = debug_sub.add_parser(
+        "hotpath", help="Audit verifier hot-path kernel and sync boundaries"
+    )
     debug_hotpath_p.add_argument("--output")
     debug_hotpath_p.set_defaults(func=cmd_debug_public)
 
-    metrics_p = sub.add_parser("metrics", help="Inspect a running MTPLX server's metrics")
+    metrics_p = sub.add_parser(
+        "metrics", help="Inspect a running MTPLX server's metrics"
+    )
     metrics_sub = metrics_p.add_subparsers(dest="metrics_action", required=True)
-    metrics_watch_p = metrics_sub.add_parser("watch", help="Poll /metrics and print a compact live view")
+    metrics_watch_p = metrics_sub.add_parser(
+        "watch", help="Poll /metrics and print a compact live view"
+    )
     metrics_watch_p.add_argument("--url", default="http://127.0.0.1:8000")
     metrics_watch_p.add_argument("--interval", type=float, default=1.0)
-    metrics_watch_p.add_argument("--count", type=int, default=1, help="Poll count. Use 0 to watch until interrupted.")
+    metrics_watch_p.add_argument(
+        "--count",
+        type=int,
+        default=1,
+        help="Poll count. Use 0 to watch until interrupted.",
+    )
     metrics_watch_p.add_argument("--timeout", type=float, default=5.0)
     metrics_watch_p.add_argument("--json", action="store_true")
     metrics_watch_p.set_defaults(func=cmd_metrics_public)
@@ -3193,13 +4461,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dashboard_p.add_argument("--host", default="127.0.0.1", help="MTPLX server host")
     dashboard_p.add_argument("--port", type=int, default=8000, help="MTPLX server port")
-    dashboard_p.add_argument("--timeout", type=float, default=2.5, help="Health-probe timeout in seconds")
+    dashboard_p.add_argument(
+        "--timeout", type=float, default=2.5, help="Health-probe timeout in seconds"
+    )
     dashboard_p.add_argument(
         "--no-browser",
         action="store_true",
         help="Print the dashboard URL but do not open the browser",
     )
-    dashboard_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    dashboard_p.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
     dashboard_p.set_defaults(func=cmd_dashboard_public)
 
     integrate_p = sub.add_parser("integrate", help="Print client integration settings")
@@ -3210,7 +4482,11 @@ def build_parser() -> argparse.ArgumentParser:
         integration_p.add_argument("--port", type=int, default=8000)
         integration_p.add_argument("--model-id", default=DEFAULT_PUBLIC_MODEL_ID)
         integration_p.add_argument("--api-key-env", default="MTPLX_API_KEY")
-        integration_p.add_argument("--docker", action="store_true", help="Include Dockerized Open WebUI command")
+        integration_p.add_argument(
+            "--docker",
+            action="store_true",
+            help="Include Dockerized Open WebUI command",
+        )
         integration_p.add_argument("--webui-port", type=int, default=3000)
         integration_p.add_argument("--single-user", action="store_true")
         integration_p.add_argument("--api-key", default="mtplx-local")
@@ -3222,7 +4498,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     model_p = sub.add_parser("model", help="Model publishing and compatibility helpers")
     model_sub = model_p.add_subparsers(dest="model_action", required=True)
-    architectures_p = model_sub.add_parser("architectures", help="List MTPLX architecture support status")
+    architectures_p = model_sub.add_parser(
+        "architectures", help="List MTPLX architecture support status"
+    )
     architectures_p.add_argument("--json", action="store_true")
     architectures_p.set_defaults(func=cmd_model_public)
     qa_architectures_p = model_sub.add_parser(
@@ -3237,12 +4515,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Import native backend facades and report their health metadata",
     )
     qa_architectures_p.set_defaults(func=cmd_model_public)
-    publish_check_p = model_sub.add_parser("publish-check", help="Validate HF staging readiness without upload")
+    publish_check_p = model_sub.add_parser(
+        "publish-check", help="Validate HF staging readiness without upload"
+    )
     publish_check_p.add_argument(
         "--staging-dir",
         default="hf-staging/Qwen3.6-27B-MTPLX-Optimized-Speed",
     )
     publish_check_p.add_argument("--repo-id")
+    publish_check_p.add_argument(
+        "--scrub",
+        action="store_true",
+        help="Rewrite staged JSON documents that carry local paths before upload",
+    )
     publish_check_p.set_defaults(func=cmd_model_public)
 
     config_p = sub.add_parser("config", help="Show or edit MTPLX user config")
@@ -3258,7 +4543,9 @@ def build_parser() -> argparse.ArgumentParser:
     config_set_p.add_argument("--dry-run", action="store_true")
     config_set_p.set_defaults(func=cmd_config_public)
 
-    smoke_p = sub.add_parser("runtime-smoke", help="Load model, inject MTP, and run one AR/MTP forward")
+    smoke_p = sub.add_parser(
+        "runtime-smoke", help="Load model, inject MTP, and run one AR/MTP forward"
+    )
     smoke_p.add_argument("--model", default=default_model)
     smoke_p.add_argument(
         "--prompt",
@@ -3266,7 +4553,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     smoke_p.set_defaults(func=_cmd_runtime_smoke)
 
-    probe_p = sub.add_parser("probe-contract", help="Probe MTP hidden-state and concat-order contracts")
+    probe_p = sub.add_parser(
+        "probe-contract", help="Probe MTP hidden-state and concat-order contracts"
+    )
     probe_p.add_argument("--model", default=default_model)
     probe_p.add_argument("--prompts", default="mtplx/benchmarks/prompts/default.jsonl")
     probe_p.add_argument("--max-prompt-tokens", type=int, default=256)
@@ -3275,7 +4564,9 @@ def build_parser() -> argparse.ArgumentParser:
     probe_p.add_argument("--output")
     probe_p.set_defaults(func=_cmd_probe_contract)
 
-    ratio_p = sub.add_parser("verify-ratio", help="Measure cached forward(k+1) / forward(1)")
+    ratio_p = sub.add_parser(
+        "verify-ratio", help="Measure cached forward(k+1) / forward(1)"
+    )
     ratio_p.add_argument("--model", default=default_model)
     ratio_p.add_argument(
         "--prompt",
@@ -3286,9 +4577,13 @@ def build_parser() -> argparse.ArgumentParser:
     ratio_p.add_argument("--output")
     ratio_p.set_defaults(func=_cmd_verify_ratio)
 
-    profile_p = sub.add_parser("verify-profile", help="Synchronously profile target verify sections")
+    profile_p = sub.add_parser(
+        "verify-profile", help="Synchronously profile target verify sections"
+    )
     profile_p.add_argument("--model", default=default_model)
-    profile_p.add_argument("--prompts", default="mtplx/benchmarks/prompts/default.jsonl")
+    profile_p.add_argument(
+        "--prompts", default="mtplx/benchmarks/prompts/default.jsonl"
+    )
     profile_p.add_argument("--lengths", default="1,2,3,6")
     profile_p.add_argument("--repeats", type=int, default=2)
     profile_p.add_argument("--warmup", type=int, default=1)
@@ -3306,7 +4601,11 @@ def build_parser() -> argparse.ArgumentParser:
     qmm_probe_p.add_argument("--repeats", type=int, default=5)
     qmm_probe_p.add_argument("--warmup", type=int, default=2)
     qmm_probe_p.add_argument("--include", default="mlp,gdn,attn,lm_head,mtp")
-    qmm_probe_p.add_argument("--dtype", choices=["bf16", "bfloat16", "fp16", "float16", "fp32", "float32"], default="bf16")
+    qmm_probe_p.add_argument(
+        "--dtype",
+        choices=["bf16", "bfloat16", "fp16", "float16", "fp32", "float32"],
+        default="bf16",
+    )
     qmm_probe_p.add_argument("--max-groups", type=int)
     qmm_probe_p.add_argument("--seed", type=int, default=0)
     qmm_probe_p.add_argument("--no-mtp", action="store_true")
@@ -3337,7 +4636,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Compare batched target forward against sequential one-token forward",
     )
     batch_eq_p.add_argument("--model", default=default_model)
-    batch_eq_p.add_argument("--prompts", default="mtplx/benchmarks/prompts/default.jsonl")
+    batch_eq_p.add_argument(
+        "--prompts", default="mtplx/benchmarks/prompts/default.jsonl"
+    )
     batch_eq_p.add_argument("--suffix-len", type=int, default=2)
     batch_eq_p.add_argument("--limit", type=int)
     batch_eq_p.add_argument("--expand-to", type=int)
@@ -3351,14 +4652,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Verify captured GDN prefix commit against sequential AR state",
     )
     capture_eq_p.add_argument("--model", default=default_model)
-    capture_eq_p.add_argument("--prompts", default="mtplx/benchmarks/prompts/default.jsonl")
+    capture_eq_p.add_argument(
+        "--prompts", default="mtplx/benchmarks/prompts/default.jsonl"
+    )
     capture_eq_p.add_argument("--suffix-len", type=int, default=6)
     capture_eq_p.add_argument("--min-keep-tokens", type=int, default=1)
     capture_eq_p.add_argument("--limit", type=int)
     capture_eq_p.add_argument("--expand-to", type=int)
     capture_eq_p.add_argument("--disable-thinking", action="store_true")
     capture_eq_p.add_argument("--tolerance", type=float, default=1e-3)
-    capture_eq_p.add_argument("--verify-backend", choices=["direct", "graphbank"], default="direct")
+    capture_eq_p.add_argument(
+        "--verify-backend", choices=["direct", "graphbank"], default="direct"
+    )
     capture_eq_p.add_argument(
         "--verify-core",
         choices=VERIFY_CORE_CHOICES,
@@ -3368,7 +4673,9 @@ def build_parser() -> argparse.ArgumentParser:
     capture_eq_p.add_argument("--output")
     capture_eq_p.set_defaults(func=_cmd_capture_commit_equivalence)
 
-    mtp1_p = sub.add_parser("mtp1-greedy-gate", help="Compare MTP-1 greedy output against AR")
+    mtp1_p = sub.add_parser(
+        "mtp1-greedy-gate", help="Compare MTP-1 greedy output against AR"
+    )
     mtp1_p.add_argument("--model", default=default_model)
     mtp1_p.add_argument("--prompts", default="mtplx/benchmarks/prompts/default.jsonl")
     mtp1_p.add_argument("--max-tokens", type=int, default=32)
@@ -3401,9 +4708,13 @@ def build_parser() -> argparse.ArgumentParser:
     mtp1_p.add_argument("--output")
     mtp1_p.set_defaults(func=_cmd_mtp1_greedy_gate)
 
-    sampler_p = sub.add_parser("mtp1-sampler-smoke", help="Run MTP-1 at non-greedy sampler settings")
+    sampler_p = sub.add_parser(
+        "mtp1-sampler-smoke", help="Run MTP-1 at non-greedy sampler settings"
+    )
     sampler_p.add_argument("--model", default=default_model)
-    sampler_p.add_argument("--prompts", default="mtplx/benchmarks/prompts/default.jsonl")
+    sampler_p.add_argument(
+        "--prompts", default="mtplx/benchmarks/prompts/default.jsonl"
+    )
     sampler_p.add_argument("--temperature", type=float, default=0.6)
     sampler_p.add_argument("--top-p", type=float, default=0.95)
     sampler_p.add_argument("--top-k", type=int, default=20)
@@ -3459,8 +4770,12 @@ def build_parser() -> argparse.ArgumentParser:
     depth_p.add_argument("--disable-thinking", action="store_true")
     depth_p.add_argument("--compare-ar", action="store_true")
     depth_p.add_argument("--mtp-hidden-variant", default="post_norm")
-    depth_p.add_argument("--mtp-cache-policy", choices=["persistent", "fresh"], default="persistent")
-    depth_p.add_argument("--mtp-history-policy", choices=["cycle", "committed"], default="cycle")
+    depth_p.add_argument(
+        "--mtp-cache-policy", choices=["persistent", "fresh"], default="persistent"
+    )
+    depth_p.add_argument(
+        "--mtp-history-policy", choices=["cycle", "committed"], default="cycle"
+    )
     depth_p.add_argument("--draft-margin-threshold", type=float)
     depth_p.add_argument(
         "--min-speculative-depth",
@@ -3588,7 +4903,10 @@ def build_parser() -> argparse.ArgumentParser:
     depth_p.add_argument("--output")
     depth_p.set_defaults(func=_cmd_mtp_depth_sweep)
 
-    chain_p = sub.add_parser("mtp-chain-probe", help="Probe recursive MTP agreement by history/cache contract")
+    chain_p = sub.add_parser(
+        "mtp-chain-probe",
+        help="Probe recursive MTP agreement by history/cache contract",
+    )
     chain_p.add_argument("--model", default=default_model)
     chain_p.add_argument("--prompts", default="mtplx/benchmarks/prompts/default.jsonl")
     chain_p.add_argument("--depth", type=int, default=5)
@@ -3623,9 +4941,13 @@ def build_parser() -> argparse.ArgumentParser:
     chain_p.add_argument("--output")
     chain_p.set_defaults(func=_cmd_mtp_chain_probe)
 
-    tree_probe_p = sub.add_parser("mtp-tree-probe", help="Probe native-MTP tree coverage without target verify")
+    tree_probe_p = sub.add_parser(
+        "mtp-tree-probe", help="Probe native-MTP tree coverage without target verify"
+    )
     tree_probe_p.add_argument("--model", default=default_model)
-    tree_probe_p.add_argument("--prompts", default="mtplx/benchmarks/prompts/default.jsonl")
+    tree_probe_p.add_argument(
+        "--prompts", default="mtplx/benchmarks/prompts/default.jsonl"
+    )
     tree_probe_p.add_argument("--depth", type=int, default=5)
     tree_probe_p.add_argument("--budgets", default="1,2,4,8,16")
     tree_probe_p.add_argument("--branch-factor", type=int, default=4)
@@ -3638,7 +4960,9 @@ def build_parser() -> argparse.ArgumentParser:
     tree_probe_p.add_argument("--mtp-quant-bits", type=int)
     tree_probe_p.add_argument("--mtp-quant-group-size", type=int, default=64)
     tree_probe_p.add_argument("--mtp-quant-mode", default="affine")
-    tree_probe_p.add_argument("--base-hidden-variant", choices=["post_norm", "pre_norm"], default="post_norm")
+    tree_probe_p.add_argument(
+        "--base-hidden-variant", choices=["post_norm", "pre_norm"], default="post_norm"
+    )
     tree_probe_p.add_argument("--mtp-hidden-variant", default="pre_norm")
     tree_probe_p.add_argument(
         "--mtp-cache-policy",
@@ -3649,11 +4973,17 @@ def build_parser() -> argparse.ArgumentParser:
             "replays each branch path into one MTP cache before expanding it."
         ),
     )
-    tree_probe_p.add_argument("--anchor", choices=["prompt_boundary", "after_one_target"], default="prompt_boundary")
+    tree_probe_p.add_argument(
+        "--anchor",
+        choices=["prompt_boundary", "after_one_target"],
+        default="prompt_boundary",
+    )
     tree_probe_p.add_argument("--output")
     tree_probe_p.set_defaults(func=_cmd_mtp_tree_probe)
 
-    grid_p = sub.add_parser("mtp-depth-grid", help="Run a sequential fixed-depth policy grid")
+    grid_p = sub.add_parser(
+        "mtp-depth-grid", help="Run a sequential fixed-depth policy grid"
+    )
     grid_p.add_argument("--model", default=default_model)
     grid_p.add_argument("--prompts", default="mtplx/benchmarks/prompts/default.jsonl")
     grid_p.add_argument("--depth", type=int, default=5)
@@ -3671,8 +5001,12 @@ def build_parser() -> argparse.ArgumentParser:
     grid_p.add_argument("--disable-thinking", action="store_true")
     grid_p.add_argument("--compare-ar", action="store_true")
     grid_p.add_argument("--mtp-hidden-variant", default="pre_norm")
-    grid_p.add_argument("--mtp-cache-policy", choices=["persistent", "fresh"], default="fresh")
-    grid_p.add_argument("--mtp-history-policy", choices=["cycle", "committed"], default="cycle")
+    grid_p.add_argument(
+        "--mtp-cache-policy", choices=["persistent", "fresh"], default="fresh"
+    )
+    grid_p.add_argument(
+        "--mtp-history-policy", choices=["cycle", "committed"], default="cycle"
+    )
     grid_p.add_argument(
         "--verify-strategy",
         choices=[
@@ -3692,15 +5026,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     adaptive_p = sub.add_parser("mtp-adaptive", help="Run adaptive-depth native MTP")
     adaptive_p.add_argument("--model", default=default_model)
-    adaptive_p.add_argument("--prompts", default="mtplx/benchmarks/prompts/default.jsonl")
+    adaptive_p.add_argument(
+        "--prompts", default="mtplx/benchmarks/prompts/default.jsonl"
+    )
     adaptive_p.add_argument("--max-depth", type=int, default=5)
     adaptive_p.add_argument("--min-depth", type=int, default=1)
     adaptive_p.add_argument("--start-depth", type=int, default=1)
     adaptive_p.add_argument("--increase-after", type=int, default=4)
     adaptive_p.add_argument("--decrease-after", type=int, default=1)
-    adaptive_p.add_argument("--policy", choices=["streak", "expected_value"], default="streak")
+    adaptive_p.add_argument(
+        "--policy", choices=["streak", "expected_value"], default="streak"
+    )
     adaptive_p.add_argument("--ev-base-depth", type=int, default=2)
-    adaptive_p.add_argument("--ev-accept-priors", type=_comma_floats, default=(0.92, 0.64, 0.32))
+    adaptive_p.add_argument(
+        "--ev-accept-priors", type=_comma_floats, default=(0.92, 0.64, 0.32)
+    )
     adaptive_p.add_argument("--ev-draft-cost-s", type=float, default=0.0048)
     adaptive_p.add_argument("--ev-extra-verify-cost-s", type=float, default=0.0060)
     adaptive_p.add_argument("--ev-baseline-tok-s", type=float, default=40.0)
@@ -3708,7 +5048,9 @@ def build_parser() -> argparse.ArgumentParser:
     adaptive_p.add_argument("--ev-margin-center", type=float, default=1.0)
     adaptive_p.add_argument("--ev-margin-scale", type=float, default=2.0)
     adaptive_p.add_argument("--ev-confidence-weight", type=float, default=0.35)
-    adaptive_p.add_argument("--ev-min-extra-accept-probability", type=float, default=0.18)
+    adaptive_p.add_argument(
+        "--ev-min-extra-accept-probability", type=float, default=0.18
+    )
     adaptive_p.add_argument("--temperature", type=float, default=0.6)
     adaptive_p.add_argument("--top-p", type=float, default=0.95)
     adaptive_p.add_argument("--top-k", type=int, default=20)
@@ -3720,9 +5062,19 @@ def build_parser() -> argparse.ArgumentParser:
     adaptive_p.add_argument("--limit", type=int)
     adaptive_p.add_argument("--disable-thinking", action="store_true")
     adaptive_p.add_argument("--compare-ar", action="store_true")
+    adaptive_p.add_argument(
+        "--compare-static",
+        type=_comma_ints,
+        default=(),
+        help="Also run fixed-depth baselines on the same suite, e.g. 2,3",
+    )
     adaptive_p.add_argument("--mtp-hidden-variant", default="post_norm")
-    adaptive_p.add_argument("--mtp-cache-policy", choices=["persistent", "fresh"], default="persistent")
-    adaptive_p.add_argument("--mtp-history-policy", choices=["cycle", "committed"], default="cycle")
+    adaptive_p.add_argument(
+        "--mtp-cache-policy", choices=["persistent", "fresh"], default="persistent"
+    )
+    adaptive_p.add_argument(
+        "--mtp-history-policy", choices=["cycle", "committed"], default="cycle"
+    )
     adaptive_p.add_argument(
         "--verify-strategy",
         choices=[
@@ -3745,7 +5097,9 @@ def build_parser() -> argparse.ArgumentParser:
     adaptive_p.add_argument("--output")
     adaptive_p.set_defaults(func=_cmd_mtp_adaptive)
 
-    dflash_p = sub.add_parser("dflash-mlx-baseline", help="Run official DFlash MLX baseline")
+    dflash_p = sub.add_parser(
+        "dflash-mlx-baseline", help="Run official DFlash MLX baseline"
+    )
     dflash_p.add_argument("--model", default=default_model)
     dflash_p.add_argument("--draft-model", default="z-lab/Qwen3.6-27B-DFlash")
     dflash_p.add_argument("--prompts", default="mtplx/benchmarks/prompts/default.jsonl")
@@ -3777,7 +5131,9 @@ def build_parser() -> argparse.ArgumentParser:
     ddtree_p.add_argument("--output")
     ddtree_p.set_defaults(func=_cmd_ddtree_mlx_baseline)
 
-    truth_p = sub.add_parser("truth-report", help="Run the Phase 0 evidence-grade MTPLX truth harness")
+    truth_p = sub.add_parser(
+        "truth-report", help="Run the Phase 0 evidence-grade MTPLX truth harness"
+    )
     truth_p.add_argument("--model", default=default_model)
     truth_p.add_argument("--prompts", default="mtplx/benchmarks/prompts/default.jsonl")
     truth_p.add_argument(
@@ -3796,8 +5152,12 @@ def build_parser() -> argparse.ArgumentParser:
     truth_p.add_argument("--limit", type=int, default=1)
     truth_p.add_argument("--disable-thinking", action="store_true")
     truth_p.add_argument("--mtp-hidden-variant", default="pre_norm")
-    truth_p.add_argument("--mtp-cache-policy", choices=["persistent", "fresh"], default="persistent")
-    truth_p.add_argument("--mtp-history-policy", choices=["cycle", "committed"], default="cycle")
+    truth_p.add_argument(
+        "--mtp-cache-policy", choices=["persistent", "fresh"], default="persistent"
+    )
+    truth_p.add_argument(
+        "--mtp-history-policy", choices=["cycle", "committed"], default="cycle"
+    )
     truth_p.add_argument("--c3-corrector", type=Path, default=DEFAULT_C3_CORRECTOR)
     truth_p.add_argument("--c3-blend", type=float, default=0.15)
     truth_p.add_argument("--project-root", default=".")
@@ -3810,17 +5170,26 @@ def build_parser() -> argparse.ArgumentParser:
     truth_p.add_argument("--fail-fast", action="store_true")
     truth_p.set_defaults(func=_cmd_truth_report)
 
-    session_p = sub.add_parser("session-bank", help="Benchmark exact warm-prefix SessionBank prefill reuse")
+    session_p = sub.add_parser(
+        "session-bank", help="Benchmark exact warm-prefix SessionBank prefill reuse"
+    )
     session_p.add_argument("--model", default=default_model)
-    session_p.add_argument("--prompts", default="mtplx/benchmarks/prompts/default.jsonl")
+    session_p.add_argument(
+        "--prompts", default="mtplx/benchmarks/prompts/default.jsonl"
+    )
     session_p.add_argument("--prompt-index", type=int, default=0)
-    session_p.add_argument("--suffix-text", default="\n\n# Follow-up request:\nRefactor this into a cleaner implementation.\n")
+    session_p.add_argument(
+        "--suffix-text",
+        default="\n\n# Follow-up request:\nRefactor this into a cleaner implementation.\n",
+    )
     session_p.add_argument("--max-prompt-tokens", type=int, default=512)
     session_p.add_argument("--raw-prompts", action="store_true")
     session_p.add_argument("--disable-thinking", action="store_true")
     session_p.add_argument("--max-entries", type=int, default=4)
     session_p.add_argument("--tolerance", type=float, default=1e-3)
-    session_p.add_argument("--restore-mode", choices=["clone", "reference"], default="clone")
+    session_p.add_argument(
+        "--restore-mode", choices=["clone", "reference"], default="clone"
+    )
     session_p.add_argument("--output")
     session_p.set_defaults(func=_cmd_session_bank)
 
@@ -3843,15 +5212,24 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     command_names = _parser_command_names(parser)
     if raw_args[0] not in command_names and not raw_args[0].startswith("-"):
-        return _print_unknown_command(raw_args[0])
+        return _print_unknown_command(raw_args[0], command_names)
     args = parser.parse_args(raw_args)
     args._cli_flags = canonicalize_flag_tokens(
         _explicit_cli_flags(raw_args), parser, args
     )
     from .config import apply_user_config
 
-    apply_user_config(args)
-    return int(args.func(args))
+    try:
+        apply_user_config(args)
+        return int(args.func(args))
+    except (KeyboardInterrupt, EOFError):
+        # Ctrl-C at a confirmation prompt, a poll loop, or a closed stdin is
+        # the user leaving, not a crash: every command's own `finally` (fan
+        # restore, download finalize) has already run by the time this is
+        # reached. End the line the cursor sits on so the shell prompt lands
+        # cleanly, and exit with the conventional 128 + SIGINT code.
+        print(file=sys.stderr)
+        return 130
 
 
 def main_tune(argv: list[str] | None = None) -> int:

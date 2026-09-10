@@ -1164,6 +1164,51 @@ def test_contract_calibration_default_prompt_path_is_absolute():
     assert path.exists()
 
 
+def test_requested_max_session_fails_closed_without_verified_ramp(monkeypatch):
+    class FailedSession:
+        def __init__(self, *, log):
+            self.log = log
+            self.thermal = {"verified": {"message": "actual RPM never ramped"}}
+
+        def start(self):
+            return False
+
+    import mtplx.thermal as thermal
+
+    monkeypatch.setattr(thermal, "MaxSession", FailedSession)
+
+    with pytest.raises(forge.ForgeError, match="refusing Forge model load"):
+        forge._start_max_session_if_requested(True)
+
+
+@pytest.mark.parametrize("max_fans", [False, True])
+def test_forge_verify_only_requires_verified_ramp_when_requested(
+    tmp_path, monkeypatch, max_fans
+):
+    captured: dict[str, list[str]] = {}
+
+    class FinishedProcess:
+        returncode = 1
+
+        def poll(self):
+            return self.returncode
+
+    def fake_popen(command, **_kwargs):
+        captured["command"] = command
+        return FinishedProcess()
+
+    monkeypatch.setattr(forge.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(forge.ForgeError, match="mtplx tune failed"):
+        forge._run_verify(
+            tmp_path / "model",
+            tmp_path / "run",
+            max_fans=max_fans,
+        )
+
+    assert ("--require-max-fans" in captured["command"]) is max_fans
+
+
 def test_contract_calibration_fails_closed_on_probe_failure(tmp_path, monkeypatch):
     class FailedRun:
         returncode = 2
@@ -1398,6 +1443,51 @@ def test_build_reuses_legacy_speed_grid_positive_control(tmp_path, monkeypatch):
     assert runtime["mtp_contract"]["hidden_variant"] == "post_norm"
     assert {row["depth"] for row in verify["rows"]} == {0, 1, 2, 3}
     assert not (run / "build_outcome.json").exists()
+
+
+def test_saved_verify_rows_are_bound_to_the_forged_artifact(tmp_path):
+    model = tmp_path / "model"
+    _write_qwen_sidecar_fixture(model)
+    runtime = _runtime(depth=3)
+    runtime["speed_evidence"]["artifact_fingerprint"] = (
+        forge._verification_artifact_fingerprint(model)
+    )
+
+    assert (
+        forge._saved_verify_rows_reuse_blocker(
+            _speed_win_rows(),
+            runtime,
+            model_path=model,
+            source_path=model,
+            require_all_depths=True,
+        )
+        is None
+    )
+
+    changed_config = _mtp_config()
+    changed_config["mtplx_mtp_quantization"] = {
+        "policy": "requantize",
+        "bits": 4,
+        "group_size": 64,
+    }
+    _write_json(model / "config.json", changed_config)
+    assert forge._saved_verify_rows_reuse_blocker(
+        _speed_win_rows(),
+        runtime,
+        model_path=model,
+        source_path=model,
+        require_all_depths=True,
+    ) == "saved verification belongs to different artifact bytes"
+
+    runtime["speed_evidence"].pop("artifact_fingerprint")
+    runtime["forge_provenance"] = {"forged_at": "2026-05-27T00:00:00+01:00"}
+    assert forge._saved_verify_rows_reuse_blocker(
+        _speed_win_rows(),
+        runtime,
+        model_path=model,
+        source_path=model,
+        require_all_depths=True,
+    ) == "saved verification predates the forged artifact"
 
 
 def test_build_reverifies_old_runtime_without_mtp_contract(tmp_path, monkeypatch):
@@ -2112,9 +2202,21 @@ def test_calibrate_sidecar_rejects_existing_zero_mtp_payload(tmp_path):
 
 def test_publish_reads_one_token_line_and_keeps_artifacts_secret_free(tmp_path, monkeypatch):
     local = tmp_path / "model"
-    _write_json(local / "mtplx_runtime.json", {"forge_provenance": {"forged_locally": True}})
+    trunk_path = "/Users/someone/.mtplx/models/Owner--Trunk"
+    _write_json(
+        local / "mtplx_runtime.json",
+        {
+            "base_trunk": trunk_path,
+            "forge_provenance": {
+                "forged_locally": True,
+                "source_repo": trunk_path,
+                "forge_inputs": {"trunk_path": trunk_path},
+            },
+        },
+    )
     (local / "config.json").write_text("{}", encoding="utf-8")
     calls: list[tuple[str, str | None]] = []
+    uploads: dict[str, object] = {}
 
     class FakeApi:
         def create_repo(self, **kwargs):
@@ -2122,10 +2224,12 @@ def test_publish_reads_one_token_line_and_keeps_artifacts_secret_free(tmp_path, 
 
         def upload_folder(self, **kwargs):
             calls.append(("folder", kwargs.get("token")))
+            uploads["ignore_patterns"] = kwargs.get("ignore_patterns")
             return SimpleNamespace(oid="rev-folder")
 
         def upload_file(self, **kwargs):
             calls.append(("file", kwargs.get("token")))
+            uploads[str(kwargs.get("path_in_repo"))] = kwargs.get("path_or_fileobj")
             return SimpleNamespace(oid="rev-file")
 
         def model_info(self, repo_id, *, token=None):
@@ -2166,3 +2270,241 @@ def test_publish_reads_one_token_line_and_keeps_artifacts_secret_free(tmp_path, 
     assert "hf_secret" not in publish_json
     assert "hf_secret" not in runtime_json
     assert json.loads(runtime_json)["forge_provenance"]["published_to_hf"]["repo"] == "owner/Fixture-MTPLX-Speed"
+    # The local contract keeps its paths; the published copy carries none.
+    assert trunk_path in runtime_json
+    assert uploads["ignore_patterns"] == ["mtplx_runtime.json"]
+    published = json.loads(uploads["mtplx_runtime.json"].decode("utf-8"))
+    assert "/Users/" not in json.dumps(published)
+    assert published["base_trunk"] == "<redacted>/Owner--Trunk"
+    assert published["forge_provenance"]["forge_inputs"]["trunk_path"] == "<redacted>/Owner--Trunk"
+
+
+def test_stamp_names_a_local_trunk_by_its_pull_marker(tmp_path):
+    trunk = tmp_path / "Owner--Trunk"
+    trunk.mkdir()
+    _write_json(
+        trunk / ".mtplx-source.json",
+        {"repo_id": "Owner/Trunk", "resolved_sha": "abc123", "revision": None},
+    )
+
+    assert forge._resolve_source_identity(str(trunk), "") == ("Owner/Trunk", "abc123")
+    assert forge._resolve_source_identity(str(trunk), "keep") == ("Owner/Trunk", "keep")
+
+
+def test_stamp_names_a_cache_layout_trunk_without_a_marker(tmp_path):
+    trunk = tmp_path / "Owner--Trunk"
+    trunk.mkdir()
+    plain = tmp_path / "just-a-folder"
+    plain.mkdir()
+
+    assert forge._resolve_source_identity(str(trunk), "") == ("Owner/Trunk", "")
+    assert forge._resolve_source_identity(str(plain), "") == (str(plain), "")
+    assert forge._resolve_source_identity("Owner/Trunk", "sha") == ("Owner/Trunk", "sha")
+
+
+def _tiny_vision_config() -> dict:
+    return {
+        "model_type": "qwen3_5",
+        "depth": 1,
+        "hidden_size": 8,
+        "intermediate_size": 16,
+        "num_heads": 2,
+        "out_hidden_size": 4,
+        "patch_size": 2,
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 1,
+        "in_channels": 3,
+        "num_position_embeddings": 4,
+        "deepstack_visual_indexes": [],
+    }
+
+
+def _write_multimodal_source(source: Path) -> dict[str, object]:
+    """Synthetic multimodal checkpoint: language + model.visual.* weights.
+
+    The vision weights are dumped from a real (miniature) tower so the
+    graft's strict verification load has an exact key/shape match.
+    """
+    from mlx.utils import tree_flatten
+
+    from mtplx.vision.qwen3_vl_tower import Qwen3VLVisionConfig, Qwen3VLVisionTower
+
+    vision_config = _tiny_vision_config()
+    tower = Qwen3VLVisionTower(Qwen3VLVisionConfig.from_dict(vision_config))
+    tensors: dict[str, object] = {
+        "model.visual." + name: value for name, value in tree_flatten(tower.parameters())
+    }
+    tensors["model.language_model.layers.0.self_attn.q_proj.weight"] = mx.zeros(
+        (2, 2), dtype=mx.bfloat16
+    )
+    _write_json(
+        source / "config.json",
+        {
+            "model_type": "qwen3_5",
+            "vision_config": vision_config,
+            "image_token_id": 248056,
+            "video_token_id": 248057,
+            "vision_start_token_id": 248053,
+            "vision_end_token_id": 248054,
+        },
+    )
+    _write_json(
+        source / "model.safetensors.index.json",
+        {"weight_map": {key: "model.safetensors" for key in tensors}},
+    )
+    mx.save_safetensors(str(source / "model.safetensors"), tensors)
+    _write_json(source / "preprocessor_config.json", {"patch_size": 2, "merge_size": 2})
+    _write_json(source / "video_preprocessor_config.json", {"patch_size": 2})
+    return tensors
+
+
+def _write_text_only_destination(destination: Path) -> None:
+    _write_json(destination / "config.json", {"model_type": "qwen3_5"})
+    _write_json(
+        destination / "model.safetensors.index.json",
+        {
+            "metadata": {"total_size": 8},
+            "weight_map": {
+                "language_model.model.layers.0.self_attn.q_proj.weight": "model-00001-of-00001.safetensors"
+            },
+        },
+    )
+    mx.save_safetensors(
+        str(destination / "model-00001-of-00001.safetensors"),
+        {
+            "language_model.model.layers.0.self_attn.q_proj.weight": mx.zeros(
+                (2, 2), dtype=mx.bfloat16
+            )
+        },
+    )
+
+
+def test_forge_preserves_vision_tower(tmp_path):
+    from mtplx.vision_graft import graft_vision_tower
+
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    source_tensors = _write_multimodal_source(source)
+    _write_text_only_destination(destination)
+
+    forge._ensure_vision_tower(source, destination)
+
+    index = json.loads(
+        (destination / "model.safetensors.index.json").read_text(encoding="utf-8")
+    )
+    vision_keys = [
+        key for key in index["weight_map"] if key.startswith("vision_tower.")
+    ]
+    expected = sum(1 for key in source_tensors if key.startswith("model.visual."))
+    assert len(vision_keys) == expected
+    assert all(
+        index["weight_map"][key] == "model-vision.safetensors" for key in vision_keys
+    )
+    assert index["metadata"]["total_size"] > 8
+
+    config = json.loads((destination / "config.json").read_text(encoding="utf-8"))
+    assert isinstance(config.get("vision_config"), dict)
+    assert config["image_token_id"] == 248056
+    assert (destination / "model-vision.safetensors").exists()
+    assert (destination / "preprocessor_config.json").exists()
+    assert (destination / "video_preprocessor_config.json").exists()
+
+    grafted = mx.load(str(destination / "model-vision.safetensors"))
+    assert sorted(grafted) == sorted(
+        "vision_tower." + key[len("model.visual.") :]
+        for key in source_tensors
+        if key.startswith("model.visual.")
+    )
+
+    # The fail-closed validator must accept the repaired artifact.
+    forge._validate_vision_payload(source, destination)
+
+    # Provenance stamp resolves the grafted tower.
+    stamp = forge._vision_metadata_stamp(destination)
+    assert stamp == {
+        "tensor_count": expected,
+        "prefix": "vision_tower.",
+        "shards": ["model-vision.safetensors"],
+    }
+
+    # Idempotent: a second pass must be a no-op.
+    report = graft_vision_tower(source, destination)
+    assert report["status"] == "already-present"
+
+
+def test_forge_vision_noop_for_text_only_source(tmp_path):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    _write_json(source / "config.json", {"model_type": "qwen3_5"})
+    _write_json(
+        source / "model.safetensors.index.json",
+        {"weight_map": {"model.layers.0.self_attn.q_proj.weight": "model.safetensors"}},
+    )
+    _write_text_only_destination(destination)
+    index_before = (destination / "model.safetensors.index.json").read_text(
+        encoding="utf-8"
+    )
+    config_before = (destination / "config.json").read_text(encoding="utf-8")
+
+    forge._ensure_vision_tower(source, destination)
+    forge._validate_vision_payload(source, destination)
+
+    assert not (destination / "model-vision.safetensors").exists()
+    assert (destination / "model.safetensors.index.json").read_text(
+        encoding="utf-8"
+    ) == index_before
+    assert (destination / "config.json").read_text(encoding="utf-8") == config_before
+    assert forge._vision_metadata_stamp(destination) is None
+
+
+def test_forge_vision_validation_fails_closed_on_blind_artifact(tmp_path):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    # Source declares vision_config, but its index carries no vision tensors,
+    # so the graft cannot restore anything: the build must fail, not ship blind.
+    _write_json(
+        source / "config.json",
+        {"model_type": "qwen3_5", "vision_config": _tiny_vision_config()},
+    )
+    _write_json(
+        source / "model.safetensors.index.json",
+        {"weight_map": {"model.layers.0.self_attn.q_proj.weight": "model.safetensors"}},
+    )
+    _write_text_only_destination(destination)
+
+    forge._ensure_vision_tower(source, destination)
+    with pytest.raises(forge.ForgeError, match="vision"):
+        forge._validate_vision_payload(source, destination)
+
+
+def test_runtime_stamp_carries_family_sampler_law(tmp_path):
+    # The contract stamps the FAMILY's sampler, not a fixed 0.6 — the
+    # qwen4_exp / Qwen3.8 families serve at temperature 1.0 (founder law);
+    # a 0.6 stamp would mis-sample every contract-honoring client.
+    _write_json(
+        tmp_path / "config.json",
+        {
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "model_type": "qwen4_exp",
+        },
+    )
+
+    runtime = forge._stamp_runtime_metadata(
+        tmp_path,
+        branded_name="Qwen3.8-Flash-Next-MTPLX-Bare-Speed",
+        source_repo="Qwen/Qwen3.8-Flash-Next",
+        source_sha="",
+        source_format=forge.SOURCE_MLX_AFFINE_WITH_MTP,
+        recipe={},
+        forge_inputs={"lane": "verify-stamp"},
+        rows=[{"depth": 0, "tok_s": 50.0, "acceptance_by_position": []}],
+        mtp_contract={},
+        existing=None,
+    )
+
+    assert runtime["sampler"]["temperature"] == 1.0
+    assert runtime["sampler"]["top_p"] == 0.95
+    assert runtime["sampler"]["top_k"] == 20

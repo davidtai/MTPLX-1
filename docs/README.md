@@ -1,22 +1,21 @@
 # MTPLX Docs
 
-## Start
-
-- [Install details](install.md)
-- [Quickstart reference](quickstart.md)
-
-## Operate
-
+- [Quickstart](quickstart.md)
+- [Install](install.md)
 - [Model compatibility](model-compatibility.md)
 - [Profiles](profiles.md)
+- [Benchmarks](benchmarks.md)
 - [Server](server.md)
+- [Concurrency modes](concurrency.md)
 - [API](api.md)
-- [Troubleshooting](troubleshooting.md)
-- [Experimental SSD-streamed MoE](advanced/ssd-streamed-moe.md)
-
-## Develop and reference
-
+- [Dashboard](dashboard.md)
 - [Architecture](architecture.md)
+- [Architectures](architectures.md)
+- [Turbo verify kernels](turbo-verify.md)
 - [Runtime contract](runtime-contract.md)
+- [Forge backend contract](FORGE_BACKEND_CONTRACT.md)
+- [Troubleshooting](troubleshooting.md)
 - [Development](development.md)
+- [PyPI release runbook](PYPI_RELEASE.md)
+- [Release notes](releases/)
 - [Research note](research/native-mtp-on-mlx.md)

@@ -332,6 +332,12 @@ public struct MutableSettings: Codable, Equatable, Sendable {
     public var reasoning: String?
     public var reasoningEffort: String?
     public var prefillChunkTokens: Int?
+    /// `none` or a policy name (`expected_value`). Live-mutable like
+    /// `depth`; the daemon builds its depth policy per request.
+    public var adaptivePolicy: String?
+    /// False for a family that owns its own draft policy; the app hides
+    /// the Adaptive depth toggle then.
+    public var adaptiveDepthSupported: Bool?
 
     public init(
         generationMode: String? = nil,
@@ -357,7 +363,9 @@ public struct MutableSettings: Codable, Equatable, Sendable {
         reasoningParser: String? = nil,
         reasoning: String? = nil,
         reasoningEffort: String? = nil,
-        prefillChunkTokens: Int? = nil
+        prefillChunkTokens: Int? = nil,
+        adaptivePolicy: String? = nil,
+        adaptiveDepthSupported: Bool? = nil
     ) {
         self.generationMode = generationMode
         self.depth = depth
@@ -383,6 +391,8 @@ public struct MutableSettings: Codable, Equatable, Sendable {
         self.reasoning = reasoning
         self.reasoningEffort = reasoningEffort
         self.prefillChunkTokens = prefillChunkTokens
+        self.adaptivePolicy = adaptivePolicy
+        self.adaptiveDepthSupported = adaptiveDepthSupported
     }
 
     enum CodingKeys: String, CodingKey {
@@ -410,6 +420,8 @@ public struct MutableSettings: Codable, Equatable, Sendable {
         case reasoning
         case reasoningEffort = "reasoning_effort"
         case prefillChunkTokens = "prefill_chunk_tokens"
+        case adaptivePolicy = "adaptive_policy"
+        case adaptiveDepthSupported = "adaptive_depth_supported"
     }
 }
 
@@ -523,6 +535,15 @@ public struct InFlightRequest: Codable, Equatable, Sendable, Identifiable {
     public var lastProgress: DynamicObject
     public var prefillState: PrefillState?
     public var cancelled: Bool
+
+    /// The attention context grows during generation, even though the input
+    /// prompt stays fixed. Read this request's counters, never another turn's.
+    public var contextTokens: Int? {
+        guard let promptTokens else { return nil }
+        let generated = lastProgress.values["completion_tokens"]?.intValue
+            ?? lastProgress.values["generated_tokens"]?.intValue ?? 0
+        return max(0, promptTokens) + max(0, generated)
+    }
 
     enum CodingKeys: String, CodingKey {
         case requestId = "request_id"
@@ -676,7 +697,7 @@ public struct MetricsLatest: Codable, Equatable, Sendable {
                     : verifyCallsFallback
                 guard drafted > 0 else { return nil }
                 return AcceptanceCounterRow(
-                    label: "D\(idx + 1)",
+                    label: tr("D%lld", idx + 1),
                     accepted: acceptedCount,
                     drafted: drafted
                 )
@@ -690,7 +711,7 @@ public struct MetricsLatest: Codable, Equatable, Sendable {
 
         return [
             AcceptanceCounterRow(
-                label: "ALL",
+                label: tr("ALL"),
                 accepted: accepted,
                 drafted: drafted
             ),
@@ -1003,6 +1024,48 @@ public struct MemSnapshot: Codable, Equatable, Sendable {
     }
 }
 
+/// The daemon's machine memory plan (issue #305): what fits this Mac, what
+/// the serving defaults resolved to, and whether the user overcommitted.
+/// Absent on daemons built before the memory governor shipped.
+public struct MemoryPlanStatus: Codable, Equatable, Sendable {
+    public var available: Bool
+    public var unavailableReason: String?
+    public var totalRamBytes: Int?
+    public var usableBytes: Int?
+    public var modelWeightsBytes: Int?
+    /// Flash-Next n-gram table bytes when it streams from SSD (file-backed,
+    /// reclaimable — deliberately NOT in weights or Active). Nil/0 for
+    /// every other model and when the table is RAM-resident.
+    public var ngramTableStreamedBytes: Int?
+    public var contextWindowFit: Int?
+    public var contextWindowResolved: Int?
+    public var contextMachineBound: Bool?
+    public var contextOvercommitted: Bool?
+    public var modelFits: Bool?
+    public var bankIdleMaxBytes: Int?
+    public var bankSteadyBytes: Int?
+    public var headroomBytes: Int?
+    public var notes: [String]?
+
+    enum CodingKeys: String, CodingKey {
+        case available
+        case unavailableReason = "unavailable_reason"
+        case totalRamBytes = "total_ram_bytes"
+        case usableBytes = "usable_bytes"
+        case modelWeightsBytes = "model_weights_bytes"
+        case ngramTableStreamedBytes = "ngram_table_streamed_bytes"
+        case contextWindowFit = "context_window_fit"
+        case contextWindowResolved = "context_window_resolved"
+        case contextMachineBound = "context_machine_bound"
+        case contextOvercommitted = "context_overcommitted"
+        case modelFits = "model_fits"
+        case bankIdleMaxBytes = "bank_idle_max_bytes"
+        case bankSteadyBytes = "bank_steady_bytes"
+        case headroomBytes = "headroom_bytes"
+        case notes
+    }
+}
+
 public struct ThermalFan: Codable, Equatable, Sendable {
     public var rpm: Int?
     public var targetRpm: Int?
@@ -1146,6 +1209,163 @@ public struct HealthPayload: Codable, Equatable, Sendable {
     }
 }
 
+public struct RetrievalModelStatus: Codable, Equatable, Sendable, Identifiable {
+    /// The id clients pass as `"model"`. Not unique on its own: one reference
+    /// serving both roles is the supported shared-backend case and appears
+    /// twice under the same served id.
+    public var servedId: String
+    public var role: String
+    public var modelRef: String
+    public var loaded: Bool
+    public var resident: Bool
+    public var maxTokens: Int
+    public var batchSize: Int
+    /// Shard size on disk. MLX holds weights in unified memory that never
+    /// shows up in process RSS, so this is the only honest attribution.
+    public var weightBytes: Int
+    public var requests: Int
+    public var items: Int
+    public var tokens: Int
+    public var errors: Int
+    public var computeSeconds: Double
+    public var loadSeconds: Double
+    public var lastUsedS: Double?
+    public var lastError: String?
+    public var itemsPerSecond: Double?
+    public var avgLatencyMs: Double?
+
+    /// Retrieval models load on first request, so "configured" and "ready" are
+    /// different states a user needs to tell apart at a glance.
+    /// Composite identity, so a reference registered as both embedder and
+    /// reranker yields two distinct rows instead of colliding in a ForEach.
+    public var id: String { "\(role):\(servedId)" }
+
+    public var isEmbedding: Bool { role == "embedding" }
+    public var hasBeenUsed: Bool { requests > 0 }
+    /// A model that only ever failed must not read as merely idle.
+    public var hasFailed: Bool { errors > 0 }
+
+    enum CodingKeys: String, CodingKey {
+        case servedId = "id"
+        case role
+        case modelRef = "model_ref"
+        case loaded
+        case resident
+        case maxTokens = "max_tokens"
+        case batchSize = "batch_size"
+        case weightBytes = "weightBytes"
+        case requests
+        case items
+        case tokens
+        case errors
+        case computeSeconds = "computeSeconds"
+        case loadSeconds = "loadSeconds"
+        case lastUsedS = "lastUsedS"
+        case lastError = "lastError"
+        case itemsPerSecond = "itemsPerSecond"
+        case avgLatencyMs = "avgLatencyMs"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        servedId = try container.decode(String.self, forKey: .servedId)
+        role = try container.decodeIfPresent(String.self, forKey: .role) ?? "embedding"
+        modelRef = try container.decodeIfPresent(String.self, forKey: .modelRef) ?? servedId
+        loaded = try container.decodeIfPresent(Bool.self, forKey: .loaded) ?? false
+        resident = try container.decodeIfPresent(Bool.self, forKey: .resident) ?? false
+        maxTokens = try container.decodeIfPresent(Int.self, forKey: .maxTokens) ?? 0
+        batchSize = try container.decodeIfPresent(Int.self, forKey: .batchSize) ?? 0
+        weightBytes = try container.decodeIfPresent(Int.self, forKey: .weightBytes) ?? 0
+        requests = try container.decodeIfPresent(Int.self, forKey: .requests) ?? 0
+        items = try container.decodeIfPresent(Int.self, forKey: .items) ?? 0
+        tokens = try container.decodeIfPresent(Int.self, forKey: .tokens) ?? 0
+        errors = try container.decodeIfPresent(Int.self, forKey: .errors) ?? 0
+        computeSeconds = try container.decodeIfPresent(Double.self, forKey: .computeSeconds) ?? 0
+        loadSeconds = try container.decodeIfPresent(Double.self, forKey: .loadSeconds) ?? 0
+        lastUsedS = try container.decodeIfPresent(Double.self, forKey: .lastUsedS)
+        lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
+        itemsPerSecond = try container.decodeIfPresent(Double.self, forKey: .itemsPerSecond)
+        avgLatencyMs = try container.decodeIfPresent(Double.self, forKey: .avgLatencyMs)
+    }
+
+    public init(
+        servedId: String,
+        role: String,
+        modelRef: String = "",
+        loaded: Bool = false,
+        resident: Bool = false,
+        maxTokens: Int = 0,
+        batchSize: Int = 0,
+        weightBytes: Int = 0,
+        requests: Int = 0,
+        items: Int = 0,
+        tokens: Int = 0,
+        errors: Int = 0,
+        computeSeconds: Double = 0,
+        loadSeconds: Double = 0,
+        lastUsedS: Double? = nil,
+        lastError: String? = nil,
+        itemsPerSecond: Double? = nil,
+        avgLatencyMs: Double? = nil
+    ) {
+        self.servedId = servedId
+        self.role = role
+        self.modelRef = modelRef
+        self.loaded = loaded
+        self.resident = resident
+        self.maxTokens = maxTokens
+        self.batchSize = batchSize
+        self.weightBytes = weightBytes
+        self.requests = requests
+        self.items = items
+        self.tokens = tokens
+        self.errors = errors
+        self.computeSeconds = computeSeconds
+        self.loadSeconds = loadSeconds
+        self.lastUsedS = lastUsedS
+        self.lastError = lastError
+        self.itemsPerSecond = itemsPerSecond
+        self.avgLatencyMs = avgLatencyMs
+    }
+}
+
+public struct RetrievalStatus: Codable, Equatable, Sendable {
+    public var enabled: Bool
+    public var maxResident: Int
+    public var resident: [String]
+    /// Weights currently held by retrieval models, counted once per backend.
+    public var residentBytes: Int
+    public var models: [RetrievalModelStatus]
+
+    public var embedders: [RetrievalModelStatus] { models.filter { $0.role == "embedding" } }
+    public var rerankers: [RetrievalModelStatus] { models.filter { $0.role == "rerank" } }
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case maxResident = "max_resident"
+        case resident
+        case residentBytes = "resident_bytes"
+        case models
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        maxResident = try container.decodeIfPresent(Int.self, forKey: .maxResident) ?? 0
+        resident = try container.decodeIfPresent([String].self, forKey: .resident) ?? []
+        residentBytes = try container.decodeIfPresent(Int.self, forKey: .residentBytes) ?? 0
+        models = try container.decodeIfPresent([RetrievalModelStatus].self, forKey: .models) ?? []
+    }
+
+    public init(enabled: Bool = false, maxResident: Int = 0, resident: [String] = [], residentBytes: Int = 0, models: [RetrievalModelStatus] = []) {
+        self.enabled = enabled
+        self.maxResident = maxResident
+        self.resident = resident
+        self.residentBytes = residentBytes
+        self.models = models
+    }
+}
+
 public struct DashboardSnapshot: Codable, Equatable, Sendable {
     public var ts: Double
     public var modelId: String
@@ -1155,6 +1375,7 @@ public struct DashboardSnapshot: Codable, Equatable, Sendable {
     public var inFlight: [InFlightRequest]
     public var latest: MetricsLatest?
     public var recent: [MetricsLatest]
+    public var prefillRates: PrefillRateSummary?
     public var rolling: RollingMetrics
     public var lifetime: LifetimeSnapshot
     public var sessions: SessionsPayload
@@ -1166,6 +1387,27 @@ public struct DashboardSnapshot: Codable, Equatable, Sendable {
     public var scheduler: DynamicObject?
     public var machine: MachineInfo
     public var uptimeS: Double
+    /// Absent on daemons built before retrieval shipped, so it decodes to a
+    /// disabled status rather than failing the whole snapshot.
+    public var retrieval: RetrievalStatus?
+    /// macOS/allocator memory pressure (1 normal, 2 warning, 4 critical;
+    /// 0/absent unknown) and the machine memory plan. Both absent on
+    /// pre-governor daemons.
+    public var memoryPressureLevel: Int?
+    /// Which signal produced the level: "macos" (system-wide pressure,
+    /// often another process allocating) or "allocator" (this engine's
+    /// Metal footprint near its limit). Absent on older daemons.
+    public var memoryPressureSource: String?
+    /// (active+cache)/metal-limit at the same guard tick.
+    public var allocatorFraction: Double?
+    public var memoryPlan: MemoryPlanStatus?
+    /// The guard's action ring (pressure trims, ceiling evictions). The
+    /// level alone says "the allocator ran close to its limit for a tick";
+    /// only these events say caches were actually shed — the banner must
+    /// not claim shedding without one (2026-08-28: warning-level ticks
+    /// during multi-session prefill showed the shedding banner while the
+    /// ring was empty).
+    public var memoryGuardEvents: [MemoryGuardEvent]?
 
     enum CodingKeys: String, CodingKey {
         case ts
@@ -1176,6 +1418,7 @@ public struct DashboardSnapshot: Codable, Equatable, Sendable {
         case inFlight = "in_flight"
         case latest
         case recent
+        case prefillRates = "prefill_rates"
         case rolling
         case lifetime
         case sessions
@@ -1187,6 +1430,50 @@ public struct DashboardSnapshot: Codable, Equatable, Sendable {
         case scheduler
         case machine
         case uptimeS = "uptime_s"
+        case retrieval
+        case memoryPressureLevel = "memory_pressure_level"
+        case memoryPressureSource = "memory_pressure_source"
+        case allocatorFraction = "allocator_fraction"
+        case memoryPlan = "memory_plan"
+        case memoryGuardEvents = "memory_guard_events"
+    }
+}
+
+public struct MemoryGuardEvent: Codable, Equatable, Sendable {
+    public var ts: Double?
+    public var action: String?
+    public var bankEntriesEvicted: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case ts
+        case action
+        case bankEntriesEvicted = "bank_entries_evicted"
+    }
+
+    /// True when this event represents caches actually being given back —
+    /// entries evicted, or the allocation-failure shed (which always
+    /// clears the allocator cache even at zero evictions).
+    public var didShed: Bool {
+        (bankEntriesEvicted ?? 0) > 0 || action == "allocation_failure_shed"
+    }
+}
+
+/// The same measured chunks as the live prefill dial, aggregated by compute
+/// time. Waiting, cache restore and MTP history have separate latency receipts.
+public struct PrefillRateSummary: Codable, Equatable, Sendable {
+    public var tokens: Int
+    public var computeTimeS: Double
+    public var peakTokS: Double?
+
+    public var averageTokS: Double? {
+        guard tokens > 0, computeTimeS.isFinite, computeTimeS > 0 else { return nil }
+        return Double(tokens) / computeTimeS
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case tokens
+        case computeTimeS = "compute_time_s"
+        case peakTokS = "peak_tok_s"
     }
 }
 

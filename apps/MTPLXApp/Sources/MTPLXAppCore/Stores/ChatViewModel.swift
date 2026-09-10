@@ -1,6 +1,8 @@
+import AppKit
 import Combine
 import Foundation
 import ImageIO
+import QuartzCore
 import SwiftData
 
 // MARK: - StreamingPhase
@@ -26,17 +28,22 @@ public enum ChatError: LocalizedError, Equatable {
     case http(Int, String)
     case malformedRequest
     case daemonStopped
+    /// The daemon failed the request mid-stream and said why (its
+    /// `finish_reason: "error"` frame). The message is the server's
+    /// own, shown verbatim.
+    case server(String)
     case unknown(String)
 
     public var errorDescription: String? {
         switch self {
-        case .streamLost: return "Connection dropped mid-reply. Try again."
-        case .unauthorized: return "The model rejected the request. Set an API key in Settings."
+        case .streamLost: return tr("Connection dropped mid-reply. Try again.")
+        case .unauthorized: return tr("The model rejected the request. Set an API key in Settings.")
         case .http(let code, let body):
             let truncated = body.prefix(160)
-            return "HTTP \(code): \(truncated)"
-        case .malformedRequest: return "Couldn't send the message."
-        case .daemonStopped: return "MTPLX isn't running. Hit the play button to start a model."
+            return tr("HTTP %@: %@", String(code), String(truncated))
+        case .malformedRequest: return tr("Couldn't send the message.")
+        case .daemonStopped: return tr("MTPLX isn't running. Hit the play button to start a model.")
+        case .server(let message): return tr("Reply failed: %@", message)
         case .unknown(let detail): return detail
         }
     }
@@ -96,37 +103,73 @@ public final class ChatViewModel: ObservableObject {
     @Published public private(set) var conversations: [ChatConversation] = []
     @Published public private(set) var current: ChatConversation?
     @Published public private(set) var visibleMessages: [ChatMessage] = []
-    @Published public private(set) var isStreaming: Bool = false
-    @Published public private(set) var streamingPhase: StreamingPhase = .idle
-    public let streamingReasoningDocument = StreamingDocumentStore(mode: .plainLines)
-    public let streamingContentDocument = StreamingDocumentStore(mode: .plainLines)
-    @Published public private(set) var hasStreamingReasoning: Bool = false
-    @Published public private(set) var hasStreamingContent: Bool = false
-    @Published public private(set) var handoffAssistantMessageID: UUID?
-    public var streamingReasoning: String { streamingReasoningDocument.rawText + streamingReasoningBuffer }
-    public var streamingContent: String { streamingContentDocument.rawText + streamingContentBuffer }
-    public var shouldRenderStreamingAssistant: Bool {
-        guard isStreaming else { return false }
-        guard let handoffAssistantMessageID else { return true }
-        return !visibleMessages.contains { $0.id == handoffAssistantMessageID }
-    }
-    /// Every tool trace of the CURRENT turn, oldest first — accumulates
-    /// across tool rounds so the live activity strip lists the whole
-    /// turn's searches, not just the round in flight.
-    @Published public private(set) var pendingToolTraces: [PendingToolTrace] = []
-    /// Deduped sources gathered so far in the CURRENT turn. Drives the
-    /// live sources footer under the streaming answer bubble; frozen
-    /// into `sourcesJSON` on the final persist.
-    @Published public private(set) var liveTurnSources: [SourceRecord] = []
-    /// Identity shared by every assistant/tool message this turn's
-    /// tool loop persists. Published so the transcript can EXCLUDE the
-    /// in-flight turn's persisted rounds while the live surface is
-    /// their one representation; the grouped transcript re-unites the
-    /// rounds under this id once the turn settles.
-    @Published public private(set) var currentTurnGroupID: UUID?
-    @Published public private(set) var chatDecodeReading: HeadlineDecodeReading = .absent
     @Published public var pendingAttachments: [ChatAttachment] = []
     @Published public var lastError: ChatError?
+
+    // MARK: Live-turn surface (issue #324)
+    //
+    // Every in-flight turn lives in its own `ChatTurnStream`, keyed by
+    // conversation. The properties below MIRROR the turn of whichever
+    // conversation is currently visible — they are what the chat
+    // surface binds to, so selecting another conversation swaps the
+    // mirror without touching the underlying streams. Mutations that
+    // used to write `@Published` vars now write the stream and fire
+    // `objectWillChange` via `publishTurnState(_:)` when (and only
+    // when) the mutated stream belongs to the visible conversation, so
+    // a background conversation's tokens never re-render the visible
+    // transcript.
+    public var isStreaming: Bool { currentTurnStream != nil }
+    public var streamingPhase: StreamingPhase { currentTurnStream?.phase ?? .idle }
+    public var streamingReasoningDocument: StreamingDocumentStore {
+        currentTurnStream?.reasoningDocument ?? idleReasoningDocument
+    }
+    public var streamingContentDocument: StreamingDocumentStore {
+        currentTurnStream?.contentDocument ?? idleContentDocument
+    }
+    /// Frontend streaming-performance instrumentation (inert unless
+    /// MTPLX_UI_PERF / MTPLX_AIME_DIAGNOSTICS is set at launch).
+    public let uiPerfProbe = UIStreamPerfProbe()
+    public var hasStreamingReasoning: Bool { currentTurnStream?.hasReasoning ?? false }
+    public var hasStreamingContent: Bool { currentTurnStream?.hasContent ?? false }
+    public var handoffAssistantMessageID: UUID? { currentTurnStream?.handoffAssistantMessageID }
+    public var streamingReasoning: String { currentTurnStream?.reasoningText ?? "" }
+    public var streamingContent: String { currentTurnStream?.contentText ?? "" }
+    /// The unflushed coalescing buffer alone (small, CoW-shared). Live
+    /// views that only need "what hasn't reached the document yet" read
+    /// this — the full concatenating properties above cost O(answer)
+    /// per access and are for turn-boundary persistence only.
+    public var streamingContentPending: String { currentTurnStream?.contentBuffer ?? "" }
+    public var shouldRenderStreamingAssistant: Bool {
+        guard let stream = currentTurnStream else { return false }
+        guard let handoffID = stream.handoffAssistantMessageID else { return true }
+        return !visibleMessages.contains { $0.id == handoffID }
+    }
+    /// Every tool trace of the visible conversation's in-flight turn,
+    /// oldest first — accumulates across tool rounds so the live
+    /// activity strip lists the whole turn's searches, not just the
+    /// round in flight.
+    public var pendingToolTraces: [PendingToolTrace] { currentTurnStream?.pendingToolTraces ?? [] }
+    /// Deduped sources gathered so far in the visible conversation's
+    /// in-flight turn. Drives the live sources footer under the
+    /// streaming answer bubble; frozen into `sourcesJSON` on the final
+    /// persist.
+    public var liveTurnSources: [SourceRecord] { currentTurnStream?.liveTurnSources ?? [] }
+    /// Identity shared by every assistant/tool message the visible
+    /// conversation's in-flight tool loop persists. Exposed so the
+    /// transcript can EXCLUDE the in-flight turn's persisted rounds
+    /// while the live surface is their one representation; the grouped
+    /// transcript re-unites the rounds under this id once the turn
+    /// settles.
+    public var currentTurnGroupID: UUID? { currentTurnStream?.turnID }
+    public var chatDecodeReading: HeadlineDecodeReading {
+        // A live turn owns the chip outright (including its early
+        // `.absent`, matching the old reset-at-turn-start behavior);
+        // once idle, the conversation's last held summary survives the
+        // switch away and back.
+        if let stream = currentTurnStream { return stream.decodeReading }
+        guard let current else { return .absent }
+        return heldDecodeReadings[current.id] ?? .absent
+    }
 
     // Public knobs
     public var webSearchEnabled: Bool {
@@ -146,51 +189,50 @@ public final class ChatViewModel: ObservableObject {
     private let modelName: () -> String?
     private let reasoningEnabledProvider: @MainActor () -> Bool?
     private let onDaemonUnreachable: @MainActor () -> Void
+    /// Fires with `true` when the first turn goes live and `false` when
+    /// the last one settles, whichever conversation owns it.
+    private let onLiveTurnActivityChanged: @MainActor (Bool) -> Void
     private let maxToolRounds: Int
+    /// Turns a dropped file into attachment data, off the main actor.
+    /// Injectable so tests can pin where it runs and how the card
+    /// follows it.
+    private let attachmentExtractor: AttachmentExtractor
 
     private var context: ModelContext { container.mainContext }
-    private var streamTask: Task<Void, Never>?
-    private var currentRequestId: String?
-    /// Monotonic turn token. Bumped when a turn starts and again on
-    /// cancel, so a cancelled stream task that is still draining can be
-    /// recognized as superseded and ignored — it must not fold tokens
-    /// into, or persist a turn over, the next message.
-    private var streamGeneration: Int = 0
+    /// The in-flight turn of each conversation, keyed by conversation
+    /// id (issue #324). A turn is REGISTERED here for exactly as long
+    /// as it owns its conversation's live surface; cancel/replace
+    /// detaches the entry first, so a still-draining task's late
+    /// events resolve to nothing and are dropped.
+    private var turnStreams: [UUID: ChatTurnStream] = [:]
+    private var currentTurnStream: ChatTurnStream? {
+        guard let current else { return nil }
+        return turnStreams[current.id]
+    }
+    /// Stable, always-empty documents the mirror properties fall back
+    /// to while the visible conversation has no in-flight turn, so
+    /// views bound to the document objects always have something to
+    /// observe. Never appended to.
+    private let idleReasoningDocument = StreamingDocumentStore(mode: .plainLines)
+    private let idleContentDocument = StreamingDocumentStore(mode: .plainLines)
+    /// Last completed turn's held decode summary per conversation —
+    /// what the header chip shows after a turn finishes, surviving a
+    /// switch away and back.
+    private var heldDecodeReadings: [UUID: HeadlineDecodeReading] = [:]
     /// Per-conversation server session id override. Normally the session
     /// id is the stable `conversation.id` (so SessionBank warm-prefix
     /// reuse works across turns); after a cancel we rotate it to a fresh
     /// UUID so the daemon can't resume the cancelled prompt's committed
     /// prefix into the next turn.
     private var sessionOverrides: [UUID: UUID] = [:]
-    /// Per-round accumulator. Lives on the viewmodel (which is
-    /// @MainActor) rather than as a captured local so the SSE event
-    /// closure can mutate it without crossing a Sendable boundary.
-    private var roundToolCalls: [Int: AccumulatingToolCall] = [:]
-    private var roundFinishReason: String = "stop"
-    private var roundUsage: ChatUsage?
-    private var roundStats: ChatStreamStats?
-    private var turnStartedAt: Date?
-    private var reasoningStartedAt: Date?
-    /// Raw (un-deduped) sources gathered across the turn's tool calls;
-    /// deduped into `liveTurnSources` after every tool completes and
-    /// frozen into `sourcesJSON` on the final persist.
-    private var turnSourceAccumulator: [SourceRecord] = []
-    /// Sum of completed think spans in earlier rounds of this turn.
-    /// The live span (reasoningStartedAt → now/first-answer-token) is
-    /// added on top when the turn finishes.
-    private var completedThinkingMs: Int = 0
-    /// Character offset into the accumulated live reasoning document
-    /// where the CURRENT round's reasoning begins. The document only
-    /// ever appends, so a count-based offset stays valid.
-    private var roundReasoningStartOffset: Int = 0
-    private var streamingReasoningBuffer = ""
-    private var streamingContentBuffer = ""
     private var streamFlushTask: Task<Void, Never>?
-    private var lastLiveDecodeUpdateAt: Date = .distantPast
-    // Paint token-sized SSE deltas near display refresh. Live chat stays plain
-    // text, so this can feel token-by-token without invoking markdown/layout
-    // work for every raw network event.
-    private static let streamFlushInterval: Duration = .milliseconds(16)
+    private var streamDisplayLink: CADisplayLink?
+    private let streamDisplayLinkTarget = StreamFlushLinkTarget()
+    // Fallback cadence for the headless path only (no attached display,
+    // e.g. unit tests). The live reveal is display-link driven; see
+    // ensureStreamFlushLoop. At local-model rates (~30-70 tok/s), 32 ms
+    // still reveals characters—not words.
+    private static let streamFlushInterval: Duration = .milliseconds(32)
     /// Hard bound on how far a coalescing buffer may run ahead of its
     /// document if the flush task ever stalls (freeze backstop).
     private static let streamBufferFlushBackstop = 1_024
@@ -201,7 +243,6 @@ public final class ChatViewModel: ObservableObject {
     static let requestToolResultContentLimit = 20_000
     private static let requestToolResultMaxResults = 5
     static let requestToolResultExcerptLimit = 2_400
-    private var leakedThinkingSplitter = ChatThinkingTagSplitter()
 
     public init(
         container: ModelContainer,
@@ -210,7 +251,9 @@ public final class ChatViewModel: ObservableObject {
         modelName: @escaping () -> String? = { nil },
         reasoningEnabledProvider: @escaping @MainActor () -> Bool? = { nil },
         onDaemonUnreachable: @escaping @MainActor () -> Void = {},
-        maxToolRounds: Int = 1
+        onLiveTurnActivityChanged: @escaping @MainActor (Bool) -> Void = { _ in },
+        maxToolRounds: Int = 1,
+        attachmentExtractor: @escaping AttachmentExtractor = ChatViewModel.extractAttachment
     ) {
         self.container = container
         self.chatClientProvider = chatClientProvider
@@ -218,8 +261,11 @@ public final class ChatViewModel: ObservableObject {
         self.modelName = modelName
         self.reasoningEnabledProvider = reasoningEnabledProvider
         self.onDaemonUnreachable = onDaemonUnreachable
+        self.onLiveTurnActivityChanged = onLiveTurnActivityChanged
         self.maxToolRounds = maxToolRounds
+        self.attachmentExtractor = attachmentExtractor
         refreshConversations()
+        retitlePlaceholderConversations()
         if let first = conversations.first {
             select(first)
         }
@@ -236,7 +282,7 @@ public final class ChatViewModel: ObservableObject {
 
     @discardableResult
     public func createNewConversation() -> ChatConversation {
-        let convo = ChatConversation(title: "New Chat")
+        let convo = ChatConversation(title: ChatConversationTitle.placeholder)
         context.insert(convo)
         saveContext()
         refreshConversations()
@@ -244,16 +290,50 @@ public final class ChatViewModel: ObservableObject {
         return convo
     }
 
+    /// Gives a name to every conversation that already has a first
+    /// message but still carries a placeholder title. Those rows exist
+    /// because the auto-title guard compared against the English
+    /// literal and never fired in other languages; one pass at launch
+    /// makes an existing user's sidebar (and its title search) usable
+    /// without waiting for the next message in each chat.
+    private func retitlePlaceholderConversations() {
+        var changed = false
+        for conversation in conversations where conversation.titleIsPlaceholder {
+            guard let firstUserMessage = conversation.messages
+                .filter({ $0.role == .user })
+                .min(by: { $0.createdAt < $1.createdAt })
+            else { continue }
+            let derived = ChatConversationTitle.derived(from: firstUserMessage.visibleContent)
+            guard !ChatConversationTitle.isPlaceholder(derived) else { continue }
+            conversation.title = derived
+            changed = true
+        }
+        if changed {
+            saveContext()
+        }
+    }
+
     public func select(_ conversation: ChatConversation) {
         current = conversation
         visibleMessages = loadMessages(for: conversation)
-        clearStreamingState()
+        // Deliberately does NOT touch any in-flight turn (issue #324):
+        // the previous conversation's stream keeps accumulating in its
+        // own `ChatTurnStream` and persists into its own conversation
+        // when it finishes; switching back re-attaches the live surface
+        // through the mirror properties. Only the visible error banner
+        // is per-surface state worth resetting here.
+        lastError = nil
     }
 
     public func delete(_ conversation: ChatConversation) async {
+        // Stop the conversation's in-flight turn (visible or not)
+        // before the model row disappears; skip the partial persist —
+        // it would write into the conversation being deleted.
+        if let stream = turnStreams[conversation.id] {
+            await cancelTurn(stream, persistPartial: false)
+        }
+        heldDecodeReadings[conversation.id] = nil
         if current?.id == conversation.id {
-            await cancel()
-            clearStreamingState()
             current = nil
             visibleMessages = []
         }
@@ -266,47 +346,195 @@ public final class ChatViewModel: ObservableObject {
     }
 
     // MARK: - Attachments
+    //
+    // Extraction (PDFKit page walk, a docx unzip that waits on a child
+    // process, image decoding) runs OFF the main actor. `attach` is a
+    // main-actor method, so it used to do that work inline and a large
+    // file froze the whole app — composer, transcript and any streaming
+    // reply — for seconds. Now every file gets its card at once, marked
+    // extracting, the work runs detached one file at a time, and each
+    // card settles to ready (with a truncation note when the caps cut
+    // something) or to a visible failure. The card is the surface for
+    // attachment problems; the transcript's error card (and its Retry)
+    // is for replies.
 
-    private static let imageAttachmentExtensions: Set<String> = [
+    /// Everything extraction produces for one file, as a value that can
+    /// cross back to the main actor (the `ChatAttachment` model object
+    /// is built there).
+    public struct ExtractedAttachment: Sendable, Equatable {
+        public var filename: String
+        public var mimeType: String
+        public var sizeBytes: Int
+        public var extractedText: String
+        public var imageData: Data?
+        public var truncation: ExtractionTruncation?
+
+        public init(
+            filename: String,
+            mimeType: String,
+            sizeBytes: Int,
+            extractedText: String,
+            imageData: Data? = nil,
+            truncation: ExtractionTruncation? = nil
+        ) {
+            self.filename = filename
+            self.mimeType = mimeType
+            self.sizeBytes = sizeBytes
+            self.extractedText = extractedText
+            self.imageData = imageData
+            self.truncation = truncation
+        }
+    }
+
+    /// Where a pending attachment is in its life on the composer strip.
+    public enum AttachmentExtractionState: Equatable, Sendable {
+        case extracting
+        case ready(truncation: ExtractionTruncation?)
+        case failed(message: String)
+    }
+
+    public typealias AttachmentExtractor = @Sendable (URL) throws -> ExtractedAttachment
+
+    @Published public private(set) var attachmentStates: [UUID: AttachmentExtractionState] = [:]
+
+    public var isExtractingAttachments: Bool {
+        attachmentStates.values.contains(.extracting)
+    }
+
+    public func extractionState(for attachment: ChatAttachment) -> AttachmentExtractionState? {
+        attachmentStates[attachment.id]
+    }
+
+    nonisolated private static let imageAttachmentExtensions: Set<String> = [
         "png", "jpg", "jpeg", "webp",
     ]
-    private static let imageAttachmentMaxBytes = 20 * 1024 * 1024
-    private static let imageAttachmentMaxDimension = 2048
+    nonisolated private static let imageAttachmentMaxBytes = 20 * 1024 * 1024
+    nonisolated private static let imageAttachmentMaxDimension = 2048
 
-    public func attach(_ urls: [URL]) async {
-        var added: [ChatAttachment] = []
+    /// Whether `url` would attach as an image (and so needs a model that
+    /// can see). One answer for the extractor and the vision gate.
+    nonisolated private static func isImageAttachment(_ url: URL) -> Bool {
+        imageAttachmentExtensions.contains(url.pathExtension.lowercased())
+    }
+
+    /// Why an image stays off the message when the served model has no
+    /// vision tower. The card carries it, so the refusal is never silent.
+    private static var imagesUnsupportedMessage: String {
+        tr("This model can't see images.")
+    }
+
+    /// Attaches files from the file panel, a drop, or a Finder paste.
+    ///
+    /// `visionEnabled` is passed by the caller rather than read from a
+    /// store: the composer is the one place attachments enter, and it
+    /// already holds the served model's vision capability for the
+    /// paperclip's type filter. Passing the same value at the moment of
+    /// attaching keeps one fact in one place, with no second copy to keep
+    /// in sync and no new wiring at the view model's construction. An
+    /// image attached while the model cannot see gets a card that says so
+    /// instead of quietly riding along and being ignored by the server.
+    public func attach(_ urls: [URL], visionEnabled: Bool) async {
+        // Every file gets its card immediately, so the strip shows the
+        // whole drop while the work is still running.
+        let extractor = attachmentExtractor
+        var queued: [PendingExtraction] = []
         for url in urls {
-            if Self.imageAttachmentExtensions.contains(url.pathExtension.lowercased()) {
-                do {
-                    added.append(try Self.imageAttachment(from: url))
-                } catch {
-                    lastError = .unknown(error.localizedDescription)
-                }
+            let placeholder = ChatAttachment(
+                filename: url.lastPathComponent,
+                mimeType: FileExtractor.mimeType(for: url.pathExtension),
+                sizeBytes: 0,
+                extractedText: ""
+            )
+            pendingAttachments.append(placeholder)
+            if !visionEnabled, Self.isImageAttachment(url) {
+                attachmentStates[placeholder.id] = .failed(message: Self.imagesUnsupportedMessage)
                 continue
             }
-            do {
-                let extracted = try FileExtractor.extract(from: url)
-                let attachment = ChatAttachment(
-                    filename: extracted.filename,
-                    mimeType: extracted.mimeType,
-                    sizeBytes: extracted.sizeBytes,
-                    extractedText: extracted.combinedText
-                )
-                added.append(attachment)
-            } catch let error as FileExtractorError {
-                let placeholder = ChatAttachment(
-                    filename: url.lastPathComponent,
-                    mimeType: FileExtractor.mimeType(for: url.pathExtension),
-                    sizeBytes: 0,
-                    extractedText: ""
-                )
-                lastError = .unknown(error.localizedDescription)
-                added.append(placeholder)
-            } catch {
-                lastError = .unknown(error.localizedDescription)
+            attachmentStates[placeholder.id] = .extracting
+            queued.append(PendingExtraction(attachment: placeholder) { try extractor(url) })
+        }
+        await settle(queued)
+    }
+
+    /// Attaches an image pasted from the clipboard. There is no file
+    /// behind it: the bytes go through the same cap, validity check and
+    /// downscale a dropped image file gets, and the card follows the
+    /// same life. `filename` is the caller's, since only it knows the
+    /// paste happened (`ComposerPasteClassifier.pastedImageFilename`).
+    public func attachPastedImage(_ data: Data, filename: String, visionEnabled: Bool) async {
+        let placeholder = ChatAttachment(
+            filename: filename,
+            mimeType: "image/png",
+            sizeBytes: 0,
+            extractedText: ""
+        )
+        pendingAttachments.append(placeholder)
+        guard visionEnabled else {
+            attachmentStates[placeholder.id] = .failed(message: Self.imagesUnsupportedMessage)
+            return
+        }
+        attachmentStates[placeholder.id] = .extracting
+        await settle([
+            PendingExtraction(attachment: placeholder) {
+                try Self.imageAttachment(data: data, filename: filename, originalMimeType: "image/png")
+            },
+        ])
+    }
+
+    /// A card already on the strip in the extracting state, and the work
+    /// that settles it.
+    private struct PendingExtraction {
+        let attachment: ChatAttachment
+        let extract: @Sendable () throws -> ExtractedAttachment
+    }
+
+    /// Runs each extraction off the main actor, one at a time, and
+    /// settles its card to ready or to a visible failure. Every attach
+    /// path ends here so the strip behaves the same whatever the source.
+    private func settle(_ queued: [PendingExtraction]) async {
+        for pending in queued {
+            let attachment = pending.attachment
+            let extract = pending.extract
+            // Detached, not a child task: a child would inherit this
+            // method's main-actor isolation and run on the main thread.
+            let outcome = await Task.detached(priority: .userInitiated) {
+                Result { try extract() }
+            }.value
+            // Removed from the strip while extracting: nothing to update.
+            guard pendingAttachments.contains(where: { $0.id == attachment.id }) else {
+                attachmentStates[attachment.id] = nil
+                continue
+            }
+            objectWillChange.send()
+            switch outcome {
+            case .success(let extracted):
+                attachment.filename = extracted.filename
+                attachment.mimeType = extracted.mimeType
+                attachment.sizeBytes = extracted.sizeBytes
+                attachment.extractedText = extracted.extractedText
+                attachment.imageData = extracted.imageData
+                attachmentStates[attachment.id] = .ready(truncation: extracted.truncation)
+            case .failure(let error):
+                attachmentStates[attachment.id] = .failed(message: error.localizedDescription)
             }
         }
-        pendingAttachments.append(contentsOf: added)
+    }
+
+    /// The production extractor: images decode (and downscale) to
+    /// `imageData`; everything else goes through `FileExtractor`, whose
+    /// caps report what they cut.
+    nonisolated public static func extractAttachment(from url: URL) throws -> ExtractedAttachment {
+        if isImageAttachment(url) {
+            return try imageAttachment(from: url)
+        }
+        let extracted = try FileExtractor.extract(from: url)
+        return ExtractedAttachment(
+            filename: extracted.filename,
+            mimeType: extracted.mimeType,
+            sizeBytes: extracted.sizeBytes,
+            extractedText: extracted.combinedText,
+            truncation: extracted.truncation
+        )
     }
 
     public var hasSendablePendingAttachments: Bool {
@@ -320,6 +548,7 @@ public final class ChatViewModel: ObservableObject {
 
     public func removeAttachment(_ attachment: ChatAttachment) {
         pendingAttachments.removeAll { $0.id == attachment.id }
+        attachmentStates[attachment.id] = nil
     }
 
     // MARK: - Send / cancel
@@ -328,10 +557,17 @@ public final class ChatViewModel: ObservableObject {
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || hasSendablePendingAttachments else { return }
         guard !isStreaming else { return }
+        // A file still extracting would otherwise be left behind on the
+        // strip and ride along with the NEXT message; the composer
+        // disables Send for the same reason.
+        guard !isExtractingAttachments else { return }
 
         let conversation = current ?? createNewConversation()
         let attachments = pendingAttachments.filter(Self.isSendableAttachment)
         pendingAttachments.removeAll(where: Self.isSendableAttachment)
+        for attachment in attachments {
+            attachmentStates[attachment.id] = nil
+        }
 
         let fencedAttachmentText = Self.buildAttachmentContext(attachments: attachments)
         let visibleUserContent = text
@@ -355,8 +591,8 @@ public final class ChatViewModel: ObservableObject {
         context.insert(userMessage)
         conversation.messages.append(userMessage)
         conversation.updatedAt = userMessage.createdAt
-        if conversation.title == "New Chat", !visibleUserContent.isEmpty {
-            conversation.title = Self.firstNWords(visibleUserContent, n: 5)
+        if conversation.titleIsPlaceholder, !visibleUserContent.isEmpty {
+            conversation.title = ChatConversationTitle.derived(from: visibleUserContent)
         }
         saveContext()
         publishVisibleMessages(for: conversation, ensuring: userMessage)
@@ -383,30 +619,49 @@ public final class ChatViewModel: ObservableObject {
         )
     }
 
+    /// User Stop for the VISIBLE conversation's turn (composer stop
+    /// button, Esc). Background conversations' turns keep running —
+    /// stopping generation you cannot see is never what Stop means.
     public func cancel() async {
-        guard isStreaming else { return }
-        flushStreamingBuffers()
-        stopStreamFlushLoop()
-        // Invalidate the in-flight task's writes BEFORE awaiting it, so any
-        // late SSE events it emits while tearing down are recognized as
-        // superseded (generation mismatch) and dropped instead of bleeding
-        // into the next turn.
-        streamGeneration &+= 1
-        let task = streamTask
-        streamTask = nil
+        guard let current, let stream = turnStreams[current.id] else { return }
+        await cancelTurn(stream)
+    }
+
+    /// Stop every in-flight turn, whichever conversation owns it.
+    /// App-teardown path (stop-all coordinator / termination).
+    public func cancelAllTurns() async {
+        for stream in Array(turnStreams.values) {
+            await cancelTurn(stream)
+        }
+    }
+
+    private func cancelTurn(_ stream: ChatTurnStream, persistPartial: Bool = true) async {
+        // Already superseded/finished — its owner did the teardown.
+        guard turnStreams[stream.conversationID] === stream else { return }
+        flushStreamingBuffers(of: stream)
+        // Detach BEFORE awaiting the task: late SSE events the draining
+        // task emits resolve against the registry, find no entry, and
+        // are dropped instead of bleeding into a later turn.
+        publishTurnState(stream)
+        turnStreams[stream.conversationID] = nil
+        stopStreamFlushLoopIfIdle()
+        let task = stream.task
+        stream.task = nil
         task?.cancel()
-        if let requestId = currentRequestId {
+        if let requestId = stream.requestId {
             await chatClientProvider().cancel(requestId: requestId)
         }
-        // Wait for the stream task to actually stop before resetting state,
+        // Wait for the stream task to actually stop before finalizing,
         // so a new send() can't race a still-draining cancelled task.
         await task?.value
         // Rotate the server session so the cancelled prompt's committed
         // prefix can't be resumed into the next message.
-        if let conversation = current {
-            sessionOverrides[conversation.id] = UUID()
+        sessionOverrides[stream.conversationID] = UUID()
+        if persistPartial {
+            finalizePartialAssistantTurn(of: stream, reason: "cancelled")
+        } else {
+            finalizeTurnUI(of: stream)
         }
-        finalizePartialAssistantTurn(reason: "cancelled")
     }
 
     /// Server session id for a conversation. Stable (== conversation.id)
@@ -423,31 +678,15 @@ public final class ChatViewModel: ObservableObject {
         conversation: ChatConversation,
         requestMessages: [ChatRequestMessage]? = nil
     ) {
-        streamGeneration &+= 1
-        let generation = streamGeneration
-        isStreaming = true
-        streamingPhase = reasoningEnabledProvider() == false ? .generating : .thinking
-        streamingReasoningDocument.reset()
-        streamingContentDocument.reset()
-        hasStreamingReasoning = false
-        hasStreamingContent = false
-        handoffAssistantMessageID = nil
-        pendingToolTraces = []
-        liveTurnSources = []
-        chatDecodeReading = .absent
-        roundToolCalls = [:]
-        turnStartedAt = Date()
-        reasoningStartedAt = nil
-        currentTurnGroupID = UUID()
-        turnSourceAccumulator = []
-        completedThinkingMs = 0
-        currentRequestId = nil
+        let stream = ChatTurnStream(
+            conversation: conversation,
+            phase: reasoningEnabledProvider() == false ? .generating : .thinking
+        )
+        objectWillChange.send()
+        turnStreams[conversation.id] = stream
+        uiPerfProbe.turnStarted()
         lastError = nil
-        streamingReasoningBuffer = ""
-        streamingContentBuffer = ""
-        leakedThinkingSplitter.reset()
-        lastLiveDecodeUpdateAt = .distantPast
-        startStreamFlushLoop(generation: generation)
+        ensureStreamFlushLoop()
 
         // Take a snapshot of the request shape so the loop is reentrant.
         let initialMessages = requestMessages ?? Self.buildRequestMessages(
@@ -461,13 +700,12 @@ public final class ChatViewModel: ObservableObject {
         let model = modelName()
 
         let client = chatClientProvider()
-        streamTask = Task { [weak self] in
+        stream.task = Task { [weak self] in
             guard let self else { return }
             await self.toolFactory.beginTurn()
             await self.runToolLoop(
-                generation: generation,
+                stream: stream,
                 client: client,
-                conversation: conversation,
                 sessionId: sessionId,
                 messages: initialMessages,
                 model: model,
@@ -478,15 +716,20 @@ public final class ChatViewModel: ObservableObject {
     }
 
     private func runToolLoop(
-        generation: Int,
+        stream: ChatTurnStream,
         client: MTPLXChatClient,
-        conversation: ChatConversation,
         sessionId: UUID,
         messages initial: [ChatRequestMessage],
         model: String?,
         tools: [ChatRequestTool]?,
         toolChoice initialToolChoice: String?
     ) async {
+        let conversation = stream.conversation
+        // Sendable identity for the SSE closure: events re-resolve the
+        // stream through the registry, so a cancelled/replaced turn's
+        // late events are dropped at the door.
+        let conversationID = stream.conversationID
+        let turnID = stream.turnID
         var messages = initial
         var toolChoice = initialToolChoice
         var round = 0
@@ -500,58 +743,82 @@ public final class ChatViewModel: ObservableObject {
                 tools: tools,
                 toolChoice: toolChoice
             )
-            roundToolCalls.removeAll(keepingCapacity: true)
-            roundFinishReason = "stop"
-            roundUsage = nil
-            roundStats = nil
+            stream.roundToolCalls.removeAll(keepingCapacity: true)
+            stream.roundFinishReason = nil
+            stream.roundUsage = nil
+            stream.roundStats = nil
+            stream.roundServerError = nil
             var streamError: Error?
             do {
                 try await client.stream(
                     request: request,
                     sessionId: sessionId
                 ) { [weak self] event in
-                    await self?.handleEvent(event, generation: generation)
+                    await self?.handleEvent(
+                        event,
+                        conversationID: conversationID,
+                        turnID: turnID
+                    )
                 }
             } catch is CancellationError {
-                // User Stop: cancel() owns teardown/finalization. Do not
-                // persist a turn or report an error.
+                // User Stop: cancelTurn() owns teardown/finalization. Do
+                // not persist a turn or report an error.
                 return
             } catch let error as MTPLXChatClientError {
                 streamError = error
             } catch {
                 // Transport-level cancellation (URLError.cancelled) arrives
                 // here, not as CancellationError; recognize it via the
-                // generation bump that cancel() performs.
-                if generation != streamGeneration { return }
+                // registry detach that cancelTurn() performs.
+                if !isRegistered(stream) { return }
                 streamError = error
             }
 
-            // Superseded by a cancel() (which bumps the generation and owns
-            // finalization) — don't fall through to persistence. Keyed on
-            // the generation token, not Task.isCancelled, because the
-            // latter can read true transiently and would wrongly drop a
-            // normal finish.
-            if generation != streamGeneration {
+            // Superseded by a cancelTurn() (which detaches the stream and
+            // owns finalization) — don't fall through to persistence.
+            // Keyed on registry identity, not Task.isCancelled, because
+            // the latter can read true transiently and would wrongly drop
+            // a normal finish.
+            if !isRegistered(stream) {
                 return
             }
 
-            flushLeakedThinkingSplitter()
-            flushStreamingBuffers()
+            flushLeakedThinkingSplitter(of: stream)
+            flushStreamingBuffers(of: stream)
 
             if let streamError {
-                handleStreamError(streamError, conversation: conversation)
+                handleStreamError(streamError, stream: stream)
                 return
             }
 
-            let accumulatedToolCalls = roundToolCalls
-            let finishReason = roundFinishReason
-            let finalUsage = roundUsage
-            let finalStats = roundStats
+            // The daemon failed the request and said why (memory guard,
+            // context overflow, tool-loop exception). Whatever partial
+            // text arrived is kept, but the turn is a failure: Retry
+            // card now, "Failed: <message>" on the settled bubble.
+            if let serverMessage = stream.roundServerError {
+                handleServerFailure(serverMessage, stream: stream)
+                return
+            }
+
+            // The bytes stopped without a terminal chunk: the daemon
+            // died or the connection was cut mid-reply. URLSession ends
+            // the byte stream normally in both cases (a clean close and
+            // a chunked body cut before its last chunk alike), so the
+            // absence of the finish frame is the only evidence — and a
+            // half answer must never be filed as a finished one.
+            guard let finishReason = stream.roundFinishReason else {
+                handleStreamLost(stream: stream)
+                return
+            }
+
+            let accumulatedToolCalls = stream.roundToolCalls
+            let finalUsage = stream.roundUsage
+            let finalStats = stream.roundStats
 
             if finishReason == "tool_calls", round <= maxToolRounds {
                 // Close this round's think span before persisting so
                 // the final "Thought · Ns" chip sums every round.
-                closeThinkingSpan()
+                closeThinkingSpan(of: stream)
                 // Persist the assistant turn that requested the tool
                 // calls, then dispatch each call and append role:"tool"
                 // responses, then continue the loop. The message stores
@@ -563,13 +830,13 @@ public final class ChatViewModel: ObservableObject {
                 // duplicates on the next message (the query-less
                 // "Web Search" chips in pre-2026-07-02 transcripts).
                 let assistantMessage = persistAssistantTurn(
-                    conversation: conversation,
+                    of: stream,
                     finishReason: finishReason,
                     usage: finalUsage,
                     stats: finalStats,
                     toolCalls: Array(accumulatedToolCalls.values),
                     traces: [],
-                    reasoningOverride: currentRoundReasoning
+                    reasoningOverride: currentRoundReasoning(of: stream)
                 )
                 messages.append(
                     Self.assistantRequestMessage(from: assistantMessage)
@@ -582,7 +849,8 @@ public final class ChatViewModel: ObservableObject {
                     // id is round-prefixed — engine call ids can repeat
                     // between rounds and must not collide.
                     let traceId = "r\(round)-\(call.id)"
-                    pendingToolTraces.append(
+                    publishTurnState(stream)
+                    stream.pendingToolTraces.append(
                         PendingToolTrace(
                             id: traceId,
                             name: call.name,
@@ -592,27 +860,38 @@ public final class ChatViewModel: ObservableObject {
                             status: .pending
                         )
                     )
-                    streamingPhase = Self.streamingPhase(forTool: call.name)
-                    let result = await toolFactory.dispatch(
+                    stream.phase = Self.streamingPhase(forTool: call.name)
+                    let outcome = await toolFactory.dispatch(
                         name: call.name,
                         argumentsJSON: call.arguments
                     )
-                    updatePendingTrace(id: traceId) { trace in
-                        trace.status = .success
-                        trace.detail = Self.shortResultDetail(for: call.name, json: result)
+                    // A failed call is recorded as a failure everywhere
+                    // it shows: the live strip, the persisted trace,
+                    // and (through resultJSON) the model's tool result.
+                    let result = outcome.resultJSON
+                    let status: ToolTraceStatus = outcome.succeeded ? .success : .failed
+                    updatePendingTrace(of: stream, id: traceId) { trace in
+                        trace.status = status
+                        trace.detail = outcome.failure.map(Self.failureDetail)
+                            ?? Self.shortResultDetail(for: call.name, json: result)
                     }
-                    accumulateTurnSources(
-                        toolName: call.name,
-                        argumentsJSON: call.arguments,
-                        resultJSON: result
-                    )
+                    // A failed fetch has a URL in its arguments but no
+                    // page was read: it is not a source.
+                    if outcome.succeeded {
+                        accumulateTurnSources(
+                            into: stream,
+                            toolName: call.name,
+                            argumentsJSON: call.arguments,
+                            resultJSON: result
+                        )
+                    }
                     persistToolTrace(
                         on: assistantMessage,
                         id: call.id,
                         name: call.name,
                         argumentsJSON: call.arguments,
                         resultJSON: result,
-                        status: .success
+                        status: status
                     )
                     let requestResult = Self.compactToolResultContent(result)
                     messages.append(
@@ -626,7 +905,7 @@ public final class ChatViewModel: ObservableObject {
                         role: .tool,
                         visibleContent: result,
                         toolCallId: call.id,
-                        turnGroupID: currentTurnGroupID,
+                        turnGroupID: stream.turnID,
                         createdAt: Date(),
                         conversation: conversation
                     )
@@ -642,24 +921,25 @@ public final class ChatViewModel: ObservableObject {
                 // is process talk, not the answer — fold it into the
                 // thinking stream so it never pops up as a stray
                 // half-answer bubble, then mark the round boundary.
-                let narration = streamingContent
+                publishTurnState(stream)
+                let narration = stream.contentText
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if !narration.isEmpty {
-                    appendThinkingRoundSeparatorIfNeeded()
-                    streamingReasoningDocument.append(narration)
-                    hasStreamingReasoning = true
+                    appendThinkingRoundSeparatorIfNeeded(of: stream)
+                    stream.reasoningDocument.append(narration)
+                    stream.hasReasoning = true
                 }
-                appendThinkingRoundSeparatorIfNeeded()
-                roundReasoningStartOffset = streamingReasoning.count
+                appendThinkingRoundSeparatorIfNeeded(of: stream)
+                stream.roundReasoningStartOffset = stream.reasoningText.count
 
-                streamingContentDocument.reset()
-                streamingContentBuffer = ""
-                hasStreamingContent = false
-                streamingPhase = .thinking
+                stream.contentDocument.reset()
+                stream.contentBuffer = ""
+                stream.hasContent = false
+                stream.phase = .thinking
                 // Start the next round from a fully flushed document so
                 // the live thought viewport can never sit on a stale
                 // pre-boundary state while round-2 tokens buffer.
-                flushStreamingBuffers()
+                flushStreamingBuffers(of: stream)
                 if round == maxToolRounds {
                     // Final pass: stop the model from issuing more tool
                     // calls so the user always gets a concrete answer.
@@ -668,125 +948,272 @@ public final class ChatViewModel: ObservableObject {
                 continue loop
             }
 
-            // Plain finish (stop / length / unknown). Persist and stop.
-            closeThinkingSpan()
+            // Plain finish (stop / length / unknown). Persist into the
+            // stream's OWN conversation and stop — whichever
+            // conversation happens to be visible (issue #324).
+            closeThinkingSpan(of: stream)
             let assistantMessage = persistAssistantTurn(
-                conversation: conversation,
+                of: stream,
                 finishReason: finishReason,
                 usage: finalUsage,
                 stats: finalStats,
                 toolCalls: Array(accumulatedToolCalls.values),
                 traces: [],
                 publishImmediately: false,
-                reasoningOverride: currentRoundReasoning,
-                sourcesJSON: SourceRecord.encodeJSON(liveTurnSources),
-                thinkingTimeMs: completedThinkingMs > 0 ? completedThinkingMs : nil
+                reasoningOverride: currentRoundReasoning(of: stream),
+                sourcesJSON: SourceRecord.encodeJSON(stream.liveTurnSources),
+                thinkingTimeMs: stream.completedThinkingMs > 0 ? stream.completedThinkingMs : nil
             )
-            updateChatDecodeReading(from: finalStats)
+            // #349 hardening: a "tool_calls" finish that lands HERE was not
+            // dispatched (the round budget is spent, or a server ignored
+            // tool_choice "none"). Persisting the calls with no results would
+            // replay a transcript of unanswered tool calls into every later
+            // request — the model then truthfully reports "I invoke the tool,
+            // but I do not receive any result or output back". Every call
+            // gets a non-empty, truthful error result instead of silence.
+            if finishReason == "tool_calls", !accumulatedToolCalls.isEmpty {
+                for call in accumulatedToolCalls.values {
+                    let result = Self.unexecutedToolResultJSON(toolName: call.name)
+                    persistToolTrace(
+                        on: assistantMessage,
+                        id: call.id,
+                        name: call.name,
+                        argumentsJSON: call.arguments,
+                        resultJSON: result,
+                        status: .failed
+                    )
+                    let toolStorageMessage = ChatMessage(
+                        role: .tool,
+                        visibleContent: result,
+                        toolCallId: call.id,
+                        turnGroupID: stream.turnID,
+                        createdAt: Date(),
+                        conversation: conversation
+                    )
+                    context.insert(toolStorageMessage)
+                    conversation.messages.append(toolStorageMessage)
+                }
+                saveContext()
+            }
+            updateChatDecodeReading(of: stream, from: finalStats)
             publishVisibleMessages(for: conversation, ensuring: assistantMessage)
             refreshConversations()
-            handoffAssistantMessageID = assistantMessage.id
-            finalizeAssistantTurnUI()
+            publishTurnState(stream)
+            stream.handoffAssistantMessageID = assistantMessage.id
+            finalizeTurnUI(of: stream)
             return
         }
-        // Reached only if the task was cancelled between rounds. If cancel()
-        // bumped the generation it owns finalization; otherwise (e.g. the
-        // task was cancelled by teardown) finalize the partial turn here.
-        if Task.isCancelled, generation == streamGeneration {
-            finalizePartialAssistantTurn(reason: "cancelled")
+        // Reached only if the task was cancelled between rounds. If
+        // cancelTurn() detached the stream it owns finalization;
+        // otherwise (e.g. the task was cancelled by teardown) finalize
+        // the partial turn here.
+        if Task.isCancelled, isRegistered(stream) {
+            finalizePartialAssistantTurn(of: stream, reason: "cancelled")
         }
+    }
+
+    /// The stream still owns its conversation's live-turn slot. False
+    /// once cancelTurn() detached it or a newer turn replaced it — the
+    /// per-turn equivalent of the old generation-token check.
+    private func isRegistered(_ stream: ChatTurnStream) -> Bool {
+        turnStreams[stream.conversationID] === stream
+    }
+
+    /// `objectWillChange` for mutations of a turn stream's
+    /// UI-mirrored state — but only when that stream belongs to the
+    /// visible conversation. Background turns accumulate silently.
+    /// Call BEFORE the mutation (willSet semantics).
+    private func publishTurnState(_ stream: ChatTurnStream) {
+        guard stream.conversationID == current?.id else { return }
+        objectWillChange.send()
     }
 
     // MARK: - Event folding
 
-    private func handleEvent(_ event: ChatStreamEvent, generation: Int) async {
-        // Drop events from a superseded (cancelled / replaced) turn so a
-        // still-draining task can't fold tokens into the next message.
-        guard generation == streamGeneration else { return }
+    private func handleEvent(
+        _ event: ChatStreamEvent,
+        conversationID: UUID,
+        turnID: UUID
+    ) async {
+        // Resolve the owning turn through the registry. A cancelled
+        // turn was detached and a replaced turn carries a different
+        // turnID, so a still-draining task's late events can't fold
+        // tokens into a conversation's next message.
+        guard let stream = turnStreams[conversationID],
+              stream.turnID == turnID
+        else { return }
         switch event {
         case .requestId(let id):
-            currentRequestId = id
+            stream.requestId = id
         case .role:
             break
         case .reasoningDelta(let fragment):
-            appendStreamingReasoning(fragment)
+            uiPerfProbe.chunkArrived(bytes: fragment.utf8.count)
+            appendStreamingReasoning(fragment, to: stream)
         case .contentDelta(let fragment):
-            let split = leakedThinkingSplitter.feed(fragment)
-            appendStreamingReasoning(split.reasoning)
-            appendStreamingContent(split.content)
+            uiPerfProbe.chunkArrived(bytes: fragment.utf8.count)
+            let split = stream.leakedThinkingSplitter.feed(fragment)
+            appendStreamingReasoning(split.reasoning, to: stream)
+            appendStreamingContent(split.content, to: stream)
         case .toolCallStart(let index, let id, let name):
-            roundToolCalls[index] = AccumulatingToolCall(id: id, name: name, arguments: "")
+            stream.roundToolCalls[index] = AccumulatingToolCall(id: id, name: name, arguments: "")
         case .toolCallArgumentsDelta(let index, let fragment):
-            roundToolCalls[index, default: AccumulatingToolCall(
+            stream.roundToolCalls[index, default: AccumulatingToolCall(
                 id: "call_\(index)", name: "", arguments: ""
             )].arguments.append(fragment)
         case .progress(let frame):
-            updateChatDecodeReading(from: frame)
+            updateChatDecodeReading(of: stream, from: frame)
         case .finished(let reason, let usage, let stats):
-            roundFinishReason = reason
-            roundUsage = usage
-            roundStats = stats
+            stream.roundFinishReason = reason
+            stream.roundUsage = usage
+            stream.roundStats = stats
+        case .serverError(let message):
+            stream.roundServerError = message
         }
     }
 
-    private func appendStreamingReasoning(_ fragment: String) {
+    private func appendStreamingReasoning(_ fragment: String, to stream: ChatTurnStream) {
         guard !fragment.isEmpty else { return }
-        let wasEmpty = streamingReasoning.isEmpty
-        if reasoningStartedAt == nil {
-            reasoningStartedAt = Date()
+        // NOT `reasoningText.isEmpty`: that computed property
+        // concatenates the whole transcript per call, and this runs per
+        // delta — O(answer) per token (2026-08-17 field regression).
+        // The has-flag mirrors emptiness exactly (set with first
+        // append, cleared with every reset).
+        let wasEmpty = !stream.hasReasoning
+        if stream.reasoningStartedAt == nil {
+            stream.reasoningStartedAt = Date()
         }
-        streamingReasoningBuffer.append(fragment)
+        stream.reasoningBuffer.append(fragment)
         if wasEmpty {
-            hasStreamingReasoning = true
-            flushStreamingBuffers()
-        } else if streamingReasoningBuffer.count > Self.streamBufferFlushBackstop {
-            // Backstop: the 16 ms flush loop is the cadence; this bound
-            // guarantees the live viewport can never lag more than ~1KB
-            // behind the stream even if that task stalls.
-            flushStreamingBuffers()
+            publishTurnState(stream)
+            stream.hasReasoning = true
+            flushStreamingBuffers(of: stream)
+        } else if stream.reasoningBuffer.count > Self.streamBufferFlushBackstop {
+            // Backstop: the display-cadence flush loop is the cadence;
+            // this bound guarantees the live viewport can never lag more
+            // than ~1KB behind the stream even if that task stalls.
+            flushStreamingBuffers(of: stream, drainCompletely: false)
         }
-        if streamingContent.isEmpty, streamingPhase != .thinking {
-            streamingPhase = .thinking
+        if !stream.hasContent, stream.phase != .thinking {
+            publishTurnState(stream)
+            stream.phase = .thinking
         }
     }
 
-    private func appendStreamingContent(_ fragment: String) {
+    private func appendStreamingContent(_ fragment: String, to stream: ChatTurnStream) {
         guard !fragment.isEmpty else { return }
-        let wasEmpty = streamingContent.isEmpty
-        streamingContentBuffer.append(fragment)
-        if !wasEmpty, streamingContentBuffer.count > Self.streamBufferFlushBackstop {
-            flushStreamingBuffers()
+        let wasEmpty = !stream.hasContent
+        stream.contentBuffer.append(fragment)
+        stream.typewriterPacer.recordArrival(
+            chars: fragment.count,
+            now: ProcessInfo.processInfo.systemUptime
+        )
+        if !wasEmpty, stream.contentBuffer.count > Self.streamBufferFlushBackstop {
+            flushStreamingBuffers(of: stream, drainCompletely: false)
         }
         if wasEmpty {
-            hasStreamingContent = true
+            publishTurnState(stream)
+            stream.hasContent = true
             // The think span ends the moment answer tokens start; a
             // later reasoningDelta (interleaved thinking) opens a new
             // span, so multi-burst turns sum every burst.
-            closeThinkingSpan()
+            closeThinkingSpan(of: stream)
         }
-        if streamingPhase != .answering {
-            streamingPhase = .answering
+        if stream.phase != .answering {
+            publishTurnState(stream)
+            stream.phase = .answering
         }
         if wasEmpty {
-            flushStreamingBuffers()
+            // Paced, not a whole drain: a context-copy round can open
+            // the answer with a two-line block, and pasting it would be
+            // the very burst the typewriter exists to smooth.
+            flushStreamingBuffers(of: stream, drainCompletely: false)
         }
     }
 
-    private func updateChatDecodeReading(from frame: ChatProgressFrame) {
-        guard let value = Self.chatDecodeTokS(from: frame) else { return }
+    private func updateChatDecodeReading(of stream: ChatTurnStream, from frame: ChatProgressFrame) {
+        recordDecodeWindowSample(into: stream, from: frame)
+        guard let value = liveDecodeValue(of: stream, from: frame) else { return }
         let now = Date()
-        guard chatDecodeReading == .absent
-            || now.timeIntervalSince(lastLiveDecodeUpdateAt) >= Self.liveDecodeUpdateInterval
+        guard stream.decodeReading == .absent
+            || now.timeIntervalSince(stream.lastLiveDecodeUpdateAt) >= Self.liveDecodeUpdateInterval
         else { return }
-        lastLiveDecodeUpdateAt = now
-        chatDecodeReading = .live(value)
+        let next = HeadlineDecodeReading.live(value)
+        // Publish only when the chip's displayed reading changes. The
+        // header latches on its own 0.5 s poll and renders whole tok/s,
+        // so a publish on every 200 ms frame re-evaluated the whole
+        // transcript, sidebar and composer five times a second for a
+        // number nobody could see change.
+        if !Self.sameDisplayedReading(stream.decodeReading, next) {
+            publishTurnState(stream)
+        }
+        stream.lastLiveDecodeUpdateAt = now
+        stream.decodeReading = next
     }
 
-    private func updateChatDecodeReading(from stats: ChatStreamStats?) {
+    /// Two readings the header chip would render identically: the same
+    /// lifecycle phase and, while live, the same whole tok/s.
+    private static func sameDisplayedReading(
+        _ lhs: HeadlineDecodeReading,
+        _ rhs: HeadlineDecodeReading
+    ) -> Bool {
+        switch (lhs, rhs) {
+        case (.live(let a), .live(let b)):
+            return Int(a.rounded()) == Int(b.rounded())
+        default:
+            return lhs == rhs
+        }
+    }
+
+    // MARK: Live decode window (2026-07-31 founder: "it says 50 but it
+    // looks like 30 — are you sure it's not average?")
+    //
+    // It was: the live chip showed tokens/decode-elapsed since turn
+    // start, so once long-context decay sets in, the average reads high
+    // (a 10k-token turn that started at 55 tok/s and is now doing 35
+    // averages ~48). The chip now shows a sliding ~5 s window computed
+    // from progress-frame token counts, so mid-generation it tracks
+    // what the stream is doing NOW. The held reading after completion
+    // stays the full-turn cumulative — the honest summary number. The
+    // 0.5 s display latch in ChatHeaderView still smooths the strobe.
+    private static let decodeWindowSpanS = 5.0
+
+    private func recordDecodeWindowSample(into stream: ChatTurnStream, from frame: ChatProgressFrame) {
+        guard let tokens = frame.completionTokens.map(Double.init)
+            ?? frame.raw.values["completion_tokens"]?.doubleValue,
+            tokens > 0
+        else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if let last = stream.decodeWindowSamples.last, tokens < last.tokens {
+            // Token count went backwards: a new tool round started a
+            // fresh request. Restart the window rather than mixing.
+            stream.decodeWindowSamples = []
+        }
+        stream.decodeWindowSamples.append((t: now, tokens: tokens))
+        while let first = stream.decodeWindowSamples.first,
+              now - first.t > Self.decodeWindowSpanS {
+            stream.decodeWindowSamples.removeFirst()
+        }
+    }
+
+    private func liveDecodeValue(of stream: ChatTurnStream, from frame: ChatProgressFrame) -> Double? {
+        if let first = stream.decodeWindowSamples.first,
+           let last = stream.decodeWindowSamples.last,
+           last.t - first.t >= 1.2,
+           last.tokens > first.tokens {
+            let rate = (last.tokens - first.tokens) / (last.t - first.t)
+            if rate.isFinite, rate > 0 { return rate }
+        }
+        // Early in the turn (window not yet meaningful): cumulative.
+        return Self.chatDecodeTokS(from: frame)
+    }
+
+    private func updateChatDecodeReading(of stream: ChatTurnStream, from stats: ChatStreamStats?) {
+        publishTurnState(stream)
         if let value = Self.chatDecodeTokS(from: stats) {
-            chatDecodeReading = .held(value: value, completedAt: Date())
-        } else if case .live(let value) = chatDecodeReading {
-            chatDecodeReading = .held(value: value, completedAt: Date())
+            stream.decodeReading = .held(value: value, completedAt: Date())
+        } else if case .live(let value) = stream.decodeReading {
+            stream.decodeReading = .held(value: value, completedAt: Date())
         }
     }
 
@@ -827,13 +1254,15 @@ public final class ChatViewModel: ObservableObject {
     }
 
     private func updatePendingTrace(
+        of stream: ChatTurnStream,
         id: String,
         _ mutate: (inout PendingToolTrace) -> Void
     ) {
-        guard let index = pendingToolTraces.firstIndex(where: { $0.id == id }) else { return }
-        var trace = pendingToolTraces[index]
+        guard let index = stream.pendingToolTraces.firstIndex(where: { $0.id == id }) else { return }
+        publishTurnState(stream)
+        var trace = stream.pendingToolTraces[index]
         mutate(&trace)
-        pendingToolTraces[index] = trace
+        stream.pendingToolTraces[index] = trace
     }
 
     // MARK: - Turn aggregation (single-card thinking + sources footer)
@@ -844,30 +1273,31 @@ public final class ChatViewModel: ObservableObject {
     /// persisted on earlier messages. The slice is stored VERBATIM —
     /// trimming is only used to decide emptiness, so a single-round
     /// turn persists byte-for-byte what the model emitted.
-    private var currentRoundReasoning: String? {
-        let full = streamingReasoning
-        guard roundReasoningStartOffset < full.count else { return nil }
-        let slice = String(full.dropFirst(roundReasoningStartOffset))
+    private func currentRoundReasoning(of stream: ChatTurnStream) -> String? {
+        let full = stream.reasoningText
+        guard stream.roundReasoningStartOffset < full.count else { return nil }
+        let slice = String(full.dropFirst(stream.roundReasoningStartOffset))
         let isBlank = slice
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .isEmpty
         return isBlank ? nil : slice
     }
 
-    private func appendThinkingRoundSeparatorIfNeeded() {
-        let text = streamingReasoningDocument.rawText
+    private func appendThinkingRoundSeparatorIfNeeded(of stream: ChatTurnStream) {
+        let text = stream.reasoningDocument.rawText
         guard !text.isEmpty, !text.hasSuffix("\n\n") else { return }
-        streamingReasoningDocument.append(text.hasSuffix("\n") ? "\n" : "\n\n")
+        stream.reasoningDocument.append(text.hasSuffix("\n") ? "\n" : "\n\n")
     }
 
     /// Fold the live think span (if one is open) into the turn total.
-    private func closeThinkingSpan(at end: Date = Date()) {
-        guard let start = reasoningStartedAt else { return }
-        completedThinkingMs += max(0, Int(end.timeIntervalSince(start) * 1000))
-        reasoningStartedAt = nil
+    private func closeThinkingSpan(of stream: ChatTurnStream, at end: Date = Date()) {
+        guard let start = stream.reasoningStartedAt else { return }
+        stream.completedThinkingMs += max(0, Int(end.timeIntervalSince(start) * 1000))
+        stream.reasoningStartedAt = nil
     }
 
     private func accumulateTurnSources(
+        into stream: ChatTurnStream,
         toolName: String,
         argumentsJSON: String?,
         resultJSON: String?
@@ -878,14 +1308,48 @@ public final class ChatViewModel: ObservableObject {
             resultJSON: resultJSON
         )
         guard !extracted.isEmpty else { return }
-        turnSourceAccumulator.append(contentsOf: extracted)
-        liveTurnSources = SourceRecord.dedupe(turnSourceAccumulator)
+        publishTurnState(stream)
+        stream.turnSourceAccumulator.append(contentsOf: extracted)
+        stream.liveTurnSources = SourceRecord.dedupe(stream.turnSourceAccumulator)
     }
 
     // MARK: - Stream UI coalescing
 
-    private func startStreamFlushLoop(generation: Int) {
-        stopStreamFlushLoop()
+    /// One shared reveal loop drives EVERY in-flight turn stream (the
+    /// pacing state itself is per-stream). Started with the first live
+    /// turn, stopped when the last one settles.
+    private func ensureStreamFlushLoop() {
+        guard streamDisplayLink == nil, streamFlushTask == nil else { return }
+        onLiveTurnActivityChanged(true)
+        // Reveal on the DISPLAY clock, not a dispatch timer. The 32 ms
+        // Task.sleep loop this replaces was measured slipping 4-9 frame
+        // multiples under decode load (flush-gap p95 140 ms / max 315 ms
+        // while the paint watchdog's display link fired 60 Hz without one
+        // missed tick — 2026-08-19 cache-hit field session): main-queue
+        // timer continuations get coalesced under sustained SoC pressure
+        // and starve outright during scroll-tracking runloop modes, and
+        // every slipped tick reads as freeze-then-multi-line-vomit. A
+        // display link in .common modes wakes exactly once per painted
+        // frame, so reveal cadence and paint cadence cannot drift apart.
+        if let screen = NSScreen.main ?? NSScreen.screens.first {
+            streamDisplayLinkTarget.onTick = { [weak self] in
+                self?.flushLiveTurnStreams()
+            }
+            let link = screen.displayLink(
+                target: streamDisplayLinkTarget,
+                selector: #selector(StreamFlushLinkTarget.tick(_:))
+            )
+            // 60 Hz is already finer than the old 32 ms cadence and halves
+            // wakeups on ProMotion panels; the reveal budget uses real dt,
+            // so the system dropping to 30 Hz just scales the per-tick cut.
+            link.preferredFrameRateRange = CAFrameRateRange(
+                minimum: 30, maximum: 60, preferred: 60
+            )
+            link.add(to: .main, forMode: .common)
+            streamDisplayLink = link
+            return
+        }
+        // Headless fallback (no attached display; unit tests).
         streamFlushTask = Task { [weak self] in
             while !Task.isCancelled {
                 do {
@@ -893,45 +1357,158 @@ public final class ChatViewModel: ObservableObject {
                 } catch {
                     return
                 }
-                self?.flushStreamingBuffersIfCurrent(generation: generation)
+                self?.flushLiveTurnStreams()
             }
         }
     }
 
     private func stopStreamFlushLoop() {
+        let wasLive = streamDisplayLink != nil || streamFlushTask != nil
+        streamDisplayLink?.invalidate()
+        streamDisplayLink = nil
+        streamDisplayLinkTarget.onTick = {}
         streamFlushTask?.cancel()
         streamFlushTask = nil
+        if wasLive { onLiveTurnActivityChanged(false) }
     }
 
-    private func flushStreamingBuffersIfCurrent(generation: Int) {
-        guard generation == streamGeneration else { return }
-        flushStreamingBuffers()
+    private func stopStreamFlushLoopIfIdle() {
+        guard turnStreams.isEmpty else { return }
+        stopStreamFlushLoop()
     }
 
-    private func flushStreamingBuffers() {
-        if !streamingReasoningBuffer.isEmpty {
-            let delta = streamingReasoningBuffer
-            streamingReasoningBuffer = ""
-            streamingReasoningDocument.append(delta)
-        }
-        if !streamingContentBuffer.isEmpty {
-            let delta = streamingContentBuffer
-            streamingContentBuffer = ""
-            streamingContentDocument.append(delta)
+    private func flushLiveTurnStreams() {
+        for stream in turnStreams.values {
+            flushStreamingBuffers(of: stream, drainCompletely: false)
         }
     }
 
-    private func flushLeakedThinkingSplitter() {
-        let split = leakedThinkingSplitter.finish()
-        appendStreamingReasoning(split.reasoning)
-        appendStreamingContent(split.content)
+    // MARK: Typewriter pacing (2026-07-31 founder: "I like it when I can
+    // see every individual character typing")
+    //
+    // The display-cadenced flush loop used to drain the WHOLE arrival buffer each
+    // tick, so any main-thread hiccup turned into a multi-word paste —
+    // the "vomits five words at a time" feel. Paced mode reveals a
+    // bounded slice per tick instead: at steady state it reveals a few
+    // characters every 32 ms, and after a stall the backlog drains
+    // geometrically (quarter per tick) so catch-up looks like fast
+    // typing, not a paste. Bounded latency: steady-state lag is ~70 ms,
+    // and backlogs over 4 KB drain whole. Lifecycle flushes (finalize,
+    // cancel, error, tool-round handoff) always drain completely —
+    // `drainCompletely` defaults to true so only the display-link tick and
+    // the mid-event backstop opt into pacing. `MTPLX_STREAM_TYPEWRITER=0`
+    // restores the old drain-everything behavior.
+    private static let typewriterPacingEnabled: Bool = {
+        switch ProcessInfo.processInfo.environment["MTPLX_STREAM_TYPEWRITER"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "0", "false", "off", "no": return false
+        default: return true
+        }
+    }()
+    private static let typewriterMinRevealCharacters = 3
+    /// Per-tick reveal ceiling. The old behavior whole-drained any
+    /// buffer above 4 KB in a single frame — that WAS the visible
+    /// "vomit" paste whenever the main thread hiccuped and a backlog
+    /// built (2026-08-17 field regression). The 256-character ceiling
+    /// still clears a 4 KB recovery backlog in well under a second;
+    /// steady-state streams reveal only a few characters per tick.
+    private static let typewriterMaxRevealCharacters = 256
+
+    // Rate-based reveal (streamwar 2026-08-19, re-estimated 2026-09-02):
+    // the budget tracks the ARRIVAL rate, not the backlog size, so
+    // recovery from a stall looks like the same typing, just briefly
+    // faster. The estimate itself lives in `StreamTypewriterPacer`: it is
+    // taken over wall-clock time including idle frames and paired with a
+    // drain-to-next-arrival deadline, because sampling only on frames
+    // that received bytes read a context-copy block (about 110
+    // characters in one frame) as thousands of characters per second
+    // and pasted it whole: "two lines, freeze, two lines".
+    private func typewriterTickBudget(of stream: ChatTurnStream, now: Double) -> Int {
+        stream.typewriterPacer.tickBudget(backlog: stream.contentBuffer.count, now: now)
+    }
+
+    // Internal (not private) so the regression test can pin the reveal
+    // ceiling — the unbounded whole-drain WAS the "vomit" paste.
+    static func pacedCut(
+        _ buffer: String,
+        budget: Int
+    ) -> (reveal: String, rest: String) {
+        let count = buffer.count
+        guard count > typewriterMinRevealCharacters else { return (buffer, "") }
+        let reveal = min(
+            max(typewriterMinRevealCharacters, budget),
+            typewriterMaxRevealCharacters
+        )
+        guard reveal < count else { return (buffer, "") }
+        let cut = buffer.index(buffer.startIndex, offsetBy: reveal)
+        return (String(buffer[..<cut]), String(buffer[cut...]))
+    }
+
+    private func flushStreamingBuffers(of stream: ChatTurnStream, drainCompletely: Bool = true) {
+        let paced = Self.typewriterPacingEnabled && !drainCompletely
+        var drainedBytes = 0
+        let probeEnabled = uiPerfProbe.enabled
+        let applyStarted = probeEnabled
+            ? ProcessInfo.processInfo.systemUptime
+            : 0
+        if !stream.reasoningBuffer.isEmpty {
+            // Reasoning is diagnostic plain text, so show the daemon's real
+            // cadence. Quarter-buffer "typewriter" recovery made thought
+            // output alternately crawl and burst even while production was
+            // steady; one display-cadenced drain is ordered and still bounds
+            // paint work to the display-cadence flush loop.
+            let delta = stream.reasoningBuffer
+            stream.reasoningBuffer = ""
+            drainedBytes += delta.utf8.count
+            stream.reasoningDocument.append(delta)
+        }
+        if !stream.contentBuffer.isEmpty {
+            let delta: String
+            if paced {
+                let cut = Self.pacedCut(
+                    stream.contentBuffer,
+                    budget: typewriterTickBudget(
+                        of: stream,
+                        now: ProcessInfo.processInfo.systemUptime
+                    )
+                )
+                delta = cut.reveal
+                stream.contentBuffer = cut.rest
+            } else {
+                delta = stream.contentBuffer
+                stream.contentBuffer = ""
+            }
+            drainedBytes += delta.utf8.count
+            stream.contentDocument.append(delta)
+        } else if paced {
+            stream.typewriterPacer.noteIdleTick(now: ProcessInfo.processInfo.systemUptime)
+        }
+        if probeEnabled, drainedBytes > 0 {
+            let applyMs = (ProcessInfo.processInfo.systemUptime - applyStarted) * 1000
+            uiPerfProbe.flushApplied(
+                drainedBytes: drainedBytes,
+                applyMs: applyMs,
+                blocksAfter: stream.contentDocument.blocks.count
+                    + stream.reasoningDocument.blocks.count,
+                linesFinalizedTotal: stream.contentDocument.liveFinalizedCount
+                    + stream.reasoningDocument.liveFinalizedCount,
+                mergesTotal: stream.contentDocument.liveSegmentMergeCount
+                    + stream.reasoningDocument.liveSegmentMergeCount
+            )
+        }
+    }
+
+    private func flushLeakedThinkingSplitter(of stream: ChatTurnStream) {
+        let split = stream.leakedThinkingSplitter.finish()
+        appendStreamingReasoning(split.reasoning, to: stream)
+        appendStreamingContent(split.content, to: stream)
     }
 
     // MARK: - Persistence helpers
 
     @discardableResult
     private func persistAssistantTurn(
-        conversation: ChatConversation,
+        of stream: ChatTurnStream,
         finishReason: String,
         usage: ChatUsage?,
         stats: ChatStreamStats?,
@@ -942,6 +1519,7 @@ public final class ChatViewModel: ObservableObject {
         sourcesJSON: String? = nil,
         thinkingTimeMs: Int? = nil
     ) -> ChatMessage {
+        let conversation = stream.conversation
         let toolCallRecords = toolCalls.map { call in
             ToolCallRecord(id: call.id, name: call.name, arguments: call.arguments)
         }
@@ -978,16 +1556,18 @@ public final class ChatViewModel: ObservableObject {
         // The live reasoning document accumulates across tool rounds
         // (single-card UI); each persisted message stores only its own
         // round's slice via `reasoningOverride` so replays and the
-        // grouped transcript never double-count a round.
+        // grouped transcript never double-count a round. Content is
+        // read from the STREAM being persisted — never the visible
+        // conversation's mirror (issue #324).
         let reasoning = reasoningOverride
         let message = ChatMessage(
             role: .assistant,
-            visibleContent: streamingContent,
+            visibleContent: stream.contentText,
             reasoningContent: reasoning,
             toolCallsJSON: toolCallsJSON,
             statsJSON: statsJSON,
             finishReason: finishReason,
-            turnGroupID: currentTurnGroupID,
+            turnGroupID: stream.turnID,
             sourcesJSON: sourcesJSON,
             createdAt: Date(),
             conversation: conversation
@@ -1035,48 +1615,53 @@ public final class ChatViewModel: ObservableObject {
         message.toolTraces.append(trace)
     }
 
-    private func finalizeAssistantTurnUI() {
-        flushStreamingBuffers()
-        stopStreamFlushLoop()
-        isStreaming = false
-        streamingPhase = .idle
-        currentRequestId = nil
-        turnStartedAt = nil
-        reasoningStartedAt = nil
-        currentTurnGroupID = nil
-        turnSourceAccumulator = []
-        liveTurnSources = []
-        completedThinkingMs = 0
-        roundReasoningStartOffset = 0
-        lastLiveDecodeUpdateAt = .distantPast
-        pendingToolTraces = []
-        streamingContentDocument.reset()
-        streamingReasoningDocument.reset()
-        hasStreamingContent = false
-        hasStreamingReasoning = false
-        handoffAssistantMessageID = nil
-        streamingContentBuffer = ""
-        streamingReasoningBuffer = ""
+    /// End-of-life for a turn stream: drain what's left into its
+    /// documents, deregister it (its conversation's live surface goes
+    /// idle), and stash the held decode summary. The stream object
+    /// itself — documents included — simply dies with its last
+    /// reference; nothing shared needs resetting anymore.
+    private func finalizeTurnUI(of stream: ChatTurnStream) {
+        publishTurnState(stream)
+        flushStreamingBuffers(of: stream)
+        if isRegistered(stream) {
+            turnStreams[stream.conversationID] = nil
+        }
+        if case .held = stream.decodeReading {
+            heldDecodeReadings[stream.conversationID] = stream.decodeReading
+        }
+        stopStreamFlushLoopIfIdle()
+        uiPerfProbe.turnEnded(requestId: stream.requestId)
+        stream.task = nil
     }
 
-    private func finalizePartialAssistantTurn(reason: String) {
-        guard isStreaming, let conversation = current else { return }
-        flushLeakedThinkingSplitter()
-        flushStreamingBuffers()
-        closeThinkingSpan()
+    /// Persists whatever the interrupted turn produced. `failure` is
+    /// the daemon's own message for a server-reported error; it rides
+    /// in `statsJSON` so the settled bubble can read "Failed: <message>".
+    private func finalizePartialAssistantTurn(
+        of stream: ChatTurnStream,
+        reason: String,
+        failure: ChatTurnFailure? = nil
+    ) {
+        let conversation = stream.conversation
+        flushLeakedThinkingSplitter(of: stream)
+        flushStreamingBuffers(of: stream)
+        closeThinkingSpan(of: stream)
         var partialMessage: ChatMessage?
-        if !streamingContent.isEmpty || currentRoundReasoning != nil {
+        let content = stream.contentText
+        let roundReasoning = currentRoundReasoning(of: stream)
+        if !content.isEmpty || roundReasoning != nil {
             // Store only the interrupted ROUND's reasoning — earlier
             // rounds of this turn were already persisted on their own
             // messages, and the shared turnGroupID re-unites them in
             // the transcript.
             let message = ChatMessage(
                 role: .assistant,
-                visibleContent: streamingContent,
-                reasoningContent: currentRoundReasoning,
+                visibleContent: content,
+                reasoningContent: roundReasoning,
+                statsJSON: ChatTurnFailure.statsJSON(stats: nil, failure: failure),
                 finishReason: reason,
-                turnGroupID: currentTurnGroupID,
-                sourcesJSON: SourceRecord.encodeJSON(liveTurnSources),
+                turnGroupID: stream.turnID,
+                sourcesJSON: SourceRecord.encodeJSON(stream.liveTurnSources),
                 createdAt: Date(),
                 conversation: conversation
             )
@@ -1088,56 +1673,80 @@ public final class ChatViewModel: ObservableObject {
         }
         if let partialMessage {
             publishVisibleMessages(for: conversation, ensuring: partialMessage)
-        } else {
+        } else if current?.id == conversation.id {
             refreshVisibleMessages(preferRelationshipFirst: true)
         }
         refreshConversations()
-        finalizeAssistantTurnUI()
+        finalizeTurnUI(of: stream)
     }
 
-    private func handleStreamError(_ error: Error, conversation: ChatConversation) {
+    private func handleStreamError(_ error: Error, stream: ChatTurnStream) {
+        var reportedError: ChatError
         switch error {
         case let chatError as MTPLXChatClientError:
             switch chatError {
-            case .unauthorized: lastError = .unauthorized
+            case .unauthorized: reportedError = .unauthorized
             case .daemonUnreachable:
+                // Daemon-level state: surface app-wide regardless of
+                // which conversation's stream tripped it.
                 onDaemonUnreachable()
-                lastError = .daemonStopped
-            case .httpStatus(let code, let body): lastError = .http(code, body)
-            case .bodyEncodingFailed: lastError = .malformedRequest
-            case .invalidResponse: lastError = .streamLost
+                reportedError = .daemonStopped
+            case .httpStatus(let code, let body): reportedError = .http(code, body)
+            case .bodyEncodingFailed: reportedError = .malformedRequest
+            case .invalidResponse: reportedError = .streamLost
             }
+        case let urlError as URLError where urlError.code == .networkConnectionLost:
+            // The transport reported the cut itself (the other way a
+            // dying daemon shows up); same outcome as a silent end.
+            reportedError = .streamLost
         default:
-            lastError = .unknown(error.localizedDescription)
+            reportedError = .unknown(error.localizedDescription)
         }
-        finalizePartialAssistantTurn(reason: "error")
+        // The error banner is per-surface UI: show it only when the
+        // failing stream's conversation is the visible one. A
+        // background failure still persists its partial below with
+        // finishReason "error", so the transcript shows the truncation
+        // when the user returns.
+        if stream.conversationID == current?.id {
+            lastError = reportedError
+        }
+        finalizePartialAssistantTurn(
+            of: stream,
+            reason: reportedError == .streamLost ? Self.streamLostFinishReason : "error"
+        )
+    }
+
+    /// Finish reason persisted for a reply the daemon never finished:
+    /// the bytes stopped with no terminal chunk. Distinct from "error"
+    /// (the daemon said why) and "cancelled" (the user stopped it).
+    nonisolated public static let streamLostFinishReason = "incomplete"
+
+    /// The byte stream ended with no terminal chunk and no transport
+    /// error. Keep the partial, persist it as incomplete, and offer
+    /// Retry — never file it as a completed answer.
+    private func handleStreamLost(stream: ChatTurnStream) {
+        if stream.conversationID == current?.id {
+            lastError = .streamLost
+        }
+        finalizePartialAssistantTurn(of: stream, reason: Self.streamLostFinishReason)
+    }
+
+    /// The daemon's own failure frame (`finish_reason: "error"`). Same
+    /// surface rules as a transport error — banner only for the visible
+    /// conversation, partial persisted with finishReason "error" — plus
+    /// the server's message, persisted so the transcript can show it.
+    private func handleServerFailure(_ message: String, stream: ChatTurnStream) {
+        if stream.conversationID == current?.id {
+            lastError = .server(message)
+        }
+        finalizePartialAssistantTurn(
+            of: stream,
+            reason: "error",
+            failure: ChatTurnFailure(errorMessage: message)
+        )
     }
 
     // MARK: - Glue
-
-    private func clearStreamingState() {
-        isStreaming = false
-        streamingPhase = .idle
-        stopStreamFlushLoop()
-        streamingReasoningDocument.reset()
-        streamingContentDocument.reset()
-        hasStreamingReasoning = false
-        hasStreamingContent = false
-        handoffAssistantMessageID = nil
-        streamingReasoningBuffer = ""
-        streamingContentBuffer = ""
-        leakedThinkingSplitter.reset()
-        pendingToolTraces = []
-        liveTurnSources = []
-        turnSourceAccumulator = []
-        currentTurnGroupID = nil
-        completedThinkingMs = 0
-        roundReasoningStartOffset = 0
-        currentRequestId = nil
-        chatDecodeReading = .absent
-        lastError = nil
-        lastLiveDecodeUpdateAt = .distantPast
-    }
 
     private func refreshVisibleMessages(preferRelationshipFirst: Bool = false) {
         guard let current else {
@@ -1257,20 +1866,48 @@ public final class ChatViewModel: ObservableObject {
             || !attachment.extractedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    private static func imageAttachment(from url: URL) throws -> ChatAttachment {
-        let data = try Data(contentsOf: url)
-        guard data.count <= imageAttachmentMaxBytes else {
+    nonisolated private static func imageAttachment(from url: URL) throws -> ExtractedAttachment {
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
             throw FileExtractorError.unreadable(
                 filename: url.lastPathComponent,
-                reason: "image exceeds the 20MB attachment limit"
+                reason: error.localizedDescription
+            )
+        }
+        return try imageAttachment(
+            data: data,
+            filename: url.lastPathComponent,
+            originalMimeType: FileExtractor.mimeType(for: url.pathExtension)
+        )
+    }
+
+    /// One implementation for an image file and for pasted image bytes:
+    /// the size cap, the decodability check and the downscale live here
+    /// only. `originalMimeType` describes `data` as given and is reported
+    /// when the original bytes are kept; a downscaled image is always PNG.
+    nonisolated private static func imageAttachment(
+        data: Data,
+        filename: String,
+        originalMimeType: String
+    ) throws -> ExtractedAttachment {
+        guard data.count <= imageAttachmentMaxBytes else {
+            throw FileExtractorError.unreadable(
+                filename: filename,
+                reason: tr("image exceeds the 20MB attachment limit")
+            )
+        }
+        guard CGImageSourceCreateWithData(data as CFData, nil).map({ CGImageSourceGetCount($0) > 0 }) == true else {
+            throw FileExtractorError.unreadable(
+                filename: filename,
+                reason: tr("not a readable image")
             )
         }
         let downscaled = downscaledImageData(data)
-        return ChatAttachment(
-            filename: url.lastPathComponent,
-            mimeType: downscaled != nil
-                ? "image/png"
-                : FileExtractor.mimeType(for: url.pathExtension),
+        return ExtractedAttachment(
+            filename: filename,
+            mimeType: downscaled != nil ? "image/png" : originalMimeType,
             sizeBytes: (downscaled ?? data).count,
             extractedText: "",
             imageData: downscaled ?? data
@@ -1279,7 +1916,7 @@ public final class ChatViewModel: ObservableObject {
 
     /// Returns PNG bytes capped at the max dimension, or nil when the
     /// original already fits (keep the original bytes and format).
-    private static func downscaledImageData(_ data: Data) -> Data? {
+    nonisolated private static func downscaledImageData(_ data: Data) -> Data? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
                 as? [CFString: Any]
@@ -1319,16 +1956,6 @@ public final class ChatViewModel: ObservableObject {
                 return "data:\(attachment.mimeType);base64,\(data.base64EncodedString())"
             }
         return urls.isEmpty ? nil : urls
-    }
-
-    private static func firstNWords(_ text: String, n: Int) -> String {
-        let words = text
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .split(whereSeparator: { $0.isWhitespace || $0.isNewline })
-            .prefix(n)
-            .map { String($0) }
-        let joined = words.joined(separator: " ")
-        return joined.isEmpty ? "New Chat" : joined
     }
 
     static func buildRequestMessages(
@@ -1652,9 +2279,9 @@ public final class ChatViewModel: ObservableObject {
                 let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                 let query = dict["query"] as? String, !query.isEmpty
             {
-                return "Searching: \(query)"
+                return tr("Searching: %@", query)
             }
-            return "Searching"
+            return tr("Searching")
         case "fetch_url":
             if let data = call.arguments.data(using: .utf8),
                 let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -1662,7 +2289,7 @@ public final class ChatViewModel: ObservableObject {
             {
                 return url
             }
-            return "Reading URL"
+            return tr("Reading URL")
         default:
             return call.name.replacingOccurrences(of: "_", with: " ")
         }
@@ -1670,18 +2297,56 @@ public final class ChatViewModel: ObservableObject {
 
     private static func liveDetail(for toolName: String) -> String {
         switch toolName {
-        case "web_search": return "Querying DuckDuckGo + Brave…"
-        case "fetch_url": return "Fetching page content…"
-        default: return "Running tool…"
+        case "web_search": return tr("Querying DuckDuckGo + Brave…")
+        case "fetch_url": return tr("Fetching page content…")
+        default: return tr("Running tool…")
+        }
+    }
+
+    /// Truthful tool-result payload for a call the app did NOT execute
+    /// (#349). Internal (not private) so the regression test can pin that a
+    /// skipped call always produces a non-empty, explanatory result — an
+    /// empty string here is exactly the "tool calls going out into the void"
+    /// bug.
+    static func unexecutedToolResultJSON(toolName: String) -> String {
+        let name = toolName.isEmpty ? "unknown" : toolName
+        let note =
+            "MTPLX chat did not execute this call: the turn's tool phase was "
+            + "already closed. There is no output to wait for. Answer from "
+            + "what you already have, and if the task needs file or terminal "
+            + "access, tell the user this chat cannot provide it."
+        let payload: [String: Any] = [
+            "error": "tool_not_executed",
+            "tool": name,
+            "note": note,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+            let text = String(data: data, encoding: .utf8), !text.isEmpty
+        else {
+            return "{\"error\":\"tool_not_executed\",\"note\":\"MTPLX chat did not execute this call.\"}"
+        }
+        return text
+    }
+
+    /// Activity-strip caption for a failed call: a localised label for
+    /// what failed, then the reason as the tool reported it.
+    static func failureDetail(_ failure: ChatToolFailure) -> String {
+        switch failure.kind {
+        case .searchFailed, .emptyQuery:
+            return tr("Search failed: %@", failure.detail)
+        case .fetchFailed, .invalidURL:
+            return tr("Fetch failed: %@", failure.detail)
+        case .unknownTool:
+            return tr("Tool failed: %@", failure.detail)
         }
     }
 
     private static func shortResultDetail(for toolName: String, json: String) -> String {
         guard let data = json.data(using: .utf8),
             let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return "Done" }
+        else { return tr("Done") }
         if let error = dict["error"] as? String {
-            return "Error: \(error)"
+            return tr("Error: %@", error)
         }
         switch toolName {
         case "web_search":
@@ -1689,29 +2354,31 @@ public final class ChatViewModel: ObservableObject {
                 let titles = results.prefix(3)
                     .compactMap { $0["title"] as? String }
                     .joined(separator: " · ")
-                return "Found \(results.count) results — \(titles)"
+                return tr("Found %lld results — %@", results.count, titles)
             }
-            return "Done"
+            return tr("Done")
         case "fetch_url":
             if let title = dict["title"] as? String, !title.isEmpty {
-                return "Read: \(title)"
+                return tr("Read: %@", title)
             }
-            return "Read"
+            return tr("Read")
         default:
-            return "Done"
+            return tr("Done")
         }
     }
 }
 
 // MARK: - Internal accumulator
 
-private struct AccumulatingToolCall: Sendable {
+// Internal (not private): `ChatTurnStream` carries the per-round
+// accumulator and splitter for its turn.
+struct AccumulatingToolCall: Sendable {
     var id: String
     var name: String
     var arguments: String
 }
 
-private struct ChatThinkingTagSplitter {
+struct ChatThinkingTagSplitter {
     struct Split {
         var reasoning = ""
         var content = ""
@@ -1804,5 +2471,19 @@ private struct ChatThinkingTagSplitter {
             }
         }
         return 0
+    }
+}
+
+/// CADisplayLink requires an NSObject target; ChatViewModel is a plain
+/// ObservableObject. The link retains this target, the closure holds the
+/// view model weakly, and stopStreamFlushLoop's invalidate() releases the
+/// link's retain — no cycles. The link is added to the main runloop, so
+/// the tick always runs on the MainActor.
+@MainActor
+private final class StreamFlushLinkTarget: NSObject {
+    var onTick: () -> Void = {}
+
+    @objc func tick(_ link: CADisplayLink) {
+        onTick()
     }
 }

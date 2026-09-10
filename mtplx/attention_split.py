@@ -15,6 +15,26 @@ def _env_enabled(name: str, *, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+# F23b (2026-08-16): packed-GQA route declines. Counted only when the lane
+# is enabled AND the call is a verify-shaped dense-cache window (q_len 2..4,
+# cache present, blockwise/paged lanes not owning attention) yet the route
+# still fell back to fused SDPA. By-design non-applicability (q_len 1
+# decode, prefill, paged-cache calls) is never counted. Import-stable
+# surface for /health; increments happen only on the declined path —
+# engaged calls skip the block via the same gate bool the router uses.
+# Kernel-level contract bails have their own precise counters in
+# mtplx.kernels.sdpa_gqa_packed.gqa_packed_bail_counts. Inside a compiled
+# verify graph this python body runs at trace time only, so traced-path
+# declines count once per trace, not once per replay.
+gqa_packed_route_bail_counts: dict[str, int] = {}
+
+
+def _count_gqa_packed_route_bail(reason: str) -> None:
+    gqa_packed_route_bail_counts[reason] = (
+        gqa_packed_route_bail_counts.get(reason, 0) + 1
+    )
+
+
 def _env_index_set(name: str) -> set[int]:
     raw = os.environ.get(name, "")
     out: set[int] = set()
@@ -141,22 +161,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
         x: mx.array,
         mask: mx.array | None = None,
         cache: Any | None = None,
-        *extra_args: Any,
-        **extra_kwargs: Any,
-    ) -> Any:
-        # Custom attention families can carry additional state (GLM-5.2
-        # IndexShare passes ``prev_topk_indices``).  The Qwen-specific split
-        # implementation cannot reproduce those contracts, so preserve the
-        # original call byte-for-byte instead of intercepting or dropping them.
-        if extra_args or extra_kwargs:
-            return original_call(
-                self,
-                x,
-                mask,
-                cache,
-                *extra_args,
-                **extra_kwargs,
-            )
+    ) -> mx.array:
         if not getattr(self, "_mtplx_split_full_attention_enabled", False):
             return original_call(self, x, mask=mask, cache=cache)
         if not _attention_has_gated_q_proj(self):
@@ -253,12 +258,18 @@ def _install_split_attention_hook(attn: Any) -> bool:
             from .kernel_selfcheck import lane_disabled
 
             gqa_packed_enabled = not lane_disabled("gqa_packed_sdpa")
+        # MTPLX_GQA_PACKED_WIDE (2026-08-25 flat-decode): route q_len 5-16
+        # to the query-group kernel instead of the second-bank path the QL
+        # sweep measured as the depth cliff. Off = shipping behavior.
+        gqa_packed_wide = _env_enabled("MTPLX_GQA_PACKED_WIDE")
         should_use_gqa_packed = (
             gqa_packed_enabled
             and cache is not None
             and not blockwise_enabled
             and not vllm_metal_paged_enabled
-            and 2 <= int(queries.shape[2]) <= 4
+            # 8 rows since 2026-07-21 (second float4 bank): depth 4's
+            # verify window is q_len 5; QL <= 4 compiles identically.
+            and 2 <= int(queries.shape[2]) <= (16 if gqa_packed_wide else 8)
             and can_slice_mask
             and getattr(cache, "keys", None) is not None
             and getattr(cache, "values", None) is not None
@@ -273,12 +284,63 @@ def _install_split_attention_hook(attn: Any) -> bool:
                 and int(mask.shape[-2]) == int(queries.shape[2])
                 and int(mask.shape[-1]) == int(cache.keys.shape[2])
             )
+        if (
+            gqa_packed_enabled
+            and not should_use_gqa_packed
+            and cache is not None
+            and not blockwise_enabled
+            and not vllm_metal_paged_enabled
+            and 2 <= int(queries.shape[2]) <= 8
+        ):
+            # F23b: enabled verify-shaped dense-cache window that the packed
+            # route declined — record why (bail path only).
+            if (
+                getattr(cache, "keys", None) is None
+                or getattr(cache, "values", None) is None
+            ):
+                _count_gqa_packed_route_bail("kv_buffers_none")
+            elif int(cache.keys.shape[2]) < gqa_packed_threshold:
+                _count_gqa_packed_route_bail("capacity_below_threshold")
+            elif not can_slice_mask:
+                _count_gqa_packed_route_bail("mask_type_unsupported")
+            else:
+                _count_gqa_packed_route_bail("mask_shape_mismatch")
         should_use_vllm_metal_paged = (
             vllm_metal_paged_enabled
             and cache is not None
             and hasattr(cache, "paged_attention")
             and can_slice_mask
         )
+        if _env_enabled("MTPLX_ROUTE_DEBUG"):
+            # One line per layer for the first 2 decode-shaped calls: which
+            # branch the ladder takes and why — the 147.4k lane went dark
+            # because every fast branch declined SILENTLY (2026-08-26).
+            dbg_count = int(getattr(self, "_mtplx_route_debug_calls", 0))
+            if dbg_count < 8 and int(queries.shape[2]) <= 16:
+                self._mtplx_route_debug_calls = dbg_count + 1
+                import sys as _sys
+
+                print(
+                    "mtplx_route_debug "
+                    f"layer={getattr(self, '_mtplx_full_attention_index', -1)} "
+                    f"q_len={int(queries.shape[2])} "
+                    f"cache={type(cache).__name__} "
+                    f"blockwise={blockwise_enabled} "
+                    f"vllm_flag={bool(getattr(self, '_mtplx_vllm_metal_paged_enabled', False))} "
+                    f"vllm_enabled={vllm_metal_paged_enabled} "
+                    f"vllm_should={should_use_vllm_metal_paged} "
+                    f"packed_enabled={gqa_packed_enabled} "
+                    f"packed_should={should_use_gqa_packed} "
+                    f"has_uwf={hasattr(cache, 'update_without_fetch')} "
+                    f"has_pa={hasattr(cache, 'paged_attention')} "
+                    f"keys_none={getattr(cache, 'keys', None) is None} "
+                    f"cap={0 if getattr(cache, 'keys', None) is None else int(cache.keys.shape[2])} "
+                    f"mask={type(mask).__name__} "
+                    f"can_slice={can_slice_mask} "
+                    f"twopass={should_use_2pass}",
+                    file=_sys.stderr,
+                    flush=True,
+                )
         should_split = (
             cache is not None
             and getattr(self, "_mtplx_split_full_attention_explicit_enabled", False)
@@ -322,15 +384,104 @@ def _install_split_attention_hook(attn: Any) -> bool:
                     mask=mask,
                 )
         elif should_use_gqa_packed:
-            from .kernels.sdpa_gqa_packed import sdpa_gqa_packed_tail
-
-            output = sdpa_gqa_packed_tail(
-                queries=queries,
-                keys=cache.keys,
-                values=cache.values,
-                offset=cache.offset,
-                scale=self.scale,
+            from .kernels.sdpa_gqa_packed import (
+                sdpa_gqa_packed_tail,
+                sdpa_gqa_packed_tail_grouped,
             )
+
+            output = None
+            # MTPLX_NAX_FLASH_ROUTE (2026-09-01 hyper K2): TensorOps
+            # flash-decoding kernel (in-threadgroup key split, no V staging)
+            # for every packed-eligible window. Walk bench 72.7k QL4:
+            # 1.08 ms/layer vs packed 1.42 (-24%) at half the power. Bails
+            # fall through to the scalar routes unchanged.
+            if _env_enabled("MTPLX_NAX_FLASH_ROUTE") and int(queries.shape[2]) >= 2:
+                from .kernels.sdpa_nax_flash import sdpa_nax_flash
+                from .kernels.sdpa_nax_flash_dsplit import sdpa_nax_flash_dsplit
+
+                # Variant B (head-dim split, 64 accumulators/thread, no spills) owns the
+                # M<=32 windows (QL<=5 at GQA 6): 0.917 vs 1.015 ms/layer at 72.7k, 0.257 vs
+                # 0.306 at 16k. Variant A covers the wider windows (QL 6-10). Both bail to
+                # the scalar routes on any contract miss.
+                if not lane_disabled("nax_flash_dsplit_sdpa"):
+                    output = sdpa_nax_flash_dsplit(
+                        queries=queries,
+                        keys=cache.keys,
+                        values=cache.values,
+                        offset=cache.offset,
+                        scale=self.scale,
+                    )
+                if output is None and not lane_disabled("nax_flash_sdpa"):
+                    output = sdpa_nax_flash(
+                        queries=queries,
+                        keys=cache.keys,
+                        values=cache.values,
+                        offset=cache.offset,
+                        scale=self.scale,
+                    )
+                if output is not None:
+                    self._mtplx_nax_flash_calls = (
+                        int(getattr(self, "_mtplx_nax_flash_calls", 0)) + 1
+                    )
+                    if _env_enabled("MTPLX_GQA_PACKED_SDPA_TRACE") and (
+                        self._mtplx_nax_flash_calls <= 2
+                    ):
+                        import sys as _sys
+
+                        print(
+                            "mtplx_nax_flash_route engaged "
+                            f"layer={getattr(self, '_mtplx_full_attention_index', -1)} "
+                            f"q_len={int(queries.shape[2])} "
+                            f"capacity={int(cache.keys.shape[2])}",
+                            file=_sys.stderr,
+                            flush=True,
+                        )
+            if output is not None:
+                pass
+            # MTPLX_NAX_TILE_ROUTE (2026-08-26 hyper): TensorOps wide-M tile
+            # kernel for q_len >= 6 — the M-curve regime where the scalar
+            # kernels pay (Battery A + spot receipts: QL9 +34%/+45% at
+            # 71k/128k). Bails fall through to the scalar routes unchanged.
+            elif (
+                _env_enabled("MTPLX_NAX_TILE_ROUTE")
+                and int(queries.shape[2]) >= 6
+                and not lane_disabled("nax_tile_sdpa")
+            ):
+                from .kernels.sdpa_nax_tile import sdpa_nax_tile
+
+                output = sdpa_nax_tile(
+                    queries=queries,
+                    keys=cache.keys,
+                    values=cache.values,
+                    offset=cache.offset,
+                    scale=self.scale,
+                )
+                if output is not None:
+                    self._mtplx_nax_tile_calls = (
+                        int(getattr(self, "_mtplx_nax_tile_calls", 0)) + 1
+                    )
+            if output is not None:
+                pass
+            # Grouped wins past the second-bank register cliff: 2026-08-25
+            # three-way sweep at 71k — bank2 ahead at QL5-6; grouped ahead
+            # from QL7 (QL8 68.6 vs stock 83.7; QL9 with the mixed 4+5 v3
+            # tail 61.1 vs stock 83.6, -27%).
+            elif gqa_packed_wide and int(queries.shape[2]) >= 7:
+                output = sdpa_gqa_packed_tail_grouped(
+                    queries=queries,
+                    keys=cache.keys,
+                    values=cache.values,
+                    offset=cache.offset,
+                    scale=self.scale,
+                )
+            else:
+                output = sdpa_gqa_packed_tail(
+                    queries=queries,
+                    keys=cache.keys,
+                    values=cache.values,
+                    offset=cache.offset,
+                    scale=self.scale,
+                )
             if output is not None:
                 self._mtplx_gqa_packed_sdpa_calls = (
                     int(getattr(self, "_mtplx_gqa_packed_sdpa_calls", 0)) + 1
@@ -434,8 +585,15 @@ def _full_attention_layers(model: Any):
         if getattr(layer, "is_linear", False):
             continue
         attn = getattr(layer, "self_attn", None)
-        if attn is not None:
-            yield attn
+        if attn is None:
+            continue
+        # Modules whose attention semantics are not plain dense SDPA (e.g.
+        # the qwen4_exp QSA indexer mask) opt out class-side; hooking them
+        # would replace their __call__ with a rewrite that drops those
+        # semantics.
+        if getattr(attn, "_mtplx_generic_sdpa_rewrites_unsupported", False):
+            continue
+        yield attn
 
 
 def configure_split_full_attention(

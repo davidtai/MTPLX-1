@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import hashlib
 import json
@@ -18,6 +19,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import importlib
 import importlib.metadata
@@ -31,6 +33,7 @@ from typing import Any, Callable
 
 from mtplx.artifacts import inspect_model
 from mtplx.benchmarks.validators.basic import (
+    ValidationResult,
     summarize_benchmark_quality,
     validate_balanced_delimiters,
     validate_no_degenerate_loop,
@@ -39,6 +42,7 @@ from mtplx.benchmarks.validators.basic import (
 from mtplx.constants import DEFAULT_RUNTIME_MODEL_DIR
 from mtplx.default_models import (
     OPTIMIZED_QUALITY_DESCRIPTION,
+    DefaultModelUnavailable,
     StreamingReleaseIdentity,
     is_verified_default_model_ref,
     optimized_quality_model_ref,
@@ -49,6 +53,7 @@ from mtplx.default_models import (
 )
 from mtplx.env import collect_environment
 from mtplx.fan_mode import FAN_MODE_MAX, FAN_MODE_SMART, fan_mode_from_args
+from mtplx.jsonc import InvalidConfigFile
 from mtplx.kpi import (
     EXIT_EXACTNESS,
     EXIT_QUALITY,
@@ -72,11 +77,15 @@ from mtplx.backends.registry import (
     architecture_catalog,
 )
 from mtplx.backends.descriptors import (
+    QWEN3_8_DRAFT_TEMPERATURE,
     descriptor_for_architecture_id,
     descriptor_for_backend_id,
     descriptor_from_inspection,
+    draft_semantics_for_model,
     model_controls_for_descriptor,
     model_family_from_inspection,
+    reasoning_policy_for_model,
+    sampler_defaults_for_model,
     tune_policy_for_model,
 )
 from mtplx.profiles import (
@@ -86,8 +95,16 @@ from mtplx.profiles import (
     DEFAULT_MODEL_ID,
     DEFAULT_PROFILE_NAME,
     DEFAULT_PUBLIC_MODEL_ID,
+    FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+    FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
     LEGACY_OPTIMIZED_HF_MODEL_ID,
     LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
+    OPTIMIZED_SPEED_V1_HF_MODEL_ID,
+    OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID,
+    OPTIMIZED_SPEED_V2_HF_MODEL_ID,
+    OPTIMIZED_SPEED_V2_PUBLIC_MODEL_ID,
     QUALITY_FP16_HF_MODEL_ID,
     QUALITY_FP16_PUBLIC_MODEL_ID,
     QUALITY_HF_MODEL_ID,
@@ -96,6 +113,18 @@ from mtplx.profiles import (
     QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
     QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
     QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+    QWEN38_BARE_SPEED_FP16_HF_MODEL_ID,
+    QWEN38_BARE_SPEED_FP16_PUBLIC_MODEL_ID,
+    QWEN38_BARE_SPEED_HF_MODEL_ID,
+    QWEN38_BARE_SPEED_PUBLIC_MODEL_ID,
+    QWEN38_OPTIMIZED_QUALITY_FP16_HF_MODEL_ID,
+    QWEN38_OPTIMIZED_QUALITY_FP16_PUBLIC_MODEL_ID,
+    QWEN38_OPTIMIZED_QUALITY_HF_MODEL_ID,
+    QWEN38_OPTIMIZED_QUALITY_PUBLIC_MODEL_ID,
+    QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+    QWEN38_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
+    QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID,
+    QWEN38_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
     QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID,
     QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID,
     QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID,
@@ -109,13 +138,20 @@ from mtplx.profiles import (
     restore_profile_env,
     runtime_env_with_contract_overrides,
 )
+from mtplx.reasoning_effort import (
+    REASONING_EFFORT_CHOICES,
+    REASONING_EFFORT_LEVELS,
+)
 from mtplx.server_urls import (
     bind_label,
     connect_host_for_bind,
     is_wildcard_bind,
     local_url_for_bind,
+    network_url_for_bind,
 )
+from mtplx.kv_quant import paged_kv_quant_mode_from_env
 from mtplx.runtime_options import (
+    generate_api_key_file,
     normalize_paged_kv_quantization,
     paged_kv_quantization_env,
     resolve_api_key,
@@ -256,9 +292,6 @@ HERMES_LATENCY_DEFAULTS: dict[str, Any] = {
     "temperature": 0.6,
     "top_p": 1.0,
     "top_k": 20,
-    "draft_temperature": 0.6,
-    "draft_top_p": 1.0,
-    "draft_top_k": 20,
     "tool_prompt_mode": "hybrid",
     "chat_template_profile": OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT,
     "adaptive_policy": "expected_value",
@@ -302,8 +335,7 @@ def _detect_total_ram_bytes_for_opencode_defaults() -> int | None:
 def _opencode_memory_env_defaults() -> dict[str, str]:
     total_ram = _detect_total_ram_bytes_for_opencode_defaults()
     high_memory = (
-        total_ram is not None
-        and total_ram >= _OPENCODE_HIGH_MEMORY_THRESHOLD_BYTES
+        total_ram is not None and total_ram >= _OPENCODE_HIGH_MEMORY_THRESHOLD_BYTES
     )
     max_entries = (
         _OPENCODE_HIGH_MEMORY_MAX_ENTRIES
@@ -311,6 +343,12 @@ def _opencode_memory_env_defaults() -> dict[str, str]:
         else _OPENCODE_DEFAULT_MAX_ENTRIES
     )
     return {
+        # Long-context decode route: route only — the MIN_CONTEXT/MIN_Q/MAX_Q
+        # overrides (32768/3/5, unmeasured 1.0.0 launch values) are gone in
+        # lockstep with the app's codingAgentRuntimeEnvironment so the engine
+        # defaults (65536/4/5) govern. Issue #228 measured async_per_head
+        # below 64k at 4-7x SLOWER decode at 43k ctx.
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head",
         "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
         "MTPLX_SESSION_BANK_MAX_ENTRIES": max_entries,
         # "auto" = the engine budgets half the RAM surplus left after the
@@ -325,10 +363,10 @@ def _opencode_memory_env_defaults() -> dict[str, str]:
         "MTPLX_LAZY_BONUS_VERIFY": "1",
         "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
         "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
-        "MTPLX_ACTIVE_READ_INSPECTION_TOTAL_MAX_LINES": "72",
-        "MTPLX_ACTIVE_READ_INSPECTION_MIN_LINES_PER_FILE": "8",
-        "MTPLX_ACTIVE_READ_INSPECTION_MULTI_FILE_LINE_MAX_CHARS": "120",
-        "MTPLX_READ_ONLY_INSPECTION_FORCE_ANSWER_AFTER_TOOLS": "12",
+        # The read-inspection compaction battery is gone (#282): an explicit
+        # env re-arms that compactor past the engine's passthrough default,
+        # so exporting the battery here silently rewrote agent transcripts.
+        # In lockstep with the app's codingAgentRuntimeEnvironment.
         "MTPLX_TOOL_PROMPT_MODE": "hybrid",
         "MTPLX_CHAT_TEMPLATE_PROFILE": OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT,
     }
@@ -376,12 +414,16 @@ def _runtime_env_with_external_overrides(runtime_env: dict[str, str]) -> dict[st
 
 
 def _model_runtime_contract(inspection: dict[str, Any]) -> dict[str, Any] | None:
-    compatibility = inspection.get("compatibility") if isinstance(inspection, dict) else None
+    compatibility = (
+        inspection.get("compatibility") if isinstance(inspection, dict) else None
+    )
     if isinstance(compatibility, dict):
         contract = compatibility.get("runtime_contract")
         if isinstance(contract, dict):
             return contract
-    contract = inspection.get("runtime_contract") if isinstance(inspection, dict) else None
+    contract = (
+        inspection.get("runtime_contract") if isinstance(inspection, dict) else None
+    )
     return contract if isinstance(contract, dict) else None
 
 
@@ -405,11 +447,37 @@ def _runtime_env_with_model_contract_overrides(
     runtime_env: dict[str, str],
     inspection: dict[str, Any],
     profile: Any,
+    *,
+    model: str | None = None,
 ) -> dict[str, str]:
-    return runtime_env_with_contract_overrides(
+    resolved = runtime_env_with_contract_overrides(
         runtime_env,
         _profile_scoped_model_runtime_contract(inspection, profile),
     )
+    if model is not None and _model_config_is_qwen4_exp(model):
+        from mtplx.profiles import (
+            MODEL_RUNTIME_ENV_OVERRIDE_KEYS,
+            PROFILE_ENV_USER_OVERRIDE_KEYS,
+        )
+        from mtplx.server.openai import (
+            _server_runtime_env_overrides,
+            load_runtime_contract,
+        )
+
+        # Resolve before applying any profile: profile defaults must not look
+        # like operator exports to the serve contract's hardware/pack gates.
+        # Keep the same precedence as serve: explicit runtime env, then the
+        # family overrides (which remove operator-owned lane keys themselves).
+        for key in MODEL_RUNTIME_ENV_OVERRIDE_KEYS | PROFILE_ENV_USER_OVERRIDE_KEYS:
+            value = os.environ.get(key)
+            if value is not None and value.strip():
+                resolved[key] = value
+        contract, _ = load_runtime_contract(model)
+        resolved.update(_server_runtime_env_overrides(
+            SimpleNamespace(model=model, generation_mode="mtp", verify_strategy="batched"),
+            contract.runtime_env_overrides if contract is not None else {},
+        ))
+    return resolved
 
 
 def _bench_run_console_summary(envelope: dict[str, Any]) -> dict[str, Any]:
@@ -463,11 +531,7 @@ def _model_gate(
                 file=sys.stderr,
             )
         return inspection, None
-    if (
-        unsafe_force_unverified
-        and yes
-        and tier == TIER_ARCH_COMPATIBLE_UNVERIFIED
-    ):
+    if unsafe_force_unverified and yes and tier == TIER_ARCH_COMPATIBLE_UNVERIFIED:
         print(
             "WARNING: attempting an architecture-compatible but unverified MTPLX "
             "model; startup will continue and the loader result is authoritative.",
@@ -554,8 +618,10 @@ def _model_gate_error_lines(inspection: dict[str, Any]) -> list[str]:
         )
     if runtime_compatibility == "missing-mtp-weights":
         lines.append(
-            "fix: choose a model with real MTP weights, or graft an MTP sidecar "
-            "into this base model."
+            "fix: use a complete model with matching MTP weights, or build and "
+            "verify one from its original source with mtplx forge. MTPLX does not "
+            "attach arbitrary sidecars because config/tensor checks cannot prove "
+            "their trunk lineage."
         )
     elif compatibility.get("tier") == TIER_ARCH_COMPATIBLE_UNVERIFIED:
         lines.append(
@@ -605,7 +671,10 @@ def _print_command_error(
     if detail:
         print(f"detail: {detail}")
     if error == "model is not available locally":
-        print(f"try: mtplx {command} --download --model {model}")
+        # `--download` only exists on `mtplx start`; every other command's
+        # download path is `mtplx pull` first (the old hint suggested a flag
+        # the parser rejects).
+        print(f"try: mtplx pull {model}")
         print("try: mtplx models")
 
 
@@ -624,10 +693,25 @@ def _looks_like_gemma4_model_ref(value: Any) -> bool:
 
 
 def _public_depth_ceiling(args: Any) -> int:
-    if _looks_like_gemma4_model_ref(getattr(args, "model", None)) or _looks_like_gemma4_model_ref(
-        getattr(args, "model_id", None)
-    ):
+    refs = (getattr(args, "model", None), getattr(args, "model_id", None))
+    if any(_looks_like_gemma4_model_ref(ref) for ref in refs):
         return MAX_GEMMA4_SPECULATIVE_DEPTH
+    for ref in refs:
+        if not ref:
+            continue
+        family = model_family_from_inspection(None, model_ref=str(ref))
+        if family == "qwen3_8":
+            descriptor = descriptor_for_architecture_id("qwen3-next-mtp")
+            return draft_semantics_for_model(
+                str(ref), descriptor=descriptor
+            ).maximum
+        # The artifact ref decides the ceiling. Once the default served
+        # name became the 3.8 id (2026-08-14 flip), letting the model_id
+        # alias widen the gate would grant D4-D6 to any non-3.8 artifact
+        # served under the default identity; keep the pre-3.8 ceiling and
+        # let the post-inspection contract path raise it when the real
+        # artifact supports it.
+        break
     return MAX_PUBLIC_SPECULATIVE_DEPTH
 
 
@@ -664,6 +748,11 @@ def _generation_mode_from_args(args: Any) -> str:
         return GENERATION_MODE_AR
     explicit = getattr(args, "generation_mode", None)
     if explicit is not None:
+        if str(explicit).strip().lower() == "auto" and (
+            getattr(args, "load_mtp", True) is False
+            or bool(getattr(args, "no_mtp", False))
+        ):
+            return GENERATION_MODE_AR
         return _normalize_generation_mode(explicit)
     if getattr(args, "load_mtp", True) is False:
         return GENERATION_MODE_AR
@@ -672,6 +761,64 @@ def _generation_mode_from_args(args: Any) -> str:
         if bool(getattr(args, "no_mtp", False))
         else GENERATION_MODE_MTP
     )
+
+
+def _apply_runtime_compatibility_mode(
+    args: Any,
+    inspection: dict[str, Any],
+    *,
+    printer=print,
+) -> int | None:
+    compatibility = inspection.get("compatibility")
+    if isinstance(compatibility, dict):
+        runtime_compatibility = compatibility.get(
+            "runtime_compatibility"
+        ) or inspection.get("runtime_compatibility")
+    else:
+        # inspect's four-tier contract returns ``compatibility`` as a plain
+        # string tier; the runtime-lane marker then lives at top level.
+        runtime_compatibility = inspection.get("runtime_compatibility")
+    if runtime_compatibility == "native-ar-only-missing-mtp":
+        # Founder directive 2026-08-09: a missing MTP head degrades, never
+        # blocks. Announce loudly, then serve the trunk autoregressive.
+        if _generation_mode_from_args(args) != GENERATION_MODE_AR:
+            printer(
+                "mtp_heads not found -> mtp_off: serving autoregressive "
+                "(no speculative decode acceleration; build an MTP artifact "
+                "with Forge for full speed)."
+            )
+            _set_generation_mode_on_args(args, GENERATION_MODE_AR)
+            setattr(args, "depth", 0)
+        setattr(args, "load_mtp", False)
+        return None
+    if runtime_compatibility == "native-ar-only-mtp-unsupported":
+        # Same directive, generalized 2026-08-26: an MTP head this build
+        # cannot attach (unsupported family, failed tensor gate, pending
+        # backend) is unavailable, never a blocker. The head is left
+        # untouched on disk; the trunk serves autoregressive.
+        if _generation_mode_from_args(args) != GENERATION_MODE_AR:
+            printer(
+                "MTP unavailable in this MTPLX build -> mtp_off: serving "
+                "autoregressive (trunk loads natively; speculative "
+                "acceleration for this model lands with a runtime update)."
+            )
+            _set_generation_mode_on_args(args, GENERATION_MODE_AR)
+            setattr(args, "depth", 0)
+        setattr(args, "load_mtp", False)
+        return None
+    if runtime_compatibility != "native-ar-only":
+        return None
+    if _generation_mode_from_args(args) != GENERATION_MODE_AR:
+        # Same founder directive as the missing-head case: target-only AR
+        # architectures degrade loudly instead of blocking on --no-mtp.
+        printer(
+            "target-only AR architecture -> mtp_off: serving autoregressive "
+            "(this checkpoint family has no native MTP head)."
+        )
+        _set_generation_mode_on_args(args, GENERATION_MODE_AR)
+        setattr(args, "depth", 0)
+    setattr(args, "load_mtp", False)
+    return None
 
 
 def _streamed_generation_mode_error(args: Any) -> str | None:
@@ -822,7 +969,24 @@ def _model_draft_sampler_spec(
         from mtplx.draft_sampling import draft_sampler_spec_from_runtime_contract
 
         contract = _profile_scoped_model_runtime_contract(inspection, profile)
-        return draft_sampler_spec_from_runtime_contract(contract, fallback=fallback)
+        if not isinstance(contract, dict):
+            # A profile mismatch (artifact recommends another profile) hides
+            # the typed contract, but the recommended draft sampler is a
+            # property of the ARTIFACT, not of the profile match — exactly
+            # like _model_contract_depth above: keep resolving from the
+            # top-level mtplx_runtime.json metadata so serving --profile
+            # turbo against a sustained-stamped artifact does not silently
+            # drop the artifact's draft-sampler stamp.
+            contract = _artifact_runtime_metadata(inspection)
+        try:
+            return draft_sampler_spec_from_runtime_contract(
+                contract, fallback=fallback
+            )
+        except (TypeError, ValueError):
+            # Artifact metadata is fail-safe by contract; a malformed
+            # recommended_draft_sampler degrades to the profile default
+            # instead of failing the launch.
+            return fallback
     except ImportError:
         return fallback
 
@@ -845,7 +1009,34 @@ def _model_draft_sampler_spec(
 _MODEL_CONTRACT_DEPTH_DEFAULTS: dict[str, int] = {
     QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID: 2,
     QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID: 2,
+    # Qwen3.8 27B Optimized Quality briefly carried a :2 entry here from the
+    # drop-day forge-verify rows (D3 "18.8" vs D2 33.9). The gated live ABBA
+    # then measured D2 39.5 vs D3 40.6 matched-window — the collapse was
+    # order/JIT confound in single in-process tune rows, so the family D3
+    # ceiling stands and the entry was removed the same day. Never pin from
+    # forge-verify rows (mistakes ledger, 2026-08-14).
 }
+
+
+def _artifact_runtime_metadata(inspection: dict[str, Any]) -> dict[str, Any]:
+    """Top-level ``mtplx_runtime.json`` of the inspected artifact, or ``{}``.
+
+    The typed contract keeps only schema fields; identity and depth-default
+    keys live beside them at the top level of the artifact json. Reading it
+    here is fail-safe: any I/O or parse problem returns an empty dict and the
+    caller falls back to contract-only behavior.
+    """
+    model_dir = inspection.get("model_dir") if isinstance(inspection, dict) else None
+    if not model_dir:
+        return {}
+    try:
+        path = Path(str(model_dir)) / "mtplx_runtime.json"
+        if not path.is_file():
+            return {}
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        return {}
 
 
 def _model_contract_depth(
@@ -854,11 +1045,30 @@ def _model_contract_depth(
     profile: Any,
     fallback: int = 3,
 ) -> int:
+    if int(fallback) == 0:
+        # fallback 0 is the missing-MTP degrade pin (AR mode); artifact
+        # metadata must not resurrect a draft depth past it.
+        return 0
     contract = _profile_scoped_model_runtime_contract(inspection, profile)
     if not isinstance(contract, dict):
+        # A profile mismatch (artifact recommends another profile) hides the
+        # typed contract, but the measured depth default is a property of the
+        # ARTIFACT, not of the profile match: keep resolving from the
+        # top-level mtplx_runtime.json metadata. Repro: 3.8 Optimized
+        # Quality stamps recommended_profile=sustained + mtp_depth_default=2;
+        # serving --profile turbo used to early-return here and launch the
+        # measured-worst depth 3.
+        contract = {}
+    metadata_for_max = _artifact_runtime_metadata(inspection)
+    if not contract and not metadata_for_max:
+        # No typed contract and no artifact metadata: exact legacy behavior.
         return int(fallback)
     try:
-        depth_max = int(contract.get("mtp_depth_max", fallback))
+        depth_max = int(
+            contract.get(
+                "mtp_depth_max", metadata_for_max.get("mtp_depth_max", fallback)
+            )
+        )
     except (TypeError, ValueError):
         return int(fallback)
     # ``mtp_depth_max`` is a CEILING (the deepest sidecar the artifact
@@ -866,19 +1076,43 @@ def _model_contract_depth(
     # shallower declare ``mtp_depth_default``; the ceiling then only bounds
     # it. Without the split every artifact runs at its maximum depth, a
     # measured loss whenever per-level acceptance decays quickly.
-    measured_default = _MODEL_CONTRACT_DEPTH_DEFAULTS.get(
-        str(contract.get("public_model_id") or "").strip()
+    #
+    # The typed RuntimeContract serialization carries only its schema fields,
+    # so identity and depth-default keys living at the top level of
+    # ``mtplx_runtime.json`` never reach this dict — which silently killed the
+    # measured-depth map for every artifact (35B-A3B quickstart launched at
+    # its D3 ceiling, the exact -22% regression repro_a3b_depth_default.py
+    # documents). Resolve both from the artifact metadata when the contract
+    # dict lacks them; ``recommended_mtp_depth`` is honored as the historical
+    # spelling of ``mtp_depth_default`` (the Balance artifact ships it).
+    metadata = _artifact_runtime_metadata(inspection)
+    public_id = str(
+        contract.get("public_model_id") or metadata.get("public_model_id") or ""
+    ).strip()
+    measured_default = _MODEL_CONTRACT_DEPTH_DEFAULTS.get(public_id)
+    declared_default = next(
+        (
+            source.get(key)
+            for source in (contract, metadata)
+            for key in ("mtp_depth_default", "recommended_mtp_depth")
+            if source.get(key) is not None
+        ),
+        None,
     )
     try:
-        depth = int(contract.get("mtp_depth_default", measured_default or depth_max))
+        depth = int(
+            declared_default
+            if declared_default is not None
+            else (measured_default or depth_max)
+        )
     except (TypeError, ValueError):
         depth = measured_default or depth_max
     depth = min(depth, depth_max)
-    depth_ceiling = (
-        MAX_GEMMA4_SPECULATIVE_DEPTH
-        if _inspection_is_gemma4_assistant(inspection)
-        else MAX_PUBLIC_SPECULATIVE_DEPTH
-    )
+    model_ref = inspection.get("model_dir") or inspection.get("runtime_model")
+    descriptor = descriptor_from_inspection(inspection)
+    depth_ceiling = draft_semantics_for_model(
+        str(model_ref or ""), inspection, descriptor
+    ).maximum
     return max(1, min(depth_ceiling, depth))
 
 
@@ -909,7 +1143,12 @@ def _apply_model_contract_depth_default(
 # Gemma, and third-party artifacts keep the sustained default.
 _TURBO_DEFAULT_PUBLIC_MODEL_IDS = frozenset(
     {
-        DEFAULT_PUBLIC_MODEL_ID,  # 27B Optimized-Speed (flat 4-bit)
+        # 27B Optimized Speed V2 (hybrid 4-bit). Named explicitly: this
+        # entry used to ride on DEFAULT_PUBLIC_MODEL_ID, so the 2026-08-14
+        # default flip to Qwen 3.8 would have silently demoted V2 to
+        # sustained (the turbo-default-parity ledger class).
+        OPTIMIZED_SPEED_V2_PUBLIC_MODEL_ID,
+        OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID,  # original 27B Optimized Speed
         QUALITY_PUBLIC_MODEL_ID,  # 27B Optimized-Quality (8-bit)
         LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,  # 27B Optimized (gdn8 hybrid, 8/4-bit)
         # 27B Speed-FP16 (INT4/g64 weights, fp16 activations — the M1/M2
@@ -933,6 +1172,34 @@ _TURBO_DEFAULT_PUBLIC_MODEL_IDS = frozenset(
         # are exactness-proven, so both promote together.
         QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
         QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
+        # Qwen3.8 27B family (2026-08-14). Trunk geometry is identical to the
+        # Qwen3.6 27B flagships above, so the vk/NAX verify kernels and their
+        # quant-bits gates carry over; the day-one A/B on the real artifacts
+        # replaces this rationale with measured numbers before release.
+        QWEN38_BARE_SPEED_PUBLIC_MODEL_ID,
+        QWEN38_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+        QWEN38_OPTIMIZED_QUALITY_PUBLIC_MODEL_ID,
+        # Qwen3.8 27B FP16 precision siblings (2026-08-15, the M1/M2 routing
+        # targets): byte-identical quantized packs, bf16 -> fp16 for every
+        # 16-bit tensor, so they ride the same fp16-templated vk/NAX lanes the
+        # 3.6 FP16 siblings above already run under turbo. Promoted together
+        # with their parents on the day-one FP16 parity campaign (ABBA parent
+        # vs sibling on the turbo serve path, receipts in the release notes).
+        QWEN38_BARE_SPEED_FP16_PUBLIC_MODEL_ID,
+        QWEN38_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
+        QWEN38_OPTIMIZED_QUALITY_FP16_PUBLIC_MODEL_ID,
+        # Qwen 3.8 Flash-Next serve packs (2026-08-27). Turbo here does NOT
+        # ride the 27B NAX/vk verify machinery: the qwen4_exp family carries
+        # its own measured fast lane — the family env octet in
+        # openai.py:_server_runtime_env_overrides (AR pipeline, compiled GDN,
+        # layer-owned capture-commit, fused hc/gdn kernels) — and the same
+        # block family-neutralizes MTPLX_NAX_VERIFY until it earns a receipt
+        # on this family. Newest member's receipt (one-dispatch GDN step,
+        # 2026-08-27): two boot-triples in both arm orders, A/B/A +1.7% and
+        # B/A/B +2.2%, AR 60-62 t/s on 512-tok rows, zero-overlap warm rows
+        # in the confirm triple.
+        FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+        FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
     }
 )
 
@@ -949,7 +1216,16 @@ def _apply_model_default_profile(args: Any, model_id: str) -> bool:
     cli_flags = getattr(args, "_cli_flags", set()) or set()
     if "profile" in cli_flags:
         return False
-    if model_id not in _TURBO_DEFAULT_PUBLIC_MODEL_IDS:
+    if getattr(args, "_profile_from_config", None):
+        # A profile from config.toml is the user's standing pin (stamped by
+        # config._apply_profile_default). Honor it even when it equals the
+        # parser default — config "sustained" used to be silently promoted.
+        return False
+    model_ref = getattr(args, "model", None)
+    if (
+        model_id not in _TURBO_DEFAULT_PUBLIC_MODEL_IDS
+        and _artifact_recommended_profile(model_ref) != "turbo"
+    ):
         return False
     current = str(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     if current != DEFAULT_PROFILE_NAME:
@@ -973,7 +1249,11 @@ def _resolved_default_profile_name(args: Any, model: str | None = None) -> str:
 
     current = str(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     cli_flags = getattr(args, "_cli_flags", set()) or set()
-    if "profile" in cli_flags or current != DEFAULT_PROFILE_NAME:
+    if (
+        "profile" in cli_flags
+        or current != DEFAULT_PROFILE_NAME
+        or getattr(args, "_profile_from_config", None)
+    ):
         return current
     model_ref = str(model if model is not None else getattr(args, "model", "") or "")
     if not model_ref:
@@ -982,13 +1262,53 @@ def _resolved_default_profile_name(args: Any, model: str | None = None) -> str:
         model_id = _public_model_id_for_args(args, model_ref)
     except Exception:
         return current
-    if model_id in _TURBO_DEFAULT_PUBLIC_MODEL_IDS:
+    if (
+        model_id in _TURBO_DEFAULT_PUBLIC_MODEL_IDS
+        or _artifact_recommended_profile(model_ref) == "turbo"
+    ):
         return "turbo"
     return current
 
 
+def resolved_default_profile_name_for_ref(model_ref: str | Path | None) -> str:
+    """Default profile per-model launch resolution picks for an artifact ref.
+
+    The args-free core of ``_resolved_default_profile_name`` for surfaces
+    that report or stamp a profile for an artifact without a CLI namespace
+    (cache listings, doctor's support matrix, forge runtime stamps). No
+    user override can exist on those surfaces, so the answer is exactly
+    the per-model turbo promotion over the served public id — the same
+    ``public_model_id_for_ref`` mapping serve-time resolution uses.
+    """
+
+    if (
+        public_model_id_for_ref(model_ref) in _TURBO_DEFAULT_PUBLIC_MODEL_IDS
+        or _artifact_recommended_profile(model_ref) == "turbo"
+    ):
+        return "turbo"
+    return DEFAULT_PROFILE_NAME
+
+
+def _artifact_recommended_profile(model_ref: str | Path | None) -> str | None:
+    """Read a local Forge artifact's measured launch profile, if present."""
+
+    if model_ref is None:
+        return None
+    runtime, _ = _local_runtime_metadata(str(model_ref))
+    if not isinstance(runtime, dict):
+        return None
+    profile = str(runtime.get("recommended_profile") or "").strip().lower()
+    return profile if profile in {"stable", "sustained", "turbo"} else None
+
+
 def _apply_qwen36_35b_optimized_speed_defaults(args: Any, model_id: str) -> None:
-    if model_id != QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID:
+    # The -FP16 sibling shares the byte-identical INT packs and the measured
+    # launch defaults; the app's substring detection already applied them to
+    # it while this exact-id gate skipped it (2026-08-03 parity audit).
+    if model_id not in {
+        QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+        QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
+    }:
         return
     cli_flags = getattr(args, "_cli_flags", set()) or set()
     injected = set(getattr(args, "_injected_default_flags", set()) or set())
@@ -1010,10 +1330,9 @@ def _apply_qwen36_35b_optimized_speed_defaults(args: Any, model_id: str) -> None
     # draft-sampler resolution treats them like requested values while
     # user-typed flags still win.
     args._injected_default_flags = injected
-    if (
-        "chat-template-profile" not in cli_flags
-        and getattr(args, "chat_template_profile", None) in (None, "local_qwen36")
-    ):
+    if "chat-template-profile" not in cli_flags and getattr(
+        args, "chat_template_profile", None
+    ) in (None, "local_qwen36"):
         args.chat_template_profile = "local_qwen36"
 
 
@@ -1065,57 +1384,191 @@ def _gemma4_pair_draft_block_size(inspection: dict[str, Any]) -> int:
 def _apply_backend_serve_defaults(args: Any, inspection: dict[str, Any]) -> None:
     descriptor = descriptor_from_inspection(inspection)
     cli_flags = getattr(args, "_cli_flags", set()) or set()
-    reasoning = descriptor.reasoning_codec
+    if _inspection_backend_id(inspection) == "qwen4_exp":
+        # Flash-Next verify defaults: the capture-commit verifier walks the
+        # qwen3-next GDN internals, which this family's own GDN classes do
+        # not expose — batched verify snapshots/restores the recurrent caches
+        # generically. A family-native capture backend replaces this default
+        # when it lands. Depth follows the family DraftSemantics ceiling (3)
+        # with the adaptive expected_value policy owning per-step depth —
+        # the 27B contract (founder, 2026-08-26); no static clamp here.
+        if "verify-strategy" not in cli_flags:
+            args.verify_strategy = "batched"
+        # Target + draft sampler flow from the qwen4_exp family policy
+        # (QWEN4_EXP_SAMPLER_DEFAULTS: the model-card thinking-mode set) via
+        # the standard sampler block below. The 08-27 draft-temp 0.1 receipt
+        # was measured at target 0.6 and is superseded by the advised
+        # target-1.0 contract; re-calibrate draft temp under target 1.0
+        # before pinning any non-identity value.
+    # Family-aware policy, not the raw lane descriptor: shared lanes (mlx_lm_ar)
+    # pin parser=none while a family on that lane (lfm2) has a verified codec.
+    # Stamping the lane's "none" here reads as an operator override downstream
+    # and permanently disables reasoning for the child daemon.
+    reasoning = reasoning_policy_for_model(
+        inspection=inspection,
+        descriptor=descriptor,
+    )
     if "reasoning" not in cli_flags and getattr(args, "reasoning", None) is None:
         args.reasoning = reasoning.default_mode if reasoning.supported else "off"
-    if (
-        "reasoning-parser" not in cli_flags
-        and getattr(args, "reasoning_parser", None) in (None, "qwen3")
-    ):
-        args.reasoning_parser = descriptor.reasoning_codec.parser
+    if "reasoning-parser" not in cli_flags and getattr(
+        args, "reasoning_parser", None
+    ) in (None, "qwen3"):
+        args.reasoning_parser = reasoning.parser
     if (
         "reasoning-effort" not in cli_flags
         and getattr(args, "reasoning_effort", None) in (None, "auto")
-        and descriptor.reasoning_codec.default_effort
+        and reasoning.default_effort
     ):
-        args.reasoning_effort = descriptor.reasoning_codec.default_effort
+        args.reasoning_effort = reasoning.default_effort
+    required_tool_prompt_mode = descriptor.required_tool_prompt_mode
+    if required_tool_prompt_mode is not None:
+        requested_tool_prompt_mode = str(
+            getattr(args, "tool_prompt_mode", required_tool_prompt_mode)
+            or required_tool_prompt_mode
+        )
+        if (
+            "tool-prompt-mode" in cli_flags
+            and requested_tool_prompt_mode != required_tool_prompt_mode
+        ):
+            raise ValueError(
+                f"{descriptor.display_name} requires --tool-prompt-mode "
+                f"{required_tool_prompt_mode}"
+            )
+        args.tool_prompt_mode = required_tool_prompt_mode
+    elif "tool-prompt-mode" not in cli_flags and not getattr(
+        args, "tool_prompt_mode", None
+    ):
+        args.tool_prompt_mode = descriptor.default_tool_prompt_mode
+    required_chat_template_profile = descriptor.required_chat_template_profile
+    if required_chat_template_profile is not None:
+        requested_profile = str(
+            getattr(args, "chat_template_profile", required_chat_template_profile)
+            or required_chat_template_profile
+        )
+        has_conflicting_profile = (
+            "chat-template-profile" in cli_flags
+            and requested_profile != required_chat_template_profile
+        )
+        has_custom_path = bool(getattr(args, "chat_template_path", None))
+        if has_conflicting_profile or (
+            has_custom_path and not descriptor.allows_chat_template_path
+        ):
+            raise ValueError(
+                f"{descriptor.display_name} requires its tokenizer chat template"
+            )
+        args.chat_template_profile = required_chat_template_profile
+        args.chat_template_path = None
 
-    sampler = descriptor.sampler_defaults.to_dict()
+    # Family-aware for the same reason as the reasoning policy above: the
+    # qwen3_next lane serves qwen3_5/3_6 (0.6 coding sampler) and qwen3_8
+    # (official 1.0 thinking sampler) alike.
+    sampler = sampler_defaults_for_model(
+        inspection=inspection,
+        descriptor=descriptor,
+    ).to_dict()
+    draft_semantics = draft_semantics_for_model(
+        inspection=inspection,
+        descriptor=descriptor,
+    )
+    if descriptor.default_max_response_tokens is not None:
+        if (
+            "max-tokens" not in cli_flags
+            and hasattr(args, "max_tokens")
+            and getattr(args, "max_tokens", None) is None
+        ):
+            args.max_tokens = int(descriptor.default_max_response_tokens)
+        if (
+            "max-response-tokens" not in cli_flags
+            and hasattr(args, "max_response_tokens")
+            and getattr(args, "max_response_tokens", None) is None
+        ):
+            args.max_response_tokens = int(descriptor.default_max_response_tokens)
+    # config.toml presence beats value-sentinels for the launch sampler trio:
+    # apply_user_config stamps the parsed file onto ``args.mtplx_config``, so
+    # a config value that happens to EQUAL the parser default (0.6/0.95/20)
+    # is still the user's standing pin — the bare ``in (None, 0.6)`` checks
+    # read it as "unset" and silently replaced it with the family sampler.
+    # Injected family values are recorded in ``_injected_default_flags``
+    # (the same provenance contract as the draft trio below).
+    mtplx_config = getattr(args, "mtplx_config", None)
+    config_pinned = {
+        key
+        for key in ("temperature", "top_p", "top_k")
+        if isinstance(mtplx_config, dict)
+        and mtplx_config.get(key) is not None
+        and getattr(args, key, None) is not None
+    }
+    injected = set(getattr(args, "_injected_default_flags", set()) or set())
     if (
         "temperature" not in cli_flags
         and "default-temperature" not in cli_flags
+        and "temperature" not in config_pinned
         and getattr(args, "temperature", None) in (None, 0.6)
     ):
         args.temperature = sampler["temperature"]
+        injected.add("temperature")
     if (
         "top-p" not in cli_flags
         and "default-top-p" not in cli_flags
-        and getattr(args, "top_p", None) is None
+        and "top_p" not in config_pinned
+        and getattr(args, "top_p", None) in (None, 0.95)
     ):
         args.top_p = sampler["top_p"]
-    if "top-k" not in cli_flags and getattr(args, "top_k", None) in (None, 20):
+        injected.add("top-p")
+    if (
+        "top-k" not in cli_flags
+        and "top_k" not in config_pinned
+        and getattr(args, "top_k", None) in (None, 20)
+    ):
         args.top_k = sampler["top_k"]
+        injected.add("top-k")
     if (
         "depth" not in cli_flags
-        and descriptor.draft_semantics.request_field == "depth"
+        and draft_semantics.request_field == "depth"
         and getattr(args, "depth", None) in (None, 3)
     ):
-        args.depth = descriptor.draft_semantics.default
-    if (
-        "draft-temperature" not in cli_flags
-        and getattr(args, "draft_temperature", None) in (None, 0.6)
-    ):
-        args.draft_temperature = sampler["temperature"]
+        args.depth = draft_semantics.default
+    # Injected-default provenance (same contract as
+    # _apply_qwen36_35b_optimized_speed_defaults): the family draft values
+    # below must reach the daemon as the launch draft sampler even when the
+    # model contract carries no recommended_draft_sampler — and telemetry
+    # must be able to tell an injected default from an artifact stamp.
+    # _injected_default_flags feeds _explicit_draft_sampler_override, while
+    # --draft-sampler-source stays "default" (user-typed _cli_flags only),
+    # so injected values never pin and the family curve stays live.
+    if "draft-temperature" not in cli_flags and getattr(
+        args, "draft_temperature", None
+    ) in (None, 0.6):
+        # Qwen3.8 owns a measured family value even though it currently
+        # matches the target sampler. Keeping one policy owner prevents the
+        # app and CLI from drifting when later calibration changes it.
+        family = model_family_from_inspection(
+            inspection,
+            descriptor=descriptor,
+        )
+        if family == "qwen3_8":
+            args.draft_temperature = QWEN3_8_DRAFT_TEMPERATURE
+        else:
+            args.draft_temperature = sampler["temperature"]
+        injected.add("draft-temperature")
     if "draft-top-p" not in cli_flags and getattr(args, "draft_top_p", None) is None:
         args.draft_top_p = sampler["top_p"]
-    if (
-        "draft-top-k" not in cli_flags
-        and getattr(args, "draft_top_k", None) in (None, 20)
+        injected.add("draft-top-p")
+    if "draft-top-k" not in cli_flags and getattr(args, "draft_top_k", None) in (
+        None,
+        20,
     ):
         args.draft_top_k = sampler["top_k"]
+        injected.add("draft-top-k")
+    args._injected_default_flags = injected
     if (
         "chat-template-profile" not in cli_flags
-        and descriptor.model_family not in {"qwen", "qwen3_5", "qwen3_6"}
+        and model_family_from_inspection(
+            inspection,
+            model_ref=str(getattr(args, "model", None) or ""),
+            descriptor=descriptor,
+        )
+        not in {"qwen3_5", "qwen3_6"}
         and getattr(args, "chat_template_profile", None) == "local_qwen36"
     ):
         args.chat_template_profile = "tokenizer"
@@ -1141,12 +1594,19 @@ def _apply_backend_serve_defaults(args: Any, inspection: dict[str, Any]) -> None
         args.top_k = sampler["top_k"]
     if getattr(args, "depth", None) in (None, 3):
         args.depth = draft_block_size
+    # Same injected-default provenance as the family block above: the
+    # gemma4 pair draft values are launch defaults, not user pins.
+    injected = set(getattr(args, "_injected_default_flags", set()) or set())
     if getattr(args, "draft_temperature", None) in (None, 0.6):
         args.draft_temperature = sampler["temperature"]
+        injected.add("draft-temperature")
     if getattr(args, "draft_top_p", None) is None:
         args.draft_top_p = sampler["top_p"]
+        injected.add("draft-top-p")
     if getattr(args, "draft_top_k", None) in (None, 20):
         args.draft_top_k = sampler["top_k"]
+        injected.add("draft-top-k")
+    args._injected_default_flags = injected
     if getattr(args, "chat_template_profile", None) == "local_qwen36":
         args.chat_template_profile = "tokenizer"
     if getattr(args, "adaptive_policy", None) == "expected_value":
@@ -1165,6 +1625,32 @@ def _draft_sampler_from_spec(spec: dict[str, Any] | None) -> Any | None:
     )
 
 
+def _greedy_coupled_draft_spec(
+    spec: dict[str, Any] | None,
+    args: Any,
+    target_temperature: float,
+) -> dict[str, Any] | None:
+    """Force the draft greedy when the target decodes greedily.
+
+    Mirror of the daemon resolver's coupling for the lanes that call
+    generate_mtpk directly and never pass through it: a stamped sampled
+    draft under a greedy target collapses acceptance by depth
+    ([79/65/42]% vs [96/87/76]% coupled on the coding suite), which reads
+    as an engine slowdown. A user-typed --draft-temperature keeps its
+    value; a None spec already mirrors the target sampler downstream
+    (_effective_draft_sampler) and needs nothing.
+    """
+    if spec is None or target_temperature > 0:
+        return spec
+    if float(spec.get("temperature", 0.0)) <= 0:
+        return spec
+    if "draft-temperature" in set(getattr(args, "_cli_flags", set()) or set()):
+        return spec
+    coupled = dict(spec)
+    coupled["temperature"] = 0.0
+    return coupled
+
+
 _DRAFT_SAMPLER_FLAG_ATTRS = {
     "draft-temperature": "draft_temperature",
     "draft-top-p": "draft_top_p",
@@ -1178,14 +1664,17 @@ def _explicit_draft_sampler_override(
 ) -> dict[str, Any] | None:
     """Return a user-requested draft sampler override, not an internal default.
 
-    Measured per-model defaults injected by `_apply_*_defaults` helpers count
-    as requested values (tracked via ``args._injected_default_flags``) so the
+    Provenance order: user-typed CLI flags always win; defaults injected by
+    `_apply_*_defaults` helpers (tracked via ``args._injected_default_flags``)
+    only FILL THE GAP when no contract/profile spec exists, so the
     benchmarked launch configuration still reaches the daemon when the model
-    contract carries no ``recommended_draft_sampler``.
+    contract carries no ``recommended_draft_sampler`` — and an injected
+    generic default can never clobber an artifact's stamped value.
     """
 
     cli_flags = set(getattr(args, "_cli_flags", set()) or set())
-    cli_flags |= set(getattr(args, "_injected_default_flags", set()) or set())
+    if base_sampler is None:
+        cli_flags |= set(getattr(args, "_injected_default_flags", set()) or set())
     if not any(flag in cli_flags for flag in _DRAFT_SAMPLER_FLAG_ATTRS):
         return None
     base = base_sampler or {
@@ -1241,7 +1730,7 @@ def _resolve_model_context_window(tokenizer: Any, model_path: str | Path) -> int
                 if isinstance(value, int):
                     candidates.append(value)
 
-    sane = [value for value in candidates if 0 < value <= 1_000_000]
+    sane = [value for value in candidates if 0 < value <= 1_048_576]
     return max(sane) if sane else 262_144
 
 
@@ -1289,28 +1778,52 @@ def _preserve_thinking_policy(args: Any) -> str:
     return mode if mode in {"auto", "on", "off", "scoped"} else "auto"
 
 
-def _pi_preserve_thinking_policy(args: Any) -> str:
-    cli_flags = getattr(args, "_cli_flags", set()) or set()
-    if "preserve-thinking" in cli_flags or "strip-assistant-reasoning-history" in cli_flags:
-        return _preserve_thinking_policy(args)
-    return "off"
-
-
 def _apply_pi_history_budget_env_defaults(env: dict[str, str]) -> None:
-    env.setdefault("MTPLX_TOOL_RESULT_COMPACT_THRESHOLD_CHARS", "1200")
-    env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_COMPACT_MAX_LINES", "32")
-    env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_LINE_MAX_CHARS", "180")
-    env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_TOTAL_MAX_LINES", "96")
-    env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_MIN_LINES_PER_FILE", "16")
-    env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_MULTI_FILE_LINE_MAX_CHARS", "150")
-    env.setdefault("MTPLX_ACTIVE_TOOL_RESULT_COMPACT_MAX_LINES", "32")
-    env.setdefault("MTPLX_ACTIVE_TOOL_RESULT_LINE_MAX_CHARS", "220")
+    """Pi lane = the shared coding-agent engine block, nothing more.
+
+    Mirrors the app's composition exactly: codingAgentRuntimeEnvironment,
+    then a .pi case that sets no env overrides. The Pi compaction battery
+    (compact threshold 1200 plus the line caps) is gone (#282): an explicit
+    env re-arms its compactor past the engine's passthrough default, which
+    silently rewrote Pi transcripts from both launchers.
+    """
+    _apply_opencode_memory_env_defaults(env)
 
 
 def _enable_thinking_for_reasoning(mode: str) -> bool | None:
     if mode == "auto":
         return None
     return mode == "on"
+
+
+def _one_shot_reasoning_effort(
+    args: Any, enable_thinking: bool | None, model_ref: str | None
+) -> str | None:
+    """Resolve --reasoning-effort for the in-process one-shot lanes
+    (run/chat/quickstart) with the server's semantics: thinking off or a
+    family without declared levels -> None; auto -> the family default; an
+    undeclared-but-real tier maps to the nearest declared tier up the
+    global ladder, else nearest below."""
+
+    if enable_thinking is False:
+        return None
+    codec = reasoning_policy_for_model(model_ref=str(model_ref or ""))
+    levels = tuple(codec.effort_levels) if codec.supported else ()
+    if not levels:
+        return None
+    requested = str(getattr(args, "reasoning_effort", None) or "auto").strip().lower()
+    if requested in levels:
+        return requested
+    if requested not in REASONING_EFFORT_LEVELS:
+        return codec.default_effort
+    rank = REASONING_EFFORT_LEVELS.index(requested)
+    for candidate in REASONING_EFFORT_LEVELS[rank + 1 :]:
+        if candidate in levels:
+            return candidate
+    for candidate in reversed(REASONING_EFFORT_LEVELS[:rank]):
+        if candidate in levels:
+            return candidate
+    return codec.default_effort
 
 
 def _redact_secret_value(value: Any) -> Any:
@@ -1557,6 +2070,17 @@ def _opencode_doctor_report(args: Any) -> dict[str, Any]:
     }
 
 
+def _doctor_port_from_base_url(base_url: str, args: Any) -> int:
+    if base_url:
+        try:
+            port = urllib.parse.urlsplit(base_url).port
+        except ValueError:
+            port = None
+        if port:
+            return int(port)
+    return int(getattr(args, "port", None) or 8000)
+
+
 def _pi_doctor_report(args: Any) -> dict[str, Any]:
     from mtplx.pi import pi_models_json_path, pi_model_ref
 
@@ -1577,7 +2101,9 @@ def _pi_doctor_report(args: Any) -> dict[str, Any]:
         first = models[0]
         model_config = first if isinstance(first, dict) else None
     configured_model_id = (
-        str(model_config.get("id")) if isinstance(model_config, dict) and model_config.get("id") else None
+        str(model_config.get("id"))
+        if isinstance(model_config, dict) and model_config.get("id")
+        else None
     )
     model_ref = pi_model_ref(configured_model_id) if configured_model_id else None
     base_url = str(provider.get("baseUrl") or "") if isinstance(provider, dict) else ""
@@ -1642,10 +2168,21 @@ def _pi_doctor_report(args: Any) -> dict[str, Any]:
         "transport_headers": headers,
         "mtplx_client_header_configured": headers.get("x-mtplx-client") == "pi",
         "reasoning_enabled": (
-            bool(model_config.get("reasoning")) if isinstance(model_config, dict) else False
+            bool(model_config.get("reasoning"))
+            if isinstance(model_config, dict)
+            else False
         ),
-        "has_hidden_max_tokens": "maxTokens" in json.dumps(model_config or {}),
-        "expected_start_command": "mtplx start pi --port 8000 --max",
+        # Presence is the healthy state for Pi: without advertised maxTokens
+        # metadata Pi silently serializes a 16,384 output ceiling, and the
+        # request-policy extension strips only the generated wire cap.
+        "advertised_max_tokens": (
+            model_config.get("maxTokens") if isinstance(model_config, dict) else None
+        ),
+        # The restart hint must name the port the config actually points at
+        # (the app serves on 8002); 8000 is only the bare-CLI fallback.
+        "expected_start_command": (
+            f"mtplx start pi --port {_doctor_port_from_base_url(base_url, args)} --max"
+        ),
     }
 
 
@@ -1766,6 +2303,18 @@ def _exact_paged_env_from_args(args: Any) -> dict[str, str]:
     return exact_paged_attention_env(**_exactness_profile_kwargs(args))
 
 
+
+def _model_config_is_qwen4_exp(model: str) -> bool:
+    """Mirror of the server's qwen4_exp predicate: read the pack config."""
+    try:
+        with open(Path(str(model)) / "config.json", "rb") as fh:
+            cfg = json.load(fh)
+    except Exception:
+        return False
+    mt = str(cfg.get("model_type") or "").lower()
+    tmt = str((cfg.get("text_config") or {}).get("model_type") or "").lower()
+    return "qwen4_exp" in (mt, tmt) or "qwen4_exp_text" in (mt, tmt)
+
 def _depth_sweep_native60(
     *,
     model: str,
@@ -1792,16 +2341,27 @@ def _depth_sweep_native60(
 ) -> dict[str, Any]:
     from mtplx.benchmarks.runners.mtp_depth_sweep import run_mtp_depth_sweep
 
+    _family_batched = _model_config_is_qwen4_exp(model)
     previous = apply_profile_env("performance-cold")
     if runtime_env:
+        for key in runtime_env:
+            previous.setdefault(key, os.environ.get(key))
         os.environ.update({key: str(value) for key, value in runtime_env.items()})
     draft_lm_head = draft_lm_head or {
         "bits": 4,
         "group_size": 64,
         "mode": "affine",
     }
+    # Serve-path memory discipline (#261, F7): the depth-sweep harness loads
+    # the model in-process; pin the serve-path Metal allocator caps first.
+    from mtplx.server.openai import apply_memory_caps_preflight
+
     try:
-        return run_mtp_depth_sweep(
+        memory_preflight = apply_memory_caps_preflight(
+            entry="bench.depth_sweep",
+            model=str(model),
+        )
+        result = run_mtp_depth_sweep(
             model,
             prompt_suite,
             depths=depths,
@@ -1821,18 +2381,29 @@ def _depth_sweep_native60(
             mtp_cache_policy=mtp_cache_policy,
             mtp_history_policy=mtp_history_policy,
             min_speculative_depth=1,
-            verify_strategy="capture_commit",
+            # qwen4_exp cannot run the qwen3-next structure verify lanes: their
+            # capture stack introspects the qwen3-next DecoderLayer layout
+            # (input_layernorm et al.) and raises on Flash-Next hyper-connection
+            # layers. The family's repair-free lane wraps the batched verify
+            # (MTPLX_FAMILY_CAPTURE_COMMIT), so batched is the base strategy
+            # there -- the same coercion the server applies at boot.
+            verify_strategy="batched" if _family_batched else "capture_commit",
             draft_core=str(draft_core or "stock"),
-            verify_core="linear-gdn-from-conv-tape",
+            verify_core="stock" if _family_batched else "linear-gdn-from-conv-tape",
             draft_lm_head_bits=int(draft_lm_head["bits"]),
             draft_lm_head_group_size=int(draft_lm_head["group_size"]),
             draft_lm_head_mode=str(draft_lm_head["mode"]),
             draft_temperature=(
                 None if draft_sampler is None else float(draft_sampler["temperature"])
             ),
-            draft_top_p=None if draft_sampler is None else float(draft_sampler["top_p"]),
+            draft_top_p=None
+            if draft_sampler is None
+            else float(draft_sampler["top_p"]),
             draft_top_k=None if draft_sampler is None else int(draft_sampler["top_k"]),
         )
+        if isinstance(result, dict):
+            result.setdefault("memory_preflight", memory_preflight)
+        return result
     finally:
         restore_profile_env(previous)
 
@@ -1852,6 +2423,73 @@ class _temporary_env:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+def _compiled_verify_fence_report(args: Any) -> dict[str, Any]:
+    """Static compiled-verify fence status for doctor (issue #255).
+
+    The fence is the context ceiling of the compiled verify step: above it
+    every verify call falls back to the eager path (graphbank
+    ``_compiled_verify_max_context``; engine default 6144 tokens). The
+    founder's public commitment on #255 is that doctor prints the live
+    value. Resolution mirrors the launch: an operator env always beats the
+    profile value (both envs are in profiles.py's passthrough set), else the
+    profile the default launch resolves for this Mac's verified default
+    model, else the engine default. Mode mapping mirrors
+    ``graphbank.compiled_verify_mode``. Static env + profile state only —
+    no GPU probing.
+    """
+
+    engine_default_max_context = 6144
+    try:
+        default_model = str(select_default_model().model)
+    except Exception:
+        default_model = None
+    profile_name = DEFAULT_PROFILE_NAME
+    if default_model:
+        try:
+            profile_name = _resolved_default_profile_name(args, default_model)
+        except Exception:
+            profile_name = DEFAULT_PROFILE_NAME
+    try:
+        profile_env = get_profile(profile_name).env_dict()
+    except Exception:
+        profile_env = {}
+
+    def _resolve(name: str, fallback: str) -> tuple[str, str]:
+        if name in os.environ:
+            return str(os.environ[name]).strip(), f"{name} env"
+        if name in profile_env:
+            return str(profile_env[name]).strip(), f"{profile_name} profile"
+        return fallback, "engine default"
+
+    mode_raw, mode_source = _resolve("MTPLX_COMPILED_VERIFY", "")
+    lowered = mode_raw.lower()
+    if lowered in {"", "0", "false", "no", "off"}:
+        mode = "off"
+    elif lowered in {"parity", "parity2"}:
+        mode = lowered
+    else:
+        mode = "on"
+    raw_max, max_source = _resolve(
+        "MTPLX_COMPILED_VERIFY_MAX_CONTEXT", str(engine_default_max_context)
+    )
+    try:
+        max_context = max(0, int(raw_max))
+    except (TypeError, ValueError):
+        max_context = engine_default_max_context
+        max_source = "engine default"
+    return {
+        "mode": mode,
+        "mode_source": mode_source,
+        "max_context_tokens": max_context,
+        "max_context_source": max_source,
+        # max_context == 0 disables the ceiling (experiments only).
+        "fenced": bool(max_context),
+        "resolved_default_profile": profile_name,
+        "default_model": default_model,
+        "above_fence_behavior": "eager verify per call",
+    }
 
 
 def cmd_doctor(args: Any) -> int:
@@ -1905,12 +2543,17 @@ def _build_doctor_report(args: Any) -> dict[str, Any]:
             "fanmax_counts_for_product_gate": False,
             "benchmark_exactness_smoke_context": 2048,
         },
+        "compiled_verify": _compiled_verify_fence_report(args),
     }
     cli_flags = getattr(args, "_cli_flags", set()) or set()
     report["diagnostics"] = build_diagnostics_payload(
         model_cache=getattr(args, "model_cache", None),
         include_startup_default_model="model-cache" not in cli_flags,
         deep=bool(getattr(args, "deep", False)),
+        # An explicit --port aims the server checks; the bare default (8008)
+        # exists for the topic bridges and must not move the server probe off
+        # the shipped :8000 default.
+        server_port=(int(getattr(args, "port", 8000)) if "port" in cli_flags else 8000),
         mlx_info=env.get("mlx") if isinstance(env.get("mlx"), dict) else None,
         thermal_control=thermal_control,
         server_dependencies=server_deps if getattr(args, "deep", False) else None,
@@ -1941,6 +2584,16 @@ def _render_doctor_report(args: Any, report: dict[str, Any]) -> int:
             print(f"{marker:4} {check['id']}: {check['observed']}")
             if check.get("fix") and check["status"] != "pass":
                 print(f"     fix: {check['fix']}")
+        # The compiled-verify fence is the answer to "why does long context
+        # feel different" (#255) — the summary view must carry it too, not
+        # only the full report (F15).
+        fence = report.get("compiled_verify") or {}
+        if fence.get("fenced"):
+            print(
+                "compiled verify fence: "
+                f"<= {fence.get('max_context_tokens')} tokens "
+                f"({fence.get('max_context_source')})"
+            )
         if report.get("bundle"):
             print(f"bundle: {report['bundle']['bundle_dir']}")
             print(f"zip: {report['bundle']['bundle_zip']}")
@@ -1958,11 +2611,39 @@ def _render_doctor_report(args: Any, report: dict[str, Any]) -> int:
         print(f"project: {env_info.get('project_root') or os.getcwd()}")
         print(f"model cache: {hf.get('cache_dir') or 'default'}")
         print(f"cached models: {hf.get('cached_models', 'unknown')}")
+        token_source = hf.get("token_source")
+        if token_source == "environment":
+            print("hugging face token: from HF_TOKEN (used by mtplx pull)")
+        elif token_source == "login":
+            print("hugging face token: from `hf auth login` (used by mtplx pull)")
+        else:
+            print(
+                "hugging face token: none (public models need none; for gated "
+                "models run `hf auth login` or export HF_TOKEN)"
+            )
         print(
             "thermal: "
             f"{'available' if thermal.get('available') else 'not configured'}"
             f" ({selected.get('kind') or 'none'})"
         )
+        fence = report.get("compiled_verify") or {}
+        if fence:
+            print(
+                "compiled verify: "
+                f"{fence.get('mode')} ({fence.get('mode_source')})"
+            )
+            if fence.get("fenced"):
+                print(
+                    "compiled verify fence: "
+                    f"<= {fence.get('max_context_tokens')} tokens "
+                    f"({fence.get('max_context_source')}); above it each "
+                    "verify call falls back to eager"
+                )
+            else:
+                print(
+                    "compiled verify fence: disabled "
+                    f"({fence.get('max_context_source')}); no context ceiling"
+                )
         if getattr(args, "deep", False):
             launchers = report.get("launchers") or {}
             config = report.get("config") or {}
@@ -1993,7 +2674,11 @@ def _render_doctor_report(args: Any, report: dict[str, Any]) -> int:
             )
             print(
                 "  MTPLX client header: "
-                + ("ready" if opencode.get("mtplx_client_header_configured") else "missing")
+                + (
+                    "ready"
+                    if opencode.get("mtplx_client_header_configured")
+                    else "missing"
+                )
             )
             if opencode.get("stale_model_warning"):
                 print(f"  warning: {opencode.get('stale_model_warning')}")
@@ -2001,7 +2686,9 @@ def _render_doctor_report(args: Any, report: dict[str, Any]) -> int:
             pi = report["pi"]
             print("Pi:")
             print(f"  config: {pi.get('config_path')}")
-            print(f"  provider: {'present' if pi.get('provider_present') else 'missing'}")
+            print(
+                f"  provider: {'present' if pi.get('provider_present') else 'missing'}"
+            )
             print(f"  model: {pi.get('model_ref') or 'missing'}")
             if pi.get("model_matches_live_server") is True:
                 print("  model sync: ok")
@@ -2013,8 +2700,14 @@ def _render_doctor_report(args: Any, report: dict[str, Any]) -> int:
                 print(f"  live model: {pi.get('live_model_id')}")
             print(f"  base URL: {pi.get('base_url') or 'missing'}")
             print(f"  auth header: {str(bool(pi.get('auth_header'))).lower()}")
+            advertised_max_tokens = pi.get("advertised_max_tokens")
             print(
-                f"  hidden maxTokens: {str(bool(pi.get('has_hidden_max_tokens'))).lower()}"
+                "  advertised maxTokens: "
+                + (
+                    str(advertised_max_tokens)
+                    if advertised_max_tokens
+                    else "missing (Pi will inject a 16,384 output ceiling)"
+                )
             )
             print(
                 "  MTPLX client header: "
@@ -2178,8 +2871,7 @@ def cmd_stop_public(args: Any) -> int:
     reason_lines = {
         "no_server": [f"No MTPLX server is listening on port {port}."],
         "not_mtplx": [
-            f"Port {port} is in use, but not by an MTPLX server. "
-            "Not touching it."
+            f"Port {port} is in use, but not by an MTPLX server. Not touching it."
         ],
         "no_pid": [
             f"The MTPLX server on port {port} does not report a pid; "
@@ -2254,9 +2946,7 @@ def cmd_settings_public(args: Any) -> int:
             print("usage: mtplx settings set key=value [key=value ...]")
             print("example: mtplx settings set depth=2 reasoning=off")
         return 2
-    response = _http_post_json(
-        base + "/v1/mtplx/settings", update, timeout=10.0
-    )
+    response = _http_post_json(base + "/v1/mtplx/settings", update, timeout=10.0)
     if response.get("ok"):
         body = response.get("json") or {}
         applied = body.get("applied") or {}
@@ -2290,14 +2980,10 @@ def cmd_settings_public(args: Any) -> int:
             )
             return 2
         if kind == "unknown_settings":
-            print(
-                "error: unknown settings: " + ", ".join(str(key) for key in keys)
-            )
+            print("error: unknown settings: " + ", ".join(str(key) for key in keys))
             supported = detail.get("supported") or []
             if supported:
-                print(
-                    "supported: " + ", ".join(str(key) for key in supported)
-                )
+                print("supported: " + ", ".join(str(key) for key in supported))
             return 2
     if isinstance(detail, str) and detail:
         print(f"error: {detail}")
@@ -2334,9 +3020,7 @@ def _format_aime_grid(per_question: list[dict[str, Any]]) -> list[str]:
     for row in per_question:
         idx = int(row.get("idx") or 0)
         status = str(row.get("status") or "")
-        marks[idx] = (
-            "✓" if status == "correct" else "·" if status == "skipped" else "✗"
-        )
+        marks[idx] = "✓" if status == "correct" else "·" if status == "skipped" else "✗"
     if not marks:
         return []
     highest = max(marks)
@@ -2511,7 +3195,9 @@ def _tune_requested_model(args: Any) -> str:
             return str(configured_model)
         try:
             selection = select_default_model()
-            model = getattr(selection, "model", None) or getattr(selection, "hf_model", None)
+            model = getattr(selection, "model", None) or getattr(
+                selection, "hf_model", None
+            )
             if model:
                 return str(model)
         except Exception:
@@ -2568,6 +3254,8 @@ def _identity_text_parts(value: Any) -> list[str]:
 
 
 def _mtplx_tune_family_from_text(text: str) -> str | None:
+    if any(marker in text for marker in ("qwen3.8", "qwen3_8", "qwen38")):
+        return "qwen3_8"
     if any(marker in text for marker in ("qwen3.6", "qwen3_6", "qwen3-6", "qwen36")):
         return "qwen3_6"
     if any(marker in text for marker in ("qwen3.5", "qwen3_5", "qwen3-5", "qwen35")):
@@ -2616,7 +3304,9 @@ def _fast_mtplx_tune_inspection(model: str) -> dict[str, Any] | None:
             (runtime or {}).get("recommended_profile") or DEFAULT_PROFILE_NAME
         ),
         "runtime_contract": runtime_contract,
-        "runtime_contract_path": str(runtime_path) if runtime_path is not None else None,
+        "runtime_contract_path": str(runtime_path)
+        if runtime_path is not None
+        else None,
         "runtime_compatibility": "native",
         "support_level": "mtplx-fast-tune",
     }
@@ -2631,7 +3321,9 @@ def _fast_mtplx_tune_inspection(model: str) -> dict[str, Any] | None:
         "recommended_backend": descriptor.backend_id,
         "recommended_profile": compatibility["recommended_profile"],
         "runtime_contract": runtime_contract,
-        "runtime_contract_path": str(runtime_path) if runtime_path is not None else None,
+        "runtime_contract_path": str(runtime_path)
+        if runtime_path is not None
+        else None,
         "compatibility": compatibility,
     }
 
@@ -2657,7 +3349,7 @@ def _tune_support_payload(
         inspection=inspection,
     )
     unsupported_reason = policy.unsupported_reason or (
-        "Tune is supported for Qwen 3.5, Qwen 3.6, and Gemma 4 MTPLX models only."
+        "Tune is supported for Qwen 3.5, Qwen 3.6, Qwen 3.8, and Gemma 4 MTPLX models only."
     )
     return {
         "ok": bool(policy.supported),
@@ -2677,7 +3369,10 @@ def _unsupported_tune_model_error(
     *,
     json_output: bool,
 ) -> int:
-    message = "Tune is supported for Qwen 3.5, Qwen 3.6, and Gemma 4 MTPLX models only."
+    message = (
+        "Tune is supported for Qwen 3.5, Qwen 3.6, Qwen 3.8, "
+        "and Gemma 4 MTPLX models only."
+    )
     family = str(payload.get("model_family") or "unknown")
     detail = str(payload.get("unsupported_reason") or message)
     body = {
@@ -2686,7 +3381,7 @@ def _unsupported_tune_model_error(
         "model": payload.get("model"),
         "model_family": family,
         "supported_families": payload.get("supported_families")
-        or ["qwen3_5", "qwen3_6", "gemma4"],
+        or ["qwen3_5", "qwen3_6", "qwen3_8", "gemma4"],
         "message": message,
         "detail": detail,
         "model_controls": payload.get("model_controls"),
@@ -2733,14 +3428,39 @@ def _tune_default_candidate_values(support_payload: dict[str, Any] | None) -> li
     return _parse_tune_depths(TUNE_DEFAULT_DEPTHS)
 
 
+def _apply_tune_sampling_defaults(
+    args: Any, support_payload: dict[str, Any] | None
+) -> None:
+    """Resolve tune sampling from the same family contract used by serve.
+
+    Parser defaults predate Qwen3.8 and are therefore not evidence that the
+    operator explicitly selected the legacy 0.6 sampler. Explicit CLI flags
+    always win.
+    """
+
+    controls = (support_payload or {}).get("model_controls")
+    sampling = controls.get("sampling") if isinstance(controls, dict) else None
+    if not isinstance(sampling, dict):
+        return
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    for attribute, flag in (
+        ("temperature", "temperature"),
+        ("top_p", "top-p"),
+        ("top_k", "top-k"),
+    ):
+        if flag not in cli_flags and sampling.get(attribute) is not None:
+            setattr(args, attribute, sampling[attribute])
+
+
 def _parse_tune_candidate_values(
     raw: Any,
     *,
     support_payload: dict[str, Any] | None,
 ) -> list[int]:
     field = _tune_control_field(support_payload)
+    allowed_values = _tune_default_candidate_values(support_payload)
     if raw is None or str(raw).strip() == "":
-        return _tune_default_candidate_values(support_payload)
+        return allowed_values
     parts = [part.strip() for part in str(raw).split(",") if part.strip()]
     if not parts:
         raise ValueError("tune candidates must include at least one value")
@@ -2750,14 +3470,17 @@ def _parse_tune_candidate_values(
             value = int(part)
         except ValueError as exc:
             if field == "draft_block_size":
-                raise ValueError("Gemma tune blocks must be integers from 2 to 8") from exc
-            raise ValueError("tune depths must be integers from 1 to 3") from exc
+                raise ValueError(
+                    "Gemma tune blocks must be integers from 2 to 8"
+                ) from exc
+            raise ValueError("tune depths must be integers") from exc
         if field == "draft_block_size":
             if value < 2 or value > 8:
                 raise ValueError("Gemma tune blocks must be between 2 and 8")
         else:
-            if value < 1 or value > MAX_PUBLIC_SPECULATIVE_DEPTH:
-                raise ValueError("tune depths must be between 1 and 3")
+            if value not in allowed_values:
+                allowed = ",".join(str(item) for item in allowed_values)
+                raise ValueError(f"tune depths must be one of {allowed}")
         if value not in values:
             values.append(value)
     return values
@@ -2816,6 +3539,7 @@ def _cmd_tune(
                 support_payload,
                 json_output=json_output or action == "bench tune",
             )
+        _apply_tune_sampling_defaults(args, support_payload)
         try:
             depths = _parse_tune_candidate_values(
                 getattr(args, "depths", None),
@@ -2825,6 +3549,7 @@ def _cmd_tune(
             return _tune_error(str(exc), json_output=json_output)
         settings = _tune_settings(
             args,
+            model=model,
             depths=depths,
             control_field=_tune_control_field(support_payload),
         )
@@ -2865,6 +3590,7 @@ def _cmd_tune(
             support_payload,
             json_output=json_output,
         )
+    _apply_tune_sampling_defaults(args, support_payload)
     try:
         depths = _parse_tune_candidate_values(
             getattr(args, "depths", None),
@@ -2874,6 +3600,7 @@ def _cmd_tune(
         return _tune_error(str(exc), json_output=json_output)
     settings = _tune_settings(
         args,
+        model=runtime_model,
         depths=depths,
         control_field=_tune_control_field(support_payload),
     )
@@ -2900,16 +3627,25 @@ def _cmd_tune(
             or state_key is None
             or key_material is None
         ):
-            hardware = _apple_hardware_context()
-            software = _software_context()
-            backend = _mlx_backend_context()
-            state_key, key_material = _tune_state_key(
-                runtime_model,
-                settings=settings,
-                hardware=hardware,
-                software=software,
-                backend=backend,
-            )
+            # Shared constructor so save and wizard-lookup keys can never
+            # drift (issue #280 re-tune loop). Falls back to the inline
+            # construction only if the shared path cannot resolve — the
+            # model is already resolved and support-checked by this point,
+            # so that fallback should be unreachable.
+            context = _tune_state_context_for_args(args)
+            if context is not None:
+                hardware, software, backend, state_key, key_material = context
+            else:
+                hardware = _apple_hardware_context()
+                software = _software_context()
+                backend = _mlx_backend_context()
+                state_key, key_material = _tune_state_key(
+                    runtime_model,
+                    settings=settings,
+                    hardware=hardware,
+                    software=software,
+                    backend=backend,
+                )
         return hardware, software, backend, state_key, key_material
 
     cached = None
@@ -3058,8 +3794,10 @@ def _cmd_tune(
             # A measured loss supersedes any stored winner for the same
             # environment; otherwise a record poisoned by GPU contention
             # replays forever (#177).
-            if save_default and not bool(getattr(args, "no_save", False)) and (
-                verdict in TUNE_RECORD_CLEARING_VERDICTS
+            if (
+                save_default
+                and not bool(getattr(args, "no_save", False))
+                and (verdict in TUNE_RECORD_CLEARING_VERDICTS)
             ):
                 cleared = _clear_tune_record(state_key)
                 if cleared is not None:
@@ -3117,15 +3855,27 @@ def _cmd_tune_candidate(args: Any) -> int:
         value = int(candidate)
         if control_field == "draft_block_size":
             if value < 2 or value > 8:
-                return _tune_error("Gemma tune blocks must be between 2 and 8", json_output=True)
-        elif value < 1 or value > MAX_PUBLIC_SPECULATIVE_DEPTH:
-            return _tune_error("tune depths must be between 1 and 3", json_output=True)
-    profile = get_profile(str(getattr(args, "profile", None) or "performance-cold"))
+                return _tune_error(
+                    "Gemma tune blocks must be between 2 and 8", json_output=True
+                )
+        elif value not in _tune_default_candidate_values(support_payload):
+            allowed = ",".join(
+                str(item) for item in _tune_default_candidate_values(support_payload)
+            )
+            return _tune_error(
+                f"tune depths must be one of {allowed}", json_output=True
+            )
+    # The parent tune run always passes --profile explicitly; this default
+    # covers direct candidate invocations and must match what serve resolves
+    # (the hidden performance-cold default tuned depth under different
+    # kernels than the launch profile actually uses).
+    profile = get_profile(_resolved_default_profile_name(args, runtime_model))
     runtime_env = _runtime_env_with_external_overrides(
         _runtime_env_with_model_contract_overrides(
             profile.env_dict(),
             inspection,
             profile,
+            model=runtime_model,
         )
     )
     draft_lm_head = _model_draft_lm_head_spec(inspection, profile)
@@ -3151,6 +3901,9 @@ def _cmd_tune_candidate(args: Any) -> int:
                 else (draft_sampler or {}).get("top_k", 20)
             ),
         }
+    draft_sampler = _greedy_coupled_draft_spec(
+        draft_sampler, args, float(getattr(args, "temperature", 0.6))
+    )
     result = _depth_sweep_native60(
         model=runtime_model,
         prompt_suite=prompt_suite_path(
@@ -3172,7 +3925,9 @@ def _cmd_tune_candidate(args: Any) -> int:
         base_hidden_variant=getattr(args, "base_hidden_variant", None),
         concat_order=getattr(args, "concat_order", None),
         mtp_cache_policy=str(getattr(args, "mtp_cache_policy", None) or "persistent"),
-        mtp_history_policy=str(getattr(args, "mtp_history_policy", None) or "committed"),
+        mtp_history_policy=str(
+            getattr(args, "mtp_history_policy", None) or "committed"
+        ),
         compare_ar=candidate == "ar",
         ar_only=candidate == "ar",
         gemma4_draft_block_size=(
@@ -3289,6 +4044,7 @@ def _tune_model_source_notes(args: Any, *, runtime_model: str) -> list[str]:
 def _tune_settings(
     args: Any,
     *,
+    model: str,
     depths: list[int],
     control_field: str = "depth",
 ) -> dict[str, Any]:
@@ -3297,7 +4053,11 @@ def _tune_settings(
         or getattr(args, "suite", None)
         or TUNE_DEFAULT_SUITE
     )
-    profile = get_profile(str(getattr(args, "profile", None) or "performance-cold"))
+    # Tune must measure under the profile serve will actually resolve for
+    # this model (the macOS app already guards this); the old hidden
+    # performance-cold default tuned depth under different kernels than the
+    # launch profile uses. An explicit --profile always wins.
+    profile = get_profile(_resolved_default_profile_name(args, model))
     return {
         "profile": profile.name,
         "suite": str(suite),
@@ -3328,8 +4088,12 @@ def _tune_settings(
             if getattr(args, "concat_order", None)
             else None
         ),
-        "mtp_cache_policy": str(getattr(args, "mtp_cache_policy", None) or "persistent"),
-        "mtp_history_policy": str(getattr(args, "mtp_history_policy", None) or "committed"),
+        "mtp_cache_policy": str(
+            getattr(args, "mtp_cache_policy", None) or "persistent"
+        ),
+        "mtp_history_policy": str(
+            getattr(args, "mtp_history_policy", None) or "committed"
+        ),
         "draft_temperature": getattr(args, "draft_temperature", None),
         "draft_top_p": getattr(args, "draft_top_p", None),
         "draft_top_k": getattr(args, "draft_top_k", None),
@@ -3425,9 +4189,7 @@ def _clear_tune_record(state_key: str) -> dict[str, Any] | None:
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json(path, state)
     old_payload = old.get("payload") if isinstance(old, dict) else None
-    old_best = (
-        old_payload.get("best") if isinstance(old_payload, dict) else None
-    )
+    old_best = old_payload.get("best") if isinstance(old_payload, dict) else None
     return {
         "state_key": state_key,
         "previous_best": old_best if isinstance(old_best, dict) else None,
@@ -3450,6 +4212,54 @@ def _save_tune_record(
     path = _tune_state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json(path, state)
+
+
+def _tune_state_context_for_args(
+    args: Any,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], str, dict[str, Any]] | None:
+    """Resolve (hardware, software, backend, state_key, key_material) exactly as
+    a live ``mtplx tune`` save would for these args.
+
+    Every reader of the tune-record store MUST derive its key through this
+    function. The 2.8.0/2.8.1 quickstart wizard rebuilt the settings dict by
+    hand (stale ``performance-cold`` profile, unjoined depths, missing keys),
+    so its lookup hash could never match the record ``tune`` had just saved —
+    users were re-offered tuning on every start (issue #280).
+    """
+    model, resolve_error = _resolve_runtime_model_path(
+        _tune_requested_model(args),
+        cache_dir=getattr(args, "cache_dir", None),
+    )
+    if resolve_error is not None:
+        return None
+    support_payload = _tune_support_payload(model, inspect_local=True)
+    if not support_payload["tune_supported"]:
+        return None
+    _apply_tune_sampling_defaults(args, support_payload)
+    try:
+        depths = _parse_tune_candidate_values(
+            getattr(args, "depths", None),
+            support_payload=support_payload,
+        )
+    except ValueError:
+        return None
+    settings = _tune_settings(
+        args,
+        model=model,
+        depths=depths,
+        control_field=_tune_control_field(support_payload),
+    )
+    hardware = _apple_hardware_context()
+    software = _software_context()
+    backend = _mlx_backend_context()
+    state_key, key_material = _tune_state_key(
+        model,
+        settings=settings,
+        hardware=hardware,
+        software=software,
+        backend=backend,
+    )
+    return hardware, software, backend, state_key, key_material
 
 
 def _tune_state_key(
@@ -3506,11 +4316,14 @@ def _tune_dry_run_payload(
     commands = []
     for candidate in ["ar", *[str(depth) for depth in depths]]:
         candidate_output = output_root / (
-            _tune_candidate_file_stem(candidate, settings.get("control_field")) + ".json"
+            _tune_candidate_file_stem(candidate, settings.get("control_field"))
+            + ".json"
         )
         commands.append(
             {
-                "candidate": _tune_candidate_label(candidate, settings.get("control_field")),
+                "candidate": _tune_candidate_label(
+                    candidate, settings.get("control_field")
+                ),
                 "command": _tune_candidate_command(
                     args,
                     candidate=candidate,
@@ -4148,6 +4961,7 @@ def _tune_candidate_command(
 ) -> list[str]:
     command = [
         sys.executable,
+        "-P",  # never let the caller's cwd shadow the environment's mtplx
         "-m",
         "mtplx.cli",
         "tune",
@@ -4205,7 +5019,9 @@ def _tune_candidate_label(candidate: str, control_field: str | None = "depth") -
     return f"D{candidate}"
 
 
-def _tune_candidate_file_stem(candidate: str, control_field: str | None = "depth") -> str:
+def _tune_candidate_file_stem(
+    candidate: str, control_field: str | None = "depth"
+) -> str:
     if candidate == "ar":
         return "ar"
     if str(control_field or "depth") == "draft_block_size":
@@ -4234,7 +5050,9 @@ def _row_finish_reason_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def _row_hit_token_budget_count(rows: list[dict[str, Any]]) -> int:
-    return sum(1 for row in rows if isinstance(row, dict) and row.get("hit_token_budget"))
+    return sum(
+        1 for row in rows if isinstance(row, dict) and row.get("hit_token_budget")
+    )
 
 
 def _tune_candidate_summary(
@@ -4252,7 +5070,9 @@ def _tune_candidate_summary(
         "mode": label,
         "depth": candidate_value,
         "control_field": control_field,
-        "draft_block_size": candidate_value if control_field == "draft_block_size" else None,
+        "draft_block_size": candidate_value
+        if control_field == "draft_block_size"
+        else None,
         "candidate": candidate,
         "returncode": returncode,
         "artifact": str(path),
@@ -4605,17 +5425,17 @@ def _best_multiplier_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         if raw_winner is not None
         else None,
         "quality_rejected": [
-                {
-                    "mode": row.get("mode"),
-                    "depth": row.get("depth"),
-                    "tok_s": row.get("tok_s"),
-                    "multiplier_vs_ar": row.get("multiplier_vs_ar"),
-                    "hit_token_budget": row.get("hit_token_budget"),
-                    "hit_token_budget_count": row.get("hit_token_budget_count"),
-                    "finish_reasons": row.get("finish_reasons"),
-                }
-                for row in quality_rejected
-            ],
+            {
+                "mode": row.get("mode"),
+                "depth": row.get("depth"),
+                "tok_s": row.get("tok_s"),
+                "multiplier_vs_ar": row.get("multiplier_vs_ar"),
+                "hit_token_budget": row.get("hit_token_budget"),
+                "hit_token_budget_count": row.get("hit_token_budget_count"),
+                "finish_reasons": row.get("finish_reasons"),
+            }
+            for row in quality_rejected
+        ],
         "acceptance_collapsed": acceptance_collapsed,
         "failure_reasons": _tune_failure_reasons(
             annotated,
@@ -4844,7 +5664,9 @@ def _print_tune_human(payload: dict[str, Any], *, verbose: bool = False) -> None
     if cleared:
         previous = cleared.get("previous_best") or {}
         previous_label = previous.get("mode") or (
-            f"D{previous.get('depth')}" if previous.get("depth") is not None else "record"
+            f"D{previous.get('depth')}"
+            if previous.get("depth") is not None
+            else "record"
         )
         print(
             f"Cleared saved default {previous_label}: "
@@ -4852,7 +5674,9 @@ def _print_tune_human(payload: dict[str, Any], *, verbose: bool = False) -> None
         )
     if payload.get("saved") and best:
         control_field = str(payload.get("control_field") or "").strip()
-        control_label = "draft block" if control_field == "draft_block_size" else "depth"
+        control_label = (
+            "draft block" if control_field == "draft_block_size" else "depth"
+        )
         print(
             f"Saved: Web UI starts will use {control_label} {best.get('depth')} for this model."
         )
@@ -4900,6 +5724,41 @@ def _tune_error(
     return 1
 
 
+_PULL_NETWORK_FAILURE_MARKERS = (
+    "timed out",
+    "timeout",
+    "connection",
+    "network",
+    "name resolution",
+    "unreachable",
+    "max retries",
+    "cannot find the requested files in the local cache",
+)
+
+
+def _pull_failure_hint(exc: BaseException) -> str | None:
+    """Mirror hint for network-shaped pull failures (#259, #96).
+
+    ``mtplx pull`` goes through ``huggingface_hub``, which honors
+    ``HF_ENDPOINT`` natively; the app exposes the same knob as Settings ->
+    Advanced -> HF download mirror. Users on networks where huggingface.co
+    is blocked only ever see the raw connection error, so name the knob at
+    the point of failure. Silent when an endpoint is already configured
+    (the mirror itself is what failed) or when the failure is not
+    network-shaped (a placeholder repo with missing shards, a bad repo id).
+    """
+    if os.environ.get("HF_ENDPOINT", "").strip():
+        return None
+    text = str(exc).lower()
+    if not any(marker in text for marker in _PULL_NETWORK_FAILURE_MARKERS):
+        return None
+    return (
+        "Hugging Face was unreachable. If huggingface.co is blocked on your "
+        "network, set HF_ENDPOINT=https://hf-mirror.com and rerun "
+        "(in the app: Settings -> Advanced -> HF download mirror)."
+    )
+
+
 def cmd_pull_public(args: Any) -> int:
     from mtplx.hf_loader import pull_model, repo_id_from_model_ref
 
@@ -4942,6 +5801,7 @@ def cmd_pull_public(args: Any) -> int:
         return 130
     except Exception as exc:
         finalize()
+        hint = _pull_failure_hint(exc)
         if progress_json:
             emit_progress_json(
                 {
@@ -4953,11 +5813,16 @@ def cmd_pull_public(args: Any) -> int:
                 }
             )
         elif json_mode:
-            _print({"error": "pull failed", "model": args.model, "detail": str(exc)})
+            payload = {"error": "pull failed", "model": args.model, "detail": str(exc)}
+            if hint:
+                payload["hint"] = hint
+            _print(payload)
         else:
             print("error: pull failed")
             print(f"model: {args.model}")
             print(f"detail: {exc}")
+            if hint:
+                print(f"hint: {hint}")
         return 1
     finalize()
     if progress_json:
@@ -4969,15 +5834,175 @@ def cmd_pull_public(args: Any) -> int:
         print(f"model: {result.get('repo_id')}")
         print(f"path: {result.get('path')}")
         print(f"size: {_format_bytes(result.get('size_bytes'))}")
+        stale_bytes = result.get("stale_bytes")
+        if isinstance(stale_bytes, int) and stale_bytes > 0:
+            print(
+                f"leftovers: {_format_bytes(stale_bytes)} in "
+                f"{result.get('stale_files')} partial file(s) from earlier downloads "
+                "(under .cache or *.incomplete); not part of the model, safe to remove"
+            )
         print(
             f"runtime contract: {str(bool(result.get('has_runtime_contract'))).lower()}"
         )
     return 0
 
 
+def _cmd_models_check(args: Any) -> int:
+    from mtplx.hf_loader import model_cache_dir
+    from mtplx.model_updates import (
+        ENGINE_VERSION,
+        STATE_UPDATE_AVAILABLE,
+        check_model_updates,
+    )
+
+    rows = check_model_updates(cache_dir=args.cache_dir)
+    stale = [row for row in rows if row.state == STATE_UPDATE_AVAILABLE]
+    payload = {
+        "cache_dir": str(model_cache_dir(args.cache_dir)),
+        "engine_version": ENGINE_VERSION,
+        "updates_available": len(stale),
+        "models": [row.to_dict() for row in rows],
+    }
+    if getattr(args, "json", False):
+        _print(payload)
+        return 0
+    print("MTPLX model updates")
+    print(f"cache: {payload['cache_dir']}")
+    if not rows:
+        print("no tracked models (pull a model to start update tracking)")
+        return 0
+    for row in rows:
+        local = (row.local_revision or "untracked")[:10]
+        remote = (row.remote_revision or "unknown")[:10]
+        line = f"- {row.repo_id}  {row.state}  {local} -> {remote}"
+        if row.update_bytes:
+            line += f"  ({_format_bytes(row.update_bytes)})"
+        print(line)
+        if row.note:
+            print(f"  {row.note}")
+        if row.state == "engine-update-required" and row.min_engine_version:
+            print(f"  requires MTPLX >= {row.min_engine_version}")
+    if stale:
+        print(f"updates available: {len(stale)} — run: mtplx models --update")
+    else:
+        print("all tracked packs are current")
+    return 0
+
+
+def _cmd_models_update(args: Any, targets: list[str]) -> int:
+    from mtplx.model_updates import (
+        STATE_UPDATE_AVAILABLE,
+        check_model_updates,
+        fetch_models_manifest,
+        update_cached_model,
+    )
+
+    json_mode = bool(getattr(args, "json", False))
+    progress_json = bool(getattr(args, "progress_json", False))
+    installed_path = getattr(args, "installed_path", None)
+    downloaded_by_repo: dict[str, int] = {}
+
+    def emit_progress_json(event: dict[str, Any]) -> None:
+        payload = dict(event)
+        event_repo = payload.get("repo_id")
+        if isinstance(event_repo, str):
+            downloaded = downloaded_by_repo.get(event_repo, 0)
+            if payload.get("event") == "progress":
+                downloaded += max(0, int(payload.get("delta_bytes") or 0))
+                downloaded_by_repo[event_repo] = downloaded
+            payload["downloaded_bytes"] = downloaded
+        print(json.dumps(payload, sort_keys=True), flush=True)
+
+    manifest = fetch_models_manifest()
+    if targets:
+        repos = list(dict.fromkeys(targets))
+    else:
+        rows = check_model_updates(cache_dir=args.cache_dir, manifest=manifest)
+        repos = [row.repo_id for row in rows if row.state == STATE_UPDATE_AVAILABLE]
+        if not repos:
+            if progress_json:
+                emit_progress_json({"event": "result", "updated": []})
+            elif json_mode:
+                _print({"updated": [], "message": "all tracked packs are current"})
+            else:
+                print("all tracked packs are current")
+            return 0
+    if installed_path and len(repos) != 1:
+        message = "--installed-path requires exactly one --update REPO"
+        if progress_json:
+            emit_progress_json({"event": "failed", "error": "invalid_request", "message": message})
+        else:
+            print(f"error: {message}", file=sys.stderr)
+        return 2
+    results: list[dict[str, Any]] = []
+    failed = False
+    for repo in repos:
+        callback = None
+        finalize: Callable[[], None] = lambda: None  # noqa: E731
+        if progress_json:
+            # The app's update stream parses the same event schema as
+            # `pull --progress-json`; update_cached_model forwards these
+            # straight from pull_model, so the shapes match by construction.
+            callback = emit_progress_json
+            emit_progress_json({"event": "resolving", "repo_id": repo})
+        elif not json_mode:
+            print(f"updating {repo}")
+            callback, finalize = _rich_download_progress_callback(repo_id=repo)
+        try:
+            result = update_cached_model(
+                repo,
+                cache_dir=args.cache_dir,
+                destination_path=installed_path,
+                manifest=manifest,
+                progress_callback=callback,
+                progress_interval_s=0.4 if callback else 10.0,
+            )
+        except Exception as exc:
+            finalize()
+            failed = True
+            results.append({"repo_id": repo, "error": str(exc)})
+            if progress_json:
+                emit_progress_json(
+                    {
+                        "event": "failed",
+                        "error": "update_failed",
+                        "model": repo,
+                        "message": str(exc),
+                        "detail": str(exc),
+                    }
+                )
+            elif not json_mode:
+                print(f"error: update failed for {repo}: {exc}")
+            continue
+        finalize()
+        row = {
+            "repo_id": result.get("repo_id", repo),
+            "path": result.get("path"),
+            "resolved_sha": result.get("resolved_sha"),
+            "delta_bytes": max(
+                0,
+                int(result.get("size_bytes") or 0)
+                - int(result.get("started_size_bytes") or 0),
+            ),
+        }
+        results.append(row)
+        if progress_json:
+            emit_progress_json({"event": "result", **row})
+        elif not json_mode:
+            print(f"updated {repo} -> {str(result.get('resolved_sha') or 'unknown')[:10]}")
+    if json_mode and not progress_json:
+        _print({"updated": results})
+    return 1 if failed else 0
+
+
 def cmd_list_public(args: Any) -> int:
     from mtplx.hf_loader import list_cached_models, model_cache_dir
 
+    update_targets = getattr(args, "update", None)
+    if update_targets is not None:
+        return _cmd_models_update(args, update_targets)
+    if getattr(args, "check", False):
+        return _cmd_models_check(args)
     models = [row.to_dict() for row in list_cached_models(cache_dir=args.cache_dir)]
     payload = {"cache_dir": str(model_cache_dir(args.cache_dir)), "models": models}
     if getattr(args, "json", False):
@@ -4998,8 +6023,38 @@ def cmd_list_public(args: Any) -> int:
 
 
 def cmd_remove_public(args: Any) -> int:
-    from mtplx.hf_loader import remove_cached_model
+    from mtplx.hf_loader import (
+        directory_size_bytes,
+        remove_cached_model,
+        resolve_cached_model_target,
+    )
 
+    # Resolve through the same containment fence the remover uses, so a
+    # traversal ref is refused before we offer to delete anything.
+    try:
+        repo_id, target = resolve_cached_model_target(
+            args.model, cache_dir=args.cache_dir
+        )
+    except ValueError as exc:
+        print(f"mtplx remove: {exc}", file=sys.stderr)
+        return 1
+    if target.exists() and not getattr(args, "yes", False):
+        size = _format_bytes(directory_size_bytes(target))
+        if not sys.stdin.isatty():
+            print(
+                f"mtplx remove: refusing to delete {target} ({size}) without "
+                "confirmation; pass --yes to remove it non-interactively",
+                file=sys.stderr,
+            )
+            return 1
+        print("MTPLX remove")
+        print(f"model: {repo_id}")
+        print(f"path: {target}")
+        print(f"size: {size}")
+        answer = input("Delete this cached model? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            print("aborted: nothing was removed")
+            return 1
     result = remove_cached_model(args.model, cache_dir=args.cache_dir)
     if getattr(args, "json", False):
         _print(result)
@@ -5098,10 +6153,21 @@ def _cmd_bench_run(args: Any) -> int:
     if gate_exit is not None:
         _print({"error": "model failed MTP primary gate", "model": inspection})
         return gate_exit
+    if (inspection.get("compatibility") or {}).get(
+        "runtime_compatibility"
+    ) == "native-ar-only":
+        _print(
+            {
+                "error": "bench run requires an MTP-capable runtime",
+                "detail": "Laguna-S-2.1 is target-only AR; use mtplx run --no-mtp",
+            }
+        )
+        return EXIT_UNSUPPORTED_MODEL
     runtime_env = _runtime_env_with_model_contract_overrides(
         runtime_env,
         inspection,
         selected_profile,
+        model=runtime_model,
     )
     draft_lm_head = _model_draft_lm_head_spec(inspection, selected_profile)
     draft_sampler = _model_draft_sampler_spec(inspection, selected_profile)
@@ -5208,6 +6274,14 @@ def _bench_run_profile_name(args: Any, *, suite: str) -> str:
     requested = getattr(args, "profile", None)
     if requested:
         return str(requested)
+    # Founder order (2026-08-16, redp314 board): our flagship models default
+    # to turbo across EVERY feature — context suites included. The old bare
+    # sustained defaults here meant exactly the people producing public
+    # numbers benchmarked the slow profile. Explicit --profile always wins;
+    # non-flagship models keep the memory-safe sustained defaults below.
+    resolved = _resolved_default_profile_name(args)
+    if resolved == "turbo":
+        return "turbo"
     if suite in BENCH_SUSTAINED_DEFAULT_SUITES:
         return "sustained"
     try:
@@ -5219,7 +6293,7 @@ def _bench_run_profile_name(args: Any, *, suite: str) -> str:
         and max_tokens > BENCH_SUSTAINED_MAX_TOKENS_THRESHOLD
     ):
         return "sustained"
-    return DEFAULT_PROFILE_NAME
+    return resolved
 
 
 def _direct_http_bench_command(
@@ -5509,10 +6583,21 @@ def _cmd_bench_run_direct_http(
     return 0
 
 
-def _nightly_tasks(args: Any) -> list[dict[str, Any]]:
-    sustained_profile = get_profile(
-        getattr(args, "profile", None) or DEFAULT_PROFILE_NAME
-    ).name
+def _suite_default_profile_name(args: Any, *, model: str) -> str:
+    """Launch-rule profile for suite tasks built without an explicit flag.
+
+    Suite builders set ``child.profile`` explicitly, which bypasses the
+    serve-time per-model resolution — so the default must be resolved HERE,
+    against the model the suite will actually run, or the flagships silently
+    benchmark sustained (the 25.3 tok/s shape). An explicit --profile always
+    wins via ``_resolved_default_profile_name``.
+    """
+
+    return get_profile(_resolved_default_profile_name(args, model)).name
+
+
+def _nightly_tasks(args: Any, *, model: str) -> list[dict[str, Any]]:
+    default_profile = _suite_default_profile_name(args, model=model)
     return [
         {
             "label": "cold-long-code-192",
@@ -5527,7 +6612,7 @@ def _nightly_tasks(args: Any) -> list[dict[str, Any]]:
             "label": "flappy-6k",
             "suite": "flappy",
             "max_tokens": 6000,
-            "profile": sustained_profile,
+            "profile": default_profile,
             "strict": bool(getattr(args, "strict", False)),
             "strict_cold": False,
             "harness": "direct-http",
@@ -5536,7 +6621,7 @@ def _nightly_tasks(args: Any) -> list[dict[str, Any]]:
             "label": "flappy-10k",
             "suite": "flappy",
             "max_tokens": 10000,
-            "profile": sustained_profile,
+            "profile": default_profile,
             "strict": bool(getattr(args, "strict", False)),
             "strict_cold": False,
             "harness": "direct-http",
@@ -5545,7 +6630,7 @@ def _nightly_tasks(args: Any) -> list[dict[str, Any]]:
             "label": "python-modules-6k",
             "suite": "python_modules_long",
             "max_tokens": 6000,
-            "profile": sustained_profile,
+            "profile": default_profile,
             "strict": False,
             "strict_cold": False,
             "harness": "direct-http",
@@ -5557,12 +6642,14 @@ def _bench_suite_is_quick(args: Any) -> bool:
     return bool(getattr(args, "quick", False))
 
 
-def _client_contract_task(label: str, client: str, *, max_tokens: int) -> dict[str, Any]:
+def _client_contract_task(
+    label: str, client: str, *, max_tokens: int, profile: str
+) -> dict[str, Any]:
     return {
         "label": label,
         "suite": "flappy",
         "max_tokens": max_tokens,
-        "profile": "sustained",
+        "profile": profile,
         "strict": False,
         "strict_cold": False,
         "harness": "direct-http",
@@ -5585,16 +6672,14 @@ def _client_contract_task(label: str, client: str, *, max_tokens: int) -> dict[s
     }
 
 
-def _quick_suite_tasks(args: Any) -> list[dict[str, Any]]:
-    sustained_profile = get_profile(
-        getattr(args, "profile", None) or DEFAULT_PROFILE_NAME
-    ).name
+def _quick_suite_tasks(args: Any, *, model: str) -> list[dict[str, Any]]:
+    default_profile = _suite_default_profile_name(args, model=model)
     return [
         {
             "label": "short-context-384",
             "suite": "flappy",
             "max_tokens": 384,
-            "profile": sustained_profile,
+            "profile": default_profile,
             "strict": False,
             "strict_cold": False,
             "harness": "direct-http",
@@ -5612,7 +6697,7 @@ def _quick_suite_tasks(args: Any) -> list[dict[str, Any]]:
             "label": "long-tool-history-1536",
             "suite": "python_modules_long",
             "max_tokens": 1536,
-            "profile": sustained_profile,
+            "profile": default_profile,
             "strict": False,
             "strict_cold": False,
             "harness": "direct-http",
@@ -5627,14 +6712,27 @@ def _quick_suite_tasks(args: Any) -> list[dict[str, Any]]:
                 "late verify cost does not collapse the tail",
             ],
         },
-        _client_contract_task("opencode-contract-1024", "opencode", max_tokens=1024),
-        _client_contract_task("pi-contract-1024", "pi", max_tokens=1024),
-        _client_contract_task("hermes-contract-1024", "hermes", max_tokens=1024),
+        _client_contract_task(
+            "opencode-contract-1024",
+            "opencode",
+            max_tokens=1024,
+            profile=default_profile,
+        ),
+        _client_contract_task(
+            "pi-contract-1024", "pi", max_tokens=1024, profile=default_profile
+        ),
+        _client_contract_task(
+            "hermes-contract-1024", "hermes", max_tokens=1024, profile=default_profile
+        ),
     ]
 
 
-def _bench_suite_tasks(args: Any) -> list[dict[str, Any]]:
-    return _quick_suite_tasks(args) if _bench_suite_is_quick(args) else _nightly_tasks(args)
+def _bench_suite_tasks(args: Any, *, model: str) -> list[dict[str, Any]]:
+    return (
+        _quick_suite_tasks(args, model=model)
+        if _bench_suite_is_quick(args)
+        else _nightly_tasks(args, model=model)
+    )
 
 
 def _bench_suite_exactness_contexts(args: Any) -> str:
@@ -5642,7 +6740,10 @@ def _bench_suite_exactness_contexts(args: Any) -> str:
         getattr(args, "nightly_exactness_contexts", BENCH_SUITE_FULL_EXACTNESS_CONTEXTS)
         or BENCH_SUITE_FULL_EXACTNESS_CONTEXTS
     )
-    if _bench_suite_is_quick(args) and configured == BENCH_SUITE_FULL_EXACTNESS_CONTEXTS:
+    if (
+        _bench_suite_is_quick(args)
+        and configured == BENCH_SUITE_FULL_EXACTNESS_CONTEXTS
+    ):
         return BENCH_SUITE_QUICK_EXACTNESS_CONTEXTS
     return configured
 
@@ -5703,7 +6804,8 @@ def _bench_suite_task_gates(
         )
     if "late_verify_ms_le" in warn:
         gates["late_verify_ms_le_warn_floor"] = bool(
-            late_verify_ms is not None and late_verify_ms <= float(warn["late_verify_ms_le"])
+            late_verify_ms is not None
+            and late_verify_ms <= float(warn["late_verify_ms_le"])
         )
     return gates
 
@@ -5718,7 +6820,9 @@ def _bench_suite_model(args: Any) -> str:
     model = getattr(args, "model", None) or DEFAULT_CHAMPION
     cli_flags = getattr(args, "_cli_flags", set()) or set()
     if "model" not in cli_flags and is_verified_default_model_ref(model):
-        selection = select_default_model()
+        # Same refusal as `mtplx start`: a Mac with no runnable default
+        # (Intel, or too little memory) gets the sentence, not a traceback.
+        selection = _select_default_model_or_exit()
         to_dict = getattr(selection, "to_dict", None)
         args._mtplx_default_model_selection = (
             to_dict() if callable(to_dict) else dict(vars(selection))
@@ -5740,11 +6844,9 @@ def _cmd_bench_nightly(args: Any) -> int:
     action_name = _bench_suite_action_name(args)
     default_prefix = "cli-suite" if action_name == "bench suite" else "cli-nightly"
     run_id = args.run_id or f"{default_prefix}-{time.strftime('%Y%m%d-%H%M%S')}"
-    tasks = _bench_suite_tasks(args)
+    tasks = _bench_suite_tasks(args, model=model)
     default_root = Path(
-        "outputs/cli/suite"
-        if action_name == "bench suite"
-        else "outputs/cli/nightly"
+        "outputs/cli/suite" if action_name == "bench suite" else "outputs/cli/nightly"
     )
     output = Path(args.output or default_root / run_id / "summary.json")
     task_root = Path(args.output_dir or output.parent)
@@ -6925,7 +8027,10 @@ def _cmd_qa_exactness(args: Any) -> int:
                 print(f"detail: {stripped[:240]}")
                 break
     print(f"output: {output}")
-    print("try: mtplx qa exactness --exactness-attention-impl mlx_vector_paged")
+    print(
+        "try: a different --exactness-attention-impl "
+        "(run `mtplx qa exactness --help` for the choices)"
+    )
     return EXIT_EXACTNESS
 
 
@@ -6999,15 +8104,48 @@ def cmd_profile_public(args: Any) -> int:
     raise SystemExit(f"unknown profile action: {args.profile_action}")
 
 
+def _research_script(name: str) -> Path | None:
+    """Resolve a research-workspace helper script, or None when not shipped.
+
+    Several diagnostic subcommands drive scripts that live in the MTPLX
+    research workspace and are not part of the distributed package (a wheel
+    install has no scripts/ tree at all). Resolving through this check keeps
+    those commands honest: run the real script, or say exactly why not —
+    never hand python3 a phantom path.
+    """
+    candidate = repo_root() / "scripts" / name
+    return candidate if candidate.is_file() else None
+
+
+def _research_script_unavailable(action: str, script: str) -> int:
+    _print(
+        {
+            "action": action,
+            "available": False,
+            "reason": (
+                f"scripts/{script} is a research-workspace tool and is not "
+                "included in this installation"
+            ),
+            "hint": "Run from an MTPLX source checkout that provides this script.",
+        }
+    )
+    return 2
+
+
 def _cmd_profile_dispatch(args: Any) -> int:
+    trace_script = _research_script("analyze_metal_command_trace.py")
     if args.trace:
+        if trace_script is None:
+            return _research_script_unavailable(
+                "profile dispatch --trace", "analyze_metal_command_trace.py"
+            )
         out_dir = Path(args.output_dir or "outputs/cli/dispatch") / time.strftime(
             "%Y%m%d-%H%M%S"
         )
         proc = subprocess.run(
             [
                 sys.executable,
-                str(repo_root() / "scripts" / "analyze_metal_command_trace.py"),
+                str(trace_script),
                 args.trace,
                 "--out-dir",
                 str(out_dir),
@@ -7024,16 +8162,27 @@ def _cmd_profile_dispatch(args: Any) -> int:
             "suite": args.suite,
             "max_tokens": args.max_tokens,
             "implemented_capture": False,
-            "next": "Run with --trace PATH to analyze an existing MLX Metal command trace.",
+            "next": (
+                "Run with --trace PATH to analyze an existing MLX Metal command trace."
+                if trace_script is not None
+                else "Trace analysis needs the research-workspace script "
+                "scripts/analyze_metal_command_trace.py, which is not included "
+                "in this installation."
+            ),
         }
     )
     return 0
 
 
 def _cmd_profile_thermal(args: Any) -> int:
+    script = _research_script("run_flappy_smc_thermal_diagnostics.py")
+    if script is None:
+        return _research_script_unavailable(
+            "profile thermal", "run_flappy_smc_thermal_diagnostics.py"
+        )
     cmd = [
         sys.executable,
-        str(repo_root() / "scripts" / "run_flappy_smc_thermal_diagnostics.py"),
+        str(script),
         "--model",
         args.model,
         "--run-id",
@@ -7047,8 +8196,32 @@ def _cmd_profile_thermal(args: Any) -> int:
     return subprocess.call(cmd, cwd=repo_root())
 
 
+def _reject_native_ar_for_mtp_diagnostic(
+    inspection: dict[str, Any],
+    *,
+    action: str,
+) -> int | None:
+    if (inspection.get("compatibility") or {}).get(
+        "runtime_compatibility"
+    ) != "native-ar-only":
+        return None
+    _print(
+        {
+            "error": f"{action} requires an MTP-capable runtime",
+            "detail": "Laguna-S-2.1 is installed as target-only AR",
+        }
+    )
+    return EXIT_UNSUPPORTED_MODEL
+
+
 def _cmd_profile_compile_audit(args: Any) -> int:
     inspection, gate_exit = _model_gate(args.model)
+    native_ar_exit = _reject_native_ar_for_mtp_diagnostic(
+        inspection,
+        action="profile compile-audit",
+    )
+    if native_ar_exit is not None:
+        return native_ar_exit
     output = (
         Path(args.output)
         if args.output
@@ -7139,6 +8312,12 @@ def _cmd_profile_compile_audit(args: Any) -> int:
 
 def _cmd_profile_eval_attribution(args: Any) -> int:
     inspection, gate_exit = _model_gate(args.model)
+    native_ar_exit = _reject_native_ar_for_mtp_diagnostic(
+        inspection,
+        action="profile eval-attribution",
+    )
+    if native_ar_exit is not None:
+        return native_ar_exit
     output = (
         Path(args.output)
         if args.output
@@ -7147,9 +8326,14 @@ def _cmd_profile_eval_attribution(args: Any) -> int:
             / f"eval-attribution-{time.strftime('%Y%m%d-%H%M%S')}.json"
         )
     )
+    script = _research_script("probe_eval_attribution.py")
+    if script is None:
+        return _research_script_unavailable(
+            "profile eval-attribution", "probe_eval_attribution.py"
+        )
     cmd = [
         sys.executable,
-        str(repo_root() / "scripts" / "probe_eval_attribution.py"),
+        str(script),
         "--model",
         args.model,
         "--prefix-tokens",
@@ -7217,6 +8401,7 @@ def cmd_thermal_public(args: Any) -> int:
     run_id = args.run_id or f"cli-fanmax-{time.strftime('%Y%m%d-%H%M%S')}"
     child = [
         sys.executable,
+        "-P",  # never let the caller's cwd shadow the environment's mtplx
         "-m",
         "mtplx.cli",
         "bench",
@@ -7231,9 +8416,14 @@ def cmd_thermal_public(args: Any) -> int:
         run_id,
         "--fanmax",
     ]
+    script = _research_script("run_fanmax_command.py")
+    if script is None:
+        return _research_script_unavailable(
+            "thermal fanmax-run", "run_fanmax_command.py"
+        )
     cmd = [
         sys.executable,
-        str(repo_root() / "scripts" / "run_fanmax_command.py"),
+        str(script),
         "--output-dir",
         args.output_dir or "outputs/cli/fanmax",
         "--",
@@ -7414,9 +8604,7 @@ def cmd_dashboard_public(args: Any) -> int:
 
     health = _http_json(health_url, timeout=timeout)
     server_up = bool(
-        isinstance(health, dict)
-        and "error" not in health
-        and health.get("ok")
+        isinstance(health, dict) and "error" not in health and health.get("ok")
     )
 
     payload: dict[str, Any] = {
@@ -7430,14 +8618,10 @@ def cmd_dashboard_public(args: Any) -> int:
     if server_up:
         payload["model"] = health.get("model")
         profile = health.get("profile")
-        payload["profile"] = (
-            profile.get("name") if isinstance(profile, dict) else None
-        )
+        payload["profile"] = profile.get("name") if isinstance(profile, dict) else None
     else:
         payload["error"] = "MTPLX server is not reachable"
-        payload["detail"] = (
-            health.get("error") if isinstance(health, dict) else None
-        )
+        payload["detail"] = health.get("error") if isinstance(health, dict) else None
 
     if json_output:
         _print(payload)
@@ -7528,9 +8712,7 @@ def _mlx_backend_context() -> dict[str, Any]:
         )
         if os.environ.get(key)
     }
-    stock_layout = bool(
-        path and ("site-packages" in path or "dist-packages" in path)
-    )
+    stock_layout = bool(path and ("site-packages" in path or "dist-packages" in path))
     return {
         "mlx_core_path": path,
         "mlx_version": _package_version("mlx"),
@@ -7722,12 +8904,17 @@ def _print_serve_handoff(args: Any, runtime_model: str, profile_name: str) -> No
         _print_serve_start_line(
             f"      Local API Base URL: {_server_url(args.host, int(args.port))}/v1"
         )
+        network_url = network_url_for_bind(args.host, int(args.port), path="/v1")
+        if network_url:
+            _print_serve_start_line(
+                f"      Network API Base URL: {network_url} (other devices + VM guests)"
+            )
     else:
         _print_serve_start_line(
             f"[1/6] Server config ready: {_server_url(args.host, int(args.port))}/v1"
         )
     _print_serve_start_line(f"[2/6] Model resolved: {runtime_model}")
-    _print_serve_start_line("[3/6] Runtime contract verified")
+    _print_serve_start_line(f"[3/6] Runtime contract verified — profile: {profile_name}")
     _print_serve_start_line(
         "      Loading the model can take about a minute on first start."
     )
@@ -7858,6 +9045,16 @@ def _model_ref_from_public_model_id(model_id: str | None) -> str | None:
         DEFAULT_HF_MODEL_ID.lower(): DEFAULT_HF_MODEL_ID,
         DEFAULT_MODEL_ID.lower(): DEFAULT_HF_MODEL_ID,
         Path(DEFAULT_HF_MODEL_ID).name.lower(): DEFAULT_HF_MODEL_ID,
+        OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID.lower(): OPTIMIZED_SPEED_V1_HF_MODEL_ID,
+        OPTIMIZED_SPEED_V1_HF_MODEL_ID.lower(): OPTIMIZED_SPEED_V1_HF_MODEL_ID,
+        Path(
+            OPTIMIZED_SPEED_V1_HF_MODEL_ID
+        ).name.lower(): OPTIMIZED_SPEED_V1_HF_MODEL_ID,
+        OPTIMIZED_SPEED_V2_PUBLIC_MODEL_ID.lower(): OPTIMIZED_SPEED_V2_HF_MODEL_ID,
+        OPTIMIZED_SPEED_V2_HF_MODEL_ID.lower(): OPTIMIZED_SPEED_V2_HF_MODEL_ID,
+        Path(
+            OPTIMIZED_SPEED_V2_HF_MODEL_ID
+        ).name.lower(): OPTIMIZED_SPEED_V2_HF_MODEL_ID,
         DEFAULT_FP16_PUBLIC_MODEL_ID.lower(): DEFAULT_FP16_HF_MODEL_ID,
         DEFAULT_FP16_HF_MODEL_ID.lower(): DEFAULT_FP16_HF_MODEL_ID,
         Path(DEFAULT_FP16_HF_MODEL_ID).name.lower(): DEFAULT_FP16_HF_MODEL_ID,
@@ -7872,22 +9069,74 @@ def _model_ref_from_public_model_id(model_id: str | None) -> str | None:
         Path(QUALITY_FP16_HF_MODEL_ID).name.lower(): QUALITY_FP16_HF_MODEL_ID,
         QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID.lower(): QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
         QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID.lower(): QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
-        Path(QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID).name.lower(): QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
+        Path(
+            QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID
+        ).name.lower(): QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
         QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID.lower(): QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
         QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID.lower(): QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
-        Path(QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID).name.lower(): QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+        Path(
+            QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID
+        ).name.lower(): QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
         QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
         QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
-        Path(QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID).name.lower(): QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
+        Path(
+            QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID
+        ).name.lower(): QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
         QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
         QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
-        Path(QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID).name.lower(): QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+        Path(
+            QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID
+        ).name.lower(): QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
         QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID,
         QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID,
-        Path(QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID).name.lower(): QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID,
+        Path(
+            QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID
+        ).name.lower(): QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID,
         QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID,
         QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID,
-        Path(QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID).name.lower(): QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID,
+        Path(
+            QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID
+        ).name.lower(): QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID,
+        QWEN38_BARE_SPEED_PUBLIC_MODEL_ID.lower(): QWEN38_BARE_SPEED_HF_MODEL_ID,
+        QWEN38_BARE_SPEED_HF_MODEL_ID.lower(): QWEN38_BARE_SPEED_HF_MODEL_ID,
+        Path(
+            QWEN38_BARE_SPEED_HF_MODEL_ID
+        ).name.lower(): QWEN38_BARE_SPEED_HF_MODEL_ID,
+        QWEN38_OPTIMIZED_SPEED_PUBLIC_MODEL_ID.lower(): QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID,
+        QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID.lower(): QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID,
+        Path(
+            QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID
+        ).name.lower(): QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID,
+        QWEN38_OPTIMIZED_QUALITY_PUBLIC_MODEL_ID.lower(): QWEN38_OPTIMIZED_QUALITY_HF_MODEL_ID,
+        QWEN38_OPTIMIZED_QUALITY_HF_MODEL_ID.lower(): QWEN38_OPTIMIZED_QUALITY_HF_MODEL_ID,
+        Path(
+            QWEN38_OPTIMIZED_QUALITY_HF_MODEL_ID
+        ).name.lower(): QWEN38_OPTIMIZED_QUALITY_HF_MODEL_ID,
+        QWEN38_BARE_SPEED_FP16_PUBLIC_MODEL_ID.lower(): QWEN38_BARE_SPEED_FP16_HF_MODEL_ID,
+        QWEN38_BARE_SPEED_FP16_HF_MODEL_ID.lower(): QWEN38_BARE_SPEED_FP16_HF_MODEL_ID,
+        Path(
+            QWEN38_BARE_SPEED_FP16_HF_MODEL_ID
+        ).name.lower(): QWEN38_BARE_SPEED_FP16_HF_MODEL_ID,
+        QWEN38_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID.lower(): QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+        QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID.lower(): QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+        Path(
+            QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID
+        ).name.lower(): QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+        QWEN38_OPTIMIZED_QUALITY_FP16_PUBLIC_MODEL_ID.lower(): QWEN38_OPTIMIZED_QUALITY_FP16_HF_MODEL_ID,
+        QWEN38_OPTIMIZED_QUALITY_FP16_HF_MODEL_ID.lower(): QWEN38_OPTIMIZED_QUALITY_FP16_HF_MODEL_ID,
+        Path(
+            QWEN38_OPTIMIZED_QUALITY_FP16_HF_MODEL_ID
+        ).name.lower(): QWEN38_OPTIMIZED_QUALITY_FP16_HF_MODEL_ID,
+        FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID.lower(): FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+        FLASH_NEXT_BARE_SPEED_HF_MODEL_ID.lower(): FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+        Path(
+            FLASH_NEXT_BARE_SPEED_HF_MODEL_ID
+        ).name.lower(): FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+        FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID.lower(): FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
+        FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID.lower(): FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
+        Path(
+            FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID
+        ).name.lower(): FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
         "qwen3.6-35b-a3b-mtplx-official4-cyankiwimtp-cleanrecipe": QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
     }
     for candidate in lookup_keys:
@@ -7918,6 +9167,25 @@ def _resolve_runtime_options_on_args(
     *,
     printer: Callable[[str], None],
 ) -> int | None:
+    # --api-key-file pointing at a missing path creates the file with a fresh
+    # key instead of erroring: the non-localhost refusal below suggests
+    # `--api-key-file ~/.mtplx/api-key` as the recovery command, and that
+    # suggestion must work on a machine that has never had a key. The key is
+    # printed once, at generation — it never appears again on later launches,
+    # and the file path stays the durable copy. Only server entrypoints get
+    # this behavior; read-only key-file consumers keep strict missing-file
+    # errors.
+    api_key_file = getattr(args, "api_key_file", None)
+    if api_key_file and not getattr(args, "api_key", None):
+        key_path = Path(str(api_key_file)).expanduser()
+        if not key_path.exists():
+            try:
+                generated = generate_api_key_file(key_path)
+            except OSError as exc:
+                printer(f"error: could not create API key file: {exc}")
+                return 2
+            printer(f"Generated a new API key and saved it to {key_path}")
+            printer(f"API key (use as Bearer token from other machines): {generated}")
     try:
         resolved_key = resolve_api_key(
             explicit_api_key=getattr(args, "api_key", None),
@@ -7930,8 +9198,17 @@ def _resolve_runtime_options_on_args(
     setattr(args, "api_key_source", resolved_key.source)
     try:
         kv_mode = normalize_paged_kv_quantization(
-            getattr(args, "paged_kv_quantization", None)
+            getattr(args, "paged_kv_quantization", None),
+            allow_none=True,
         )
+        if kv_mode is None:
+            # No explicit --paged-kv-quantization: inherit the launcher's
+            # environment. The app (and any wrapper tooling) communicates the
+            # KV-quant choice through the env pair, and rewriting the absent
+            # flag to an explicit "off" here used to clobber that env in the
+            # rebuilt child argv/env, killing the toggle engine-wide. An
+            # explicit flag still wins over the environment.
+            kv_mode = paged_kv_quant_mode_from_env()
     except ValueError as exc:
         printer(f"error: {exc}")
         return 2
@@ -8043,6 +9320,11 @@ def cmd_serve_public(args: Any) -> int:
         return 2
     dry_run = bool(getattr(args, "dry_run", False))
     quiet_json = dry_run and bool(getattr(args, "json", False))
+    agent_rewrites = getattr(args, "agent_rewrites", None)
+    if agent_rewrites:
+        # The server child inherits os.environ; the env var is the single
+        # source of truth so in-process helpers and the spawned daemon agree.
+        os.environ["MTPLX_AGENT_REWRITES"] = str(agent_rewrites)
     runtime_options_error = _resolve_runtime_options_on_args(
         args,
         printer=_print_serve_start_line,
@@ -8063,11 +9345,15 @@ def cmd_serve_public(args: Any) -> int:
         if getattr(args, "json", False):
             _print(payload)
         else:
-            print("error: --api-key or --api-key-file is required when --host is not localhost")
+            print(
+                "error: --api-key or --api-key-file is required when --host is not localhost"
+            )
             print(f"host: {getattr(args, 'host', None)}")
             server_command = _server_command_name(args)
             print(f"try: mtplx {server_command} --host 127.0.0.1")
-            print(f"try: mtplx {server_command} --host 0.0.0.0 --api-key-file ~/.mtplx/api-key")
+            print(
+                f"try: mtplx {server_command} --host 0.0.0.0 --api-key-file ~/.mtplx/api-key"
+            )
         return 2
     cli_flags = getattr(args, "_cli_flags", set()) or set()
     _apply_model_id_as_model_default(
@@ -8075,7 +9361,7 @@ def cmd_serve_public(args: Any) -> int:
         has_explicit_model="model" in cli_flags,
     )
     if _serve_should_onboard(args):
-        from mtplx.ui.onboarding import run_serve_flow
+        from mtplx.ui.onboarding import PROFILE_AUTO, run_serve_flow
 
         choice = run_serve_flow(
             configured_model=getattr(args, "model", None),
@@ -8089,6 +9375,12 @@ def cmd_serve_public(args: Any) -> int:
         chosen_model = choice.get("model")
         if chosen_model:
             args.model = chosen_model
+            # Explicitness markers: see the matching stamp in
+            # cmd_quickstart_public (issues #279/#280 — a wizard pick must
+            # never be re-resolved to the hardware default downstream).
+            args._model_explicit = True
+            args._cli_flags = set(getattr(args, "_cli_flags", set()) or set())
+            args._cli_flags.add("model")
             try:
                 from mtplx.hf_loader import repo_id_from_model_ref
 
@@ -8097,10 +9389,12 @@ def cmd_serve_public(args: Any) -> int:
             except Exception:
                 pass
         chosen_profile = choice.get("profile")
-        if chosen_profile:
+        if chosen_profile and chosen_profile != PROFILE_AUTO:
             args.profile = chosen_profile
-            # A wizard pick is a user decision: record it so per-model
-            # default-profile resolution never overrides it.
+            # An explicit wizard pick is a user decision: record it so
+            # per-model default-profile resolution never overrides it. Auto
+            # is the opposite decision — stamp nothing, so the engine keeps
+            # resolving the launch profile per model.
             args._cli_flags = set(getattr(args, "_cli_flags", set()) or set())
             args._cli_flags.add("profile")
         args.max = bool(choice.get("max"))
@@ -8115,7 +9409,10 @@ def cmd_serve_public(args: Any) -> int:
         return depth_error
     generation_mode = _generation_mode_from_args(args)
     fan_mode = _fan_mode_from_args(args)
-    if generation_mode == GENERATION_MODE_MTP and getattr(args, "load_mtp", True) is False:
+    if (
+        generation_mode == GENERATION_MODE_MTP
+        and getattr(args, "load_mtp", True) is False
+    ):
         _print_serve_start_line("error: --generation-mode mtp requires --load-mtp")
         _print_serve_start_line("try: mtplx serve --generation-mode ar --no-load-mtp")
         return 2
@@ -8243,7 +9540,11 @@ def cmd_serve_public(args: Any) -> int:
             health = _http_json(base + "/health", timeout=1.5, api_key=api_key)
             if health.get("ok"):
                 command = str(getattr(args, "hermes_launch_command", "") or "").strip()
-                model_id = health.get("model") or getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID
+                model_id = (
+                    health.get("model")
+                    or getattr(args, "model_id", None)
+                    or DEFAULT_PUBLIC_MODEL_ID
+                )
                 _print_serve_start_line("MTPLX is already running.")
                 _print_serve_start_line(f"OpenAI API Base URL: {base}/v1")
                 _print_serve_start_line(f"Hermes model: {model_id}")
@@ -8300,7 +9601,7 @@ def cmd_serve_public(args: Any) -> int:
             f"try: mtplx {server_command}{profile_arg}{max_arg} --port {int(args.port) + 1}"
         )
         return 2
-    profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
+    profile = get_profile(_resolved_default_profile_name(args))
     cache_dir = getattr(args, "cache_dir", None)
     if bool(getattr(args, "download", False)) and not dry_run:
         try:
@@ -8389,6 +9690,17 @@ def cmd_serve_public(args: Any) -> int:
     if gate_exit is not None:
         _print_model_gate_error(inspection, printer=_print_serve_start_line)
         return gate_exit
+    mode_exit = _apply_runtime_compatibility_mode(
+        args,
+        inspection,
+        printer=_print_serve_start_line,
+    )
+    if mode_exit is not None:
+        return mode_exit
+    # The missing-MTP degrade above may have flipped args to AR; the local
+    # snapshot taken before model resolution would otherwise hand the child
+    # a stale "--generation-mode mtp" with load_mtp already stripped.
+    generation_mode = _generation_mode_from_args(args)
     model_id = _public_model_id_for_args(args, str(runtime_model))
     args.model_id = model_id
     if _apply_model_default_profile(args, model_id):
@@ -8410,6 +9722,13 @@ def cmd_serve_public(args: Any) -> int:
         _print_serve_handoff(args, runtime_model, profile.name)
     cmd = [
         sys.executable,
+        # -P (safe path, 3.11+): -m alone puts the CWD on sys.path, so
+        # serving from any directory containing an mtplx/ package silently
+        # swapped the daemon's runtime to that directory's code — measured
+        # live 2026-08-27 when an A/B battery's "shipped 2.9.2" arm imported
+        # the checkout instead of its own venv. The daemon must run the code
+        # of the environment that launched it, never the caller's cwd.
+        "-P",
         "-m",
         "mtplx.server.openai",
         "--model",
@@ -8429,13 +9748,14 @@ def cmd_serve_public(args: Any) -> int:
         "--reasoning-mode",
         _reasoning_mode(args, default="auto"),
         "--preserve-thinking",
-        _pi_preserve_thinking_policy(args)
-        if bool(getattr(args, "quickstart_pi", False))
-        else _preserve_thinking_policy(args),
+        _preserve_thinking_policy(args),
         "--verify-strategy",
         str(getattr(args, "verify_strategy", "capture_commit") or "capture_commit"),
         "--verify-core",
-        str(getattr(args, "verify_core", "linear-gdn-from-conv-tape") or "linear-gdn-from-conv-tape"),
+        str(
+            getattr(args, "verify_core", "linear-gdn-from-conv-tape")
+            or "linear-gdn-from-conv-tape"
+        ),
         "--draft-lm-head-bits",
         str(draft_lm_head["bits"]),
         "--draft-lm-head-group-size",
@@ -8450,6 +9770,8 @@ def cmd_serve_public(args: Any) -> int:
         str(getattr(args, "scheduler_mode", "serial") or "serial"),
         "--batching-preset",
         str(getattr(args, "batching_preset", "latency") or "latency"),
+        "--mtp-batch-numerics",
+        str(getattr(args, "mtp_batch_numerics", "throughput") or "throughput"),
         "--warmup-tokens",
         str(getattr(args, "warmup_tokens", 16)),
         "--model-id",
@@ -8471,9 +9793,49 @@ def cmd_serve_public(args: Any) -> int:
         value = getattr(args, attr, None)
         if value is not None:
             cmd.extend([flag, str(value)])
+    # Retrieval models. The server runs as a subprocess with an explicitly
+    # rebuilt argv, so anything not forwarded here never reaches it — the
+    # endpoints would stay unconfigured on every path but a bare `mtplx serve`.
+    for flag, attr in (("--embedding-model", "embedding_model"), ("--reranker-model", "reranker_model")):
+        for reference in getattr(args, attr, None) or []:
+            if str(reference).strip():
+                cmd.extend([flag, str(reference)])
+    for flag, attr in (
+        ("--retrieval-max-resident", "retrieval_max_resident"),
+        ("--retrieval-max-tokens", "retrieval_max_tokens"),
+        ("--retrieval-idle-timeout", "retrieval_idle_timeout"),
+    ):
+        value = getattr(args, attr, None)
+        if value:
+            cmd.extend([flag, str(value)])
+    if bool(getattr(args, "retrieval_trust_remote_code", False)):
+        cmd.append("--retrieval-trust-remote-code")
+    # The 2.5.4 notes promised `mtplx serve --no-auth`; the flag lived only on
+    # the server module's parser until this forward existed, so the promised
+    # spelling died at this parser with an argparse error.
+    if bool(getattr(args, "no_auth", False)):
+        cmd.append("--no-auth")
+    # The chat model is already an absolute path by this point, but retrieval
+    # references are resolved inside the server, which has no cache directory
+    # of its own — so a model pulled into a custom --cache-dir would not be
+    # found unless the directory travels with them.
+    retrieval_cache_dir = getattr(args, "cache_dir", None)
+    if retrieval_cache_dir and (
+        getattr(args, "embedding_model", None) or getattr(args, "reranker_model", None)
+    ):
+        cmd.extend(["--retrieval-cache-dir", str(retrieval_cache_dir)])
     context_window = getattr(args, "context_window", None)
     if context_window is not None:
         cmd.extend(["--context-window", str(context_window)])
+    stream_stall_deadline_s = getattr(args, "stream_stall_deadline_s", None)
+    if stream_stall_deadline_s is not None:
+        # Issue #448: the app's Stall watchdog setting rides this flag; the
+        # module owns the value, the wrapper only has to know the flag.
+        cmd.extend(
+            ["--stream-stall-deadline-s", format(float(stream_stall_deadline_s), "g")]
+        )
+    if bool(getattr(args, "allow_swap", False)):
+        cmd.append("--allow-swap")
     mtp_adapter = getattr(args, "mtp_adapter", None)
     if mtp_adapter:
         cmd.extend(["--mtp-adapter", str(mtp_adapter)])
@@ -8552,6 +9914,18 @@ def cmd_serve_public(args: Any) -> int:
             ):
                 cmd.extend([flag, str(getattr(args, attr))])
     if draft_sampler is not None:
+        # Provenance for the dynamic draft-temperature curve: only a
+        # user-typed CLI draft flag pins the sampler. Injected measured
+        # defaults and the app's boilerplate launch flag (the app always
+        # emits --draft-temperature from its preset/target mirror,
+        # identified by --app-launch-id) are curve anchors, not pins.
+        user_typed_draft = any(
+            flag in (getattr(args, "_cli_flags", set()) or set())
+            for flag in _DRAFT_SAMPLER_FLAG_ATTRS
+        )
+        launched_by_app = bool(
+            str(getattr(args, "app_launch_id", "") or "").strip()
+        )
         cmd.extend(
             [
                 "--draft-temperature",
@@ -8560,6 +9934,12 @@ def cmd_serve_public(args: Any) -> int:
                 str(float(draft_sampler["top_p"])),
                 "--draft-top-k",
                 str(int(draft_sampler["top_k"])),
+                "--draft-sampler-source",
+                (
+                    "explicit"
+                    if user_typed_draft and not launched_by_app
+                    else "default"
+                ),
             ]
         )
     if getattr(args, "tool_prompt_mode", None):
@@ -8596,13 +9976,23 @@ def cmd_serve_public(args: Any) -> int:
         cmd.append("--server-console")
     if bool(getattr(args, "quickstart_hermes", False)):
         cmd.extend(["--launch-hermes", "--server-console"])
-        hermes_launch_command = str(getattr(args, "hermes_launch_command", "") or "").strip()
+        hermes_launch_command = str(
+            getattr(args, "hermes_launch_command", "") or ""
+        ).strip()
         if hermes_launch_command:
             cmd.extend(["--hermes-launch-command", hermes_launch_command])
     if bool(getattr(args, "stock_ar", False)):
         cmd.append("--stock-ar")
     elif getattr(args, "load_mtp", True) is False:
         cmd.append("--no-load-mtp")
+    # Tri-state: only an explicit choice is forwarded, so the child's own
+    # MTPLX_NGRAM_PREWARM (and the on-by-default) still decide otherwise.
+    ngram_prewarm = getattr(args, "ngram_prewarm", None)
+    if ngram_prewarm is not None:
+        cmd.extend(["--ngram-prewarm", str(ngram_prewarm)])
+    ngram_prewarm_order = getattr(args, "ngram_prewarm_order", None)
+    if ngram_prewarm_order:
+        cmd.extend(["--ngram-prewarm-order", str(ngram_prewarm_order)])
     api_key_source = str(getattr(args, "api_key_source", "none") or "none")
     api_key_file = getattr(args, "api_key_file", None)
     if api_key and api_key_source == "flag":
@@ -8869,7 +10259,9 @@ def _run_server_child_with_app_parent_watchdog(
                 if _pid_is_alive(app_parent_pid):
                     continue
                 triggered[0] = True
-                _safe_serve_watchdog_log("[mtplx] app parent exited; stopping app-owned daemon.")
+                _safe_serve_watchdog_log(
+                    "[mtplx] app parent exited; stopping app-owned daemon."
+                )
                 _terminate_server_child(proc, grace_s=shutdown_grace_s)
                 return
 
@@ -8988,22 +10380,79 @@ class _MaxIdleWatchdog:
                 self._is_max = False
 
 
+def _piped_prompt_text() -> str:
+    """Prompt text waiting on a piped stdin, or ``""`` when there is none.
+
+    ``echo "..." | mtplx run`` is the shape every other CLI honors. Returns
+    ``""`` — never raises — when stdin is a terminal, is absent, or is a stream
+    that refuses reads (a captured test stdin, a detached daemon), so callers
+    keep their own "requires a prompt" error for exactly those cases.
+    """
+
+    stream = getattr(sys, "stdin", None)
+    if stream is None:
+        return ""
+    try:
+        if stream.isatty():
+            return ""
+        return str(stream.read() or "").strip()
+    except (OSError, ValueError):
+        # An unreadable stdin means "no piped prompt", not a failure worth
+        # reporting on its own — the caller's own error is the useful one.
+        return ""
+
+
+def _in_process_runtime_env_overrides(
+    args: Any, runtime_model: str, *, generation_mode: str
+) -> dict[str, str]:
+    """The shared serve contract for all in-process CLI entrypoints (#463).
+
+    ``mtplx run`` and ``chat`` load the runtime in-process and applied only
+    the profile defaults, so Flash-Next never received the family lanes serve
+    stamps at boot (family capture commit, recurrent-state snapshot kept,
+    fixed-M4 verify). The turbo profile's MTPLX_SKIP_VERIFY_SNAPSHOT=1 then
+    left the pre-verify snapshot empty and the legacy capture walker raised
+    on the hyper-connection layers. Resolve exactly what serve resolves:
+    the pack contract, then the family overrides, with explicit exports kept.
+    """
+    from mtplx.server.openai import (
+        _server_runtime_env_overrides,
+        load_runtime_contract,
+    )
+
+    contract, _error = load_runtime_contract(runtime_model)
+    return _server_runtime_env_overrides(
+        SimpleNamespace(
+            model=runtime_model,
+            generation_mode=generation_mode,
+            verify_strategy=getattr(args, "verify_strategy", None),
+            scheduler_mode=getattr(args, "scheduler_mode", "serial"),
+        ),
+        contract.runtime_env_overrides if contract is not None else {},
+    )
+
+
 def _generate_one_shot_public(
     args: Any, *, command: str
 ) -> tuple[int, dict[str, Any], list[Any]]:
     fan_mode = _fan_mode_from_args(args)
     prompt = getattr(args, "prompt", None) or getattr(args, "prompt_arg", None)
     if not prompt:
+        # Nothing on the command line: accept the prompt from a pipe before
+        # giving up, so `cat bug.py | mtplx run` works like every other tool.
+        prompt = _piped_prompt_text()
+    if not prompt:
         raise SystemExit(f"mtplx {command} requires a prompt")
     depth_error = _validate_public_depth(args, printer=lambda _line: None)
     if depth_error is not None:
+        depth_ceiling = _public_depth_ceiling(args)
         return (
             depth_error,
             {
                 "error": "invalid depth",
                 "detail": (
                     "--depth must be between "
-                    f"1 and {MAX_PUBLIC_SPECULATIVE_DEPTH} for the current MTPLX runtime"
+                    f"1 and {depth_ceiling} for the current MTPLX runtime"
                 ),
             },
             [],
@@ -9051,16 +10500,44 @@ def _generate_one_shot_public(
             {"error": "model failed MTP primary gate", "model": inspection},
             [],
         )
+    mode_exit = _apply_runtime_compatibility_mode(
+        args,
+        inspection,
+        printer=lambda _line: None,
+    )
+    if mode_exit is not None:
+        return (
+            mode_exit,
+            {
+                "error": "model requires target-only AR",
+                "detail": "rerun with --no-mtp",
+                "model": inspection,
+            },
+            [],
+        )
+    _apply_backend_serve_defaults(args, inspection)
     if streaming_requested:
         args.no_mtp = True
         args.load_mtp = False
         args.generation_mode = GENERATION_MODE_AR
-    profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
-    apply_profile_env(profile.name)
+    # Per-model default, same rule as serve: turbo for the quantized
+    # flagships unless --profile was given. The raw sustained fallback here
+    # made `mtplx run` silently benchmark the slow profile (2026-08-16
+    # redp314 board investigation).
+    profile = get_profile(_resolved_default_profile_name(args))
     from mtplx.expert_cli import apply_expert_profile_child_env
 
     apply_expert_profile_child_env(args, os.environ)
     generation_mode = _generation_mode_from_args(args)
+    # The same runtime contract serve and tune resolve (#463): the pack's env
+    # overrides plus the family lanes, with serve's precedence over the
+    # profile defaults.
+    apply_profile_env(
+        profile.name,
+        runtime_env_overrides=_in_process_runtime_env_overrides(
+            args, runtime_model, generation_mode=generation_mode
+        ),
+    )
     draft_lm_head = (
         _model_draft_lm_head_spec(inspection, profile)
         if generation_mode == GENERATION_MODE_MTP
@@ -9070,6 +10547,9 @@ def _generate_one_shot_public(
         _model_draft_sampler_spec(inspection, profile)
         if generation_mode == GENERATION_MODE_MTP
         else None
+    )
+    draft_sampler = _greedy_coupled_draft_spec(
+        draft_sampler, args, float(args.temperature)
     )
 
     max_session: Any | None = None
@@ -9102,9 +10582,18 @@ def _generate_one_shot_public(
 
         install_generation_feature_policy(dict(os.environ))
 
+    # Serve-path memory discipline (#261, F7): pin the exact Metal allocator
+    # caps the serve path applies at startup before this in-process load.
+    from mtplx.server.openai import apply_memory_caps_preflight
+
+    memory_preflight = apply_memory_caps_preflight(
+        entry=f"cli.{command}",
+        model=str(runtime_model),
+    )
+
     rt = None
     try:
-        rt = load(runtime_model, **(load_kwargs or {"mtp": True}))
+        rt = load(runtime_model, **(load_kwargs or {"mtp": getattr(args, "load_mtp", True) is not False}))
         draft_report = None
         if (
             draft_lm_head is not None
@@ -9136,11 +10625,15 @@ def _generate_one_shot_public(
         )
         reasoning_mode = _reasoning_mode(args)
         enable_thinking = _enable_thinking_for_reasoning(reasoning_mode)
+        reasoning_effort = _one_shot_reasoning_effort(
+            args, enable_thinking, runtime_model
+        )
         prompt_ids = encode_prompt_case(
             rt.tokenizer,
             case,
             chat_template=True,
             enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
         )
         budget = _cli_generation_budget(
             tokenizer=rt.tokenizer,
@@ -9187,8 +10680,8 @@ def _generate_one_shot_public(
                         mtp_hidden_variant="post_norm",
                         mtp_cache_policy="persistent",
                         mtp_history_policy="committed",
-                        verify_strategy="capture_commit",
-                        verify_core="linear-gdn-from-conv-tape",
+                        verify_strategy=getattr(args, "verify_strategy", None) or "capture_commit",
+                        verify_core=getattr(args, "verify_core", None) or "linear-gdn-from-conv-tape",
                     )
         finally:
             if smart_fans is not None and smart_request_id is not None:
@@ -9200,16 +10693,38 @@ def _generate_one_shot_public(
         if max_session is not None:
             max_session.stop()
             thermal = max_session.thermal
+    validation_text = out.text
+    if args.expect_python:
+        from mtplx.reasoning_codecs import split_reasoning_text
+
+        # Validate the delivered program, not the model's thought channel.
+        # Only unwrap a complete outer fence; malformed or multiple blocks
+        # must still fail the normal Python validator.
+        codec = reasoning_policy_for_model(model_ref=runtime_model, inspection=inspection)
+        validation_text = split_reasoning_text(
+            out.text, parser=codec.parser, thinking_enabled=reasoning_mode != "off"
+        ).content.strip()
+        fenced = re.fullmatch(
+            r"```(?:python|py)?[ \t]*\r?\n(.*?)\r?\n```",
+            validation_text, flags=re.DOTALL | re.IGNORECASE,
+        )
+        if fenced:
+            validation_text = fenced.group(1)
     validations = [
         validate_no_degenerate_loop(out.text),
-        validate_balanced_delimiters(out.text),
+        validate_balanced_delimiters(validation_text),
     ]
     if args.expect_python:
-        validations.append(validate_python_syntax(out.text))
+        validations.append(
+            validate_python_syntax(validation_text)
+            if validation_text.strip()
+            else ValidationResult("python_syntax", False, "No Python answer after reasoning")
+        )
     payload = {
         "text": out.text,
         "model": _compact_model_summary(inspection),
         "profile": profile.to_dict(),
+        "memory_preflight": memory_preflight,
         "draft_lm_head": draft_report,
         "draft_sampler": draft_sampler,
         "stats": {
@@ -9367,6 +10882,41 @@ def _handle_quickstart_reasoning_command(args: Any, prompt: str) -> bool:
     return True
 
 
+def _handle_quickstart_effort_command(args: Any, prompt: str) -> bool:
+    """`/effort <level|status>` — the live twin of ``--reasoning-effort``.
+
+    ``_quickstart_generate`` re-reads ``args.reasoning_effort`` on every turn
+    (through ``_one_shot_reasoning_effort``), so setting it here really does
+    change the next answer, exactly like ``/reasoning`` does for the mode.
+    """
+
+    parts = prompt.strip().split()
+    if not parts or parts[0].lower() not in {"/effort", "--effort"}:
+        return False
+    levels = "|".join(REASONING_EFFORT_CHOICES)
+    if len(parts) == 1 or parts[1].lower() == "status":
+        _quickstart_line(f"Reasoning effort: {_quickstart_effort_label(args)}")
+        _quickstart_line(f"try: /effort {levels}")
+        return True
+    if len(parts) == 2 and parts[1].lower() in REASONING_EFFORT_CHOICES:
+        setattr(args, "reasoning_effort", parts[1].lower())
+        _quickstart_line(f"Reasoning effort: {_quickstart_effort_label(args)}")
+        return True
+    _quickstart_line(f"usage: /effort {levels}|status")
+    return True
+
+
+def _quickstart_effort_label(args: Any) -> str:
+    """How the live effort dial reads to the user.
+
+    ``auto`` is not a level — it defers to the loaded family's default — so
+    say that rather than printing a word the model never sees.
+    """
+
+    effort = str(getattr(args, "reasoning_effort", None) or "auto").strip().lower()
+    return "auto (model default)" if effort == "auto" else effort
+
+
 def _handle_quickstart_mtp_command(
     args: Any, prompt: str, *, runtime: Any | None = None
 ) -> bool:
@@ -9417,6 +10967,50 @@ def _quickstart_console() -> Any:
         return None
 
 
+CHAT_HISTORY_PATH = Path("~/.mtplx/history").expanduser()
+CHAT_HISTORY_LENGTH = 1000
+
+# True once ``readline`` is driving the chat REPL's ``input()`` calls. It
+# changes how the prompt has to be written (see ``_chat_input_prompt``), so the
+# fact has to outlive ``_enable_chat_line_editing``.
+_CHAT_LINE_EDITING = False
+
+
+def _enable_chat_line_editing() -> None:
+    """Give the terminal chat arrow-key editing and a history that persists.
+
+    Importing ``readline`` is the whole trick: bare ``input()`` is a raw line
+    reader, so today an up-arrow arrives as a literal ``^[[A`` and nothing
+    survives the session. The import installs editing; the rest is history.
+
+    Every step is best-effort by design. A Python built without readline, a
+    corrupt history file, or a read-only home must all degrade to a plain
+    prompt — a convenience feature never takes the chat down with it.
+    """
+
+    global _CHAT_LINE_EDITING
+    try:
+        import readline
+    except ImportError:
+        return
+
+    try:
+        readline.read_history_file(CHAT_HISTORY_PATH)
+    except (OSError, ValueError):
+        pass  # no history yet, or a file readline cannot parse: start empty
+    readline.set_history_length(CHAT_HISTORY_LENGTH)
+
+    def _save_history() -> None:
+        try:
+            CHAT_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            readline.write_history_file(CHAT_HISTORY_PATH)
+        except OSError:
+            pass  # read-only home or a full disk: losing history is not fatal
+
+    atexit.register(_save_history)
+    _CHAT_LINE_EDITING = True
+
+
 def _chat_input_prompt() -> str:
     """Prompt string for the chat REPL ``input()`` call.
 
@@ -9425,9 +11019,25 @@ def _chat_input_prompt() -> str:
 
     if not sys.stdout.isatty():
         return "\nyou> "
+
     # ANSI bold cyan for "you", reset, then bold "> ", then reset.
     # Avoid using rich here; ``input()`` does not interact well with rich Live.
-    return "\n\033[1;36myou\033[0m\033[1m>\033[0m "
+    # Under readline every non-printing byte must sit inside \001..\002 or it
+    # is counted as prompt width, and editing a wrapped line then redraws over
+    # the prompt itself.
+    def _esc(code: str) -> str:
+        return ("\001" + code + "\002") if _CHAT_LINE_EDITING else code
+
+    return (
+        "\n"
+        + _esc("\033[1;36m")
+        + "you"
+        + _esc("\033[0m")
+        + _esc("\033[1m")
+        + ">"
+        + _esc("\033[0m")
+        + " "
+    )
 
 
 def _print_assistant_fallback(label: str, text: str) -> None:
@@ -9496,11 +11106,25 @@ def _quickstart_heartbeat(
     return _QuickstartHeartbeat(label, interval_s=interval_s)
 
 
+def _select_default_model_or_exit():
+    """The verified default for this Mac, or a clean exit with the reason.
+
+    A Mac that cannot run any MTPLX model (an Intel processor, or less memory
+    than the smallest pack needs) gets the one-sentence message and exit
+    status 1: never a traceback, never a download it cannot use.
+    """
+
+    try:
+        return select_default_model()
+    except DefaultModelUnavailable as exc:
+        raise SystemExit(exc.message) from exc
+
+
 def _quickstart_current_model(args: Any) -> str:
     model = getattr(args, "model", None)
     explicit_model = bool(getattr(args, "_model_explicit", False))
     if not explicit_model and is_verified_default_model_ref(model):
-        selection = select_default_model()
+        selection = _select_default_model_or_exit()
         args._mtplx_default_model_selection = selection.to_dict()
         return selection.model
     return str(model or DEFAULT_MODEL_ID)
@@ -9511,7 +11135,7 @@ def _quickstart_download_ref(model: str) -> str:
 
     if repo_id_from_model_ref(model):
         return model
-    selection = select_default_model()
+    selection = _select_default_model_or_exit()
     default_local_refs = {
         DEFAULT_MODEL_ID,
         selection.model,
@@ -9545,7 +11169,7 @@ def _quickstart_choose_model(
         return model, download
 
     _quickstart_line(f"MTPLX {_start_command_name(args)}")
-    selection = select_default_model()
+    selection = _select_default_model_or_exit()
     _quickstart_line("Choose a model:")
     _quickstart_line(f"  1. Use verified default for this Mac ({selection.label})")
     quality_ref = optimized_quality_model_ref()
@@ -9998,11 +11622,17 @@ def _quickstart_generate(
     )
     reasoning_mode = _reasoning_mode(args)
     enable_thinking = _enable_thinking_for_reasoning(reasoning_mode)
+    reasoning_effort = _one_shot_reasoning_effort(
+        args,
+        enable_thinking,
+        getattr(rt, "model_path", getattr(args, "model", "")),
+    )
     prompt_ids = encode_prompt_case(
         rt.tokenizer,
         case,
         chat_template=True,
         enable_thinking=enable_thinking,
+        reasoning_effort=reasoning_effort,
     )
     budget = _cli_generation_budget(
         tokenizer=rt.tokenizer,
@@ -10029,6 +11659,9 @@ def _quickstart_generate(
         temperature=float(getattr(args, "temperature", 0.6)),
         top_p=float(getattr(args, "top_p", 0.95)),
         top_k=int(getattr(args, "top_k", 20)),
+    )
+    draft_sampler = _greedy_coupled_draft_spec(
+        draft_sampler, args, sampler.temperature
     )
     seed = int(getattr(args, "seed", 0)) + turn_index
     generation_mode = _generation_mode_from_args(args)
@@ -10064,8 +11697,8 @@ def _quickstart_generate(
                     mtp_hidden_variant="post_norm",
                     mtp_cache_policy="persistent",
                     mtp_history_policy="committed",
-                    verify_strategy="capture_commit",
-                    verify_core="linear-gdn-from-conv-tape",
+                    verify_strategy=getattr(args, "verify_strategy", None) or "capture_commit",
+                    verify_core=getattr(args, "verify_core", None) or "linear-gdn-from-conv-tape",
                     token_callback=record_tokens,
                 )
     finally:
@@ -10209,7 +11842,9 @@ def _batching_command_suffix(args: Any) -> str:
             parts.extend(["--ssd-session-cache-dir", shlex.quote(str(ssd_dir))])
         ssd_max_size = getattr(args, "ssd_session_cache_max_size", None)
         if ssd_max_size:
-            parts.extend(["--ssd-session-cache-max-size", shlex.quote(str(ssd_max_size))])
+            parts.extend(
+                ["--ssd-session-cache-max-size", shlex.quote(str(ssd_max_size))]
+            )
         ssd_min_prefix = getattr(args, "ssd_session_cache_min_prefix_tokens", None)
         if ssd_min_prefix is not None:
             parts.extend(
@@ -10218,9 +11853,7 @@ def _batching_command_suffix(args: Any) -> str:
                     shlex.quote(str(ssd_min_prefix)),
                 ]
             )
-    paged_kv_quantization = str(
-        getattr(args, "paged_kv_quantization", "off") or "off"
-    )
+    paged_kv_quantization = str(getattr(args, "paged_kv_quantization", "off") or "off")
     if paged_kv_quantization != "off":
         parts.extend(["--paged-kv-quantization", shlex.quote(paged_kv_quantization)])
     return (" " + " ".join(parts)) if parts else ""
@@ -10326,7 +11959,22 @@ def _hermes_config_yaml(
     base_url: str,
     api_key: str,
     workspace_path: str,
+    reasoning_effort: str | None = None,
+    vision: bool = False,
 ) -> str:
+    # SYNC PAIR: HermesIntegration.configYAML — both writers must emit the
+    # same template shape or the shared merge sweeps each other's lines.
+    # model.default_headers is the only client-side identity hook hermes
+    # exposes; without x-mtplx-client every hermes-conditional server branch
+    # (tool contract, managed-thinking carve-out, injected-cap strip) is dead.
+    # Reasoning effort must sit under agent: — hermes reads
+    # CLI_CONFIG["agent"]["reasoning_effort"]; a model.reasoning_effort line
+    # is silently ignored.
+    effort_line = (
+        f"  reasoning_effort: {_hermes_yaml_quote(reasoning_effort)}\n"
+        if reasoning_effort
+        else ""
+    )
     return (
         "model:\n"
         f"  default: {_hermes_yaml_quote(model_id)}\n"
@@ -10334,17 +11982,28 @@ def _hermes_config_yaml(
         f"  base_url: {_hermes_yaml_quote(base_url)}\n"
         f"  api_key: {_hermes_yaml_quote(api_key)}\n"
         "  api_mode: chat_completions\n"
+        f"  supports_vision: {str(vision).lower()}\n"
+        "  reasoning_echo: true\n"
+        "  default_headers:\n"
+        "    x-mtplx-client: hermes\n"
         "toolsets:\n"
         + "".join(f"  - {toolset}\n" for toolset in HERMES_CODING_TOOLSETS)
         + "agent:\n"
         f"  system_prompt: {_hermes_yaml_quote(HERMES_SYSTEM_PROMPT)}\n"
         "  max_turns: 200\n"
         "  tool_use_enforcement: auto\n"
-        "terminal:\n"
-        "  backend: local\n"
+        + effort_line
+        + "terminal:\n"
+        # terminal.backend is the user's sandbox choice (local, docker,
+        # ssh, ...), never MTPLX's: hermes defaults it to local when the
+        # key is absent, and the merge keeps a user-set value verbatim
+        # (issue #460: the old hardcoded "local" re-stamped a Docker
+        # sandbox back to the host shell on every launch).
         f"  cwd: {_hermes_yaml_quote(workspace_path)}\n"
         "  timeout: 180\n"
         "  persistent_shell: true\n"
+        "compression:\n"
+        "  tool_image_retention: until_compaction\n"
         "display:\n"
         "  streaming: true\n"
         "  show_reasoning: true\n"
@@ -10388,10 +12047,13 @@ def _hermes_dotenv(
 
 # Children owned under a template section even when the current template does
 # not emit them — conditional lines must be able to disappear instead of
-# being resurrected as user content. The app writes model.reasoning_effort
-# only while an effort is configured, and both writers share this file.
+# being resurrected as user content. Both writers emit agent.reasoning_effort
+# only while an effort is configured. "model" stays owned because
+# pre-2026-08-22 writers emitted reasoning_effort under model: (a key hermes
+# never read); owning it sweeps the stale line from user files.
 _HERMES_CONDITIONALLY_OWNED_CHILD_KEYS: dict[str, frozenset[str]] = {
     "model": frozenset({"reasoning_effort"}),
+    "agent": frozenset({"reasoning_effort"}),
 }
 
 
@@ -10515,6 +12177,32 @@ def _hermes_merged_config_yaml(existing: str | None, template: str) -> str:
     return "\n".join(out) + "\n"
 
 
+def _hermes_profile_declares_backend(existing: str | None) -> bool:
+    """True when the profile config sets ``terminal.backend`` itself."""
+    _, profile_blocks, _ = _hermes_parse_top_level_blocks(existing or "")
+    return any(
+        block["key"] == "terminal"
+        and any(key == "backend" for key, _ in _hermes_direct_child_blocks(block))
+        for block in profile_blocks
+    )
+
+
+def _hermes_inherit_terminal(existing: str | None, root: str | None) -> str | None:
+    """Seed only execution settings; an explicit profile backend wins (#460)."""
+    if not root or _hermes_profile_declares_backend(existing):
+        return existing
+    _, root_blocks, _ = _hermes_parse_top_level_blocks(root)
+    terminal = next((b for b in root_blocks if b["key"] == "terminal"), None)
+    if terminal is None:
+        return existing
+    # Root config need not use the generated profile's two-space indentation.
+    import textwrap
+
+    body = textwrap.indent(textwrap.dedent("\n".join(terminal["lines"][1:])), "  ")
+    seed = terminal["lines"][0] + "\n" + body + "\n"
+    return _hermes_merged_config_yaml(seed, existing) if existing and existing.strip() else seed
+
+
 def _write_if_changed(path: Path, text: str, *, mode: int = 0o600) -> bool:
     existing = None
     if path.exists():
@@ -10533,23 +12221,43 @@ def _write_if_changed(path: Path, text: str, *, mode: int = 0o600) -> bool:
     return changed
 
 
+def _hermes_client_reasoning_effort(args: Any) -> str | None:
+    """Explicit effort for the hermes profile; "auto" stays server-side.
+
+    hermes validates ``agent.reasoning_effort`` against its fixed ladder and
+    warns + falls back to medium on unknown values, so the "auto" sentinel
+    (server-resolved family default) must never be written client-side.
+    """
+
+    reasoning_effort = getattr(args, "reasoning_effort", None)
+    if not reasoning_effort or str(reasoning_effort) == "auto":
+        return None
+    return str(reasoning_effort)
+
+
 def _sync_hermes_profile(
     *,
     model_id: str,
     base_url: str,
     api_key: str,
     workspace_path: str,
+    reasoning_effort: str | None = None,
+    vision: bool = False,
 ) -> dict[str, Any]:
     profile_dir = _hermes_profile_dir()
     config_path = profile_dir / "config.yaml"
     env_path = profile_dir / ".env"
     profile_dir.mkdir(parents=True, exist_ok=True)
-    existing_config: str | None = None
-    if config_path.exists():
-        try:
-            existing_config = config_path.read_text(encoding="utf-8")
-        except OSError:
-            existing_config = None
+    existing_config = config_path.read_text(encoding="utf-8") if config_path.exists() else None
+    if not _hermes_profile_declares_backend(existing_config):
+        # The root config is read only when a terminal policy has to be
+        # inherited (#460): a profile with its own backend never depends on
+        # it, so an unreadable root cannot fail that profile's launch. When
+        # inheritance is needed, an unreadable root is a loud error rather
+        # than a silently dropped sandbox choice.
+        root_path = _hermes_home() / "config.yaml"
+        root_config = root_path.read_text(encoding="utf-8") if root_path.exists() else None
+        existing_config = _hermes_inherit_terminal(existing_config, root_config)
     config_changed = _write_if_changed(
         config_path,
         _hermes_merged_config_yaml(
@@ -10559,6 +12267,8 @@ def _sync_hermes_profile(
                 base_url=base_url,
                 api_key=api_key,
                 workspace_path=workspace_path,
+                reasoning_effort=reasoning_effort,
+                vision=vision,
             ),
         ),
     )
@@ -10718,7 +12428,9 @@ def _bridge_prompt_command_suffix(args: Any) -> str:
         parts.extend(["--tool-prompt-mode", shlex.quote(str(tool_prompt_mode))])
     chat_template_profile = getattr(args, "chat_template_profile", None)
     if chat_template_profile:
-        parts.extend(["--chat-template-profile", shlex.quote(str(chat_template_profile))])
+        parts.extend(
+            ["--chat-template-profile", shlex.quote(str(chat_template_profile))]
+        )
     chat_template_path = getattr(args, "chat_template_path", None)
     if chat_template_path:
         parts.extend(["--chat-template-path", shlex.quote(str(chat_template_path))])
@@ -10734,7 +12446,7 @@ def _quickstart_openwebui_payload(
     port = int(getattr(args, "port", 8000))
     model_id = _public_model_id_for_args(args, str(getattr(args, "model", "")))
     base = f"http://{_connect_host_for_bind(host)}:{port}"
-    context_window = _inspection_context_window(inspection)
+    context_window = _inspection_context_window(inspection, args=args)
     return {
         "integration": "openwebui",
         "server_url": base,
@@ -10750,6 +12462,7 @@ def _quickstart_openwebui_payload(
             f"--profile {_resolved_default_profile_name(args)} "
             f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
+            f"--context-window {context_window} "
             f"{_batching_command_suffix(args)} "
             f"{_server_sampler_command_suffix(args, include_draft=True)} "
             f"{_reasoning_command_suffix(args)} "
@@ -10769,23 +12482,26 @@ def _pi_sampler_temperature(args: Any) -> float:
 
 
 def _pi_sampler_top_p(args: Any) -> float:
-    cli_flags = getattr(args, "_cli_flags", set()) or set()
-    if "top-p" in cli_flags or "default-top-p" in cli_flags:
-        return float(getattr(args, "top_p", 0.95))
-    return 0.95
+    return float(getattr(args, "top_p", 0.95))
 
 
 def _pi_sampler_top_k(args: Any) -> int:
     return int(getattr(args, "top_k", 20))
 
 
-def _quickstart_pi_payload(args: Any, *, write_config: bool = False) -> dict[str, Any]:
+def _quickstart_pi_payload(
+    args: Any,
+    *,
+    write_config: bool = False,
+    inspection: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     from mtplx.pi import (
         PI_LOCAL_API_KEY,
         build_pi_provider_config,
         pi_launch_command,
         pi_model_ref,
         pi_models_json_path,
+        pi_request_policy_extension_path,
         write_pi_models_config,
     )
 
@@ -10797,13 +12513,22 @@ def _quickstart_pi_payload(args: Any, *, write_config: bool = False) -> dict[str
     pi_temperature = _pi_sampler_temperature(args)
     pi_top_p = _pi_sampler_top_p(args)
     pi_top_k = _pi_sampler_top_k(args)
-    pi_preserve_thinking = _pi_preserve_thinking_policy(args)
+    # Pi shares the general auto resolution: the family contract governs the
+    # reasoning-history policy (Qwen 3.8 preserves, checkpoint templates run
+    # scoped). The 1.0.0-era Pi-only hard "off" predated scoped mode (2.0.2)
+    # and kept actively stripping Pi's echoed reasoning_content history after
+    # every other lane moved to the trained contract (issue #310 receipts).
+    pi_preserve_thinking = _preserve_thinking_policy(args)
+    context_window = _inspection_context_window(inspection, args=args)
     api_key_command_suffix = _api_key_command_suffix(args) or "--api-key mtplx-local "
+    vision_enabled = _model_vision_enabled(str(getattr(args, "model", "")))
     provider = build_pi_provider_config(
         base_url=base_url,
         model_id=model_id,
         model_name=f"MTPLX {model_id}",
         api_key=api_key,
+        context_window=context_window,
+        vision=vision_enabled,
     )
     payload = {
         "integration": "pi",
@@ -10812,11 +12537,12 @@ def _quickstart_pi_payload(args: Any, *, write_config: bool = False) -> dict[str
         "api_base_url": base_url,
         "model_id": model_id,
         "model_ref": pi_model_ref(model_id),
+        "context_window": context_window,
         "api_key": _api_key_display_value(api_key),
         "config_path": str(pi_models_json_path()),
         "provider": _redact_secret_from_payload(provider, api_key),
-        "no_hidden_max_tokens": "maxTokens"
-        not in json.dumps(provider.get("models", [])),
+        "no_hidden_max_tokens": True,
+        "request_policy_extension_path": str(pi_request_policy_extension_path()),
         "launch_command": pi_launch_command(model_id),
         "server_console": True,
         "server_controls": [
@@ -10831,13 +12557,13 @@ def _quickstart_pi_payload(args: Any, *, write_config: bool = False) -> dict[str
             f"--profile {_resolved_default_profile_name(args)} "
             f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
+            f"--context-window {context_window} "
             f"{_batching_command_suffix(args)} "
             f"--default-temperature {pi_temperature} "
             f"--default-top-p {pi_top_p} --top-k {pi_top_k} "
-            f"--draft-temperature {pi_temperature} "
-            f"--draft-top-p {pi_top_p} --draft-top-k {pi_top_k} "
             f"--preserve-thinking {pi_preserve_thinking} "
             f"{_reasoning_command_suffix(args)} "
+            f"{_bridge_prompt_command_suffix(args)} "
             f"{api_key_command_suffix}--no-stats-footer"
         ),
         "pi_steps": [
@@ -10847,18 +12573,57 @@ def _quickstart_pi_payload(args: Any, *, write_config: bool = False) -> dict[str
         ],
     }
     if write_config:
-        payload["config_write"] = write_pi_models_config(
-            base_url=base_url,
-            model_id=model_id,
-            model_name=f"MTPLX {model_id}",
-            api_key=api_key,
-        )
+        try:
+            payload["config_write"] = write_pi_models_config(
+                base_url=base_url,
+                model_id=model_id,
+                model_name=f"MTPLX {model_id}",
+                api_key=api_key,
+                context_window=context_window,
+                vision=vision_enabled,
+            )
+        except (InvalidConfigFile, OSError) as exc:
+            raise SystemExit(_client_config_refusal("Pi", exc)) from exc
     return payload
 
 
-def _inspection_context_window(inspection: dict[str, Any] | None) -> int:
+def _client_config_refusal(client: str, exc: Exception) -> str:
+    """Plain message for a client config MTPLX could not read: the file was
+    left exactly as it was and nothing was written."""
+
+    detail = str(exc).rstrip(".")
+    return f"{client} config left unchanged: {detail}. Fix or move that file, then try again."
+
+
+def _model_vision_enabled(model_ref: str) -> bool:
+    """True when the resolved model dir carries a servable vision tower.
+
+    Uses the same spec probe as the server's /health vision block so the Pi
+    ``input`` capability can never disagree with what serve would report.
+    Unresolvable refs answer False (text-only is the safe advertisement).
+    """
+    if not model_ref:
+        return False
+    try:
+        from mtplx.hf_loader import resolve_model_path
+        from mtplx.vision import vision_spec_for_model_dir
+
+        return vision_spec_for_model_dir(str(resolve_model_path(model_ref))) is not None
+    except Exception:
+        return False
+
+
+def _inspection_context_window(
+    inspection: dict[str, Any] | None,
+    *,
+    args: Any | None = None,
+) -> int:
+    descriptor = descriptor_from_inspection(inspection)
+    requested = getattr(args, "context_window", None) if args is not None else None
+    if requested is not None and int(requested) > 0:
+        return min(int(requested), int(descriptor.context_window_policy.maximum))
     if not isinstance(inspection, dict):
-        return 262_144
+        return int(descriptor.context_window_policy.default)
     candidates: list[int] = []
     for key in (
         "context_window",
@@ -10876,8 +12641,24 @@ def _inspection_context_window(inspection: dict[str, Any] | None) -> int:
             value = compatibility.get(key)
             if isinstance(value, int):
                 candidates.append(value)
-    sane = [value for value in candidates if 0 < value <= 1_000_000]
-    return max(sane) if sane else 262_144
+    sane = [value for value in candidates if 0 < value <= 1_048_576]
+    return max(sane) if sane else int(descriptor.context_window_policy.default)
+
+
+def _inspection_tool_prompt_mode(
+    args: Any,
+    inspection: dict[str, Any] | None,
+) -> str:
+    descriptor = descriptor_from_inspection(inspection)
+    if descriptor.required_tool_prompt_mode is not None:
+        return descriptor.required_tool_prompt_mode
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    if "tool-prompt-mode" in cli_flags:
+        return str(
+            getattr(args, "tool_prompt_mode", descriptor.default_tool_prompt_mode)
+            or descriptor.default_tool_prompt_mode
+        )
+    return descriptor.default_tool_prompt_mode
 
 
 def _quickstart_opencode_payload(
@@ -10898,34 +12679,48 @@ def _quickstart_opencode_payload(
     port = int(getattr(args, "port", 8000))
     model_id = _public_model_id_for_args(args, str(getattr(args, "model", "")))
     base_url = f"http://{_connect_host_for_bind(host)}:{port}/v1"
-    context_window = _inspection_context_window(inspection)
+    context_window = _inspection_context_window(inspection, args=args)
     reasoning_mode = _reasoning_mode(args, default="auto")
-    enable_thinking = reasoning_mode != "off"
-    cli_flags = getattr(args, "_cli_flags", set()) or set()
-    default_tool_prompt_mode = str(
-        OPENCODE_FAIR_BATCHING_DEFAULTS.get("tool_prompt_mode")
-        or "hybrid"
+    # The declared OpenCode reasoning capability mirrors the model contract:
+    # a family with a verified codec (unless the user forced --reasoning off),
+    # never an unknown model. The resolved public id is the fallback ref so
+    # inspection-less lanes (`mtplx integrate opencode`) still resolve the
+    # family from its marker.
+    reasoning_policy = reasoning_policy_for_model(
+        model_ref=str(getattr(args, "model", "") or "") or model_id,
+        inspection=inspection,
     )
-    tool_prompt_mode = (
-        str(
-            getattr(args, "tool_prompt_mode", default_tool_prompt_mode)
-            or default_tool_prompt_mode
-        )
-        if "tool-prompt-mode" in cli_flags
-        else default_tool_prompt_mode
+    enable_thinking = reasoning_mode != "off" and reasoning_policy.supported
+    # The app/CLI dial is OpenCode's source of truth for reasoning effort:
+    # an explicit --reasoning-effort wins, otherwise the family's AGENT-lane
+    # default (codec.agent_effort — Qwen3.8: medium; Flash-Next: medium by
+    # the 2026-08-28 wall-clock A/B, chat default stays xhigh). The family's
+    # effort levels drive OpenCode's effort picker so it mirrors the dial.
+    reasoning_effort = getattr(args, "reasoning_effort", None)
+    if reasoning_effort in (None, "auto"):
+        reasoning_effort = reasoning_policy.agent_effort
+    if not enable_thinking:
+        reasoning_effort = None
+    reasoning_effort_levels = (
+        tuple(reasoning_policy.effort_levels) if reasoning_policy.supported else None
     )
+    tool_prompt_mode = _inspection_tool_prompt_mode(args, inspection)
     chat_template_profile = str(
         getattr(args, "chat_template_profile", OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT)
         or OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT
     )
     opencode_max_response_tokens = getattr(args, "max_response_tokens", None)
+    output_limit = min(
+        context_window,
+        int(opencode_max_response_tokens or context_window),
+    )
     max_response_suffix = (
         f"--max-response-tokens {int(opencode_max_response_tokens)} "
         if opencode_max_response_tokens is not None
         else ""
     )
     api_key_suffix = _api_key_command_suffix(args)
-    profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
+    profile = get_profile(_resolved_default_profile_name(args))
     generation_mode = _generation_mode_from_args(args)
     target_sampler = {
         "temperature": float(getattr(args, "temperature", 0.6)),
@@ -10937,7 +12732,9 @@ def _quickstart_opencode_payload(
         if inspection is not None
         else None
     )
-    draft_sampler_source = "model_contract_or_profile" if draft_sampler is not None else None
+    draft_sampler_source = (
+        "model_contract_or_profile" if draft_sampler is not None else None
+    )
     draft_sampler_override = _explicit_draft_sampler_override(args, draft_sampler)
     if draft_sampler_override is not None:
         draft_sampler = draft_sampler_override
@@ -10963,10 +12760,13 @@ def _quickstart_opencode_payload(
         model_name=f"MTPLX {model_id}",
         api_key=getattr(args, "api_key", None),
         context_window=context_window,
-        output_limit=context_window,
+        output_limit=output_limit,
         enable_thinking=enable_thinking,
         top_p=float(getattr(args, "top_p", 0.95)),
         top_k=int(getattr(args, "top_k", 20)),
+        reasoning_effort=reasoning_effort,
+        reasoning_effort_levels=reasoning_effort_levels,
+        vision=_model_vision_enabled(str(getattr(args, "model", ""))),
     )
     payload = {
         "integration": "opencode",
@@ -10986,9 +12786,10 @@ def _quickstart_opencode_payload(
         ),
         "detected": detect_opencode_desktop(),
         "context_window": context_window,
-        "output_limit": context_window,
+        "output_limit": output_limit,
         "transport_headers": {"x-mtplx-client": "opencode"},
-        "reasoning_field": None,
+        "reasoning_field": "reasoning_content",
+        "reasoning_effort": reasoning_effort,
         "no_hidden_max_tokens": True,
         "tool_prompt_mode": tool_prompt_mode,
         "chat_template_profile": chat_template_profile,
@@ -11010,6 +12811,7 @@ def _quickstart_opencode_payload(
             f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if generation_mode == GENERATION_MODE_AR else ''}"
             f"{api_key_suffix}"
+            f"--context-window {context_window} "
             f"{_batching_command_suffix(args)} "
             f"{_adaptive_command_suffix(args)} "
             f"{sampler_suffix}"
@@ -11029,17 +12831,23 @@ def _quickstart_opencode_payload(
         ],
     }
     if write_config:
-        payload["config_write"] = write_opencode_config(
-            base_url=base_url,
-            model_id=model_id,
-            model_name=f"MTPLX {model_id}",
-            api_key=getattr(args, "api_key", None),
-            context_window=context_window,
-            output_limit=context_window,
-            enable_thinking=enable_thinking,
-            top_p=float(getattr(args, "top_p", 0.95)),
-            top_k=int(getattr(args, "top_k", 20)),
-        )
+        try:
+            payload["config_write"] = write_opencode_config(
+                base_url=base_url,
+                model_id=model_id,
+                model_name=f"MTPLX {model_id}",
+                api_key=getattr(args, "api_key", None),
+                context_window=context_window,
+                output_limit=output_limit,
+                enable_thinking=enable_thinking,
+                top_p=float(getattr(args, "top_p", 0.95)),
+                top_k=int(getattr(args, "top_k", 20)),
+                reasoning_effort=reasoning_effort,
+                reasoning_effort_levels=reasoning_effort_levels,
+                vision=_model_vision_enabled(str(getattr(args, "model", ""))),
+            )
+        except (InvalidConfigFile, OSError) as exc:
+            raise SystemExit(_client_config_refusal("OpenCode", exc)) from exc
     return payload
 
 
@@ -11058,7 +12866,7 @@ def _quickstart_swival_payload(
     port = int(getattr(args, "port", 8000))
     model_id = _public_model_id_for_args(args, str(getattr(args, "model", "")))
     server_url = f"http://{_connect_host_for_bind(host)}:{port}"
-    context_window = _inspection_context_window(inspection)
+    context_window = _inspection_context_window(inspection, args=args)
     command_argv = build_swival_command(
         base_url=server_url,
         model_id=model_id,
@@ -11093,6 +12901,7 @@ def _quickstart_swival_payload(
             f"--profile {_resolved_default_profile_name(args)} "
             f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
+            f"--context-window {context_window} "
             f"{_batching_command_suffix(args)} "
             "--no-stats"
         ),
@@ -11117,13 +12926,22 @@ def _quickstart_hermes_payload(
     base_url = server_url.rstrip("/") + "/v1"
     api_key = str(getattr(args, "api_key", None) or HERMES_LOCAL_API_KEY)
     workspace_path = _hermes_workspace_path(args)
-    context_window = _inspection_context_window(inspection)
+    context_window = _inspection_context_window(inspection, args=args)
     launch_command = _hermes_launch_command(model_id=model_id)
     terminal_command = _hermes_terminal_command(
         model_id=model_id,
         workspace_path=workspace_path,
     )
     api_key_suffix = _api_key_command_suffix(args) or "--api-key mtplx-local "
+    draft_sampler_suffix = "".join(
+        f"{flag} {getattr(args, attr)} "
+        for attr, flag in (
+            ("draft_temperature", "--draft-temperature"),
+            ("draft_top_p", "--draft-top-p"),
+            ("draft_top_k", "--draft-top-k"),
+        )
+        if getattr(args, attr, None) is not None
+    )
     payload = {
         "integration": "hermes",
         "server_url": server_url,
@@ -11162,6 +12980,7 @@ def _quickstart_hermes_payload(
             f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
             f"{api_key_suffix}"
+            f"--context-window {context_window} "
             f"--scheduler-mode {str(getattr(args, 'scheduler_mode', 'serial'))} "
             f"--batching-preset {str(getattr(args, 'batching_preset', 'latency'))} "
             f"{_batching_command_suffix(args)} "
@@ -11169,9 +12988,7 @@ def _quickstart_hermes_payload(
             f"--temperature {float(getattr(args, 'temperature', 0.6))} "
             f"--top-p {float(getattr(args, 'top_p', 1.0))} "
             f"--top-k {int(getattr(args, 'top_k', 20))} "
-            f"--draft-temperature {float(getattr(args, 'draft_temperature', 0.6))} "
-            f"--draft-top-p {float(getattr(args, 'draft_top_p', 1.0))} "
-            f"--draft-top-k {int(getattr(args, 'draft_top_k', 20))} "
+            f"{draft_sampler_suffix}"
             f"--tool-prompt-mode {str(getattr(args, 'tool_prompt_mode', 'hybrid'))} "
             f"--chat-template-profile {str(getattr(args, 'chat_template_profile', OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT))} "
             f"--reasoning {_reasoning_mode(args, default='auto')} "
@@ -11190,6 +13007,8 @@ def _quickstart_hermes_payload(
             base_url=base_url,
             api_key=api_key,
             workspace_path=workspace_path,
+            reasoning_effort=_hermes_client_reasoning_effort(args),
+            vision=_model_vision_enabled(str(getattr(args, "model", ""))),
         )
     return payload
 
@@ -11215,7 +13034,7 @@ def _quickstart_print_pi_handoff(
     backup_path = config_write.get("backup_path")
     _quickstart_line(f"      Pi config: {config_path}")
     if backup_path:
-        _quickstart_line(f"      Backed up unreadable old Pi config: {backup_path}")
+        _quickstart_line(f"      Previous Pi config kept at: {backup_path}")
     _quickstart_line(f"      Pi model: {pi.get('model_ref')}")
     _quickstart_line(f"      Loading model: {runtime_model}")
     _quickstart_line("      Keep this terminal open for the MTPLX server.")
@@ -11257,9 +13076,7 @@ def _quickstart_print_opencode_handoff(
     _quickstart_line(f"      OpenCode config: {config_path}")
     _quickstart_line("      MTPLX client header: x-mtplx-client=opencode")
     if backup_path:
-        _quickstart_line(
-            f"      Backed up unreadable old OpenCode config: {backup_path}"
-        )
+        _quickstart_line(f"      Previous OpenCode config kept at: {backup_path}")
     _quickstart_line(f"      OpenCode model: {opencode.get('model_ref')}")
     _quickstart_line(f"      API base URL: {opencode.get('api_base_url')}")
     _quickstart_line(
@@ -11415,7 +13232,7 @@ def _quickstart_apply_local_model_defaults(
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=bool(getattr(args, "yes", False)),
     )
-    profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
+    profile = get_profile(_resolved_default_profile_name(args))
     _apply_model_contract_depth_default(args, inspection, profile)
     _apply_backend_serve_defaults(args, inspection)
     if gate_exit is not None:
@@ -11449,13 +13266,37 @@ def _with_batching_args(target: Any, source: Any) -> Any:
 
 def _with_server_policy_args(target: Any, source: Any) -> Any:
     setattr(target, "_cli_flags", getattr(source, "_cli_flags", set()) or set())
+    # The config-pin marker must survive the quickstart -> serve handoff or
+    # the child would re-promote over a config.toml profile pin.
+    setattr(
+        target, "_profile_from_config", getattr(source, "_profile_from_config", None)
+    )
+    # Same contract for the sampler pins: _apply_backend_serve_defaults reads
+    # config presence from args.mtplx_config, and these handoffs forward the
+    # raw sampler VALUES (a config temperature equal to the 0.6 parser
+    # default is indistinguishable from unset without the parsed file).
+    setattr(target, "mtplx_config", getattr(source, "mtplx_config", None))
     _with_batching_args(target, source)
     for attr, default in (
+        # Retrieval models: quickstart builds its serve namespace field by
+        # field, so without forwarding these the endpoints would silently stay
+        # unconfigured on every path except a bare `mtplx serve`.
+        ("embedding_model", []),
+        ("reranker_model", []),
+        ("retrieval_max_resident", 2),
+        ("retrieval_max_tokens", 0),
+        ("retrieval_idle_timeout", 0.0),
+        ("retrieval_trust_remote_code", False),
         ("api_key_file", None),
         ("api_key_source", "none"),
         ("default_presence_penalty", 0.0),
         ("default_frequency_penalty", 0.0),
         ("paged_kv_quantization", "off"),
+        # None = "the flag was not given", so the child falls back to
+        # MTPLX_NGRAM_PREWARM / the default. Forwarding it as True here would
+        # make every `mtplx start` overrule a shell-set value.
+        ("ngram_prewarm", None),
+        ("ngram_prewarm_order", None),
         ("tool_prompt_mode", "hybrid"),
         ("chat_template_profile", "local_qwen36"),
         ("chat_template_path", None),
@@ -11518,17 +13359,17 @@ def _apply_opencode_memory_env_defaults(env: dict[str, str]) -> None:
 def _apply_hermes_memory_env_defaults(env: dict[str, str]) -> None:
     total_ram = _detect_total_ram_bytes_for_opencode_defaults()
     high_memory = (
-        total_ram is not None
-        and total_ram >= _OPENCODE_HIGH_MEMORY_THRESHOLD_BYTES
+        total_ram is not None and total_ram >= _OPENCODE_HIGH_MEMORY_THRESHOLD_BYTES
     )
+    # Route only; thresholds defer to engine defaults (65536/4/5) — see the
+    # OpenCode lane note and issue #228.
     env.setdefault("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE", "async_per_head")
-    env.setdefault("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_CONTEXT", "32768")
-    env.setdefault("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_Q", "3")
-    env.setdefault("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MAX_Q", "5")
     env.setdefault("MTPLX_SESSION_BLOCK_PREFIX_RESTORE", "1")
     env.setdefault(
         "MTPLX_SESSION_BANK_MAX_ENTRIES",
-        _OPENCODE_HIGH_MEMORY_MAX_ENTRIES if high_memory else _OPENCODE_DEFAULT_MAX_ENTRIES,
+        _OPENCODE_HIGH_MEMORY_MAX_ENTRIES
+        if high_memory
+        else _OPENCODE_DEFAULT_MAX_ENTRIES,
     )
     # Model-aware auto budget (see _opencode_memory_env_defaults).
     env.setdefault("MTPLX_SESSION_BANK_MAX_BYTES", "auto")
@@ -11543,7 +13384,9 @@ def _apply_hermes_memory_env_defaults(env: dict[str, str]) -> None:
     env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_MULTI_FILE_LINE_MAX_CHARS", "120")
     env.setdefault("MTPLX_READ_ONLY_INSPECTION_FORCE_ANSWER_AFTER_TOOLS", "12")
     env.setdefault("MTPLX_TOOL_PROMPT_MODE", "hybrid")
-    env.setdefault("MTPLX_CHAT_TEMPLATE_PROFILE", OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT)
+    env.setdefault(
+        "MTPLX_CHAT_TEMPLATE_PROFILE", OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT
+    )
     env.setdefault("MTPLX_CLIENT", "hermes")
 
 
@@ -11600,7 +13443,7 @@ def _quickstart_run_pi(
         from mtplx.pi import PI_LOCAL_API_KEY
 
         args.api_key = PI_LOCAL_API_KEY
-    pi = _quickstart_pi_payload(args, write_config=True)
+    pi = _quickstart_pi_payload(args, write_config=True, inspection=inspection)
     _quickstart_print_pi_handoff(args, runtime_model=runtime_model, pi=pi)
     pi_temperature = _pi_sampler_temperature(args)
     pi_top_p = _pi_sampler_top_p(args)
@@ -11624,11 +13467,11 @@ def _quickstart_run_pi(
         temperature=pi_temperature,
         top_p=pi_top_p,
         top_k=pi_top_k,
-        draft_temperature=pi_temperature,
-        draft_top_p=pi_top_p,
-        draft_top_k=pi_top_k,
+        draft_temperature=getattr(args, "draft_temperature", None),
+        draft_top_p=getattr(args, "draft_top_p", None),
+        draft_top_k=getattr(args, "draft_top_k", None),
         reasoning=getattr(args, "reasoning", None),
-        preserve_thinking=_pi_preserve_thinking_policy(args),
+        preserve_thinking=_preserve_thinking_policy(args),
         reasoning_parser=getattr(args, "reasoning_parser", "qwen3"),
         reasoning_effort=getattr(args, "reasoning_effort", None),
         stats_footer=False,
@@ -11649,19 +13492,7 @@ def _quickstart_run_opencode(
     args: Any, *, runtime_model: str, inspection: dict[str, Any]
 ) -> int:
     model_id = _quickstart_served_model_id(args, runtime_model)
-    cli_flags = getattr(args, "_cli_flags", set()) or set()
-    default_tool_prompt_mode = str(
-        OPENCODE_FAIR_BATCHING_DEFAULTS.get("tool_prompt_mode")
-        or "hybrid"
-    )
-    opencode_tool_prompt_mode = (
-        str(
-            getattr(args, "tool_prompt_mode", default_tool_prompt_mode)
-            or default_tool_prompt_mode
-        )
-        if "tool-prompt-mode" in cli_flags
-        else default_tool_prompt_mode
-    )
+    opencode_tool_prompt_mode = _inspection_tool_prompt_mode(args, inspection)
     opencode_chat_template_profile = str(
         getattr(args, "chat_template_profile", OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT)
         or OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT
@@ -11808,9 +13639,9 @@ def _quickstart_run_hermes(
         temperature=float(getattr(args, "temperature", 0.6)),
         top_p=float(getattr(args, "top_p", 1.0)),
         top_k=int(getattr(args, "top_k", 20)),
-        draft_temperature=getattr(args, "draft_temperature", 0.6),
-        draft_top_p=getattr(args, "draft_top_p", 1.0),
-        draft_top_k=getattr(args, "draft_top_k", 20),
+        draft_temperature=getattr(args, "draft_temperature", None),
+        draft_top_p=getattr(args, "draft_top_p", None),
+        draft_top_k=getattr(args, "draft_top_k", None),
         reasoning=getattr(args, "reasoning", "auto"),
         preserve_thinking=getattr(args, "preserve_thinking", "auto"),
         reasoning_parser=getattr(args, "reasoning_parser", "qwen3"),
@@ -11920,25 +13751,52 @@ def _quickstart_autoselect_busy_port(
 ) -> None:
     """Auto-bump a default port held by a non-MTPLX app.
 
-    Only fires for spawning targets when the user did not pass ``--port``.
-    A healthy MTPLX daemon on the port is left alone: the downstream
-    "MTPLX is already running" reuse path attaches to it instead of
-    spawning a duplicate.
+    Only fires for spawning targets, and only for a port the user did not
+    choose. A healthy MTPLX daemon on the port is left alone: the
+    downstream "MTPLX is already running" reuse path attaches to it
+    instead of spawning a duplicate.
+
+    Issue #409 (reporter kmei3560) closed two holes here:
+
+    1. A STOPPING MTPLX server keeps its listener while it drains but
+       stops answering /health first, so the probe read our own process
+       as another app and bumped. Every stop/start cycle moved the port.
+       Fixed by settling the classification over a bounded window before
+       believing "foreign".
+    2. A port the user CONFIGURED must never be silently relocated. The
+       CLI already honored that for --port; the app's persisted port now
+       counts as configured too, so an app user who pinned 1234 keeps
+       1234 and gets actionable copy instead of a silent 1235.
     """
 
-    if target not in _QUICKSTART_SPAWNING_TARGETS or "port" in cli_flags:
+    if target not in _QUICKSTART_SPAWNING_TARGETS:
         return
     host = str(getattr(args, "host", "127.0.0.1"))
     port = int(getattr(args, "port", 8000))
     try:
         from mtplx.daemon_client import (
             PORT_FOREIGN,
+            app_configured_port,
             classify_port_occupant,
             find_free_port,
+            port_busy_advice,
+            wait_for_port_settle,
         )
 
+        configured = "port" in cli_flags or port == app_configured_port()
         occupant = classify_port_occupant(host, port)
+        if occupant.kind == PORT_FOREIGN:
+            # Give our own drain the few seconds it needs before treating
+            # the listener as a stranger's.
+            occupant = wait_for_port_settle(host, port)
         if occupant.kind != PORT_FOREIGN:
+            return
+        if configured:
+            for line in port_busy_advice(occupant, port=port):
+                _quickstart_line(line)
+            _quickstart_line(
+                f"Keeping the configured port {port} (never moved silently)."
+            )
             return
         free_port = find_free_port(host, port + 1)
     except Exception:
@@ -12073,9 +13931,7 @@ def _terminal_chat_attach_guard(args: Any, *, runtime_model: str) -> int | None:
     _quickstart_line(f"Stopping the server on port {daemon.port}...")
     result = stop_daemon(daemon.host, daemon.port)
     if not result.get("ok"):
-        _quickstart_line(
-            f"error: could not stop the server ({result.get('reason')})"
-        )
+        _quickstart_line(f"error: could not stop the server ({result.get('reason')})")
         return 1
     _quickstart_line("Server stopped.")
     return None
@@ -12121,10 +13977,22 @@ def _quickstart_run_terminal_chat_body(
     _apply_model_default_profile(
         args, _public_model_id_for_args(args, str(runtime_model))
     )
-    profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
-    apply_profile_env(profile.name)
+    profile = get_profile(_resolved_default_profile_name(args))
+    reasoning_codec = reasoning_policy_for_model(
+        model_ref=runtime_model, inspection=inspection
+    )
     generation_mode = _generation_mode_from_args(args)
-    draft_lm_head = _model_draft_lm_head_spec(inspection, profile)
+    apply_profile_env(
+        profile.name,
+        runtime_env_overrides=_in_process_runtime_env_overrides(
+            args, runtime_model, generation_mode=generation_mode
+        ),
+    )
+    draft_lm_head = (
+        _model_draft_lm_head_spec(inspection, profile)
+        if getattr(args, "load_mtp", True) is not False
+        else None
+    )
     draft_sampler = _model_draft_sampler_spec(inspection, profile)
 
     from mtplx.runtime import load
@@ -12162,6 +14030,16 @@ def _quickstart_run_terminal_chat_body(
             ],
         )
 
+    # Serve-path memory discipline (#261, F7): terminal chat loads the model
+    # in-process with no server; pin the exact Metal allocator caps the serve
+    # path applies at startup so long chats cannot balloon past serve limits.
+    from mtplx.server.openai import apply_memory_caps_preflight
+
+    apply_memory_caps_preflight(
+        entry="quickstart.terminal_chat",
+        model=str(runtime_model),
+    )
+
     started = time.perf_counter()
     quiet_progress = not sys.stdout.isatty()
     with ModelLoadProgress("Loading model", quiet=quiet_progress) as progress:
@@ -12169,7 +14047,7 @@ def _quickstart_run_terminal_chat_body(
         from mtplx.expert_cli import expert_streaming_load_kwargs
 
         load_kwargs = expert_streaming_load_kwargs(args, runtime_model)
-        rt = load(runtime_model, **(load_kwargs or {"mtp": True}))
+        rt = load(runtime_model, **(load_kwargs or {"mtp": getattr(args, "load_mtp", True) is not False}))
         progress.set_subtitle("ready")
     _quickstart_line(f"Model ready in {time.perf_counter() - started:.1f}s")
     _quickstart_line(f"Generation mode: {_generation_mode_label(generation_mode)}")
@@ -12255,8 +14133,22 @@ def _quickstart_run_terminal_chat_body(
             _quickstart_line()
             _print_stats_line(_quickstart_stats_line(payload))
         if record_history:
+            from mtplx.reasoning_codecs import split_reasoning_text
+
+            # Generation starts inside the template's thinking block. Store
+            # its two channels separately, as the server does: feeding raw
+            # `thought</think>answer` back as content nests it after an empty
+            # thinking block in Qwen 3.8 and corrupts the next turn's history.
+            parts = split_reasoning_text(
+                text,
+                parser=reasoning_codec.parser,
+                thinking_enabled=_reasoning_mode(args) != "off",
+            )
+            assistant = {"role": "assistant", "content": parts.content}
+            if parts.reasoning:
+                assistant["reasoning_content"] = parts.reasoning
             history.append({"role": "user", "content": prompt})
-            history.append({"role": "assistant", "content": text})
+            history.append(assistant)
         failures = [row for row in payload["validations"] if not row.get("passed")]
         if failures and quality_gate:
             _quickstart_line(
@@ -12270,13 +14162,21 @@ def _quickstart_run_terminal_chat_body(
         return run_turn(str(first_prompt), 0)
 
     if not sys.stdin.isatty():
+        # A piped prompt is a one-shot, not a broken REPL: answer it through
+        # the same turn path `--prompt` uses above. Only an *empty* pipe is
+        # the no-terminal case the refusal below was written for.
+        piped_prompt = _piped_prompt_text()
+        if piped_prompt:
+            return run_turn(piped_prompt, 0)
         _quickstart_line("error: no interactive terminal detected")
         prompt_hint = _start_invocation(args, ' --prompt "Say hi"')
         _quickstart_line(f"try: {prompt_hint}")
         return 2
 
+    _enable_chat_line_editing()
     _quickstart_line(
-        "Chat is ready. Type /mtp on|off|status, /stats, /speed, /reasoning on|off|auto, or /exit."
+        "Chat is ready. Type /mtp on|off|status, /stats, /speed, "
+        "/reasoning on|off|auto, /effort <level>, or /exit."
     )
     turn_index = 0
     worst_code = 0
@@ -12293,6 +14193,8 @@ def _quickstart_run_terminal_chat_body(
             _quickstart_line("bye")
             return worst_code
         if _handle_quickstart_reasoning_command(args, prompt):
+            continue
+        if _handle_quickstart_effort_command(args, prompt):
             continue
         if _handle_quickstart_mtp_command(args, prompt, runtime=rt):
             continue
@@ -12334,25 +14236,35 @@ def _quickstart_apply_tuned_depth(
         return
     if bool(getattr(args, "_explicit_depth", False)):
         return
-    settings = {
-        "profile": "performance-cold",
-        "suite": TUNE_DEFAULT_SUITE,
-        "depths": TUNE_DEFAULT_DEPTHS,
-        "max_tokens": TUNE_DEFAULT_MAX_TOKENS,
-        "limit": TUNE_DEFAULT_LIMIT,
-        "seed": TUNE_DEFAULT_SEED,
-        "thinking": "disabled",
-    }
-    hardware = _apple_hardware_context()
-    software = _software_context()
-    backend = _mlx_backend_context()
-    state_key, _key_material = _tune_state_key(
-        runtime_model,
-        settings=settings,
-        hardware=hardware,
-        software=software,
-        backend=backend,
+    tune_args = SimpleNamespace(
+        command="tune",
+        model=runtime_model,
+        # The wizard's pick IS an explicit model selection. Without this
+        # marker _tune_requested_model treats the namespace model as
+        # unrequested and re-resolves the hardware default, so picking the
+        # 4B tuned (and keyed) the 27B (2026-08-17 wizard repro).
+        _cli_flags={"model"},
+        cache_dir=getattr(args, "cache_dir", None),
+        profile=getattr(args, "profile", None),
+        depths=TUNE_DEFAULT_DEPTHS,
+        max_tokens=TUNE_DEFAULT_MAX_TOKENS,
+        limit=TUNE_DEFAULT_LIMIT,
+        seed=TUNE_DEFAULT_SEED,
+        run_id=None,
+        output_dir=None,
+        output=None,
+        json=False,
+        verbose=False,
+        dry_run=False,
+        no_save=False,
+        retune=False,
+        unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
+        yes=True,
     )
+    context = _tune_state_context_for_args(tune_args)
+    if context is None:
+        return
+    _hardware, _software, _backend, state_key, _key_material = context
     record = _load_tune_record(state_key)
     if record is not None:
         payload = record.get("payload") or {}
@@ -12378,25 +14290,6 @@ def _quickstart_apply_tuned_depth(
     if not should_tune:
         _quickstart_line("tuning skipped; using default depth")
         return
-    tune_args = SimpleNamespace(
-        command="tune",
-        model=runtime_model,
-        cache_dir=getattr(args, "cache_dir", None),
-        depths=TUNE_DEFAULT_DEPTHS,
-        max_tokens=TUNE_DEFAULT_MAX_TOKENS,
-        limit=TUNE_DEFAULT_LIMIT,
-        seed=TUNE_DEFAULT_SEED,
-        run_id=None,
-        output_dir=None,
-        output=None,
-        json=False,
-        verbose=False,
-        dry_run=False,
-        no_save=False,
-        retune=False,
-        unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
-        yes=True,
-    )
     code = _cmd_tune(
         tune_args,
         action="tune",
@@ -12481,7 +14374,7 @@ def cmd_quickstart_public(args: Any) -> int:
     )
 
     if not skip_onboarding:
-        from mtplx.ui.onboarding import run_quickstart_flow
+        from mtplx.ui.onboarding import PROFILE_AUTO, run_quickstart_flow
 
         configured_model = getattr(args, "model", None)
         # `--open-dashboard` / `--no-open-dashboard` on the CLI is the
@@ -12504,6 +14397,20 @@ def cmd_quickstart_public(args: Any) -> int:
         chosen_model = choice.get("model")
         if chosen_model:
             args.model = chosen_model
+            # A wizard pick is an explicit user decision, exactly like the
+            # profile stamp below. Both explicitness markers must be set:
+            # without _model_explicit, _quickstart_current_model re-routes a
+            # default-NAMED pick (e.g. an LM Studio folder whose basename
+            # matches the verified default) back through
+            # select_default_model(), replacing the picked path with the
+            # canonical repo id — "Model is missing. Download?" for a model
+            # that is on disk (issue #279). Without "model" in _cli_flags,
+            # _tune_requested_model re-resolves the hardware default and
+            # tunes a different model than the one being launched
+            # (2026-08-17 wizard repro: picked 4B, tuned 27B).
+            args._model_explicit = True
+            args._cli_flags = set(getattr(args, "_cli_flags", set()) or set())
+            args._cli_flags.add("model")
             # Auto-pull policy: the user has explicitly picked this model in
             # the onboarding wizard; if it isn't on disk we fetch it without
             # re-prompting. The legacy "Model is missing. Download? [Y/n]"
@@ -12517,10 +14424,12 @@ def cmd_quickstart_public(args: Any) -> int:
                 # Best-effort: never let an import problem break the wizard.
                 pass
         chosen_profile = choice.get("profile")
-        if chosen_profile:
+        if chosen_profile and chosen_profile != PROFILE_AUTO:
             args.profile = chosen_profile
-            # A wizard pick is a user decision: record it so per-model
-            # default-profile resolution never overrides it.
+            # An explicit wizard pick is a user decision: record it so
+            # per-model default-profile resolution never overrides it. Auto
+            # is the opposite decision — stamp nothing, so the engine keeps
+            # resolving the launch profile per model.
             args._cli_flags = set(getattr(args, "_cli_flags", set()) or set())
             args._cli_flags.add("profile")
         if choice.get("max"):
@@ -12552,7 +14461,11 @@ def cmd_quickstart_public(args: Any) -> int:
         # has no fan controller, offer to auto-install before MTPLX boots
         # rather than silently dumping the JSON warning later.
         fan_mode = _fan_mode_from_args(args)
-        if (has_explicit_max or has_explicit_fan_mode) and fan_mode == FAN_MODE_MAX and is_tty:
+        if (
+            (has_explicit_max or has_explicit_fan_mode)
+            and fan_mode == FAN_MODE_MAX
+            and is_tty
+        ):
             from mtplx.thermal import detect_thermal_control
 
             detection = detect_thermal_control()
@@ -12622,7 +14535,11 @@ def cmd_quickstart_public(args: Any) -> int:
             if target == "openwebui"
             else None
         )
-        pi = _quickstart_pi_payload(args) if target == "pi" else None
+        pi = (
+            _quickstart_pi_payload(args, inspection=dry_run_inspection)
+            if target == "pi"
+            else None
+        )
         opencode = (
             _quickstart_opencode_payload(args, inspection=dry_run_inspection)
             if target == "opencode"
@@ -12643,7 +14560,11 @@ def cmd_quickstart_public(args: Any) -> int:
             "target": target,
             "model": model,
             "cache_dir": cache_dir,
-            "profile": getattr(args, "profile", DEFAULT_PROFILE_NAME),
+            # Display the profile the launch will actually resolve (per-model
+            # turbo rewrite included) — the raw parser default here made the
+            # dry-run advertise "sustained" for the turbo-default flagships
+            # (the 2026-07-16 stale-display bug class, on one more surface).
+            "profile": _resolved_default_profile_name(args, model),
             "generation_mode": _generation_mode_from_args(args),
             "max": bool(getattr(args, "max", False)),
             "download_if_missing": download,
@@ -12782,7 +14703,7 @@ def cmd_quickstart_public(args: Any) -> int:
                     "selected model" if download_model == model else "verified default"
                 )
             except ValueError:
-                download_model = select_default_model().hf_model
+                download_model = _select_default_model_or_exit().hf_model
                 label = "verified default"
             answer = (
                 input(
@@ -12845,7 +14766,14 @@ def cmd_quickstart_public(args: Any) -> int:
                     json_output=bool(getattr(args, "json", False)),
                 )
                 return gate_exit
-            profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
+            mode_exit = _apply_runtime_compatibility_mode(
+                args,
+                inspection,
+                printer=_quickstart_line,
+            )
+            if mode_exit is not None:
+                return mode_exit
+            profile = get_profile(_resolved_default_profile_name(args))
             _apply_model_contract_depth_default(args, inspection, profile)
             _apply_backend_serve_defaults(args, inspection)
             _quickstart_apply_tuned_depth(
@@ -12918,7 +14846,14 @@ def cmd_quickstart_public(args: Any) -> int:
             json_output=bool(getattr(args, "json", False)),
         )
         return gate_exit
-    profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
+    mode_exit = _apply_runtime_compatibility_mode(
+        args,
+        inspection,
+        printer=_quickstart_line,
+    )
+    if mode_exit is not None:
+        return mode_exit
+    profile = get_profile(_resolved_default_profile_name(args))
     _apply_model_contract_depth_default(args, inspection, profile)
     _apply_backend_serve_defaults(args, inspection)
     _quickstart_apply_tuned_depth(
@@ -13092,63 +15027,72 @@ def cmd_integrate_public(args: Any) -> int:
             },
         }
     elif action == "opencode":
+        from mtplx.opencode import (
+            build_opencode_provider_config,
+            opencode_config_path,
+            write_opencode_config,
+        )
+
         api_key_suffix = _api_key_command_suffix(args)
+        reasoning_policy = reasoning_policy_for_model(model_ref=model_id)
         payload = {
             "integration": "opencode",
             "server_url": server_url,
             "base_url": api_base_url,
             "api_base_url": api_base_url,
             "model_id": model_id,
-            "config_path": "~/.config/opencode/opencode.json",
+            "config_path": str(opencode_config_path()),
             "server_command": (
                 f"mtplx quickstart --profile {_resolved_default_profile_name(args)} --host {args.host} --port {args.port} "
                 f"{api_key_suffix}--reasoning auto --no-stats-footer"
             ),
-            "config": {
-                "provider": {
-                    "mtplx": {
-                        "npm": "@ai-sdk/openai-compatible",
-                        "name": "MTPLX (local)",
-                        "options": {
-                            "baseURL": api_base_url,
-                            "apiKey": (
-                                f"${args.api_key_env}"
-                                if getattr(args, "api_key", None)
-                                else "mtplx-local"
-                            ),
-                            "timeout": False,
-                            "chunkTimeout": 900000,
-                            "headers": {
-                                "x-mtplx-client": "opencode",
-                            },
-                        },
-                        "models": {
-                            model_id: {
-                                "name": "MTPLX local",
-                                "reasoning": False,
-                                "tool_call": True,
-                                "temperature": False,
-                                "limit": {
-                                    "context": 262144,
-                                    "output": 262144,
-                                },
-                                "modalities": {
-                                    "input": ["text"],
-                                    "output": ["text"],
-                                },
-                            }
-                        },
-                    }
-                },
-                "model": f"mtplx/{model_id}",
-                "small_model": f"mtplx/{model_id}",
-            },
+            "config": build_opencode_provider_config(
+                base_url=api_base_url,
+                model_id=model_id,
+                model_name="MTPLX local",
+                api_key=(
+                    f"${args.api_key_env}"
+                    if getattr(args, "api_key", None)
+                    else "mtplx-local"
+                ),
+                enable_thinking=reasoning_policy.supported,
+                vision=_model_vision_enabled(str(getattr(args, "model", "") or model_id)),
+                reasoning_effort=reasoning_policy.default_effort,
+                reasoning_effort_levels=(
+                    tuple(reasoning_policy.effort_levels)
+                    if reasoning_policy.supported
+                    else None
+                ),
+            ),
             "notes": [
-                "OpenCode identifies itself with x-mtplx-client, but MTPLX owns reasoning and sampler policy.",
-                "Do not add OpenAI reasoningSummary/reasoningEffort fields for MTPLX; those are client-side overrides.",
-                "Use MTPLX server settings or --reasoning on when you intentionally want reasoning.",
+                "OpenCode identifies itself with x-mtplx-client; the MTPLX app/CLI dial is the source of truth for reasoning effort and the family sampler stays server-side.",
+                "options.reasoningEffort mirrors the MTPLX dial; an effort picked inside OpenCode overrides it for that request.",
+                "Use MTPLX server settings or --reasoning on|off to change reasoning policy.",
             ],
         }
+        # `connect opencode` used to only PRINT the config while claiming
+        # "Config path: ..." — the file was never touched, so a new model id
+        # (e.g. a day-0 family) stayed missing from the provider's models map
+        # and OpenCode failed with ProviderModelNotFoundError surfaced as
+        # "Unexpected server error" (found live wiring Flash-Next, 2026-08-27).
+        # Write through the same merge-preserving writer the app flow uses.
+        try:
+            payload["config_write"] = write_opencode_config(
+                base_url=api_base_url,
+                model_id=model_id,
+                model_name=f"MTPLX {model_id}",
+                api_key=getattr(args, "api_key", None),
+                enable_thinking=reasoning_policy.supported,
+                vision=_model_vision_enabled(str(getattr(args, "model", "") or model_id)),
+                reasoning_effort=reasoning_policy.default_effort,
+                reasoning_effort_levels=(
+                    tuple(reasoning_policy.effort_levels)
+                    if reasoning_policy.supported
+                    else None
+                ),
+            )
+        except (InvalidConfigFile, OSError) as exc:
+            raise SystemExit(_client_config_refusal("OpenCode", exc)) from exc
     elif action == "swival":
         from mtplx.swival import (
             build_swival_command,
@@ -13210,8 +15154,13 @@ def cmd_integrate_public(args: Any) -> int:
                 print("Docker:")
                 print(f"  {_shell_join(payload['docker_command_argv'])}")
         elif action == "opencode":
+            config_write = payload.get("config_write")
+            if not isinstance(config_write, dict):
+                config_write = {}
             print("OpenCode:")
-            print("  Config path: ~/.config/opencode/opencode.json")
+            print(f"  Config path: {config_write.get('config_path') or payload['config_path']}")
+            if config_write.get("backup_path"):
+                print(f"  Previous config kept at: {config_write['backup_path']}")
             print("  Provider: mtplx")
             print("  Reasoning: controlled by MTPLX server settings")
         elif action == "swival":
@@ -13638,7 +15587,9 @@ def _architecture_qa_fixtures() -> list[dict[str, Any]]:
                 "tier": "no-MTP",
                 "arch_id": None,
                 "can_run": False,
-                "runtime_compatibility": "unsupported",
+                # Config-only fixture: the weights check precedes the
+                # unsupported label for constructable trunks.
+                "runtime_compatibility": "missing-model-weights",
             },
         },
         {
@@ -13858,9 +15809,23 @@ def cmd_model_public(args: Any) -> int:
         return _cmd_model_qa_architectures(args)
     if args.model_action != "publish-check":
         raise SystemExit(f"unknown model action: {args.model_action}")
+    from mtplx.metadata_scrub import scrub_json_documents
+
     staging = Path(args.staging_dir)
     manifest_path = staging / "MTPLX_PUBLISH_MANIFEST.json"
     runtime_contract_path = staging / "mtplx_runtime.json"
+    # A staging tree exists to be uploaded, so nothing in it may name this
+    # machine. Forge stamps the paths it read into the runtime contract;
+    # --scrub rewrites the leaking documents in place, otherwise they block.
+    leaking = scrub_json_documents(staging) if staging.exists() else []
+    scrubbed_in_place: list[str] = []
+    if leaking and bool(getattr(args, "scrub", False)):
+        for document in leaking:
+            tmp = staging / f".{document.name}.{os.getpid()}.tmp"
+            tmp.write_bytes(document.payload)
+            os.replace(tmp, staging / document.name)
+            scrubbed_in_place.append(document.name)
+        leaking = []
     symlinks = (
         [str(path) for path in staging.iterdir() if path.is_symlink()]
         if staging.exists()
@@ -13882,6 +15847,7 @@ def cmd_model_public(args: Any) -> int:
         "runtime_contract_exists": runtime_contract_path.exists(),
         "no_symlinks": not symlinks,
         "repo_id_explicit": bool(args.repo_id or (manifest or {}).get("repo_id")),
+        "no_local_paths": not leaking,
         "inspect_verified": bool(
             inspection
             and (inspection.get("compatibility") or {}).get("tier") == "verified"
@@ -13900,6 +15866,8 @@ def cmd_model_public(args: Any) -> int:
         "size_bytes": (manifest or {}).get("size_bytes"),
         "weight_size_bytes": (manifest or {}).get("weight_size_bytes"),
         "uploaded": (manifest or {}).get("upload_policy", {}).get("uploaded"),
+        "local_paths": {document.name: list(document.leaks) for document in leaking},
+        "scrubbed": scrubbed_in_place,
         "gates": gates,
         "passed": all(gates.values()),
     }
@@ -13930,29 +15898,55 @@ def cmd_config_public(args: Any) -> int:
             "config set key must be one of: " + ", ".join(CONFIG_VALUE_KEYS)
         )
     value = str(args.value).strip()
+    # Every conversion below rejects a bad value with one plain line. A value
+    # that gets past here is written verbatim and re-read on every later
+    # command, so a traceback here would also mean a config file the rest of
+    # the CLI has to degrade around.
     if key == "profile":
-        value = resolve_profile_name(value)
+        try:
+            value = resolve_profile_name(value)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
     if key == "thermal_control" and value not in {"auto", "none"}:
         raise SystemExit("thermal_control must be auto or none")
     if key == "paged_kv_quantization":
-        value = normalize_paged_kv_quantization(value)
-    if key == "scheduler_mode" and value not in {
-        "serial",
-        "cooperative",
-        "ar_batch",
-        "mtp_cohort_experimental",
+        try:
+            value = normalize_paged_kv_quantization(value)
+        except (TypeError, ValueError) as exc:
+            raise SystemExit(str(exc)) from None
+    if key == "scheduler_mode":
+        # Single source of truth: the SchedulerMode enum (also feeds the CLI
+        # choices), so `mtplx config set` can never trail a new server mode.
+        from mtplx.batching.state import SchedulerMode
+
+        valid_modes = tuple(mode.value for mode in SchedulerMode)
+        if value not in valid_modes:
+            raise SystemExit(
+                "scheduler_mode must be one of: " + ", ".join(valid_modes)
+            )
+    if key == "batching_preset" and value not in {
+        "solo",
+        "latency",
+        "agent",
+        "throughput",
     }:
-        raise SystemExit("scheduler_mode must be serial, cooperative, ar_batch, or mtp_cohort_experimental")
-    if key == "batching_preset" and value not in {"solo", "latency", "agent", "throughput"}:
         raise SystemExit("batching_preset must be solo, latency, agent, or throughput")
     if key == "ssd_session_cache" and value not in {"off", "on", "write-only"}:
         raise SystemExit("ssd_session_cache must be off, on, or write-only")
-    if key == "ram_session_cache_policy" and value not in {"target-default", "minimal", "bounded"}:
-        raise SystemExit("ram_session_cache_policy must be target-default, minimal, or bounded")
+    if key == "ram_session_cache_policy" and value not in {
+        "target-default",
+        "minimal",
+        "bounded",
+    }:
+        raise SystemExit(
+            "ram_session_cache_policy must be target-default, minimal, or bounded"
+        )
     if key == "reasoning" and value not in {"auto", "on", "off"}:
         raise SystemExit("reasoning must be auto, on, or off")
-    if key == "reasoning_effort" and value not in {"auto", "low", "medium", "high"}:
-        raise SystemExit("reasoning_effort must be auto, low, medium, or high")
+    if key == "reasoning_effort" and value not in REASONING_EFFORT_CHOICES:
+        raise SystemExit(
+            "reasoning_effort must be " + ", ".join(REASONING_EFFORT_CHOICES)
+        )
     if key in {
         "max_active_requests",
         "decode_batch_max",
@@ -13962,11 +15956,17 @@ def cmd_config_public(args: Any) -> int:
         "context_window",
         "top_k",
     }:
-        value = int(value)
+        try:
+            value = int(value)
+        except ValueError:
+            raise SystemExit(f"{key} must be a whole number, got {value!r}") from None
         if value < 1:
             raise SystemExit(f"{key} must be >= 1")
     if key in {"batch_wait_ms", "temperature", "top_p"}:
-        value = float(value)
+        try:
+            value = float(value)
+        except ValueError:
+            raise SystemExit(f"{key} must be a number, got {value!r}") from None
     if key in {"experimental_mtp_cohorts", "ram_session_block_prefix_restore"}:
         value = _parse_config_bool(value, key=key)
     values[key] = value

@@ -6,12 +6,9 @@ MTPLX is Apple-Silicon-first:
 
 - macOS 14.0 or newer
 - native arm64 Python 3.11 or newer
-- the `mlx` and `mlx-lm` versions declared by the installed MTPLX package
+- `python3 -m pip install mlx` in that same environment
 - enough unified memory and disk for the selected model/profile, checked by `mtplx doctor`
 
-The first-run default model is `Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed`. The quantized 27B
-flagships select the Turbo product profile; other models normally select Sustained
-(`--profile sustained`). `stable` remains a conservative compatibility value, while
-`performance-cold` is the short-context Burst lane. See [Profiles](profiles.md).
+The first-run default model is `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed` (Qwen 3.8 27B Optimized Speed, the recommended coding pick; Bare Speed and Optimized Quality are its siblings). M1 and M2 Macs get the same three models as their FP16 builds (`…-FP16`, the identical weights with the 16-bit tensors in fp16, which those chips run natively); the CLI and the app pick that automatically. The quantized 27B and 9B flagships (the Qwen 3.8 trio, Optimized-Speed, Optimized-Quality, the legacy Optimized hybrid, and their FP16 siblings, plus the 9B Speed pair) launch on the Turbo profile by default — the same NAX verify-kernel + compiled-verify fast path the macOS app uses; every other model defaults to Sustained (`--profile sustained`). `stable` remains available as the conservative compatibility alias, and Burst is available explicitly as `--profile performance-cold --max` for short-context benchmark runs.
 
 Do not install model weights into the source checkout. Use the MTPLX model cache or a Hugging Face cache.

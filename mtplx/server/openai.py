@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import base64
 import asyncio
+import traceback
 import builtins
 import errno
 import gc
@@ -23,25 +24,28 @@ import html
 import json
 import threading
 import logging
+import math
 import os
 import re
 import secrets
 import socket
 import subprocess
+import struct
 import sys
 import time
 import urllib.parse
 import uuid
+import weakref
 import webbrowser
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 from concurrent.futures import Future
 from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Empty
 from threading import Condition, Event, Lock, Thread, Timer
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -51,7 +55,7 @@ if str(ROOT) not in sys.path:
 
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.middleware.cors import CORSMiddleware
+from starlette.datastructures import MutableHeaders
 from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
@@ -62,22 +66,41 @@ from fastapi.responses import (
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from mtplx import progress_heartbeat
+from mtplx.a3b_mtp_batch import (
+    A3B_MTP_BATCH_MAX_CONTEXT_TOKENS,
+    A3BMTPBatchCapacityError,
+    A3BMTPBatchInstallError,
+    _require_mlx_lm_arrays_cache_fix,
+    install_a3b_mtp_batch_lane,
+)
 from mtplx.adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
 from mtplx.attention_context import attention_phase
 from mtplx.cache_state import snapshot_cache
 from mtplx.mtp_patch import MTPContract
+from mtplx.mtp_batch_numerics import (
+    MTP_BATCH_NUMERICS_CHOICES,
+    MTPBatchNumerics,
+    normalize_mtp_batch_numerics,
+)
 from mtplx.backends.descriptors import (
     BackendDescriptor,
+    ReasoningCodec,
     assistant_target_distribution_choices,
     descriptor_for_backend_id,
+    descriptor_for_model,
     descriptor_from_runtime,
     model_controls_for_descriptor,
+    model_family_from_inspection,
+    REASONING_FAMILY_OVERRIDE_LANES,
+    reasoning_family_override_applies,
+    reasoning_policy_for_model,
     set_draft_control_arg,
     sync_backend_arg_aliases,
     target_distribution_mode_from_args,
 )
 from mtplx.backends.registry import load_runtime_contract
 from mtplx.batching import BatchSchedulerConfig, SchedulerMode, SchedulerPreset
+from mtplx.chat_encode_cache import GLOBAL_CHAT_ENCODE_CACHE, ChatEncodeCache
 from mtplx.chat_encoding import encode_chat_messages, is_gemma4_tokenizer
 from mtplx.constrained import (
     ResponseFormatError,
@@ -92,10 +115,23 @@ from mtplx.gemma4_pair import (
     resolve_gemma4_pair_paths,
 )
 from mtplx.model_scheduler import ModelWorkScheduler
+from mtplx.server.hyper import HYPER_ADMISSION_CAP, HyperAdmissionGate
+from mtplx.reasoning_effort import (
+    REASONING_EFFORT_CHOICES,
+    REASONING_EFFORT_LEVELS,
+    normalize_reasoning_effort as _normalize_reasoning_effort,
+)
+from mtplx.retrieval import RetrievalError, RetrievalTrustError
 from mtplx.sampling import SamplerConfig
+from mtplx.server.request_policy import (
+    BackgroundBusyBypass,
+    resolve_request_policy,
+)
+from mtplx.server.response_envelope import build_generation_result
 from mtplx.profiles import (
     DEFAULT_HF_MODEL_ID,
     DEFAULT_PROFILE_NAME,
+    NATIVE_MTP_60_FAST_PATH_ENV,
     PROFILE_CHOICES,
     apply_profile_env,
     get_profile,
@@ -110,6 +146,7 @@ from mtplx.runtime_options import (
     resolve_api_key,
 )
 from mtplx.draft_lm_head import _install_draft_lm_head
+from mtplx import request_capture
 from mtplx.fan_mode import (
     FAN_MODE_CHOICES,
     FAN_MODE_DEFAULT,
@@ -123,6 +160,7 @@ from mtplx.reasoning_codecs import (
     QWEN_STYLE_REASONING_CONTROL_RE,
     QWEN_STYLE_REASONING_OPEN_RE,
     QWEN_STYLE_REASONING_TAG_NAMES,
+    STREAM_TAG_HOLDBACK,
     normalize_qwen_thinking_tags,
     normalize_reasoning_tags as normalize_backend_reasoning_tags,
     split_reasoning_text,
@@ -131,17 +169,48 @@ from mtplx.reasoning_codecs import (
     stream_splitter_for_parser,
 )
 from mtplx.server.dashboard_state import DashboardState, InFlightHandle
+from mtplx.server.flight_recorder import FlightRecorder, resolve_flight_recorder
+
+# Inert fallback so stubbed states (tests) hit no-op recorder methods instead
+# of AttributeError; real ServerState installs its own in __init__.
+_INERT_FLIGHT = FlightRecorder(None)
+
+
+def _flight(state: Any) -> FlightRecorder:
+    return getattr(state, "flight", None) or _INERT_FLIGHT
+from mtplx.server.mtp_batch import (
+    MTPBatchFinalizeOwnership,
+    MTPBatchGenerationService,
+    MTPBatchJob,
+)
 from mtplx.server.omlx_bridge import (
     ToolCallStreamFilter as OMLXToolCallStreamFilter,
     extract_thinking as omlx_extract_thinking,
     extract_tool_calls_with_thinking as omlx_extract_tool_calls_with_thinking,
     normalize_messages_for_template as omlx_normalize_messages_for_template,
+    parse_tool_calls as omlx_parse_tool_calls,
 )
-from mtplx.server_urls import bind_label, is_wildcard_bind, local_url_for_bind
+from mtplx.server.omlx_bridge.tool_calling import (
+    PYTHONIC_TOOL_CALL_END,
+    PYTHONIC_TOOL_CALL_START,
+)
+from mtplx.server_urls import (
+    bind_label,
+    is_wildcard_bind,
+    local_url_for_bind,
+    network_url_for_bind,
+)
 
 LOGGER = logging.getLogger("mtplx.server.openai")
 
 SCHEDULER_MODE_CHOICES = tuple(mode.value for mode in SchedulerMode)
+# What /v1/mtplx/app-capabilities advertises to the app UI. "hyper" is the
+# H0 experimental chassis (2.9.3): launchable via --scheduler-mode for
+# operators, but at width 1 it is by construction identical-output with no
+# user benefit yet, so the app does not surface it as a mode choice.
+ADVERTISED_SCHEDULER_MODES = tuple(
+    mode for mode in SCHEDULER_MODE_CHOICES if mode != "hyper"
+)
 BATCHING_PRESET_CHOICES = tuple(preset.value for preset in SchedulerPreset)
 _STDOUT_LOGGING_BROKEN = False
 
@@ -170,6 +239,7 @@ def _safe_stdout_print(*values: Any, **kwargs: Any) -> bool:
     except Exception:
         return False
 
+
 try:
     from mtplx.generation import (
         PostcommitAbort,
@@ -178,9 +248,9 @@ try:
         _strip_terminal_stop,
         generate_ar,
         generate_mtpk,
-        install_generation_feature_policy,
         prefill_chunk_size_override,
         restore_or_prefill_prompt_state,
+        score_prompt_logprobs,
     )
     from mtplx.native_mlp import native_mlp_stats
     from mtplx.thinking_guard import (
@@ -209,7 +279,7 @@ except Exception as exc:
 
     generate_ar = _missing_runtime
     generate_mtpk = _missing_runtime
-    install_generation_feature_policy = _missing_runtime
+    score_prompt_logprobs = _missing_runtime
     think_marker_ids = _missing_runtime
     thinking_guard_config_from_env = _missing_runtime
     prefill_chunk_size_override = nullcontext
@@ -254,14 +324,13 @@ except Exception as exc:
         BACKGROUND_BYPASS = "background_bypass"
 
 
-FAST_PATH_ENV = {
-    "MTPLX_LAZY_VERIFY_LOGITS": "1",
-    "MTPLX_BATCH_TARGET_ARRAYS": "1",
-    "MTPLX_LAZY_TARGET_DISTRIBUTIONS": "1",
-    "MTPLX_LAZY_MTP_HISTORY_APPEND": "1",
-    "MTPLX_DROP_EVENTS": "1",
-    "MTPLX_SKIP_VERIFY_SNAPSHOT": "1",
-}
+# The native-MTP fast-path block, shared with the profile registry so
+# /health's fast_path_env can never drift from what the profiles actually
+# set. The old duplicated literal shipped 2.9.0 expecting
+# MTPLX_BATCH_TARGET_ARRAYS=1 — a value that was runtime-dead under the
+# lazy-distribution gate the same block enabled (turbo-truth audit,
+# 2026-08-21).
+FAST_PATH_ENV = dict(NATIVE_MTP_60_FAST_PATH_ENV)
 #: Verify strategies known to be correct with ``MTPLX_SKIP_VERIFY_SNAPSHOT=1``.
 #:
 #: Stated as a safe-list rather than as the complement (which used to be the
@@ -296,19 +365,91 @@ CHAT_TEMPLATE_SENTINEL_RE = re.compile(
     re.IGNORECASE,
 )
 STREAM_HEARTBEAT_INTERVAL_S = 10.0
+# #436: a request whose max_tokens is at or under this while the window
+# still has TINY_MAX_TOKENS_ROOM_TOKENS of room gets one WARNING line, so a
+# client-capped 1-token answer is diagnosable from the serve log.
+TINY_MAX_TOKENS_WARN_AT = 4
+TINY_MAX_TOKENS_ROOM_TOKENS = 64
 STREAM_SILENCE_WARN_S = 30.0
 STREAM_SILENCE_WARN_INTERVAL_S = 60.0
+# Pre-first-token SSE comment heartbeats (#358). A long prefill (minutes at
+# >32k-token prompts) used to put zero bytes on the wire before the first
+# token payload, so strict client/proxy read-timeouts (Claude Code, Cursor,
+# Open WebUI, nginx, cloudflared) killed the connection while the engine was
+# still computing. Any SSE line starting with ":" is a spec-level comment
+# that compliant parsers (official OpenAI SDKs included) ignore, yet it still
+# resets those read-timeouts. Once real payload chunks flow, token cadence is
+# the liveness signal and the comments stop.
+SSE_KEEPALIVE_COMMENT = ": keep-alive\n\n"
+SSE_KEEPALIVE_DEFAULT_INTERVAL_S = 5.0
+SSE_KEEPALIVE_MIN_INTERVAL_S = 1.0
 # Stall containment (#86): a stream that receives nothing while the model
 # owner's progress heartbeat is frozen for this long is failed with a
 # structured error instead of hanging forever. Healthy work ticks the
 # heartbeat many times per second (every settled engine forward and every
 # scheduler item), so only a genuinely parked owner can breach; the default
 # clears even a multi-minute model load. 0 disables.
-STREAM_STALL_DEADLINE_S = float(
-    os.environ.get("MTPLX_STREAM_STALL_DEADLINE_S") or 300.0
+STREAM_STALL_DEADLINE_DEFAULT_S = 300.0
+
+
+def _resolve_stream_stall_deadline_s(raw: str | float | None) -> float:
+    """Seconds a stream may wait on a frozen model owner; 0 turns it off.
+
+    Blank or absent means the default; "0" (the documented off switch) must
+    stay 0 rather than falling through to the default (issue #448).
+    """
+    if raw is None:
+        return STREAM_STALL_DEADLINE_DEFAULT_S
+    text = str(raw).strip()
+    if not text:
+        return STREAM_STALL_DEADLINE_DEFAULT_S
+    try:
+        return max(0.0, float(text))
+    except ValueError:
+        return STREAM_STALL_DEADLINE_DEFAULT_S
+
+
+STREAM_STALL_DEADLINE_S = _resolve_stream_stall_deadline_s(
+    os.environ.get("MTPLX_STREAM_STALL_DEADLINE_S")
 )
-STREAM_HIDDEN_TOOL_GUARD_TOKENS = 2048
-STREAM_HIDDEN_TOOL_GUARD_S = 30.0
+
+
+def set_stream_stall_deadline_s(value: float | None) -> float:
+    """Apply ``--stream-stall-deadline-s`` for this process (issue #448).
+
+    The macOS app launches the daemon from LaunchServices, where a shell
+    ``export`` is invisible, so the deadline is a serve flag the app can pass
+    from its settings. Mirrors the value into the environment so ``/health``,
+    child tools, and the serve log agree on the active deadline.
+    """
+    global STREAM_STALL_DEADLINE_S
+    if value is None:
+        return STREAM_STALL_DEADLINE_S
+    STREAM_STALL_DEADLINE_S = _resolve_stream_stall_deadline_s(value)
+    os.environ["MTPLX_STREAM_STALL_DEADLINE_S"] = repr(STREAM_STALL_DEADLINE_S)
+    return STREAM_STALL_DEADLINE_S
+# Absolute bound on the post-generation commit wait of a streamed response
+# (issue #425, 66duke66). Once decode has finished the client already holds
+# every token; only the terminal frame and [DONE] are missing. The session
+# postcommit that the terminal frame waits for runs as foreground scheduler
+# work, so behind a queued foreground prefill from ANOTHER request the wait is
+# long but alive: the owner heartbeat keeps ticking on that other request and
+# the stall probe above can never fire. Past this many seconds the stream
+# emits its terminal frame with the snapshot marked deferred and the
+# postcommit keeps running in the background; the next same-session request
+# waits for it through the pending-postcommit path as usual. 0 disables.
+STREAM_COMMIT_WAIT_MAX_S = float(
+    os.environ.get("MTPLX_STREAM_COMMIT_WAIT_MAX_S") or 30.0
+)
+# Runaway-hidden-generation backstop. Native-tool agent workloads stream
+# multi-thousand-token arguments (whole files) as legitimate hidden text, so
+# the ceilings are env-tunable; the defaults keep the original chat-UX guard.
+STREAM_HIDDEN_TOOL_GUARD_TOKENS = int(
+    os.environ.get("MTPLX_STREAM_HIDDEN_TOOL_GUARD_TOKENS", "2048")
+)
+STREAM_HIDDEN_TOOL_GUARD_S = float(
+    os.environ.get("MTPLX_STREAM_HIDDEN_TOOL_GUARD_S", "30")
+)
 STREAM_TOOL_CALL_FINISH_GRACE_S = 0.05
 TOOL_PROTOCOL_BOUNDARY_GRACE_S = 0.05
 _REASONING_DETAILS_RE = re.compile(
@@ -331,6 +472,10 @@ _REASONING_CONTROL_TAG_RE = re.compile(
 
 class _StreamCancelled(RuntimeError):
     """Raised inside the generation worker after a request is cancelled."""
+
+
+class MTPBatchRequestError(ValueError):
+    """The request cannot execute on the installed fixed MTP batch lane."""
 
 
 class _StopSequenceHit(_StreamCancelled):
@@ -469,6 +614,38 @@ class _StopSequenceStreamMonitor:
         return self._emit(emit)
 
 
+class _LoopFedStreamQueue:
+    """Thread-safe producer to asyncio consumer bridge for token streams.
+
+    The worker thread keeps the plain ``put(item)`` contract; items are
+    marshalled onto the event loop with ``call_soon_threadsafe`` and awaited
+    from a plain ``asyncio.Queue``. The previous design paid an
+    ``asyncio.to_thread(queue.get, ...)`` thread-pool dispatch per token —
+    a per-token executor hop on the hottest streaming path in the server.
+    Timeouts raise ``queue.Empty`` so consumer except-sites stay unchanged.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+        self._queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
+    def put(self, item: tuple[str, Any]) -> None:
+        try:
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, item)
+        except RuntimeError:
+            # Loop already closed (stream torn down). The old thread-queue
+            # silently absorbed late puts; keep that non-blocking contract.
+            pass
+
+    async def get(self, timeout: float | None = None) -> tuple[str, Any]:
+        if timeout is None:
+            return await self._queue.get()
+        try:
+            return await asyncio.wait_for(self._queue.get(), timeout=timeout)
+        except TimeoutError:
+            raise Empty from None
+
+
 def _stream_cancelled_queue_item(exc: _StreamCancelled) -> tuple[str, str]:
     reason = str(exc)
     exc.__traceback__ = None
@@ -482,10 +659,56 @@ def _raise_if_stream_cancelled(
         raise _StreamCancelled(message)
 
 
+class _AttributedCancelEvent(Event):
+    """Per-request cancel flag that remembers WHY it was first tripped.
+
+    One shared event is set by unrelated paths (the POST /v1/mtplx/cancel
+    endpoint, the client-disconnect monitor, stop-sequence completion,
+    early tool-call finalization, the hidden-tool guard, stall
+    containment, stream teardown). The terminal frame used to blame every
+    non-disconnect trip on the POST endpoint (#381); the first origin
+    recorded here is the one the client is told about.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.origin: str | None = None
+
+    def set_origin(self, origin: str) -> None:
+        if self.origin is None:
+            self.origin = origin
+        self.set()
+
+
+_CANCEL_ORIGIN_VIA = {
+    "post_endpoint": "POST /v1/mtplx/cancel",
+    "client_disconnect": "client disconnect",
+    "stop_sequence": "stop-sequence completion",
+    "early_tool_finish": "server tool-call finalization",
+    "hidden_tool_guard": "the hidden-tool stream guard",
+    "stream_stall": "stream-stall containment",
+    "stream_teardown": "server stream teardown",
+}
+
+
+def _cancel_via_label(cancel_event: Event) -> str:
+    origin = getattr(cancel_event, "origin", None)
+    if origin is None:
+        # Attribution unknown: never blame the POST endpoint for a trip
+        # it did not make (#381) — say what is actually known.
+        return "an internal cancellation path"
+    return _CANCEL_ORIGIN_VIA.get(origin, origin)
+
+
 def _cancel_stream_generation(
-    cancel_event: Event, generation_future: Any | None
+    cancel_event: Event,
+    generation_future: Any | None,
+    origin: str | None = None,
 ) -> None:
-    cancel_event.set()
+    if origin is not None and isinstance(cancel_event, _AttributedCancelEvent):
+        cancel_event.set_origin(origin)
+    else:
+        cancel_event.set()
     if generation_future is None:
         return
     try:
@@ -509,7 +732,10 @@ async def _monitor_request_disconnect(
         if disconnected:
             if on_disconnect is not None:
                 on_disconnect()
-            cancel_event.set()
+            if isinstance(cancel_event, _AttributedCancelEvent):
+                cancel_event.set_origin("client_disconnect")
+            else:
+                cancel_event.set()
             return True
         await asyncio.sleep(max(0.01, float(poll_s)))
     return False
@@ -563,12 +789,438 @@ def _server_runtime_env_overrides(
         .lower()
         .replace("-", "_")
     )
+    scheduler_mode = getattr(args, "scheduler_mode", "serial")
+    scheduler_mode = str(getattr(scheduler_mode, "value", scheduler_mode))
+    if scheduler_mode == SchedulerMode.MTP_BATCH.value:
+        overrides.update(
+            {
+                "MTPLX_A3B_GDN_POSTCONV_IMPL": "headquarter",
+                "MTPLX_A3B_WHOLE_MOE_FUSION": "0",
+                "MTPLX_COMPILED_TARGET_PREFIX": "1",
+                "MTPLX_FUSE_GDN_POST_CONV": "1",
+                "MTPLX_LINEAR_GDN_FROM_CONV_TGY": "4",
+                "MTPLX_QWEN_COMBINE_TAIL": "1",
+                "MTPLX_QWEN_MOE_PACK_GATE_UP": "1",
+                "MTPLX_QWEN_ROW_OWNED_ROUTER": "1",
+            }
+        )
     if (
         generation_mode == "mtp"
         and verify_strategy not in VERIFY_SNAPSHOT_OPTIONAL_STRATEGIES
     ):
         overrides["MTPLX_SKIP_VERIFY_SNAPSHOT"] = "0"
+    if generation_mode == "mtp" and _served_model_type_is_qwen4_exp(args):
+        # Flash-Next rejection rollback REQUIRES the recurrent-state
+        # snapshot: it is both the safety fallback and the pre-state source
+        # the family capture-commit replays from. (With the capture lane
+        # active the snapshot is the zero-copy lazy variant, so this is no
+        # longer a per-round clone.) Keyed on the served config's
+        # model_type: the family rides the generic native_mtp descriptor, so
+        # args.backend_id cannot identify it.
+        overrides["MTPLX_SKIP_VERIFY_SNAPSHOT"] = "0"
+    if _served_model_type_is_qwen4_exp(args):
+        # Family speed lanes, defaulted only when the launcher environment
+        # left them unset (an explicit operator export wins):
+        # - Pipelined AR decode + compiled GDN runs (2026-08-27 receipts:
+        #   42.6 -> 51.9 t/s AR, GPU 57% -> 96.6% busy). Arms itself only
+        #   when the n-gram table went resident (RAM-plan gated via
+        #   MTPLX_NGRAM_RESIDENT=auto); smaller machines keep the staged
+        #   classic loop.
+        # - Layer-owned capture-commit (2026-08-27 receipts: verify round
+        #   51.7 -> 38.8 ms, repair re-forwards 8.2 -> 0 ms/round, MTP
+        #   recorder 75.25 -> 85.9 t/s record) — repair-free speculative
+        #   rollback; falls back to rollback+re-forward per round if a
+        #   capture is ever missing.
+        # - Fused hyper-read v3 (2026-08-27 receipts: AR 51.2 -> 55.2,
+        #   +7.8% x3 consistent; kernel-private 8-bit pack, bf16 module
+        #   weights untouched for prefill/verify).
+        # - GDN in_proj fusion (2026-08-27 receipt: AR 55.0 -> 56.7; four
+        #   input GEMVs -> one, row-concat bit-exact, 36 layers).
+        # - MoE gate+up library merge (2026-08-27 receipt: AR 56.1 -> 57.65
+        #   mean n=4; 96 modules, 3->2 gather_qmm routed + 2->1 qmm shared).
+        #   NOTE: this arms ONLY the sanitize-time library-call merge; the
+        #   custom moe_glu_decode kernel stays behind MTPLX_FUSED_MOE_DECODE
+        #   (falsified at g64, -5%).
+        # - GDN conv+silu+l2norm fused between the GEMVs (2026-08-27 A/B/A:
+        #   59.31 -> 60.96, every B row above every A row — the first config
+        #   past the 60-AR line).
+        # - One-dispatch GDN decode step (2026-08-27): conv+silu+l2norm,
+        #   g/beta, fp32 delta recurrence, and the SigmoidRMSNormGated
+        #   epilogue in a single kernel between the in_proj/out_proj GEMVs —
+        #   a GDN layer is now 3 sends (was ~6). Supersedes CONVNORM at
+        #   decode (that kernel still covers the S>1 / verify shapes this
+        #   gate refuses). Two boot-triples, both arm orders: A/B/A
+        #   +1.03 t/s (+1.7%, B took the two fastest rows), order-reversed
+        #   B/A/B +1.26 t/s (+2.2%), B took the six fastest warm rows and
+        #   the trailing B arm beat A against the session's downward drift.
+        # - Verify-width conv+silu+l2norm rows kernel (2026-08-27): the same
+        #   chain for speculative verify blocks (S<=6, sliding in-block conv
+        #   window, capture-stash-compatible; the recurrence stays in the
+        #   library gated_delta_update dispatch). MTP two boot-triples, both
+        #   orders: B/A/B +1.95 t/s (+3.06%, fused arm held the top-5 rows),
+        #   A/B/A +1.45 t/s (+2.28%). Best arm mean of the campaign (67.15).
+        truthy_env = {"1", "true", "yes", "on"}
+        gdn_raw = os.environ.get("MTPLX_COMPILED_GDN")
+        qwen4_raw = os.environ.get("MTPLX_QWEN4EXP_COMPILE")
+        compiled_gdn_explicit_off = (
+            gdn_raw is not None and gdn_raw.strip().lower() not in truthy_env
+        )
+        qwen4_compile_explicit_off = (
+            qwen4_raw is not None and qwen4_raw.strip().lower() not in truthy_env
+        )
+        for key in (
+            "MTPLX_AR_PIPELINE",
+            "MTPLX_FAMILY_CAPTURE_COMMIT",
+            "MTPLX_FUSED_HC_V3",
+            "MTPLX_FUSED_GDN_INPROJ",
+            "MTPLX_FUSED_GATE_UP",
+            "MTPLX_FUSED_GDN_CONVNORM",
+            "MTPLX_FUSED_GDN_STEP",
+            "MTPLX_FUSED_CONVNORM_VERIFY",
+            # QSA rows-gather (2026-08-28, adapting PR #380 by @maceip):
+            # family default ON. Self-fenced to S 2..8 at KV >= 16384, so
+            # below that the config is bit-identical dense. Receipt: paired
+            # 16,384-token xhigh arms — dense verify grew 37.0->46.9
+            # ms/round (last-256 36.0 tok/s), gather held flat 45.3->45.9
+            # (last-256 64.5); parity 2e-2 on the real layer over identical
+            # visible sets. Founder release call 2026-08-28: family is
+            # unshipped, fences bound the blast radius, kill switch is
+            # MTPLX_QSA_GATHER=0. 100k rung + copy-block widths (25 rows,
+            # MTPLX_QSA_GATHER_MAX_ROWS) remain the post-release sweep.
+            "MTPLX_QSA_GATHER",
+        ):
+            if os.environ.get(key) is None:
+                overrides.setdefault(key, "1")
+        if not (compiled_gdn_explicit_off or qwen4_compile_explicit_off):
+            for key in ("MTPLX_COMPILED_GDN", "MTPLX_QWEN4EXP_COMPILE"):
+                if os.environ.get(key) is None:
+                    overrides.setdefault(key, "1")
+        if _served_model_is_qwen4_fixed_m4(args):
+            # Flash-Next speed lane (PR #391 ports by davidtai), default ON
+            # for the one measured fixed-M4 geometry since 2026-09-02
+            # (PR-VERDICTS.md receipts: A/B/A 63.8 tok/s against main's
+            # 54.7 / 59.8; 100k 57.3 vs 48.5). "When unset" only: an
+            # explicit operator export, including =0, wins via the pop loop
+            # below, and a pack contract value is carried unchanged. The
+            # two gates that are consumed at model LOAD and refuse a
+            # mismatched pack loudly (the stage-3 combine tail pins every
+            # MoE layer's group sizes, FR-Spec prunes the native Q8/g64
+            # lm_head) are pack-checked from config.json here, so a catalog
+            # pack outside their contract boots on the rest of the lane
+            # instead of dying at load.
+            lane_defaults = [
+                "MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS",
+                "MTPLX_QWEN4_FIXED_M4_VERIFY",
+                "MTPLX_QWEN4_COMPILED_MTP_PREPARE",
+                "MTPLX_QWEN4_RELAXED_DRAFT_TIES",
+                # 2026-09-03 ports from PR #391 by davidtai, measured on the
+                # same geometry (outputs/hyper-review-20260903): the exact op
+                # diet in the compiled verifier, block verification in the
+                # accept loop, and the two prefill overlaps (PLE n-gram rows
+                # for chunk k+1 gathered under chunk k, the first chunk's
+                # rows gathered at request arrival). The session-bank pair
+                # keeps a re-rendered agent turn on its boundary snapshots
+                # instead of a cold re-prefill.
+                "MTPLX_QWEN4_OPDIET",
+                "MTPLX_QWEN4_BLOCK_VERIFY",
+                "MTPLX_QWEN4_PLE_PREFILL_LOOKAHEAD",
+                "MTPLX_QWEN4_PLE_FIRST_GATHER_EARLY",
+                "MTPLX_SESSION_BANK_SHED_BOUNDARIES",
+                "MTPLX_SESSION_BANK_PROTECTED_TERMINAL",
+            ]
+            if _qwen4_port_opt_in(
+                overrides, "MTPLX_FUSED_GATE_UP"
+            ) and _served_model_pack_is_stage3_geometry(args):
+                # The tail also requires the fused gate+up owners, so the
+                # MTPLX_FUSED_GATE_UP kill switch drops it with them.
+                lane_defaults.append("MTPLX_QWEN4_M4_STAGE3")
+            for key in lane_defaults:
+                if os.environ.get(key) is None:
+                    overrides.setdefault(key, "1")
+            # Value-carrying companions of the keys above; an explicit export
+            # of the companion wins on its own, and the master switch's =0
+            # leaves them inert.
+            if os.environ.get("MTPLX_NGRAM_PREWARM") is None:
+                overrides.setdefault("MTPLX_NGRAM_PREWARM", "auto")
+            # The stage-3 child routes are consumed at model load and raise
+            # unless stage 3 itself resolves on, so they are derived from the
+            # resolved parent, never stamped alone: the routed-down reduction,
+            # its residual-tail store, the paired routed GLU, and the two-kernel
+            # routing head (which additionally needs the paired GLU).
+            if _qwen4_port_opt_in(overrides, "MTPLX_QWEN4_M4_STAGE3"):
+                for key in (
+                    "MTPLX_QWEN4_M4_ROUTED_DOWN_REDUCE",
+                    "MTPLX_QWEN4_M4_ROUTED_DOWN_RESIDUAL_TAIL",
+                    "MTPLX_QWEN4_M4_ROUTED_GLU",
+                ):
+                    if os.environ.get(key) is None:
+                        overrides.setdefault(key, "1")
+                if (
+                    _qwen4_port_opt_in(overrides, "MTPLX_QWEN4_M4_ROUTED_GLU")
+                    and os.environ.get("MTPLX_QWEN4_ROUTE_KERNEL") is None
+                ):
+                    overrides.setdefault("MTPLX_QWEN4_ROUTE_KERNEL", "1")
+            # The fused QSA rope glue installs inside the fixed-M4 compiled
+            # verify body and is probed bit-exact there, so it follows that
+            # verifier's resolved state.
+            if _qwen4_port_opt_in(overrides, "MTPLX_QWEN4_FIXED_M4_VERIFY"):
+                if os.environ.get("MTPLX_QWEN4_VERIFY_GLUE") is None:
+                    overrides.setdefault("MTPLX_QWEN4_VERIFY_GLUE", "1")
+                if os.environ.get("MTPLX_QWEN4_VERIFY_GLUE_ITEMS") is None:
+                    overrides.setdefault(
+                        "MTPLX_QWEN4_VERIFY_GLUE_ITEMS", "qsa_rope,qsa_rope_idx"
+                    )
+            # The fused K/V gather is read at cache promotion and raises
+            # unless BOTH the fixed verifier and the rows-gather lane resolve
+            # on (graphbank.from_qsa_cache; the first port's 249,670-token
+            # refusal was exactly the fused flag armed with rows-gather off),
+            # so it is derived from the resolved pair, never stamped alone.
+            if (
+                _qwen4_port_opt_in(overrides, "MTPLX_QWEN4_FIXED_M4_VERIFY")
+                and _qwen4_port_opt_in(overrides, "MTPLX_QSA_GATHER")
+                and os.environ.get("MTPLX_QSA_M4_FUSED_KV_GATHER") is None
+            ):
+                overrides.setdefault("MTPLX_QSA_M4_FUSED_KV_GATHER", "1")
+            # Rows-gather width 32 (2026-09-02 overnight window: ~3 ms/round
+            # at 100k, 5-10 at 206k over the default 8); inert below the
+            # rows-gather engage floor and under MTPLX_QSA_GATHER=0.
+            if os.environ.get("MTPLX_QSA_GATHER_MAX_ROWS") is None:
+                overrides.setdefault("MTPLX_QSA_GATHER_MAX_ROWS", "32")
+            if _served_model_lm_head_is_q8_g64(args):
+                if os.environ.get("MTPLX_FRSPEC_DRAFT") is None:
+                    overrides.setdefault("MTPLX_FRSPEC_DRAFT", "1")
+                if (
+                    _qwen4_port_opt_in(overrides, "MTPLX_FRSPEC_DRAFT")
+                    and os.environ.get("MTPLX_FRSPEC_VOCAB") is None
+                ):
+                    overrides.setdefault(
+                        "MTPLX_FRSPEC_VOCAB", "builtin:qwen38-code-64k"
+                    )
+                # The pre-scatter draft read serves K20 from the FR-Spec
+                # head's compact row and raises at install without that
+                # head, so it follows the resolved FR-Spec draft.
+                if (
+                    _qwen4_port_opt_in(overrides, "MTPLX_FRSPEC_DRAFT")
+                    and os.environ.get("MTPLX_QWEN4_DRAFT_K20_PRESCATTER") is None
+                ):
+                    overrides.setdefault("MTPLX_QWEN4_DRAFT_K20_PRESCATTER", "1")
+        if _qwen4_port_opt_in(overrides, "MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS"):
+            # Fixed-M4 target distributions (PR #391 step 1 by davidtai, his
+            # 2026-08-29 production A/B/A/B): batch all four temperature-1 /
+            # top-k-20 rows at one materialization boundary instead of
+            # synchronizing one row at a time during accept. Lazy mean 53.46
+            # tok/s; batched mean 53.89 tok/s (+0.81%), same output digest,
+            # 578/1,282 acceptance, 432 verifier calls, zero repair. The
+            # gate resolves from the lane defaults above (fixed-M4 geometry),
+            # an operator export, or the pack contract; the pair is pinned
+            # only when it resolves on, so every other qwen4_exp layout
+            # keeps turbo's generic lazy defaults. Explicit operator exports
+            # of either key and model-pack overrides still win.
+            for key, value in (
+                ("MTPLX_BATCH_TARGET_ARRAYS", "1"),
+                ("MTPLX_LAZY_TARGET_DISTRIBUTIONS", "0"),
+            ):
+                if os.environ.get(key) is None:
+                    overrides.setdefault(key, value)
+        if _qwen4_port_opt_in(
+            overrides, "MTPLX_QWEN4_FIXED_M4_VERIFY"
+        ) and _served_model_is_qwen4_fixed_m4(args):
+            # Construction-bound fixed-M4 verifier (PR #391 step 2 by davidtai,
+            # his 2026-08-29 production repeats): one traced replay over the
+            # exact Flash-Next geometry. Armed by the lane defaults above, an
+            # operator export, or the pack contract
+            # (MTPLX_QWEN4_FIXED_M4_VERIFY=1); the config predicate keeps the
+            # companion pins off every unmeasured qwen4_exp layout (the
+            # runtime installer refuses a mismatched production geometry
+            # loudly). The lane needs the compiled-verify mode on, so it is
+            # pinned here unless an explicit export set it.
+            for key in (
+                "MTPLX_COMPILED_VERIFY",
+                "MTPLX_QWEN4_FIXED_M4_VERIFY",
+            ):
+                if os.environ.get(key) is None:
+                    overrides.setdefault(key, "1")
+        # PR #391 ports (davidtai, step 5 semantic): an explicit operator
+        # export beats a pack-stamped or server-stamped value for every lane
+        # key, so a launch line kill switch (KEY=0) can never be stomped by
+        # runtime_env_overrides. The stock-QMM combine tail
+        # (MTPLX_QWEN4_M4_STAGE3) is consumed at model load by its own gate
+        # and needs no server pin beyond the default above.
+        for key in _QWEN4_LANE_KEYS:
+            if str(os.environ.get(key) or "").strip():
+                overrides.pop(key, None)
+        if os.environ.get("MTPLX_NAX_VERIFY") is None:
+            # The turbo profile arms the 27B NAX verify patch
+            # (MTPLX_NAX_VERIFY=1); on this family it is unmeasured and
+            # mostly bypassed — the fused family modules call
+            # mx.quantized_matmul directly, so the patch could only touch
+            # foreign-shape leftovers (248320-vocab lm_head, expert
+            # gathers). Hold it OFF until it earns a family receipt at
+            # verify widths. An explicit operator export still wins via the
+            # env gate above, and runtime_env_overrides are applied AFTER
+            # the profile env (apply_profile_env), so this beats turbo's 1.
+            overrides["MTPLX_NAX_VERIFY"] = "0"
     return overrides
+
+
+def _served_model_type_is_qwen4_exp(args: argparse.Namespace) -> bool:
+    try:
+        with open(Path(str(args.model)) / "config.json", "rb") as fh:
+            cfg = json.load(fh)
+    except Exception:
+        return False
+    mt = str(cfg.get("model_type") or "").lower()
+    tmt = str((cfg.get("text_config") or {}).get("model_type") or "").lower()
+    return "qwen4_exp" in (mt, tmt) or "qwen4_exp_text" in (mt, tmt)
+
+
+_QWEN4_PORT_TRUTHY = frozenset({"1", "true", "yes", "on"})
+# Gates of the PR #391 Flash-Next ports, one per ported step.
+_QWEN4_PORT_KEYS = (
+    "MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS",
+    "MTPLX_QWEN4_FIXED_M4_VERIFY",
+    "MTPLX_QWEN4_M4_STAGE3",
+    "MTPLX_QWEN4_COMPILED_MTP_PREPARE",
+    "MTPLX_QWEN4_RELAXED_DRAFT_TIES",
+    "MTPLX_QSA_M4_FUSED_KV_GATHER",
+    # 2026-09-03 ports from PR #391 by davidtai (see the lane defaults).
+    "MTPLX_QWEN4_M4_ROUTED_DOWN_REDUCE",
+    "MTPLX_QWEN4_M4_ROUTED_DOWN_RESIDUAL_TAIL",
+    "MTPLX_QWEN4_M4_ROUTED_GLU",
+    "MTPLX_QWEN4_ROUTE_KERNEL",
+    "MTPLX_QWEN4_OPDIET",
+    "MTPLX_QWEN4_DRAFT_K20_PRESCATTER",
+    "MTPLX_QWEN4_BLOCK_VERIFY",
+    "MTPLX_QWEN4_VERIFY_GLUE",
+    "MTPLX_QWEN4_VERIFY_GLUE_ITEMS",
+    "MTPLX_QWEN4_PLE_PREFILL_LOOKAHEAD",
+    "MTPLX_QWEN4_PLE_FIRST_GATHER_EARLY",
+    "MTPLX_SESSION_BANK_SHED_BOUNDARIES",
+    "MTPLX_SESSION_BANK_PROTECTED_TERMINAL",
+    "MTPLX_NGRAM_PREWARM",
+)
+# Every key the fixed-M4 lane defaults may stamp; an explicit operator
+# export (any non-empty value) always beats a stamped value for these.
+_QWEN4_LANE_KEYS = _QWEN4_PORT_KEYS + (
+    "MTPLX_FRSPEC_DRAFT",
+    "MTPLX_FRSPEC_VOCAB",
+    "MTPLX_QSA_GATHER_MAX_ROWS",
+)
+
+
+def _qwen4_port_opt_in(overrides: Mapping[str, str], key: str) -> bool:
+    """Resolved state of a Flash-Next lane gate.
+
+    An explicit operator export wins; otherwise the overrides carry the key,
+    stamped by the fixed-M4 lane defaults or by the pack contract's
+    runtime_env_overrides. Unset means the port stays off and the family
+    keeps main's shipped defaults.
+    """
+    raw = os.environ.get(key)
+    if raw is None:
+        raw = overrides.get(key)
+    return raw is not None and str(raw).strip().lower() in _QWEN4_PORT_TRUTHY
+
+
+def _served_model_is_qwen4_fixed_m4(args: argparse.Namespace) -> bool:
+    try:
+        with open(Path(str(args.model)) / "config.json", "rb") as fh:
+            config = json.load(fh)
+    except Exception:
+        return False
+    from mtplx.qwen4_fixed_verify import is_qwen4_fixed_verify_config
+
+    return is_qwen4_fixed_verify_config(config)
+
+
+def _served_model_config(args: argparse.Namespace) -> dict[str, Any] | None:
+    try:
+        with open(Path(str(args.model)) / "config.json", "rb") as fh:
+            config = json.load(fh)
+    except Exception:
+        return None
+    return config if isinstance(config, dict) else None
+
+
+def _served_module_quantization(
+    config: Mapping[str, Any], module: str
+) -> tuple[int, int, str] | None:
+    """(bits, group_size, mode) the loader applies to ``module``.
+
+    A per-module entry replaces the pack-wide values, ``False`` leaves the
+    module unquantized, anything else resolves to the pack-wide values.
+    None when the pack says nothing usable.
+    """
+    quantization = config.get("quantization")
+    if not isinstance(quantization, Mapping):
+        return None
+    entry = quantization.get(module)
+    if entry is False:
+        return None
+    if not isinstance(entry, Mapping):
+        entry = quantization
+    try:
+        bits = int(entry.get("bits"))
+        group_size = int(entry.get("group_size"))
+    except (TypeError, ValueError):
+        return None
+    return bits, group_size, str(entry.get("mode") or "affine")
+
+
+def _served_model_lm_head_is_q8_g64(args: argparse.Namespace) -> bool:
+    """FR-Spec pack predicate.
+
+    The builtin ranked table prunes the native Q8/g64 affine lm_head
+    (frspec_draft.install_frspec_draft_head) and any other head layout
+    fails the model LOAD (draft_lm_head raises), so the default only stamps
+    the lever on packs carrying that head. Catalog receipt 2026-09-02:
+    Optimized-Speed ships lm_head Q8/g64, Bare-Speed ships Q4/g64.
+    """
+    config = _served_model_config(args)
+    if config is None:
+        return False
+    text = config.get("text_config")
+    if isinstance(text, Mapping) and text.get("tie_word_embeddings"):
+        return False
+    return _served_module_quantization(config, "language_model.lm_head") == (
+        8,
+        64,
+        "affine",
+    )
+
+
+# Per-module quantization the M=4 stage-3 combine tail pins for every MoE
+# layer (qwen4_m4_stage3 contracts: router and shared expert Q8/g64, routed
+# experts Q4/g32); the installer raises on any other geometry at model load.
+_QWEN4_STAGE3_MODULE_CONTRACT = (
+    ("mlp.gate", (8, 64, "affine")),
+    ("mlp.shared_expert_gate", (8, 64, "affine")),
+    ("mlp.shared_expert.gate_proj", (8, 64, "affine")),
+    ("mlp.shared_expert.up_proj", (8, 64, "affine")),
+    ("mlp.shared_expert.down_proj", (8, 64, "affine")),
+    ("mlp.switch_mlp.gate_proj", (4, 32, "affine")),
+    ("mlp.switch_mlp.up_proj", (4, 32, "affine")),
+    ("mlp.switch_mlp.down_proj", (4, 32, "affine")),
+)
+
+
+def _served_model_pack_is_stage3_geometry(args: argparse.Namespace) -> bool:
+    """Stage-3 pack predicate over config.json's per-module quantization."""
+    config = _served_model_config(args)
+    if config is None:
+        return False
+    text = config.get("text_config")
+    layers = text.get("num_hidden_layers") if isinstance(text, Mapping) else None
+    if not isinstance(layers, int) or layers <= 0:
+        return False
+    return all(
+        _served_module_quantization(
+            config, f"language_model.model.layers.{index}.{module}"
+        )
+        == expected
+        for index in range(layers)
+        for module, expected in _QWEN4_STAGE3_MODULE_CONTRACT
+    )
 
 
 def _assert_fast_path_env() -> dict[str, dict[str, Any]]:
@@ -642,14 +1294,24 @@ def _parse_byte_limit(value: str | int | None) -> int | None:
     text = str(value).strip().lower().replace("_", "")
     if not text:
         return None
+    # Single-letter spellings included: "48G" is the form every MTPLX
+    # budget message advertises ("sizes like 4G"), yet this parser only
+    # took "48GB"/"48GiB" — `--memory-budget 48G` crashed serve startup
+    # with a raw ValueError (found by the memory-governor tests, 2026-08-26).
     multipliers = {
         "b": 1,
+        "k": 1024,
         "kb": 1024,
         "kib": 1024,
+        "m": 1024**2,
         "mb": 1024**2,
         "mib": 1024**2,
+        "g": 1024**3,
         "gb": 1024**3,
         "gib": 1024**3,
+        "t": 1024**4,
+        "tb": 1024**4,
+        "tib": 1024**4,
     }
     for suffix, multiplier in sorted(
         multipliers.items(), key=lambda item: -len(item[0])
@@ -782,6 +1444,11 @@ class ChatCompletionRequest(BaseModel):
     response_format: Any = None
     metadata: dict[str, Any] | None = None
     user: str | None = None
+    # Declared so a logprobs request fails loudly (400) instead of being
+    # silently swallowed by extra="allow" — clients were reading absent
+    # logprobs as "model returned none" rather than "server ignored me".
+    logprobs: Any = None
+    top_logprobs: int | None = None
 
 
 @dataclass
@@ -1010,6 +1677,7 @@ class MTPLXSettingsUpdate(BaseModel):
     draft_temperature: float | None = None
     draft_top_p: float | None = None
     draft_top_k: int | None = None
+    adaptive_policy: str | None = None
 
 
 class FanModeRequest(BaseModel):
@@ -1041,6 +1709,38 @@ class CompletionRequest(BaseModel):
     seed: int | None = None
     stop: Any = None
     stream: bool = False
+    # Prompt scoring (echo + logprobs + max_tokens 0): one teacher-forced
+    # pass returning per-position top-K logprobs — the lane KL-divergence
+    # harnesses consume. Decode-time logprobs remain unsupported.
+    echo: bool = False
+    logprobs: int | None = None
+
+
+class EmbeddingsRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    model: str | None = None
+    input: str | list[str] | None = None
+    encoding_format: str | None = None
+    # OpenAI's Matryoshka knob: truncate the vector to this many leading
+    # dimensions and re-normalise. Validated against the model's native width
+    # in the route — silently ignoring it would hand a client vectors that do
+    # not fit the index they sized.
+    dimensions: int | None = None
+    # Qwen3-Embedding scores queries better when they carry a task instruction,
+    # while stored documents must stay raw — so this is per request, not global.
+    instruction: str | None = None
+
+
+class RerankRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    model: str | None = None
+    query: str | None = None
+    documents: list[str] | None = None
+    top_n: int | None = None
+    return_documents: bool = False
+    instruction: str | None = None
 
 
 class AnthropicMessage(BaseModel):
@@ -1077,6 +1777,109 @@ def _startup_line(text: str = "") -> None:
     _safe_stdout_print(text)
 
 
+def _apply_ngram_prewarm_choice(args: Any) -> str:
+    """Resolve --ngram-prewarm / MTPLX_NGRAM_PREWARM; return what decided.
+
+    ``None`` (the flag was not given) leaves the environment alone, so a
+    shell-set value or the on-by-default still decides.  Never fatal: a model
+    without a streamed n-gram sidecar simply never reads the key.
+    """
+
+    try:
+        from mtplx.ple_row_gather import apply_prewarm_choice
+
+        order = getattr(args, "ngram_prewarm_order", None)
+        if order:
+            os.environ["MTPLX_NGRAM_PREWARM_ORDER"] = str(order)
+        return apply_prewarm_choice(getattr(args, "ngram_prewarm", None))
+    except Exception as error:  # a startup knob must not break startup
+        return f"unavailable: {error!r}"
+
+
+def _publish_ngram_prewarm_reservation(args: Any) -> dict[str, Any]:
+    """Tell the pre-read how much memory the KV cache is about to want.
+
+    The server's own MemoryPlan is the authority, but it is built ~350 lines
+    after the model load and the pre-read happens INSIDE that load, so the
+    number cannot be read from it.  What is available here is every input the
+    plan derives it from -- `mtplx.memory_plan` is runtime-free and reads
+    bytes/token straight out of config.json -- so this is the same arithmetic
+    on the same inputs, published before the load rather than a second policy.
+
+    Unknown inputs publish zero and say so; the pre-read then leans on its
+    documented margin instead of an invented number.
+    """
+
+    try:
+        from mtplx.ple_row_gather import (
+            estimate_engine_growth_bytes,
+            estimate_kv_reservation_bytes,
+            set_prewarm_reservation,
+        )
+
+        tokens = int(getattr(args, "context_window", 0) or 0)
+        if tokens <= 0:
+            from mtplx.generation import _dense_decode_max_context
+
+            tokens = int(_dense_decode_max_context() or 0)
+        reserved, source = estimate_kv_reservation_bytes(
+            getattr(args, "model", None), tokens
+        )
+        # The KV estimate undercounts what the engine takes on a long prompt
+        # (bank, indexer promotion, prefill scratch): reserve its whole growth
+        # to the budget when that is larger (2026-09-03 crash receipt).
+        growth, growth_source = estimate_engine_growth_bytes(
+            getattr(args, "model", None)
+        )
+        if int(growth) > int(reserved):
+            reserved, source = int(growth), growth_source
+        set_prewarm_reservation(reserved, source)
+        return {"bytes": int(reserved), "source": source, "tokens": tokens}
+    except Exception as error:  # a startup knob must not break startup
+        return {"bytes": 0, "source": f"unavailable: {error!r}", "tokens": 0}
+
+
+def _ngram_prewarm_health_payload() -> dict[str, Any]:
+    """What the n-gram table pre-read actually did, for ``/health``.
+
+    Read from the module-level receipt `mtplx.ple_row_gather` publishes, not
+    by walking the runtime down to the sidecar: that walk is family-specific
+    and five getattrs deep, and it is exactly the shape of walk that made the
+    PLE prefill lookahead silently inert on 2026-09-01.
+    """
+
+    try:
+        from mtplx.ple_row_gather import last_prewarm
+
+        receipt = last_prewarm()
+    except Exception as error:
+        return {"enabled": None, "reason": repr(error)}
+    return {
+        "enabled": receipt.get("enabled"),
+        "mode": receipt.get("mode"),
+        "order": receipt.get("order"),
+        "table_bytes": receipt.get("table_bytes"),
+        "budget_bytes": receipt.get("budget_bytes"),
+        "warmed_bytes": receipt.get("warmed_bytes", receipt.get("bytes")),
+        "seconds": receipt.get("seconds"),
+        "gib_per_s": receipt.get("gib_per_s"),
+        "free_bytes": receipt.get("free_bytes"),
+        "reserved_bytes": receipt.get("reserved_bytes"),
+        "margin_bytes": receipt.get("margin_bytes"),
+        "source": receipt.get("source"),
+        "skipped_reason": receipt.get("skipped_reason"),
+    }
+
+
+def _laguna_fused_startup_line(runtime: Any) -> str | None:
+    """Engagement receipt for the env-gated fused stack (grep: [laguna-fused])."""
+
+    report = getattr(runtime, "laguna_fused_report", None)
+    if not report:
+        return None
+    return "[5/6] [laguna-fused] " + json.dumps(report, ensure_ascii=False)
+
+
 def _startup_server_url(args: argparse.Namespace) -> str:
     return local_url_for_bind(
         str(getattr(args, "host", "127.0.0.1")),
@@ -1104,9 +1907,66 @@ def _startup_chat_url(args: argparse.Namespace) -> str:
 
 
 _BROWSER_AUTH_PATH = "/mtplx/browser-auth"
+_BROWSER_AUTH_TICKET_PATH = "/mtplx/browser-auth/ticket"
 _BROWSER_AUTH_QUERY_PARAM = "mtplx_api_key"
+_BROWSER_AUTH_TICKET_QUERY_PARAM = "ticket"
 _BROWSER_AUTH_COOKIE = "mtplx_browser_api_key"
 _BROWSER_AUTH_COOKIE_MAX_AGE_SECONDS = 12 * 60 * 60
+_BROWSER_AUTH_TICKET_TTL_SECONDS = 60
+
+
+class _BrowserAuthTickets:
+    """Single-use, short-lived sign-in tickets held in process memory.
+
+    A client that already holds the API key (the native app, a terminal
+    user) mints a ticket over an authenticated call and opens
+    ``/mtplx/browser-auth?ticket=...`` in the browser, so the key itself
+    never travels in a URL that lands in browser history or proxy logs.
+    """
+
+    def __init__(self, *, ttl_s: float = _BROWSER_AUTH_TICKET_TTL_SECONDS) -> None:
+        self._ttl_s = float(ttl_s)
+        self._lock = Lock()
+        self._expiry_by_ticket: dict[str, float] = {}
+
+    def mint(self, *, now: float | None = None) -> str:
+        now = time.monotonic() if now is None else now
+        ticket = secrets.token_urlsafe(32)
+        with self._lock:
+            self._sweep(now)
+            self._expiry_by_ticket[ticket] = now + self._ttl_s
+        return ticket
+
+    def consume(self, ticket: str | None, *, now: float | None = None) -> bool:
+        """Redeem ``ticket`` exactly once; unknown, used, or expired is False."""
+
+        if not ticket:
+            return False
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            self._sweep(now)
+            return self._expiry_by_ticket.pop(ticket, None) is not None
+
+    def _sweep(self, now: float) -> None:
+        expired = [t for t, deadline in self._expiry_by_ticket.items() if deadline <= now]
+        for ticket in expired:
+            del self._expiry_by_ticket[ticket]
+
+
+def _set_browser_auth_cookie(response: Response, request: Request, api_key: str) -> None:
+    # `secure` follows the scheme the browser actually used: an https
+    # deployment never sends the key back over plain http, while the
+    # default http://127.0.0.1 install still works (a Secure cookie set
+    # over plain http is dropped by browsers).
+    response.set_cookie(
+        _BROWSER_AUTH_COOKIE,
+        api_key,
+        max_age=_BROWSER_AUTH_COOKIE_MAX_AGE_SECONDS,
+        httponly=True,
+        samesite="lax",
+        secure=request.url.scheme == "https",
+        path="/",
+    )
 
 
 def _safe_browser_auth_next_path(value: Any) -> str:
@@ -1196,22 +2056,78 @@ def _kernel_selfcheck_health_payload() -> dict[str, Any]:
 
 def _backend_descriptor(state: "ServerState") -> BackendDescriptor:
     descriptor = getattr(state, "backend_descriptor", None)
-    if descriptor is not None:
-        return descriptor
-    return descriptor_from_runtime(
-        getattr(state, "runtime", None),
-        getattr(state, "args", None),
+    if descriptor is None:
+        descriptor = descriptor_from_runtime(
+            getattr(state, "runtime", None),
+            getattr(state, "args", None),
+        )
+    model_ref = str(
+        getattr(getattr(state, "args", None), "model", None)
+        or getattr(state, "model_id", None)
+        or ""
+    )
+    model_context_window_max = getattr(state, "model_context_window_max", None)
+    return descriptor_for_model(
+        descriptor,
+        model_ref=model_ref,
+        inspection=(
+            {"model_context_window": int(model_context_window_max)}
+            if model_context_window_max
+            else None
+        ),
     )
 
 
 def _reasoning_parser_for_state(state: "ServerState") -> str:
-    parser = str(getattr(state.args, "reasoning_parser", "qwen3") or "qwen3")
-    if parser == "none":
-        return "none"
-    backend = _backend_descriptor(state)
-    if parser != backend.reasoning_codec.parser:
-        return backend.reasoning_codec.parser
-    return parser
+    # args.reasoning_parser is the parent-resolved intent: family policy by
+    # default, or the operator's explicit --reasoning-parser. It is
+    # authoritative. The backend codec is a fallback for states that carry
+    # no parser at all (embedders/tests) — it must not censor a set value:
+    # the old backend-wins-on-mismatch rule made --reasoning-parser a silent
+    # no-op on shared lanes (llama-ar pins codec "none"), which force-closed
+    # thinking for models whose templates fully support it and no flag,
+    # request field, or header could override it.
+    parser = getattr(state.args, "reasoning_parser", None)
+    if parser:
+        return str(parser)
+    return _backend_descriptor(state).reasoning_codec.parser
+
+
+def _model_family_for_state(state: "ServerState") -> str:
+    """Family for the model this daemon is actually serving.
+
+    The lane descriptor is shared across families (qwen3_5/3_6/3_8 all ride
+    qwen3_next), so family-scoped policy must resolve from the model ref, the
+    same way the parent CLI's _apply_backend_serve_defaults does.
+    """
+    try:
+        model_ref = str(
+            getattr(state.args, "model", None)
+            or getattr(state, "model_id", None)
+            or ""
+        )
+        return model_family_from_inspection(
+            model_ref=model_ref,
+            descriptor=_backend_descriptor(state),
+        )
+    except Exception:
+        return "unknown"
+
+
+def _reasoning_codec_for_state(state: "ServerState") -> "ReasoningCodec":
+    """Family-resolved reasoning codec (effort levels live per-family)."""
+    descriptor = _backend_descriptor(state)
+    try:
+        return reasoning_policy_for_model(
+            model_ref=str(
+                getattr(state.args, "model", None)
+                or getattr(state, "model_id", None)
+                or ""
+            ),
+            descriptor=descriptor,
+        )
+    except Exception:
+        return descriptor.reasoning_codec
 
 
 def _open_browser_later(url: str, *, delay_s: float = 1.0) -> None:
@@ -1325,7 +2241,14 @@ class _StartupHeartbeat:
             "    print(f'      {label}... {elapsed:.0f}s elapsed', flush=True)\n"
         )
         self.proc = subprocess.Popen(
-            [sys.executable, "-c", script, label, str(float(interval_s)), str(os.getpid())],
+            [
+                sys.executable,
+                "-c",
+                script,
+                label,
+                str(float(interval_s)),
+                str(os.getpid()),
+            ],
             stdout=None,
             stderr=subprocess.DEVNULL,
             close_fds=True,
@@ -1426,22 +2349,52 @@ def _set_metal_memory_limit(mx: Any, name: str, value: int) -> str:
     raise AttributeError(f"MLX memory cap API {name} is unavailable")
 
 
+def _metal_system_reserve_bytes(total_ram_bytes: int) -> int:
+    """Unwired headroom macOS keeps outside the allocator caps.
+
+    16 GiB is right on 128 GB+ machines, but as a flat constant it
+    refused the 96 GB class by exactly the release notes' own margin
+    (issue #400: 77.3 GiB weights + 6 GiB floor margin + 16 GiB = 99.3
+    > 96, while the same pack ships healthy there with ~16 GiB left
+    unwired). Scale to RAM/8 below 128 GB, floored at 8 GiB — macOS's
+    own practical working floor — and keep 128 GB+ behavior unchanged.
+    """
+    return int(min(16 * 1024**3, max(8 * 1024**3, total_ram_bytes // 8)))
+
+
+def _resident_floor_margin_bytes(total_ram_bytes: int | None) -> int:
+    """Working margin above the weight files inside the wired floor
+    (allocator transients, KV pages, MTP sidecar churn).
+
+    6 GiB carries the 2026-08-27 128 GB receipt (n-gram eviction
+    collapse fix) and stays untouched at 112 GB+. Smaller machines run
+    proportionally smaller working sets and cannot afford the flat
+    constant: issue #400's 96 GB M2 Max receipt ships healthy at +2
+    GiB, so scale to RAM/32 with a 2 GiB floor below 112 GB.
+    """
+    if not total_ram_bytes or total_ram_bytes >= 112 * 1024**3:
+        return 6 * 1024**3
+    return int(max(2 * 1024**3, total_ram_bytes // 32))
+
+
 def _apply_metal_memory_caps(
     *,
     mx_module: Any | None = None,
     total_ram_bytes: int | None = None,
+    minimum_resident_bytes: int | None = None,
 ) -> dict[str, Any]:
-    """Pin MLX Metal allocator caps at startup to avoid wired-memory swap-out
-    pathologies under sustained long-context inference.
+    """Set MLX allocation and wired-residency budgets at startup.
 
     On Apple Silicon, MLX's Metal allocator can grow the wired pool past safe
     headroom under back-to-back >30 K-token requests. When the OS starts
     swapping, decode collapses ~10x (50 t/s -> 2.5 t/s) and the kernel may kill
-    the process. Setting both caps at startup keeps the allocator inside a
-    fixed budget; ``clear_cache`` periodically drops idle pool memory.
+    the process. The allocation limit is MLX's working-set guideline, not an
+    instantaneous hard ceiling: a single operation can exceed it. Admission
+    and request pressure guards remain necessary. ``clear_cache`` releases
+    unused allocator buffers; it does not clear the session bank.
 
     Operators can override via env:
-      MTPLX_MEMORY_LIMIT_BYTES   - hard cap, default 75% of total RAM,
+      MTPLX_MEMORY_LIMIT_BYTES   - allocation budget, default 75% of total RAM,
                                    capped at 192 GiB on very large Macs
       MTPLX_WIRED_LIMIT_BYTES    - wired (resident) cap, default 60% of total
                                    RAM, capped at 160 GiB on very large Macs
@@ -1488,14 +2441,43 @@ def _apply_metal_memory_caps(
             max(4 * 1024**3, int(total_ram * 0.60)),
             160 * 1024**3,
         )
+    resident_floor = max(0, int(minimum_resident_bytes or 0))
+    if resident_floor and total_ram is not None and total_ram > 0:
+        system_reserve = _metal_system_reserve_bytes(total_ram)
+        if resident_floor + system_reserve > total_ram:
+            return {
+                "applied": False,
+                "reason": "insufficient_ram",
+                "total_ram_bytes": total_ram,
+                "total_ram_source": total_ram_source,
+                "minimum_resident_bytes": resident_floor,
+                "minimum_system_reserve_bytes": system_reserve,
+            }
     mem_limit = _parse_metal_memory_size_bytes(mem_raw, default_mem)
     wired_limit = _parse_metal_memory_size_bytes(wired_raw, default_wired)
+    if resident_floor:
+        if (mem_raw and mem_limit < resident_floor) or (
+            wired_raw and wired_limit < resident_floor
+        ):
+            return {
+                "applied": False,
+                "reason": "configured_cap_below_model_minimum",
+                "total_ram_bytes": total_ram,
+                "total_ram_source": total_ram_source,
+                "minimum_resident_bytes": resident_floor,
+                "memory_limit_bytes": int(mem_limit),
+                "wired_limit_bytes": int(wired_limit),
+            }
+        mem_limit = max(mem_limit, resident_floor)
+        wired_limit = max(wired_limit, resident_floor)
 
     applied: dict[str, Any] = {
         "applied": True,
         "total_ram_bytes": total_ram,
         "total_ram_source": total_ram_source,
     }
+    if resident_floor:
+        applied["minimum_resident_bytes"] = resident_floor
     if wired_limit > mem_limit:
         wired_limit = mem_limit
         applied["wired_limit_clamped_to_memory_limit"] = True
@@ -1506,6 +2488,9 @@ def _apply_metal_memory_caps(
             mx, "set_memory_limit", int(mem_limit)
         )
         applied["memory_limit_bytes"] = int(mem_limit)
+        # "env": the operator set MTPLX_MEMORY_LIMIT_BYTES; the memory plan
+        # then takes it as the engine budget both ways (#443).
+        applied["memory_limit_source"] = "env" if mem_raw else "default"
     except Exception as exc:
         applied["memory_limit_error"] = str(exc)
     try:
@@ -1519,6 +2504,363 @@ def _apply_metal_memory_caps(
         applied["applied"] = False
         applied["reason"] = "cap_api_unavailable"
     return applied
+
+
+# --- GPU residency keepalive -------------------------------------------------
+#
+# macOS drops an idle process's Metal residency about 2.5 s after its last
+# command buffer and re-establishes it lazily on the next submit, at ~9 ms per
+# GiB (2026-09-03, M5 Max 128 GB: an 8 GiB working set touched in 15 ms warm,
+# 85-95 ms after >=3 s idle; the 77 GiB Flash-Next weights turned every
+# prefill that followed >2.5 s of quiet into a ~0.75-1.0 s TTFT — the app's
+# "hi" measured 1.17 s on the server, 0.08 s back-to-back). That is every chat
+# turn and every agent tool-call round trip. A separate process keeping the
+# GPU busy does NOT help (the state is per-process); the process's own queue
+# must submit. With a wired limit set, MLX keeps the weights in a residency
+# set attached to the queue, and a trivially small kernel every second holds
+# the whole set resident (8 GiB test: 18.7 ms after 6 s idle with a beat vs
+# 87 ms without). Without a wired limit eviction is per-page and a small
+# kernel holds nothing, so the beat is only armed when the caps applied one.
+#
+# The scheduler owns the mechanism (owner-thread beat between items, only
+# while a foreground request completed within the attentive window); this
+# section is the policy: whether, how often, and for how long.
+
+_GPU_KEEPALIVE_INTERVAL_DEFAULT_S = 1.0
+_GPU_KEEPALIVE_ATTENTIVE_DEFAULT_S = 600.0
+
+
+def _gpu_keepalive_enabled() -> bool:
+    raw = str(os.environ.get("MTPLX_GPU_KEEPALIVE", "1")).strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _gpu_keepalive_interval_s() -> float:
+    raw = str(os.environ.get("MTPLX_GPU_KEEPALIVE_INTERVAL_S", "")).strip()
+    try:
+        value = float(raw) if raw else _GPU_KEEPALIVE_INTERVAL_DEFAULT_S
+    except ValueError:
+        value = _GPU_KEEPALIVE_INTERVAL_DEFAULT_S
+    # Below 2 s of quiet the residency survives; above ~2.5 s it does not.
+    return min(2.0, max(0.25, value))
+
+
+def _gpu_keepalive_attentive_s() -> float:
+    raw = str(os.environ.get("MTPLX_GPU_KEEPALIVE_ATTENTIVE_S", "")).strip()
+    try:
+        value = float(raw) if raw else _GPU_KEEPALIVE_ATTENTIVE_DEFAULT_S
+    except ValueError:
+        value = _GPU_KEEPALIVE_ATTENTIVE_DEFAULT_S
+    return max(0.0, value)
+
+
+def _make_gpu_residency_touch() -> Callable[[], None]:
+    """One tiny kernel on the model's (default GPU) stream: its only job is to
+    put a command buffer on the queue the residency set is attached to."""
+    import mlx.core as mx
+
+    probe = mx.ones((64, 64), dtype=mx.float32)
+    mx.eval(probe)
+
+    def touch() -> None:
+        mx.eval(mx.matmul(probe, probe))
+
+    return touch
+
+
+def _arm_gpu_keepalive(state: "ServerState") -> dict[str, Any]:
+    """Decide and arm the residency keepalive; the receipt rides /health."""
+    receipt: dict[str, Any] = {
+        "enabled": False,
+        "interval_s": _gpu_keepalive_interval_s(),
+        "attentive_s": _gpu_keepalive_attentive_s(),
+    }
+    if not _gpu_keepalive_enabled():
+        receipt["reason"] = "disabled_by_env"
+        return receipt
+    caps = getattr(state, "metal_memory_caps", None) or {}
+    wired = caps.get("wired_limit_bytes")
+    if not (caps.get("applied") and isinstance(wired, int) and wired > 0):
+        receipt["reason"] = "no_wired_limit"
+        return receipt
+    scheduler = getattr(state, "model_scheduler", None)
+    if scheduler is None or not hasattr(scheduler, "arm_idle_keepalive"):
+        receipt["reason"] = "scheduler_unsupported"
+        return receipt
+    try:
+        touch = _make_gpu_residency_touch()
+    except Exception as exc:
+        receipt["reason"] = f"touch_unavailable:{type(exc).__name__}"
+        return receipt
+    scheduler.arm_idle_keepalive(
+        touch,
+        interval_s=receipt["interval_s"],
+        attentive_s=receipt["attentive_s"],
+    )
+    receipt["enabled"] = True
+    receipt["wired_limit_bytes"] = int(wired)
+    return receipt
+
+
+def _gpu_keepalive_health(state: "ServerState") -> dict[str, Any]:
+    payload = dict(getattr(state, "gpu_keepalive", None) or {"enabled": False})
+    scheduler = getattr(state, "model_scheduler", None)
+    if scheduler is not None and hasattr(scheduler, "keepalive_state"):
+        try:
+            payload.update(scheduler.keepalive_state())
+        except Exception:
+            pass
+    return payload
+
+
+def _validate_backend_context_memory_budget(
+    backend: BackendDescriptor,
+    caps: dict[str, Any],
+    requested_context_window: int | None,
+) -> None:
+    if backend.backend_id != "laguna_ar":
+        return
+    from mtplx.models.laguna_config import (
+        laguna_s_2_1_required_resident_bytes,
+    )
+
+    context_tokens = int(
+        requested_context_window or backend.context_window_policy.default
+    )
+    required = laguna_s_2_1_required_resident_bytes(context_tokens)
+    limits = [
+        int(caps[key])
+        for key in ("memory_limit_bytes", "wired_limit_bytes")
+        if isinstance(caps.get(key), int) and int(caps[key]) > 0
+    ]
+    if not limits or required <= min(limits):
+        return
+    raise RuntimeError(
+        f"Laguna-S-2.1 context window {context_tokens:,} requires about "
+        f"{required / 1024**3:.1f} GiB resident memory, above the active "
+        f"Metal cap of {min(limits) / 1024**3:.1f} GiB"
+    )
+
+
+def apply_memory_caps_preflight(
+    *,
+    entry: str,
+    model: str | None = None,
+    contexts: Iterable[int] | None = None,
+) -> dict[str, Any]:
+    """Serve-path memory discipline for non-serve entries (#261, F7).
+
+    Benchmark/ladder/terminal-chat paths used to load models with no Metal
+    allocator caps, producing 100GB+ headline peaks the serve path can never
+    reach. This applies the exact caps the serve path pins at startup — same
+    function, same values, same env overrides — and refuses context requests
+    beyond the model's context window with a clear message instead of
+    silently benchmarking past the trained window.
+
+    Returns a JSON-safe receipt for the caller's payload/envelope.
+    """
+    caps = _apply_metal_memory_caps()
+    outcome: dict[str, Any] = {
+        "entry": str(entry),
+        "metal_memory_caps": caps,
+    }
+    requested = sorted({int(value) for value in (contexts or []) if int(value) > 0})
+    if model is not None and requested:
+        limit = int(_resolve_context_window(None, str(model)))
+        outcome["model_context_window"] = limit
+        outcome["requested_contexts"] = requested
+        over = [value for value in requested if value > limit]
+        if over:
+            raise ValueError(
+                f"{entry}: requested context of {max(over):,} tokens exceeds "
+                f"the model's context window of {limit:,} tokens (from the "
+                "model config, or the 262,144-token default when no local "
+                "config.json resolves). Refusing to benchmark beyond the "
+                f"trained window; rerun with contexts <= {limit:,}."
+            )
+    return outcome
+
+
+def _allow_swap_enabled(args: Any) -> bool:
+    """--allow-swap on the command line, or MTPLX_ALLOW_SWAP=1 in the env.
+
+    The env form exists for launchers that do not expose serve flags (the
+    desktop app, ``mtplx start``): the daemon inherits its environment.
+    """
+
+    if bool(getattr(args, "allow_swap", False)):
+        return True
+    raw = os.environ.get("MTPLX_ALLOW_SWAP", "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _select_backend_context_window(
+    backend: BackendDescriptor,
+    *,
+    model_max: int,
+    requested: int | None,
+    machine_fit: int | None = None,
+) -> int:
+    """Serving window: explicit request > machine fit > model max.
+
+    ``machine_fit`` is the memory plan's largest window whose full-window
+    KV actually fits this machine's engine envelope (issue #305: the flat
+    model-max default admitted 262k-token prompts on 48 GB Macs, whose KV
+    alone exceeds the Metal budget — swap-death, not an error message).
+    It shapes only the DEFAULT: an explicit --context-window always wins,
+    with the plan warning loudly instead of refusing.
+    """
+    requested_value = int(requested or 0)
+    default_value = (
+        backend.context_window_policy.default
+        if backend.backend_id == "laguna_ar"
+        else int(model_max)
+    )
+    fit = int(machine_fit or 0)
+    if requested_value <= 0 and fit > 0:
+        default_value = min(int(default_value), fit)
+    return max(
+        4_096,
+        min(
+            int(model_max),
+            requested_value if requested_value > 0 else int(default_value),
+        ),
+    )
+
+
+def _validate_mtp_batch_settings(args: argparse.Namespace) -> None:
+    """Reject an invalid fixed-width MTP service before model construction."""
+
+    # The ArraysCache.advance() Metal buffer-object leak arms on the
+    # BatchGenerator paths (ar_batch), not only mtp_batch — install the
+    # vendored fix for EVERY server mode before the scheduler-mode
+    # early-return, closing the gate hole where stock mlx-lm could serve
+    # the AR lane unprotected (leak crash bound ~17k tokens on 35B).
+    from mtplx.arrays_cache_patch import install_arrays_cache_fix
+
+    install_arrays_cache_fix()
+    numerics = normalize_mtp_batch_numerics(getattr(args, "mtp_batch_numerics", None))
+    args.mtp_batch_numerics = numerics.value
+    if str(getattr(args, "scheduler_mode", "serial")) != SchedulerMode.MTP_BATCH:
+        if numerics is not MTPBatchNumerics.THROUGHPUT:
+            raise A3BMTPBatchInstallError(
+                f"mtp_batch numerics profile {numerics.value} "
+                "requires scheduler_mode=mtp_batch"
+            )
+        return
+    required = (
+        (str(getattr(args, "generation_mode", "")) == "mtp", "generation_mode=mtp"),
+        (bool(getattr(args, "load_mtp", False)), "load_mtp=true"),
+        (int(getattr(args, "depth", 0) or 0) == 1, "depth=1"),
+        (
+            int(getattr(args, "max_active_requests", 0) or 0) == 8,
+            "max_active_requests=8",
+        ),
+        (
+            int(getattr(args, "decode_batch_max", 0) or 0) == 8,
+            "decode_batch_max=8",
+        ),
+        (
+            int(getattr(args, "context_window", 0) or 0)
+            == A3B_MTP_BATCH_MAX_CONTEXT_TOKENS,
+            f"context_window={A3B_MTP_BATCH_MAX_CONTEXT_TOKENS}",
+        ),
+        (
+            str(getattr(args, "profile", "")).strip().lower() == "turbo",
+            "profile=turbo",
+        ),
+        (
+            str(getattr(args, "verify_strategy", "")).strip().lower()
+            == "target_prefix",
+            "verify_strategy=target_prefix",
+        ),
+        (
+            str(getattr(args, "verify_core", "")).strip().lower() == "stock",
+            "verify_core=stock",
+        ),
+    )
+    for valid, contract in required:
+        if not valid:
+            raise A3BMTPBatchInstallError(f"mtp_batch requires {contract}")
+    _require_mlx_lm_arrays_cache_fix()
+
+
+def _validate_hyper_settings(args: argparse.Namespace) -> None:
+    """Reject launch flags that contradict hyper's admission contract.
+
+    ``--scheduler-mode hyper`` fixes external admission at 1: one request in
+    flight, simultaneous requests queued FIFO exactly like serial, and any
+    width (H1/H2) spent on self-generated rows for that one request. The
+    multi-admission knobs therefore have no meaning here — an operator
+    passing them asked for two different schedulers, and hyper fails loudly
+    at startup (before model construction) instead of silently ignoring the
+    contradiction. See mtplx/server/hyper.py for the mode contract.
+    """
+
+    if str(getattr(args, "scheduler_mode", "serial")) != SchedulerMode.HYPER:
+        return
+    max_active = getattr(args, "max_active_requests", None)
+    if max_active is not None and int(max_active) != HYPER_ADMISSION_CAP:
+        raise ValueError(
+            "scheduler_mode=hyper fixes external admission at "
+            f"{HYPER_ADMISSION_CAP}; --max-active-requests {int(max_active)} "
+            "contradicts it (hyper width is per-request self-speculation, "
+            "not extra clients)"
+        )
+    decode_batch_max = getattr(args, "decode_batch_max", None)
+    if decode_batch_max is not None and int(decode_batch_max) != 1:
+        raise ValueError(
+            "scheduler_mode=hyper decodes one external request at a time; "
+            f"--decode-batch-max {int(decode_batch_max)} is an ar_batch/"
+            "mtp_batch knob. Hyper widths (H1/H2) install internally and "
+            "are not operator batch knobs."
+        )
+    batch_wait_ms = getattr(args, "batch_wait_ms", None)
+    if batch_wait_ms is not None and float(batch_wait_ms) > 0.0:
+        raise ValueError(
+            "scheduler_mode=hyper never holds a gather window "
+            f"(--batch-wait-ms {float(batch_wait_ms):g}): width comes from "
+            "the request's own speculative rows, so there is nothing to "
+            "wait for (singleton-passthrough contract)"
+        )
+    preset = str(getattr(args, "batching_preset", "latency") or "latency")
+    if preset in {"agent", "throughput"}:
+        raise ValueError(
+            "scheduler_mode=hyper is single-admission; batching preset "
+            f"'{preset}' configures multi-request admission. Use 'latency' "
+            "(default) or 'solo'."
+        )
+
+
+_QWEN3NEXT_STRUCTURE_VERIFY_STRATEGIES = frozenset(
+    {"capture", "capture_commit", "graphbank", "graphbank_capture_commit", "target_prefix"}
+)
+
+
+def _coerce_family_verify_strategy(args: argparse.Namespace) -> None:
+    """qwen4_exp packs cannot run the qwen3-next structure verify strategies.
+
+    The server default (--verify-strategy capture_commit) is the 27B fast
+    path; its capture stack introspects the qwen3-next DecoderLayer layout
+    (input_layernorm et al.) and raises AttributeError on Flash-Next
+    hyper-connection layers, so every MTP request 500s (first live hit
+    2026-08-27, raw-module boot). The family's repair-free lane is
+    MTPLX_FAMILY_CAPTURE_COMMIT, which wraps the batched verify instead of
+    replacing it, so 'batched' is the only correct base strategy here.
+    """
+    if not _served_model_type_is_qwen4_exp(args):
+        return
+    strategy = (
+        str(getattr(args, "verify_strategy", "") or "").strip().lower().replace("-", "_")
+    )
+    if strategy in _QWEN3NEXT_STRUCTURE_VERIFY_STRATEGIES:
+        print(
+            f"[serve] verify-strategy {strategy!r} is a qwen3-next structure "
+            "lane; qwen4_exp verifies 'batched' (repair-free rollback rides "
+            "the MTPLX_FAMILY_CAPTURE_COMMIT env lane). Coercing.",
+            flush=True,
+        )
+        args.verify_strategy = "batched"
 
 
 def _health_string(value: Any) -> str | None:
@@ -1654,6 +2996,9 @@ def _expert_runtime_io_backend(runtime: Any) -> str | None:
 
 class ServerState:
     def __init__(self, args: argparse.Namespace) -> None:
+        _coerce_family_verify_strategy(args)
+        _validate_mtp_batch_settings(args)
+        _validate_hyper_settings(args)
         self.args = args
         from mtplx.expert_cli import expert_streaming_load_kwargs
 
@@ -1681,8 +3026,39 @@ class ServerState:
             )
         except ValueError as exc:
             raise ValueError(str(exc)) from exc
+        if args.paged_kv_quantization != "off":
+            # Engine-side policy gate: the descriptor table is the single
+            # source of KV-quant eligibility. Without this, an env-supplied
+            # q8/q4 reached the cache installer for families that never
+            # validated it (Gemma/Step/GLM/DeepSeek). Downgrade loudly rather
+            # than refuse: a persisted app toggle must not brick a model swap.
+            from mtplx.backends.descriptors import kv_quant_policy_for_model
+
+            kv_policy = kv_quant_policy_for_model(
+                model_ref=str(getattr(args, "model", "") or "") or None,
+                descriptor=descriptor_for_backend_id(
+                    getattr(args, "backend_id", None)
+                ),
+            )
+            if not (
+                kv_policy.supported
+                and args.paged_kv_quantization in kv_policy.modes
+            ):
+                LOGGER.warning(
+                    "paged KV quantization %r is not supported for this model "
+                    "(%s) — downgrading to off",
+                    args.paged_kv_quantization,
+                    kv_policy.disabled_reason
+                    or "no validated KV-quant policy for this family",
+                )
+                args.paged_kv_quantization = "off"
         apply_paged_kv_quantization_env(args.paged_kv_quantization)
         self.model_id = args.model_id
+        # Retrieval models are independent of the MTP generation path: they are
+        # loaded on first use and may be absent entirely.
+        from mtplx.retrieval import registry_from_args
+
+        self.retrieval = registry_from_args(args)
         self.started_at_s = time.time()
         self.lock = Lock()
         self.foreground_lock = Lock()
@@ -1693,10 +3069,84 @@ class ServerState:
         # explicitly for foreground-vs-idle admission.
         self.generation_executor = self.model_scheduler
         self.postcommit_executor = None
+        # Hyper admission gate (scheduler_mode=hyper only): accounting + the
+        # H1/H2 width seam. Never constructed for other modes so the serial
+        # dispatch tail stays untouched (a None check is its whole cost).
+        self.hyper_gate = (
+            HyperAdmissionGate()
+            if str(getattr(args, "scheduler_mode", "serial")) == SchedulerMode.HYPER
+            else None
+        )
         self.rate_limiter = _RateLimiter(args.rate_limit)
-        self.metal_memory_caps = _apply_metal_memory_caps()
-        self.profile = get_profile(args.profile)
         startup_backend = descriptor_for_backend_id(getattr(args, "backend_id", None))
+        minimum_resident_bytes = None
+        resident_floor_label = "The model"
+        if startup_backend.backend_id == "laguna_ar":
+            from mtplx.models.laguna_config import (
+                LAGUNA_S_2_1_MIN_RESIDENT_BYTES,
+            )
+
+            minimum_resident_bytes = LAGUNA_S_2_1_MIN_RESIDENT_BYTES
+            resident_floor_label = "Laguna-S-2.1"
+        elif _served_model_type_is_qwen4_exp(args):
+            # The default wired cap (60% of RAM) sits BELOW this family's
+            # working set once the n-gram table goes RAM-resident: on a 128G
+            # M5 Max the cap landed at ~82G against a ~99G resident set and
+            # Metal's forced eviction collapsed serve decode to 8.5 tok/s
+            # (2026-08-27 battery receipt). Floor = pack weight files
+            # (+ the table when the resident policy arms) + working margin.
+            try:
+                from mtplx.memory_plan import (
+                    NGRAM_TABLE_FILENAME,
+                    ngram_table_resident_policy,
+                )
+
+                model_dir = Path(str(getattr(args, "model", "") or ""))
+                floor = 0
+                for f in model_dir.glob("model*.safetensors"):
+                    floor += f.stat().st_size
+                mtp_f = model_dir / "mtp.safetensors"
+                if mtp_f.exists():
+                    floor += mtp_f.stat().st_size
+                table_f = model_dir / NGRAM_TABLE_FILENAME
+                if table_f.exists() and ngram_table_resident_policy():
+                    floor += table_f.stat().st_size
+                if floor:
+                    ram_bytes, _ = _detect_total_ram_bytes_for_metal_caps()
+                    minimum_resident_bytes = floor + _resident_floor_margin_bytes(
+                        ram_bytes
+                    )
+                    resident_floor_label = "Qwen3.8-Flash-Next"
+            except OSError:
+                minimum_resident_bytes = None
+        self.metal_memory_caps = _apply_metal_memory_caps(
+            minimum_resident_bytes=minimum_resident_bytes,
+        )
+        if self.metal_memory_caps.get("reason") in {
+            "insufficient_ram",
+            "configured_cap_below_model_minimum",
+        }:
+            required_gib = (
+                int(self.metal_memory_caps.get("minimum_resident_bytes") or 0) / 1024**3
+            )
+            reserve_gib = (
+                int(
+                    self.metal_memory_caps.get("minimum_system_reserve_bytes")
+                    or 16 * 1024**3
+                )
+                / 1024**3
+            )
+            raise RuntimeError(
+                f"{resident_floor_label} cannot load inside the available Metal memory "
+                f"budget; at least {required_gib:.1f} GiB resident plus "
+                f"{reserve_gib:.0f} GiB system headroom is required"
+            )
+        _validate_backend_context_memory_budget(
+            startup_backend,
+            self.metal_memory_caps,
+            getattr(args, "context_window", None),
+        )
+        self.profile = get_profile(args.profile)
         runtime_label = _health_runtime_mode_label(
             self.profile.name,
             getattr(args, "generation_mode", None),
@@ -1750,9 +3200,6 @@ class ServerState:
         from mtplx.expert_cli import apply_expert_profile_child_env
 
         apply_expert_profile_child_env(args, os.environ)
-        self.generation_feature_policy = install_generation_feature_policy(
-            dict(os.environ)
-        )
         _startup_line("[4/6] Checking local acceleration runtime")
         _startup_line("      This may take a few seconds.")
         self.mlx_runtime_status = _mlx_runtime_status()
@@ -1762,6 +3209,13 @@ class ServerState:
             # CLI flag is the public surface, the env is the plumbing.
             os.environ["MTPLX_MEMORY_BUDGET"] = str(int(self.memory_budget_bytes))
         self.mlx_cache_limit_status = _configure_mlx_cache_limit(args)
+        # The n-gram table pre-read: the CLI flag is the public surface, the
+        # env is the plumbing (same contract as MTPLX_MEMORY_BUDGET above).
+        # Stamped AFTER apply_profile_env so an explicit --ngram-prewarm /
+        # --no-ngram-prewarm also wins over a model contract's override, and
+        # BEFORE the load below, which is what performs the read.
+        self.ngram_prewarm_source = _apply_ngram_prewarm_choice(args)
+        self.ngram_prewarm_reservation = _publish_ngram_prewarm_reservation(args)
         _startup_line("[4/6] Runtime checks complete")
         started = time.perf_counter()
         _startup_line(f"[5/6] Loading model weights: {args.model}")
@@ -1803,17 +3257,12 @@ class ServerState:
             load_heartbeat.set()
         self.load_time_s = time.perf_counter() - started
         _startup_line(f"[5/6] Model loaded in {self.load_time_s:.1f}s")
-        # SessionBank identity follows the installed runtime, not the per-request
-        # generation mode. Bind it once so an AR-only expert runtime never enters
-        # hidden-state or MTP-cache construction during postcommit maintenance.
-        self.session_mtp_history_policy = (
-            "committed" if self.runtime.mtp_enabled else "none"
-        )
-        self.session_hidden_variant = (
-            "post_norm"
-            if self.session_mtp_history_policy == "committed"
-            else None
-        )
+        # The fixed-M4 lane's per-request memory gate measures against the
+        # same allocator ceiling the prefill admission shed uses
+        # (generation._metal_memory_limit_bytes).
+        pinned_limit = self.metal_memory_caps.get("memory_limit_bytes")
+        if isinstance(pinned_limit, int) and pinned_limit > 0:
+            self.runtime.metal_memory_limit_bytes = int(pinned_limit)
         self.backend_descriptor = descriptor_from_runtime(self.runtime, args)
         args.backend_id = self.backend_descriptor.backend_id
         if self.backend_descriptor.uses_draft_lm_head:
@@ -1822,6 +3271,9 @@ class ServerState:
             _startup_line(
                 f"[5/6] {self.backend_descriptor.display_name} drafter is active"
             )
+        fused_line = _laguna_fused_startup_line(self.runtime)
+        if fused_line:
+            _startup_line(fused_line)
         if self.backend_descriptor.uses_draft_lm_head and self.runtime.mtp_enabled:
             self.draft_lm_head = self.model_scheduler.submit_foreground(
                 _install_draft_lm_head,
@@ -1839,14 +3291,14 @@ class ServerState:
         else:
             self.draft_lm_head = {"installed": False, "reason": "mtp_disabled"}
         if self.backend_descriptor.uses_draft_lm_head and self.runtime.mtp_enabled:
-            self.draft_head_identity = (
-                self.model_scheduler.submit_foreground(
-                    _draft_head_identity,
-                    self.runtime,
-                    batch_key="startup.draft_head_identity",
-                ).result()
-            )
-        elif self.backend_descriptor.uses_external_assistant and self.runtime.mtp_enabled:
+            self.draft_head_identity = self.model_scheduler.submit_foreground(
+                _draft_head_identity,
+                self.runtime,
+                batch_key="startup.draft_head_identity",
+            ).result()
+        elif (
+            self.backend_descriptor.uses_external_assistant and self.runtime.mtp_enabled
+        ):
             runtime_config = getattr(self.runtime, "config", None)
             assistant_path = getattr(runtime_config, "assistant_model_path", None)
             draft_block_size = getattr(runtime_config, "draft_block_size", None)
@@ -1857,6 +3309,57 @@ class ServerState:
             )
         else:
             self.draft_head_identity = None
+        scheduler_config = _scheduler_config_from_args(args)
+        self.mtp_batch_lane = None
+        self.mtp_batch_lanes: dict[int, Any] = {}
+        self.mtp_batch_omit_speculative_bonus = False
+        if scheduler_config.mode == SchedulerMode.HYPER:
+            _startup_line(
+                "[4/6] hyper scheduler installed: stage=h0 "
+                f"admission_cap={HYPER_ADMISSION_CAP} width=1 "
+                "passthrough=serial_b1 (singleton chassis; width seam idle)"
+            )
+        if scheduler_config.mode == SchedulerMode.MTP_BATCH:
+            self.mtp_batch_omit_speculative_bonus = str(
+                os.environ.get("MTPLX_OMIT_SPECULATIVE_BONUS", "")
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            self.mtp_batch_lane = self.model_scheduler.submit_foreground(
+                install_a3b_mtp_batch_lane,
+                self.runtime,
+                numerics=args.mtp_batch_numerics,
+                batch_key="startup.mtp_batch_lane",
+            ).result()
+            self.mtp_batch_lanes = {
+                int(self.mtp_batch_lane.geometry.cohort_slots): self.mtp_batch_lane
+            }
+            _startup_line(
+                "[4/6] mtp_batch lane installed: "
+                f"width={int(self.mtp_batch_lane.geometry.cohort_slots)} "
+                f"route={self.mtp_batch_lane.route_id} "
+                f"selfcheck_ok={bool(self.mtp_batch_lane.selfcheck.get('ok'))}"
+            )
+            if (
+                normalize_mtp_batch_numerics(args.mtp_batch_numerics)
+                is MTPBatchNumerics.THROUGHPUT
+            ):
+                # Native small-cohort width: 2-3 request cohorts run a
+                # physical B3/T2 graph instead of B8 with five inert rows.
+                # Install fails closed — a B3 selfcheck failure aborts
+                # startup exactly like a B8 one.
+                b3_lane = self.model_scheduler.submit_foreground(
+                    install_a3b_mtp_batch_lane,
+                    self.runtime,
+                    numerics=args.mtp_batch_numerics,
+                    cohort_slots=3,
+                    batch_key="startup.mtp_batch_lane_b3",
+                ).result()
+                self.mtp_batch_lanes[int(b3_lane.geometry.cohort_slots)] = b3_lane
+                _startup_line(
+                    "[4/6] mtp_batch lane installed: "
+                    f"width={int(b3_lane.geometry.cohort_slots)} "
+                    f"route={b3_lane.route_id} "
+                    f"selfcheck_ok={bool(b3_lane.selfcheck.get('ok'))}"
+                )
         self.chat_template_profile = _normalize_chat_template_profile(
             getattr(args, "chat_template_profile", None)
         )
@@ -1870,7 +3373,9 @@ class ServerState:
             self.chat_template_profile = _CHAT_TEMPLATE_PROFILE_CUSTOM
         _startup_line(
             "[5/6] Chat template profile: "
-            + str(self.chat_template_report.get("profile") or self.chat_template_profile)
+            + str(
+                self.chat_template_report.get("profile") or self.chat_template_profile
+            )
         )
         self.template_hash = (
             self.model_scheduler.submit_foreground(
@@ -1897,30 +3402,243 @@ class ServerState:
             if args.draft_temperature is not None
             else None
         )
+        # Draft-sampler policy state (dynamic draft temperature):
+        # - pinned: a user-typed launch flag or an explicit live-settings
+        #   draft value disables the per-family curve; injected defaults and
+        #   the app's boilerplate launch flag are curve anchors, and the
+        #   live-settings implicit temperature->draft mirror never pins.
+        # - curve: measured per-family (target -> draft) temperature map;
+        #   None means identity (today's static behavior).
+        self.draft_sampler_pinned = _launch_draft_sampler_pinned(
+            args, self.draft_sampler
+        )
+        from mtplx.backends.descriptors import draft_temperature_curve_for_model
+
+        self.draft_temperature_curve = draft_temperature_curve_for_model(
+            model_ref=str(getattr(args, "model", "") or "") or None,
+            descriptor=self.backend_descriptor,
+        )
         self.model_context_window_max = _resolve_context_window(
             self.runtime.tokenizer,
             args.model,
         )
         requested_context_window = int(getattr(args, "context_window", None) or 0)
-        # Preserve the model capability separately for metadata, but install
-        # only a served window that the selected runtime can actually admit.
-        self.context_window = _effective_served_context_window(
-            model_context_window_max=self.model_context_window_max,
-            requested_context_window=requested_context_window,
-            runtime=self.runtime,
+        # --allow-swap / MTPLX_ALLOW_SWAP (#427): the operator accepts swap
+        # past the machine fit. The fit stops shaping the default window
+        # and stops refusing prompts; the plan still reports the
+        # overcommit honestly and the pressure guard keeps shedding.
+        self.allow_swap = _allow_swap_enabled(args)
+        # Machine memory plan (issue #305): weights are a disk scan, RAM a
+        # sysctl, so the machine's largest safe window is knowable BEFORE
+        # any request — and it shapes the default window below. Five
+        # subsystems budgeting independently with a machine-blind 262k
+        # default is how a 48 GB Mac reached 61.8 GB resident and 3 tok/s.
+        from mtplx.engine_session import (
+            model_weights_bytes as _model_weights_bytes,
         )
+        from mtplx.memory_plan import (
+            describe_plan as _describe_memory_plan,
+            detect_total_ram_bytes as _plan_detect_total_ram,
+            plan_memory as _plan_memory,
+        )
+
+        _plan_weights_bytes = _model_weights_bytes(
+            getattr(self.runtime, "model_path", None)
+        )
+        # Flash-Next n-gram sidecar: a commitment ONLY when the resident
+        # policy arms (it is then materialized into MLX memory at load);
+        # streamed mode reads reclaimable file-backed pages, so the plan
+        # carries it as a note instead of shrinking the window and the
+        # bank by 30G (the false MODEL-DOES-NOT-FIT chain, 2026-08-28).
+        from mtplx.engine_session import ngram_table_bytes as _ngram_table_bytes
+        from mtplx.memory_plan import (
+            ngram_table_resident_policy as _ngram_table_resident,
+        )
+
+        _plan_table_bytes = _ngram_table_bytes(
+            getattr(self.runtime, "model_path", None)
+        )
+        _plan_table_streamed_bytes = 0
+        if _plan_table_bytes:
+            if _ngram_table_resident():
+                _plan_weights_bytes = (_plan_weights_bytes or 0) + _plan_table_bytes
+            else:
+                _plan_table_streamed_bytes = _plan_table_bytes
+        # env override > model-config-derived geometry > flagship default
+        _plan_kv_bytes_per_token = 0
+        try:
+            _plan_kv_bytes_per_token = int(
+                os.environ.get("MTPLX_DENSE_KV_BYTES_PER_TOKEN") or 0
+            )
+        except (TypeError, ValueError):
+            _plan_kv_bytes_per_token = 0
+        _plan_model_path = getattr(self.runtime, "model_path", None)
+        _plan_model_config: dict[str, Any] | None = None
+        if _plan_model_path is not None:
+            try:
+                _plan_model_config = json.loads(
+                    (Path(_plan_model_path) / "config.json").read_text()
+                )
+            except (OSError, ValueError):
+                _plan_model_config = None
+        if _plan_kv_bytes_per_token <= 0:
+            from mtplx.memory_plan import (
+                dense_kv_bytes_per_token_from_config as _plan_kv_from_config,
+            )
+
+            _plan_kv_bytes_per_token = (
+                _plan_kv_from_config(_plan_model_config) or 65536
+            )
+        _plan_metal_limit: int | None = None
+        _plan_metal_explicit = False
+        _caps = getattr(self, "metal_memory_caps", None)
+        if isinstance(_caps, dict):
+            _cap_value = _caps.get("memory_limit_bytes")
+            if isinstance(_cap_value, int) and _cap_value > 0:
+                _plan_metal_limit = _cap_value
+                _plan_metal_explicit = _caps.get("memory_limit_source") == "env"
+        from mtplx.memory_plan import (
+            qsa_aux_bytes_per_token_from_config as _plan_aux_from_config,
+        )
+        from mtplx.memory_plan import (
+            qsa_prefill_transient_bytes_per_token_from_config as _plan_transient_from_config,
+        )
+
+        # The context-linear transient prices the DENSE indexer lane's
+        # [S, T] mask/score chain. When the sparse prefill lane will serve
+        # this process (auto on NAX machines, or explicitly armed), those
+        # transients are crossover-bounded and the honest per-token term is
+        # zero — measured: 262K cold prefill peaked at 87.4 GB on a 128 GiB
+        # M5 Max (weights 77.3 + KV 6.4 + aux + flat reserve), against the
+        # dense-priced ~115 GB that #393 observed wedging the machine.
+        _plan_transient_per_token = _plan_transient_from_config(_plan_model_config)
+        if _plan_transient_per_token:
+            try:
+                from mtplx.models.qwen4_exp import (
+                    _qsa_prefill_enabled as _qsa_prefill_lane_resolved,
+                )
+
+                if _qsa_prefill_lane_resolved():
+                    _plan_transient_per_token = 0
+            except Exception:
+                pass
+        _plan_inputs: dict[str, Any] = {
+            "total_ram_bytes": _plan_detect_total_ram(),
+            "model_weights_bytes": _plan_weights_bytes,
+            "ngram_table_streamed_bytes": _plan_table_streamed_bytes,
+            "kv_bytes_per_token": _plan_kv_bytes_per_token,
+            "kv_quantization": _effective_paged_kv_quantization(),
+            "model_max_context": int(self.model_context_window_max),
+            "memory_budget_bytes": self.memory_budget_bytes,
+            "usable_bytes_override": _plan_metal_limit,
+            "usable_bytes_explicit": _plan_metal_explicit,
+            # Family terms the KV number misses (QSA streams + MTP-head KV,
+            # and the context-linear QSA prefill transient) — issue #393:
+            # without them a 262K window was admitted on 128 GB with 2.4x
+            # phantom headroom and died at 119 GB with no 507.
+            "aux_bytes_per_token": _plan_aux_from_config(_plan_model_config),
+            "prefill_transient_bytes_per_token": _plan_transient_per_token,
+        }
+        _fit_plan = _plan_memory(**_plan_inputs)
+        _machine_fit = (
+            int(_fit_plan.context_window_fit)
+            if _fit_plan.available and _fit_plan.model_fits
+            else 0
+        )
+        self.context_window = _select_backend_context_window(
+            self.backend_descriptor,
+            model_max=int(self.model_context_window_max),
+            requested=requested_context_window,
+            machine_fit=0 if self.allow_swap else _machine_fit,
+        )
+        # Expert streaming installs a hard live-KV ceiling: the served window
+        # can never exceed the streamed runtime's memory plan, or the bounded
+        # expert cache would admit more tokens than its budget allows.
+        _expert_streaming = getattr(self.runtime, "expert_streaming", None)
+        if _expert_streaming is not None:
+            _stream_config = getattr(_expert_streaming, "config", None)
+            _max_live_kv_tokens = getattr(
+                _stream_config, "max_live_kv_tokens", None
+            )
+            if (
+                isinstance(_max_live_kv_tokens, bool)
+                or not isinstance(_max_live_kv_tokens, int)
+                or _max_live_kv_tokens <= 0
+            ):
+                raise ValueError(
+                    "installed expert streaming config requires positive "
+                    "max_live_kv_tokens"
+                )
+            self.context_window = min(
+                int(self.context_window), _max_live_kv_tokens
+            )
+        if (
+            scheduler_config.mode == SchedulerMode.MTP_BATCH
+            and self.mtp_batch_lane is not None
+            and int(self.context_window)
+            > int(self.mtp_batch_lane.geometry.max_context_tokens)
+        ):
+            raise RuntimeError(
+                "mtp_batch context window exceeds its installed fixed-width "
+                f"capacity of {self.mtp_batch_lane.geometry.max_context_tokens} tokens"
+            )
         _startup_line(f"[5/6] Context window: {self.context_window} tokens")
         # The paged KV pool clamps geometric growth to this window (#150);
         # env is the plumbing because cache_state has no server handle.
         os.environ["MTPLX_CONTEXT_WINDOW_TOKENS"] = str(int(self.context_window))
-        self.session_bank_cold_tier = _session_bank_cold_tier_from_args(args)
-        from mtplx.engine_session import model_weights_bytes as _model_weights_bytes
+        # Final plan against the RESOLVED window (the fit plan above only
+        # shaped the default): overcommit and machine-bound verdicts ride
+        # the banner, the health payload, and the app's dashboard stream.
+        from mtplx.generation import (
+            _dense_decode_max_context as _dense_decode_ceiling,
+        )
 
+        _plan_inputs["requested_context"] = (
+            int(self.context_window)
+            if requested_context_window > 0 or self.allow_swap
+            else None
+        )
+        _plan_inputs["dense_decode_ceiling"] = int(_dense_decode_ceiling())
+        self.memory_plan = _plan_memory(**_plan_inputs)
+        if self.memory_plan.available:
+            _startup_line(
+                f"[5/6] Memory plan: {_describe_memory_plan(self.memory_plan)}"
+            )
+            for _plan_note in self.memory_plan.notes:
+                _startup_line(f"[5/6] Memory plan: {_plan_note}")
+            if self.allow_swap and self.memory_plan.context_overcommitted:
+                _startup_line(
+                    "[5/6] Memory plan: --allow-swap: prompts past the fit of "
+                    f"{self.memory_plan.context_window_fit} tokens are admitted; "
+                    "expect swap and slow decode there"
+                )
+        else:
+            # A detector whose failure path is "quietly use the default"
+            # is how the app-daemon PATH bug shipped (mistakes ledger);
+            # the fallback names its reason in one log read.
+            _startup_line(
+                "[5/6] Memory plan unavailable "
+                f"({self.memory_plan.unavailable_reason}); legacy budgets apply"
+            )
+        # Weights are mapped and the Metal caps (residency set) are in place:
+        # keep that working set resident between turns.
+        self.gpu_keepalive = _arm_gpu_keepalive(self)
+        if self.gpu_keepalive.get("enabled"):
+            _startup_line(
+                "[5/6] GPU residency keepalive: every "
+                f"{self.gpu_keepalive['interval_s']:g}s for "
+                f"{self.gpu_keepalive['attentive_s']:g}s after each request"
+            )
+        else:
+            _startup_line(
+                "[5/6] GPU residency keepalive off "
+                f"({self.gpu_keepalive.get('reason', 'unknown')})"
+            )
+        self.session_bank_cold_tier = _session_bank_cold_tier_from_args(args)
         self.sessions = EngineSessionManager(
             cold_tier=self.session_bank_cold_tier,
-            model_weights_bytes=_model_weights_bytes(
-                getattr(self.runtime, "model_path", None)
-            ),
+            model_weights_bytes=_plan_weights_bytes,
+            memory_plan=self.memory_plan,
         )
         # Keep the SSD cold-tier encode (full-KV byte conversion; post-#169
         # it runs at enqueue, never on the writer thread) off request and
@@ -1929,12 +3647,41 @@ class ServerState:
         _bank = getattr(self.sessions, "bank", None)
         if _bank is not None and hasattr(_bank, "cold_enqueue_dispatch"):
             _scheduler = self.model_scheduler
-            _bank.cold_enqueue_dispatch = (
-                lambda job: _scheduler.submit_idle_postcommit(
-                    job, batch_key="ssd.cold_enqueue"
+            if getattr(_scheduler, "SUPPORTS_IDLE_PERSISTENCE", False):
+                # Durability band: cold encodes must never displace the
+                # canonical postcommit whose entry anchors the next turn's
+                # restore (2026-08-06 causal probe: FIFO idle ordering cost
+                # 0.66-1.17s per warm agent turn). Explicit capability
+                # check; legacy schedulers keep the idle-postcommit lane.
+                _bank.cold_enqueue_dispatch = lambda job: (
+                    _scheduler.submit_idle_persistence(
+                        job,
+                        batch_key="ssd.cold_enqueue",
+                        coalesce_key=getattr(job, "coalesce_key", None),
+                    )
                 )
+            else:
+                _bank.cold_enqueue_dispatch = lambda job: (
+                    _scheduler.submit_idle_postcommit(job, batch_key="ssd.cold_enqueue")
+                )
+        # Foreground-yield wiring (2026-08-07): the cold tier's encode runs
+        # on the model-owner thread and its writer thread moves GBs through
+        # unified memory — both must stand down while a request is queued or
+        # running (encode aborts between tensor evals and re-dispatches;
+        # writer pauses between entry writes). Without this the SSD write of
+        # each fresh postcommit entry overlapped the next turn: -30% decode
+        # + 0.66-0.75 s unattributed prompt-state wall (gate254-c4s).
+        if self.session_bank_cold_tier is not None and hasattr(
+            self.model_scheduler, "foreground_busy"
+        ):
+            self.session_bank_cold_tier.foreground_busy = (
+                self.model_scheduler.foreground_busy
             )
         self.last_metrics: list[dict[str, Any]] = []
+        # Per-request flight recorder (second-by-second telemetry + live
+        # in-flight endpoint). Inert when resolved off; hot paths only touch
+        # plain counters and a queue.
+        self.flight = resolve_flight_recorder(self.args)
         self.tool_parse_counters = {key: 0 for key in _TOOL_PARSE_COUNTER_KEYS}
         # Activity timestamps used by the parent-process thermal watchdog to
         # decide when to drop fans back to auto after an idle period.
@@ -1952,7 +3699,8 @@ class ServerState:
         from mtplx.thermal import SmartFanController
 
         self.smart_fans = SmartFanController(
-            log=lambda line: LOGGER.info("%s", line)
+            log=lambda line: LOGGER.info("%s", line),
+            activity_probe=self._smart_fan_activity_probe,
         )
         # Dashboard primitives: pub/sub bus, in-flight registry, 5-min rolling
         # TPS window, lifetime counters, prefill history. Created before
@@ -1960,7 +3708,72 @@ class ServerState:
         # surface as user requests.
         self.dashboard = DashboardState()
         self.ar_batch_service = _BatchedARGenerationService(self)
+        self.ar_batch_unavailable_reason: str | None = None
+        if scheduler_config.mode in {
+            SchedulerMode.AR_BATCH,
+            SchedulerMode.MTP_COHORT_EXPERIMENTAL,
+        }:
+            # MTPLX_AR_BATCH_CACHE_PROBE=0 is the operator belt: skip the
+            # probe and let the lane try to batch anyway.
+            if os.environ.get("MTPLX_AR_BATCH_CACHE_PROBE", "1").strip().lower() in {
+                "0",
+                "off",
+                "false",
+                "no",
+            }:
+                _startup_line(
+                    "[5/6] Scheduler: ar_batch cache-family probe skipped "
+                    "(MTPLX_AR_BATCH_CACHE_PROBE=0)"
+                )
+            else:
+                self.ar_batch_unavailable_reason = _ar_batch_unavailable_reason(
+                    self.runtime
+                )
+            if self.ar_batch_unavailable_reason:
+                _startup_line(
+                    f"[5/6] Scheduler: --scheduler-mode {scheduler_config.mode.value} "
+                    f"requested but {self.ar_batch_unavailable_reason}; "
+                    "concurrent requests serve one at a time on the solo lane"
+                )
+        self.mtp_batch_service = (
+            MTPBatchGenerationService(
+                self,
+                lane=self.mtp_batch_lane,
+                lanes=dict(self.mtp_batch_lanes),
+                owner_finalize=lambda jobs: _finalize_mtp_batch_cohort_owner(
+                    self, jobs
+                ),
+                batch_wait_s=(
+                    float(scheduler_config.to_dict()["batch_wait_ms"]) / 1000.0
+                ),
+            )
+            if self.mtp_batch_lane is not None
+            else None
+        )
         self.warmup_status = _run_startup_warmup(self)
+
+    def _smart_fan_activity_probe(self) -> bool:
+        """True while any model work is executing, queued, or recently active.
+
+        Feeds the SmartFanController stale-lease reconciler (#201). Covers
+        every legitimate work state: foreground generation (begin/end_foreground
+        wraps dispatch on all paths including the AR batch service), scheduler
+        queues and the executing item of either lane (foreground + idle
+        postcommit), and a short recency window so back-to-back agent turns
+        never look idle between requests.
+        """
+        if self.has_foreground():
+            return True
+        scheduler = getattr(self, "model_scheduler", None)
+        if scheduler is not None and hasattr(scheduler, "any_pending_or_active"):
+            try:
+                if scheduler.any_pending_or_active():
+                    return True
+            except BaseException:
+                return True
+        last_started = float(getattr(self, "last_request_started_at", 0.0) or 0.0)
+        last_finished = float(getattr(self, "last_request_at", 0.0) or 0.0)
+        return (time.time() - max(last_started, last_finished)) < 30.0
 
     def begin_foreground(self) -> None:
         with self.foreground_lock:
@@ -2321,6 +4134,23 @@ class _BatchedARGenerationService:
                 "last_miss_reason",
                 job.cache_miss_reason,
             )
+            if os.environ.get("MTPLX_BANK_RESTORE_DEBUG"):
+                diag = getattr(job.session_bank, "last_prefix_diagnostic", None)
+                _safe_stdout_print(
+                    json.dumps(
+                        {
+                            "event": "ar_batch_restore_miss_debug",
+                            "prompt_len": len(job.prompt_ids),
+                            "bank_entries": len(job.session_bank),
+                            "miss_reason": job.cache_miss_reason,
+                            "session_id": job.session_id,
+                            "template_hash": job.session_template_hash,
+                            "policy_fingerprint": job.session_policy_fingerprint,
+                            "diag": diag,
+                        },
+                        default=str,
+                    )
+                )
             return False
         if not self._cache_supports_batch_history_merge(restored.cache):
             # mlx-lm BatchGenerator requires history caches to expose merge().
@@ -2393,7 +4223,7 @@ class _BatchedARGenerationService:
             import mlx.core as mx
 
             prefill_started = time.perf_counter()
-            with attention_phase("ar_batch_shared_prefill"):
+            with attention_phase("prefill"):
                 logits = self.state.runtime.forward_ar(
                     mx.array([prefix_tokens]),
                     cache=cache,
@@ -2491,8 +4321,9 @@ class _BatchedARGenerationService:
         self, jobs: list[_BatchedARJob]
     ) -> tuple[list[_BatchedARJob], list[_BatchedARJob]]:
         for job in jobs:
-            if job.insert_cache is not None and not self._cache_supports_batch_history_merge(
-                job.insert_cache
+            if (
+                job.insert_cache is not None
+                and not self._cache_supports_batch_history_merge(job.insert_cache)
             ):
                 job.insert_cache = None
                 job.insert_all_tokens = []
@@ -2565,6 +4396,109 @@ class _BatchedARGenerationService:
                 self._active[int(uid)] = job
             self._condition.notify_all()
 
+    def _commit_prompt_boundary(self, job: _BatchedARJob, generator: Any, uid: int) -> None:
+        """Store a batched row's PROMPT-ONLY state at its first generation step.
+
+        At the first response, the step that produced token 1 has just
+        consumed the final prompt token, so the row's cache covers exactly the
+        prompt — and MLX array immutability makes the extracted slices a
+        coherent snapshot that `put` clones before the next decode step. The
+        entry keys on the prompt alone, so it is a strict prefix of EVERY
+        follow-up round's prompt: restores survive reasoning-history scoping,
+        which drops prior thinking and made finish-time keys (prompt + raw
+        generation) diverge mid-entry with no recurrent-safe restore point
+        (live receipt 2026-08-09: 10 entries banked, every app worker round
+        ssd_prefix_miss). Same fail-safe contract as the finish commit."""
+        bank = getattr(job, "session_bank", None)
+        if bank is None or job.session_cache_hit:
+            return  # a restored row's prompt state is already banked
+        prompt_ids = [int(token) for token in job.prompt_ids]
+        if len(prompt_ids) < 512:
+            return
+        if any(token >= (1 << 40) for token in prompt_ids):
+            return
+        started = time.perf_counter()
+        try:
+            extracted = generator.extract_cache([uid])
+            row = extracted.get(uid)
+            if row is None:
+                return
+            cache = row[0] if isinstance(row, tuple) else row
+            entry = bank.put(
+                runtime=self.state.runtime,
+                token_ids=prompt_ids,
+                cache=cache,
+                logits=None,
+                hidden=None,
+                session_id=job.session_id,
+                template_hash=job.session_template_hash,
+                policy_fingerprint=job.session_policy_fingerprint,
+                snapshot_epoch=len(prompt_ids),
+            )
+            job.request_observability["ar_batch_prompt_boundary_bank_stored"] = (
+                entry is not None
+            )
+        except Exception as exc:
+            job.request_observability["ar_batch_prompt_boundary_bank_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+        finally:
+            job.request_observability["ar_batch_prompt_boundary_bank_put_s"] = round(
+                time.perf_counter() - started, 6
+            )
+
+    def _commit_finished_row(self, job: _BatchedARJob, response: Any) -> None:
+        """Store a finished batched row's state in the session bank.
+
+        The fleet's deep-context collapse (LOG 2026-08-09) is this seam's
+        absence: mlx-lm's batch step already extracts the finishing row's
+        per-layer cache into `response.prompt_cache`, and dropping it forced
+        every follow-up tool round to re-prefill its whole transcript
+        (live receipt: cached_tokens=0 on 23/23 fleet rounds). The extracted
+        caches are the standard mergeable classes, so entries stored here are
+        insertable by _prepare_session_bank_restore on the next round.
+
+        The cache holds positions for every token EXCEPT the just-sampled
+        final one, so the entry keys on tokens[:-1] — which also keeps every
+        stored prefix strictly shorter than any follow-up prompt (the
+        full-prefix-not-insertable refusal can't hit these entries).
+        A commit failure must never break generation: errors are recorded and
+        swallowed."""
+        bank = getattr(job, "session_bank", None)
+        if bank is None:
+            return
+        row_cache = getattr(response, "prompt_cache", None)
+        all_tokens = list(getattr(response, "all_tokens", None) or [])
+        if row_cache is None or len(all_tokens) < 2:
+            return
+        token_ids = [int(token) for token in all_tokens[:-1]]
+        if len(token_ids) < 512:
+            return  # matches the cold-tier floor; tiny prefixes aren't worth a slot
+        if any(token >= (1 << 40) for token in token_ids):
+            return  # vision surrogate ids never enter the batched bank path
+        started = time.perf_counter()
+        try:
+            entry = bank.put(
+                runtime=self.state.runtime,
+                token_ids=token_ids,
+                cache=row_cache,
+                logits=None,
+                hidden=None,
+                session_id=job.session_id,
+                template_hash=job.session_template_hash,
+                policy_fingerprint=job.session_policy_fingerprint,
+                snapshot_epoch=len(token_ids),
+            )
+            job.request_observability["ar_batch_row_bank_stored"] = entry is not None
+        except Exception as exc:
+            job.request_observability["ar_batch_row_bank_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+        finally:
+            job.request_observability["ar_batch_row_bank_put_s"] = round(
+                time.perf_counter() - started, 6
+            )
+
     def _complete_job(self, job: _BatchedARJob, *, finish_reason: str) -> None:
         if job.future.done():
             return
@@ -2572,7 +4506,11 @@ class _BatchedARGenerationService:
         job.completed_s = completed
         elapsed_s = max(0.0, completed - job.created_s)
         prompt_eval_time_s = (
-            max(0.0, (job.prefill_done_s or completed) - (job.prefill_started_s or job.created_s))
+            max(
+                0.0,
+                (job.prefill_done_s or completed)
+                - (job.prefill_started_s or job.created_s),
+            )
             if job.prefill_started_s is not None
             else 0.0
         )
@@ -2603,7 +4541,8 @@ class _BatchedARGenerationService:
             ),
             "prompt_target_prefill_time_s": float(prompt_eval_time_s),
             "prompt_target_prefill_tok_s": (
-                max(0, len(job.prompt_ids) - int(job.cached_tokens)) / prompt_eval_time_s
+                max(0, len(job.prompt_ids) - int(job.cached_tokens))
+                / prompt_eval_time_s
                 if prompt_eval_time_s > 0 and job.prompt_ids
                 else 0.0
             ),
@@ -2643,13 +4582,15 @@ class _BatchedARGenerationService:
             "ar_batch_max_observed": int(job.max_batch_size_observed),
             "active_batch_size": int(job.max_batch_size_observed),
             "mtp_disabled_reason": job.mtp_disabled_reason,
-            "queue_wait_s": max(
-                0.0, (job.admitted_s or job.created_s) - job.created_s
-            ),
+            "queue_wait_s": max(0.0, (job.admitted_s or job.created_s) - job.created_s),
             "request_started_s": float(job.created_s),
             "server_seed": int(job.seed),
         }
         stats.update(job.request_observability)
+        # AR service lane: never surface draft-sampler policy stamps as
+        # draft stats on an AR response (F8 — absent, not null-with-value).
+        for key in [k for k in stats if k.startswith("draft_sampler")]:
+            del stats[key]
         stats.update(
             {
                 "cached_tokens": int(job.cached_tokens),
@@ -2667,9 +4608,7 @@ class _BatchedARGenerationService:
                 ),
                 "session_restore_mode": job.effective_restore_mode,
                 "ar_batch_shared_prefix_tokens": int(job.shared_prefix_tokens),
-                "ar_batch_shared_prefix_prefill_s": float(
-                    job.shared_prefix_prefill_s
-                ),
+                "ar_batch_shared_prefix_prefill_s": float(job.shared_prefix_prefill_s),
                 "ar_batch_shared_prefix_snapshot_s": float(
                     job.shared_prefix_snapshot_s
                 ),
@@ -2811,10 +4750,9 @@ class _BatchedARGenerationService:
                             self._active.pop(uid, None)
                         try:
                             generator.remove([uid])
-                        except BaseException:
-                            pass
-                        if not job.future.done():
-                            job.future.set_exception(self._cancelled_error(job))
+                        finally:
+                            if not job.future.done():
+                                job.future.set_exception(self._cancelled_error(job))
                         continue
                     job.max_batch_size_observed = max(
                         job.max_batch_size_observed,
@@ -2829,10 +4767,13 @@ class _BatchedARGenerationService:
                         if not job.future.done():
                             job.future.set_exception(exc)
                         continue
+                    if len(job.tokens) == 1:
+                        self._commit_prompt_boundary(job, generator, uid)
                     finish_reason = getattr(response, "finish_reason", None)
                     if finish_reason is not None:
                         with self._condition:
                             self._active.pop(uid, None)
+                        self._commit_finished_row(job, response)
                         self._complete_job(job, finish_reason=str(finish_reason))
                 mx.eval([])
         except BaseException as exc:
@@ -2867,11 +4808,10 @@ class _BatchedARGenerationService:
             return
         try:
             generator.remove([uid for uid, _job in cancelled])
-        except BaseException:
-            pass
-        for _uid, job in cancelled:
-            if not job.future.done():
-                job.future.set_exception(self._cancelled_error(job))
+        finally:
+            for _uid, job in cancelled:
+                if not job.future.done():
+                    job.future.set_exception(self._cancelled_error(job))
 
 
 def _submit_idle_postcommit_model_work(
@@ -2917,7 +4857,9 @@ def validate_server_security_args(args: argparse.Namespace) -> None:
     if not _is_localhost_bind(getattr(args, "host", None)) and not getattr(
         args, "api_key", None
     ):
-        raise SystemExit("--api-key or --api-key-file is required when --host is not localhost")
+        raise SystemExit(
+            "--api-key or --api-key-file is required when --host is not localhost"
+        )
     if int(getattr(args, "stream_interval", 1)) < 1:
         raise SystemExit("--stream-interval must be >= 1")
     if int(getattr(args, "rate_limit", 0)) < 0:
@@ -2960,6 +4902,94 @@ def _request_is_browser_auth_bootstrap(
         return False
     candidate = _request_browser_auth_query_key(request)
     return bool(candidate and secrets.compare_digest(candidate, configured_api_key))
+
+
+def _request_is_dashboard_bundle(method: str, path: str) -> bool:
+    """The dashboard SPA bundle: ``/dashboard``, its index, and ``assets/``.
+
+    Public static content with no secrets in it. It is served without a
+    key (and without a rate-limit charge) so the page can load and render
+    its own sign-in when the API answers 401. Every JSON route, including
+    everything under ``/mtplx``, ``/v1``, and ``/admin``, keeps the gate.
+    """
+
+    return method in {"GET", "HEAD"} and (path == "/dashboard" or path.startswith("/dashboard/"))
+
+
+# Cross-origin browser pages never reach these, not even from an origin the
+# operator allowlisted with --cors-origin: they change or expose server
+# state that only the operator's own pages (and non-browser clients) own.
+_SAME_ORIGIN_ONLY_ROOTS = ("/admin", _BROWSER_AUTH_PATH)
+
+
+def _path_is_same_origin_only(path: str) -> bool:
+    return any(path == root or path.startswith(root + "/") for root in _SAME_ORIGIN_ONLY_ROOTS)
+
+
+def _normalize_origin(value: str) -> tuple[str, str, int]:
+    """Return (scheme, host, port) for an origin string, or raise ValueError."""
+
+    text = str(value or "").strip().rstrip("/")
+    parts = urllib.parse.urlsplit(text)
+    scheme = (parts.scheme or "").lower()
+    if scheme not in {"http", "https"} or not parts.hostname:
+        raise ValueError(f"not an origin (expected scheme://host[:port]): {value!r}")
+    if parts.path or parts.query or parts.fragment or parts.username or parts.password:
+        raise ValueError(f"an origin has no path, query, or credentials: {value!r}")
+    port = parts.port if parts.port is not None else (443 if scheme == "https" else 80)
+    return scheme, parts.hostname.lower(), int(port)
+
+
+def _parse_cors_origins(values: Iterable[str] | None, env_value: str | None = None) -> tuple[str, ...]:
+    """Merge --cors-origin flags and MTPLX_CORS_ORIGINS into normalized origins."""
+
+    raw: list[str] = [str(v) for v in (values or [])]
+    for item in str(env_value or "").split(","):
+        if item.strip():
+            raw.append(item)
+    normalized: list[str] = []
+    for item in raw:
+        for piece in str(item).split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            scheme, host, port = _normalize_origin(piece)
+            default_port = 443 if scheme == "https" else 80
+            hostname = f"[{host}]" if ":" in host else host
+            origin = f"{scheme}://{hostname}" + ("" if port == default_port else f":{port}")
+            if origin not in normalized:
+                normalized.append(origin)
+    return tuple(normalized)
+
+
+def _request_origin_is_own(origin: str, *, scheme: str, host_header: str | None) -> bool:
+    """True when ``Origin`` names the very origin the client used to reach us.
+
+    The comparison is against the request's own Host and scheme rather
+    than a fixed list, so localhost, 127.0.0.1, [::1], a LAN bind, and a
+    TLS proxy that preserves Host all count as same-origin.
+    """
+
+    if not host_header:
+        return False
+    try:
+        return _normalize_origin(origin) == _normalize_origin(f"{scheme}://{host_header.strip()}")
+    except ValueError:
+        return False
+
+
+def _origin_is_allowlisted(origin: str, allowlist: Iterable[str]) -> bool:
+    try:
+        wanted = _normalize_origin(origin)
+    except ValueError:
+        return False
+    for allowed in allowlist:
+        try:
+            if _normalize_origin(allowed) == wanted:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def _rate_limit_key(request: Request) -> str:
@@ -3022,39 +5052,8 @@ def _resolve_context_window(tokenizer: Any, model_path: str) -> int:
                 if isinstance(value, int):
                     candidates.append(value)
 
-    sane = [value for value in candidates if 0 < value <= 1_000_000]
+    sane = [value for value in candidates if 0 < value <= 1_048_576]
     return max(sane) if sane else 262_144
-
-
-def _effective_served_context_window(
-    *,
-    model_context_window_max: int,
-    requested_context_window: int,
-    runtime: Any,
-) -> int:
-    served_context_window = (
-        max(
-            4_096,
-            min(int(model_context_window_max), int(requested_context_window)),
-        )
-        if requested_context_window > 0
-        else int(model_context_window_max)
-    )
-    expert_streaming = getattr(runtime, "expert_streaming", None)
-    if expert_streaming is None:
-        return served_context_window
-    stream_config = getattr(expert_streaming, "config", None)
-    max_live_kv_tokens = getattr(stream_config, "max_live_kv_tokens", None)
-    if (
-        isinstance(max_live_kv_tokens, bool)
-        or not isinstance(max_live_kv_tokens, int)
-        or max_live_kv_tokens <= 0
-    ):
-        raise ValueError(
-            "installed expert streaming config requires positive "
-            "max_live_kv_tokens"
-        )
-    return min(served_context_window, max_live_kv_tokens)
 
 
 def _content_to_text(content: Any) -> str:
@@ -3136,9 +5135,7 @@ def _vision_extract_and_flatten(
     for message in messages:
         is_mapping = isinstance(message, dict)
         content = (
-            message.get("content")
-            if is_mapping
-            else getattr(message, "content", None)
+            message.get("content") if is_mapping else getattr(message, "content", None)
         )
         if not isinstance(content, list):
             flattened.append(message)
@@ -3154,11 +5151,7 @@ def _vision_extract_and_flatten(
             item_type = str(item.get("type") or "")
             if item_type == "image_url" or "image_url" in item:
                 image_url = item.get("image_url")
-                url = (
-                    image_url.get("url")
-                    if isinstance(image_url, dict)
-                    else image_url
-                )
+                url = image_url.get("url") if isinstance(image_url, dict) else image_url
                 images.append(_image_bytes_from_url(str(url or "")))
                 parts.append(_VISION_PLACEHOLDER)
             elif item_type == "text" or "text" in item:
@@ -3181,9 +5174,7 @@ def _expand_image_pads(
     for token in prompt_ids:
         if token == image_pad_id:
             if image_index >= len(pad_counts):
-                raise ValueError(
-                    "prompt contains more image placeholders than images"
-                )
+                raise ValueError("prompt contains more image placeholders than images")
             expanded.extend([token] * pad_counts[image_index])
             image_index += 1
         else:
@@ -3201,13 +5192,18 @@ def _expand_image_pads(
 # this, each turn re-preprocesses and re-forwards the tower for pixels that
 # cannot have changed. Row-budgeted LRU: ~28 MB per 2.7k-token screenshot at
 # 5120 bf16, so the 32k-row default caps at ~340 MB.
-_VISION_EMBED_CACHE: "OrderedDict[tuple[str, int], tuple[Any, int]]" = OrderedDict()
+_VISION_EMBED_CACHE: (
+    "OrderedDict[tuple[str, int], tuple[Any, int, tuple[int, int, int]]]"
+) = OrderedDict()
 _VISION_EMBED_CACHE_MAX_ROWS = 32768
 
 
 def _vision_embed_cache_enabled() -> bool:
     return os.environ.get("MTPLX_VISION_EMBED_CACHE", "1").strip().lower() not in {
-        "0", "off", "false", "no",
+        "0",
+        "off",
+        "false",
+        "no",
     }
 
 
@@ -3219,7 +5215,10 @@ def _vision_session_cache_enabled() -> bool:
     context."""
 
     return os.environ.get("MTPLX_VISION_SESSION_CACHE", "1").strip().lower() not in {
-        "0", "off", "false", "no",
+        "0",
+        "off",
+        "false",
+        "no",
     }
 
 
@@ -3231,8 +5230,8 @@ def _image_content_digest(raw: bytes) -> int:
 
 def _vision_rows_for_image(
     state: Any, model_dir: Any, preprocessor_config: dict, raw: bytes, digest: int
-) -> tuple[Any, int]:
-    """Embedding rows + pad count for one image, via the digest LRU."""
+) -> tuple[Any, int, tuple[int, int, int]]:
+    """Embedding rows, pad count and (t, h, w) grid for one image (digest LRU)."""
 
     from mtplx.vision import load_vision_tower
     from mtplx.vision.processing import (
@@ -3247,22 +5246,23 @@ def _vision_rows_for_image(
         if hit is not None:
             _VISION_EMBED_CACHE.move_to_end(cache_key)
             return hit
-    pixel_values, grids = preprocess_images(
-        [decode_image(raw)], preprocessor_config
-    )
+    pixel_values, grids = preprocess_images([decode_image(raw)], preprocessor_config)
     pad_count = image_pad_token_count(grids[0])
+    grid = tuple(int(x) for x in grids[0])
     tower = load_vision_tower(str(model_dir))
     rows, _deepstack = tower(pixel_values, grids)
     import mlx.core as _mx
 
     _mx.eval(rows)
     if _vision_embed_cache_enabled():
-        _VISION_EMBED_CACHE[cache_key] = (rows, pad_count)
+        _VISION_EMBED_CACHE[cache_key] = (rows, pad_count, grid)
         cached_rows = sum(entry[1] for entry in _VISION_EMBED_CACHE.values())
-        while cached_rows > _VISION_EMBED_CACHE_MAX_ROWS and len(_VISION_EMBED_CACHE) > 1:
+        while (
+            cached_rows > _VISION_EMBED_CACHE_MAX_ROWS and len(_VISION_EMBED_CACHE) > 1
+        ):
             _, evicted = _VISION_EMBED_CACHE.popitem(last=False)
             cached_rows -= evicted[1]
-    return rows, pad_count
+    return rows, pad_count, grid
 
 
 def _materialize_vision_splice(
@@ -3285,14 +5285,16 @@ def _materialize_vision_splice(
     digests: list[int] = []
     row_blocks: list[Any] = []
     pad_counts: list[int] = []
+    grids: list[tuple[int, int, int]] = []
     for raw in images:
         digest = _image_content_digest(raw)
-        rows, pad_count = _vision_rows_for_image(
+        rows, pad_count, grid = _vision_rows_for_image(
             state, model_dir, preprocessor_config, raw, digest
         )
         digests.append(digest)
         row_blocks.append(rows)
         pad_counts.append(pad_count)
+        grids.append(grid)
     expanded_ids = _expand_image_pads(
         prompt_ids,
         image_pad_id=int(spec.image_token_id),
@@ -3306,11 +5308,36 @@ def _materialize_vision_splice(
     # Materialize before handing off: the generation worker runs on a
     # different thread, and a pending lazy graph must not cross it.
     _mx.eval(embeddings)
+
+    # M-RoPE table for families that rope image tokens at grid positions.
+    # Pure function of (expanded ids, grids) — recomputed per request, never
+    # persisted in cache state. A None result (video pads, layout mismatch)
+    # falls back to plain sequential rope rather than a wrong table.
+    mrope_table = None
+    mrope_delta = 0
+    if spec.mrope_section and spec.model_type == "qwen4_exp":
+        from mtplx.vision.mrope import build_mrope_positions
+
+        built = build_mrope_positions(
+            expanded_ids,
+            image_token_id=int(spec.image_token_id),
+            image_grids=grids,
+            spatial_merge_size=int(spec.spatial_merge_size),
+            video_token_id=int(spec.video_token_id),
+        )
+        if built is not None:
+            table_np, mrope_delta = built
+            mrope_table = _mx.array(table_np)
+            _mx.eval(mrope_table)
+
     return expanded_ids, VisionSplice(
         image_pad_token_id=int(spec.image_token_id),
         embeddings=embeddings,
         image_digests=tuple(digests),
         pad_counts=tuple(pad_counts),
+        image_grids=tuple(grids),
+        mrope_table=mrope_table,
+        mrope_delta=mrope_delta,
     )
 
 
@@ -3344,6 +5371,72 @@ def _anthropic_content_to_text(content: Any) -> str:
             return str(content.get("text", ""))
         return json.dumps(content, sort_keys=True)
     return str(content)
+
+
+def _anthropic_image_block_to_openai_part(block: Any) -> dict[str, Any] | None:
+    """Translate one Anthropic ``image`` block into an OpenAI ``image_url`` part.
+
+    Returns None for anything that is not a usable image (wrong type, missing
+    source, empty payload) so the caller keeps the historical text rendering
+    for it instead of dropping content.
+    """
+
+    if not isinstance(block, dict) or str(block.get("type") or "") != "image":
+        return None
+    source = block.get("source")
+    if not isinstance(source, dict):
+        return None
+    source_type = str(source.get("type") or "")
+    if source_type == "base64":
+        data = source.get("data")
+        if not isinstance(data, str) or not data:
+            return None
+        media_type = str(source.get("media_type") or "image/png")
+        url = f"data:{media_type};base64,{data}"
+    elif source_type == "url":
+        url = source.get("url")
+        if not isinstance(url, str) or not url:
+            return None
+    else:
+        return None
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
+def _anthropic_content_to_chat_content(content: Any) -> Any:
+    """Render Anthropic content as ``ChatMessage.content``.
+
+    Content without images renders to exactly the string
+    ``_anthropic_content_to_text`` produces, so the text-only bridge (and
+    its prefix-cache bytes) is untouched. Content carrying ``image`` blocks
+    renders to OpenAI content parts, text runs coalesced between images,
+    which the chat path already understands: ``_vision_extract_and_flatten``
+    lifts the ``image_url`` parts into the vision splice. Before this the
+    bridge fell through to ``json.dumps`` and the model read the base64
+    payload as prose (#441).
+    """
+
+    blocks = _anthropic_content_blocks(content)
+    parts: list[dict[str, Any]] = []
+    text_run: list[str] = []
+    saw_image = False
+
+    def _flush_text() -> None:
+        if text_run:
+            parts.append({"type": "text", "text": "".join(text_run)})
+            text_run.clear()
+
+    for block in blocks:
+        image_part = _anthropic_image_block_to_openai_part(block)
+        if image_part is None:
+            text_run.append(_anthropic_content_to_text([block]))
+            continue
+        saw_image = True
+        _flush_text()
+        parts.append(image_part)
+    if not saw_image:
+        return _anthropic_content_to_text(content)
+    _flush_text()
+    return parts
 
 
 _ANTHROPIC_SERVER_SIDE_TOOL_TYPE_PREFIXES = (
@@ -3444,17 +5537,24 @@ def _anthropic_message_to_chat_messages(
         ]
     if role == "user":
         messages: list[ChatMessage] = []
-        text_parts: list[str] = []
+        # Blocks between tool results render together so an image keeps its
+        # place among the text around it (#441).
+        pending_blocks: list[Any] = []
         for block in _anthropic_content_blocks(message.content):
             if (
                 isinstance(block, dict)
                 and str(block.get("type") or "") == "tool_result"
             ):
-                if text_parts:
+                if pending_blocks:
                     messages.append(
-                        ChatMessage(role="user", content="".join(text_parts))
+                        ChatMessage(
+                            role="user",
+                            content=_anthropic_content_to_chat_content(
+                                pending_blocks
+                            ),
+                        )
                     )
-                    text_parts = []
+                    pending_blocks = []
                 tool_call_id = _anthropic_tool_result_id(block)
                 if not tool_call_id:
                     raise HTTPException(
@@ -3465,19 +5565,25 @@ def _anthropic_message_to_chat_messages(
                     ChatMessage(
                         role="tool",
                         tool_call_id=tool_call_id,
-                        content=_anthropic_content_to_text(block.get("content")),
+                        content=_anthropic_content_to_chat_content(
+                            block.get("content")
+                        ),
                     )
                 )
-            elif isinstance(block, dict):
-                text_parts.append(_anthropic_content_to_text([block]))
             else:
-                text_parts.append(str(block))
-        if text_parts or not messages:
-            messages.append(ChatMessage(role="user", content="".join(text_parts)))
+                pending_blocks.append(block)
+        if pending_blocks or not messages:
+            messages.append(
+                ChatMessage(
+                    role="user",
+                    content=_anthropic_content_to_chat_content(pending_blocks),
+                )
+            )
         return messages
     return [
         ChatMessage(
-            role=role or "user", content=_anthropic_content_to_text(message.content)
+            role=role or "user",
+            content=_anthropic_content_to_chat_content(message.content),
         )
     ]
 
@@ -3574,6 +5680,20 @@ def _anthropic_thinking_to_enable_thinking(thinking: Any) -> bool | None:
     return None
 
 
+def _anthropic_disable_parallel_tool_use(tool_choice: Any) -> bool | None:
+    """Anthropic's parallel-tools preference rides as a sibling key on
+    tool_choice (``{"type": "auto", "disable_parallel_tool_use": true}``).
+    Surface it so the OpenAI-lane single-tool enforcement applies; None when
+    the client did not state a preference."""
+
+    if not isinstance(tool_choice, dict):
+        return None
+    raw = tool_choice.get("disable_parallel_tool_use")
+    if raw is None:
+        return None
+    return bool(raw)
+
+
 def _anthropic_to_chat_request(
     request: AnthropicMessagesRequest,
 ) -> ChatCompletionRequest:
@@ -3584,7 +5704,20 @@ def _anthropic_to_chat_request(
     for message in request.messages:
         messages.extend(_anthropic_message_to_chat_messages(message))
     enable_thinking = _anthropic_thinking_to_enable_thinking(request.thinking)
-    return ChatCompletionRequest(
+    extra_fields: dict[str, Any] = {}
+    if isinstance(request.chat_template_kwargs, dict):
+        # Carry the Qwen-style kwargs across the translation so the
+        # chat-completions path can honor the known keys (enable_thinking).
+        extra_fields["chat_template_kwargs"] = dict(request.chat_template_kwargs)
+    # Bridges riding /v1/messages (Claude Code proxies) send the flat
+    # OpenAI-style field; the model is extra="allow" so it parses, but the
+    # translation dropped it and every family went effort-blind on this
+    # lane (showdown receipt 2026-08-27: low sent, null recorded).
+    requested_effort = getattr(request, "reasoning_effort", None)
+    if isinstance(requested_effort, str) and requested_effort.strip():
+        extra_fields["reasoning_effort"] = requested_effort.strip()
+    disable_parallel = _anthropic_disable_parallel_tool_use(request.tool_choice)
+    chat_request = ChatCompletionRequest(
         model=request.model,
         messages=messages,
         max_tokens=request.max_tokens,
@@ -3593,6 +5726,9 @@ def _anthropic_to_chat_request(
         top_k=request.top_k,
         tools=_anthropic_tools_to_openai(request.tools),
         tool_choice=_anthropic_tool_choice_to_openai(request.tool_choice),
+        parallel_tool_calls=(
+            None if disable_parallel is None else not disable_parallel
+        ),
         stop=request.stop_sequences,
         metadata=request.metadata,
         enable_thinking=enable_thinking,
@@ -3601,7 +5737,14 @@ def _anthropic_to_chat_request(
         gemma_draft_block_size=request.gemma_draft_block_size,
         generation_mode=request.generation_mode,
         stream=False,
+        **extra_fields,
     )
+    if request.max_tokens is None:
+        # Anthropic's API requires max_tokens; tolerate its absence for our
+        # own bridges but record the defaulting for observability instead of
+        # rejecting (a 400 here would break those bridges).
+        chat_request.anthropic_max_tokens_defaulted = True
+    return chat_request
 
 
 def _anthropic_tool_input_from_arguments(arguments: Any) -> dict[str, Any]:
@@ -3642,16 +5785,18 @@ def _anthropic_stop_reason(
     has_tool_calls: bool,
     matched_stop: str | None = None,
 ) -> str:
-    if has_tool_calls or finish_reason == "tool_calls":
-        return "tool_use"
+    # Priority mirrors the Anthropic wire contract: a budget cut is
+    # max_tokens whatever the turn contains (a truncated tool_use block
+    # reported as "tool_use" would make clients execute a cut batch), then
+    # a client stop_sequences match, then tool_use, then natural end_turn.
     if finish_reason == "length":
         return "max_tokens"
     if matched_stop:
         # A client stop_sequences match must surface as stop_sequence per
         # the Anthropic wire contract, not as a natural end_turn (QA-117).
         return "stop_sequence"
-    if finish_reason == "stop":
-        return "end_turn"
+    if has_tool_calls or finish_reason == "tool_calls":
+        return "tool_use"
     return "end_turn"
 
 
@@ -3662,6 +5807,35 @@ def _matched_stop_sequence(openai_payload: dict[str, Any]) -> str | None:
         if isinstance(matched, str) and matched:
             return matched
     return None
+
+
+def _anthropic_usage_from_openai_usage(usage: Any) -> dict[str, int]:
+    """One translation of OpenAI usage to Anthropic usage, both dialects.
+
+    The streaming path used to keep only prompt/completion counts, dropping
+    prompt_tokens_details — so streamed /v1/messages never reported
+    cache_read_input_tokens and Claude Code/Pi (which always stream) saw the
+    prefix-cache win as zero.
+    """
+
+    data = usage if isinstance(usage, dict) else {}
+    prompt_tokens = max(0, int(data.get("prompt_tokens") or 0))
+    # OpenAI usage.prompt_tokens is the GRAND TOTAL and prompt_tokens_details.cached_tokens is a
+    # SUBSET of it. Anthropic's input_tokens and cache_read_input_tokens are DISJOINT
+    # (total_input = input_tokens + cache_read_input_tokens + cache_creation_input_tokens). Copying
+    # prompt_tokens straight into input_tokens while also reporting cache_read_input_tokens
+    # double-counts the cached prefix on every hit, so clients that sum the disjoint fields — Claude
+    # Code / Pi context and auto-compaction math — overcount by the prefix size and compact
+    # prematurely. Subtract the cached prefix; clamp defensively against malformed upstream usage.
+    cached_tokens = int((data.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+    cached_tokens = min(max(0, cached_tokens), prompt_tokens)
+    return {
+        "input_tokens": prompt_tokens - cached_tokens,
+        "output_tokens": int(data.get("completion_tokens") or 0),
+        # Anthropic-native mirror of the session-cache prefix hit
+        # (#121/#144); Claude Code and Pi read this field directly.
+        "cache_read_input_tokens": cached_tokens,
+    }
 
 
 def _anthropic_payload_from_openai(openai_payload: dict[str, Any]) -> dict[str, Any]:
@@ -3705,15 +5879,7 @@ def _anthropic_payload_from_openai(openai_payload: dict[str, Any]) -> dict[str, 
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": matched_stop,
-        "usage": {
-            "input_tokens": int(usage.get("prompt_tokens") or 0),
-            "output_tokens": int(usage.get("completion_tokens") or 0),
-            # Anthropic-native mirror of the session-cache prefix hit
-            # (#121/#144); Claude Code and Pi read this field directly.
-            "cache_read_input_tokens": int(
-                (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
-            ),
-        },
+        "usage": _anthropic_usage_from_openai_usage(usage),
         "mtplx_stats": openai_payload.get("mtplx_stats"),
     }
 
@@ -3740,6 +5906,12 @@ async def _iter_sse_data(body_iterator: Any):
             ]
             if data_lines:
                 yield "\n".join(data_lines)
+            elif frame.startswith(":"):
+                # SSE comment-only frame — the pre-first-token keep-alive
+                # (#358). Yield it verbatim so the Anthropic translator can
+                # forward the liveness bytes; the leading ":" is unambiguous
+                # because data payloads here are JSON or "[DONE]".
+                yield frame
     if buffer.strip():
         data_lines = [
             line.removeprefix("data:").strip()
@@ -3758,7 +5930,7 @@ async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
     opened_any_block = False
     opened_tool_block = False
     stop_reason = "end_turn"
-    usage = {"input_tokens": 0, "output_tokens": 0}
+    usage = _anthropic_usage_from_openai_usage(None)
     mtplx_stats: dict[str, Any] | None = None
     tool_blocks: dict[int, dict[str, Any]] = {}
 
@@ -3796,6 +5968,45 @@ async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
 
     try:
         async for data in _iter_sse_data(body_iterator):
+            if data.startswith(":"):
+                # Keep-alive comment from the inner OpenAI stream (#358),
+                # which flows only pre-first-token (long prefill). Neither
+                # raw SSE comments nor protocol `ping` events reset Claude
+                # Code's stream watchdog — its bundled SDK loop drops pings
+                # (`if(a.event==="ping")continue`) before the watchdog sees
+                # them, so a prefill longer than the 300s idle window died
+                # client-side with "Stream idle timeout - no chunks
+                # received" (measured live 2026-08-31: 137k–165k-token
+                # MCP-heavy Claude Code first turns on the 27B, killed at
+                # exactly 300.0s under both comment and ping keep-alives).
+                # Only yielded message events reset it, so pre-open the
+                # thinking block and tick it with EMPTY thinking_deltas:
+                # real events on the wire, zero content accumulated, and
+                # the model's own reasoning (which streams first on
+                # thinking-default models) continues seamlessly in the
+                # same block once prefill completes.
+                if active_thinking_index is None and active_text_index is None:
+                    active_thinking_index = next_block_index
+                    next_block_index += 1
+                    opened_any_block = True
+                    yield start_content_block(
+                        active_thinking_index,
+                        {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": "mtplx-reasoning",
+                        },
+                    )
+                if active_thinking_index is not None:
+                    yield _anthropic_sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": active_thinking_index,
+                            "delta": {"type": "thinking_delta", "thinking": ""},
+                        },
+                    )
+                continue
             if data == "[DONE]":
                 break
             try:
@@ -3826,11 +6037,7 @@ async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
                 )
                 return
             if payload.get("usage"):
-                upstream_usage = payload.get("usage") or {}
-                usage = {
-                    "input_tokens": int(upstream_usage.get("prompt_tokens") or 0),
-                    "output_tokens": int(upstream_usage.get("completion_tokens") or 0),
-                }
+                usage = _anthropic_usage_from_openai_usage(payload.get("usage"))
             if payload.get("mtplx_stats") is not None:
                 mtplx_stats = payload.get("mtplx_stats")
             for choice in payload.get("choices") or []:
@@ -3994,7 +6201,11 @@ async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
             "stop_reason": stop_reason,
             "stop_sequence": _matched_stop_sequence({"mtplx_stats": mtplx_stats}),
         },
-        "usage": {"output_tokens": usage["output_tokens"]},
+        # Full cumulative usage, not output-only: message_start necessarily
+        # streamed zeros (usage is only known at end of generation on this
+        # bridge), so clients that merge message_delta.usage fields must find
+        # input_tokens and cache_read_input_tokens here or they account 0.
+        "usage": dict(usage),
     }
     if mtplx_stats is not None:
         delta_payload["mtplx_stats"] = mtplx_stats
@@ -4095,6 +6306,169 @@ def _strip_orphan_tool_markup(text: str) -> tuple[str, int]:
     return cleaned, stripped
 
 
+_COMPLETE_ORPHAN_SPAN_RE = re.compile(
+    # Complete spans only — no \Z fallback. Used by the unclosed-span
+    # sanitizer, where an eat-to-end alternate would rebuild the exact
+    # turn-truncation bug it exists to fix.
+    r"<(?:[A-Za-z_][\w.-]*:)?tool_call>"
+    r"(?:(?!</(?:[A-Za-z_][\w.-]*:)?tool_call>).)*"
+    r"</(?:[A-Za-z_][\w.-]*:)?tool_call>"
+    r"|<function=[^>]*>(?:(?!</function>).)*</function>",
+    re.IGNORECASE | re.DOTALL,
+)
+_ORPHAN_HEAD_OPENER_RE = re.compile(
+    r"^\s*(?:<(?:[A-Za-z_][\w.-]*:)?tool_call[^>\n]*(?:>|(?=\n)|$)"
+    r"|<function=[^>\n]*(?:>|(?=\n)|$))",
+    re.IGNORECASE,
+)
+
+
+def _leading_json_blob_end(text: str) -> int | None:
+    """End index of a leading brace-balanced JSON blob, else None."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return None
+
+
+def _sanitize_orphan_span_interior(text: str) -> str:
+    """Salvage prose from an unclosed no-tools tool-markup span.
+
+    A model that opens ``<tool_call>``/``<function=`` in a no-tools request
+    and never closes used to have the whole rest of its turn discarded by
+    the stream filter (2.7.1 known issue). Strip only the structural payload
+    — opener tag, leading JSON arguments blob, parameter blocks, complete
+    nested spans — and keep whatever prose remains.
+    """
+    s = text.strip()
+    for _ in range(4):
+        previous = s
+        s = _ORPHAN_HEAD_OPENER_RE.sub("", s, count=1).lstrip()
+        if s.startswith("{"):
+            end = _leading_json_blob_end(s)
+            if end is not None:
+                s = s[end:].lstrip()
+            else:
+                last_brace = s.rfind("}")
+                if last_brace >= 0:
+                    s = s[last_brace + 1 :].lstrip()
+                else:
+                    # No closing brace anywhere: drop only the blob's first
+                    # line; later lines may be real prose.
+                    newline = s.find("\n")
+                    s = "" if newline < 0 else s[newline + 1 :].lstrip()
+        s = _COMPLETE_ORPHAN_SPAN_RE.sub("", s)
+        s = _TOOL_PARAMETER_BLOCK_RE.sub("", s)
+        s = s.strip()
+        if s == previous:
+            break
+    return re.sub(r"\n{3,}", "\n\n", s)
+
+
+# --- Unexecuted-tool-call truthfulness (#349) -------------------------------
+#
+# #160 taught the server to hide dead tool-call markup from no-tools chats,
+# and the malformed-parse fallback hides markup for undeclared names. Both
+# fixes deleted the markup SILENTLY: the model saw its call vanish with no
+# output and no error ("tool calls going out into the void" — issue #349's
+# transcript), the user saw a blank reply, and nothing in the conversation
+# said the call never ran. A swallowed call is a masked bug: whenever tool
+# markup is suppressed without execution, the turn now carries a short,
+# truthful, visible notice so the model can self-correct on its next turn
+# and the user learns why nothing happened.
+
+_TOOL_MARKUP_NAME_FUNCTION_RE = re.compile(
+    r"<function=([A-Za-z_][\w.-]*)", re.IGNORECASE
+)
+_TOOL_MARKUP_NAME_INVOKE_RE = re.compile(
+    r'<invoke\s+name="([A-Za-z_][\w.-]*)"', re.IGNORECASE
+)
+_TOOL_MARKUP_NAME_JSON_RE = re.compile(r'"name"\s*:\s*"([A-Za-z_][\w.-]*)"')
+_UNKNOWN_TOOL_REASON_RE = re.compile(r"unknown tool '([^']*)'", re.IGNORECASE)
+
+
+def _tool_markup_call_names(text: str, *, limit: int = 5) -> list[str]:
+    """Best-effort tool names from unexecuted tool-call markup (#349).
+
+    Scans only inside orphan tool-markup spans so a JSON object the model
+    wrote as prose cannot be misread as a call. Order-preserving, deduped.
+    """
+    names: list[str] = []
+    if not text or "<" not in text:
+        return names
+    for span_match in _ORPHAN_TOOL_MARKUP_RE.finditer(text):
+        span = span_match.group(0)
+        for pattern in (
+            _TOOL_MARKUP_NAME_FUNCTION_RE,
+            _TOOL_MARKUP_NAME_INVOKE_RE,
+            _TOOL_MARKUP_NAME_JSON_RE,
+        ):
+            for match in pattern.finditer(span):
+                name = match.group(1)
+                if name and name not in names:
+                    names.append(name)
+                if len(names) >= limit:
+                    return names
+    return names
+
+
+def _unknown_tool_name_from_reason(reason: str) -> str:
+    match = _UNKNOWN_TOOL_REASON_RE.search(reason or "")
+    return match.group(1).strip() if match else ""
+
+
+def _no_tools_unexecuted_call_notice(names: list[str]) -> str:
+    """Visible truth for a no-tools turn whose tool markup was suppressed."""
+    called = ", ".join(f'"{name}"' for name in names) if names else "a tool"
+    return (
+        f"[MTPLX: this reply tried to call {called}, but no tools are active "
+        "on this request, so nothing was executed — there was no output and "
+        "no error. This chat cannot read files or run terminal commands. For "
+        "file and terminal access, connect a coding agent (Claude Code, "
+        "OpenCode, or the Hermes agent in the MTPLX app) to MTPLX.]"
+    )
+
+
+def _unknown_tool_unexecuted_call_notice(
+    name: str,
+    declared: list[str],
+) -> str:
+    """Visible truth for a suppressed call to a tool this request never had."""
+    available = ", ".join(declared) if declared else "none"
+    label = f' "{name}"' if name else ""
+    return (
+        f"[MTPLX: the tool call{label} was not executed — it is not one of "
+        f"this request's available tools (available: {available}). Nothing "
+        "ran and there is no output. Use only the available tools, or answer "
+        "directly.]"
+    )
+
+
+def _append_unexecuted_tool_notice(text: str, notice: str) -> str:
+    """Append the notice as a trailing paragraph; idempotent per turn."""
+    base = (text or "").rstrip()
+    if notice in base:
+        return base
+    return f"{base}\n\n{notice}" if base else notice
+
+
 _TOOL_CALL_BLOCK_RE = re.compile(
     r"<tool_call>\s*(.*?)\s*</tool_call>",
     re.IGNORECASE | re.DOTALL,
@@ -4127,11 +6501,22 @@ _INVOKE_PARAMETER_BLOCK_RE = re.compile(
     r'<parameter\s+name="([^"]+)">\s*(.*?)\s*</parameter>',
     re.IGNORECASE | re.DOTALL,
 )
+_POOLSIDE_ARGUMENT_PAIR_RE = re.compile(
+    r"<arg_key>\s*(.*?)\s*</arg_key>\s*"
+    r"<arg_value>\s*(.*?)\s*</arg_value>",
+    re.IGNORECASE | re.DOTALL,
+)
+_POOLSIDE_TOOL_NAME_RE = re.compile(r"^\s*([A-Za-z_][\w.-]*)")
 _BRACKET_TOOL_CALL_RE = re.compile(
     r"\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)(?:\(({.*?})\))?\]",
     re.IGNORECASE | re.DOTALL,
 )
 _BRACKET_TOOL_PREFIXES = ("[Calling tool:", "[Tool call:")
+# Lowered once: _find_tool_start runs per stream chunk and used to pay a
+# fresh needle.lower() per prefix per call.
+_BRACKET_TOOL_PREFIXES_LOWER = tuple(
+    prefix.lower() for prefix in _BRACKET_TOOL_PREFIXES
+)
 _NAMESPACED_TOOL_CALL_START_RE = re.compile(
     r"<[A-Za-z_][\w.-]*:tool_call",
     re.IGNORECASE,
@@ -4174,9 +6559,7 @@ _MTPLX_TOOL_RESULT_CONTINUATION_TAG_RE = re.compile(
 _OPENAI_BRIDGE_POLICY_VERSION = (
     "omlx_style:preserve_history:parse_at_completion:tool_digest:v4"
 )
-_MTPLX_TOOL_CONTRACT_POLICY_VERSION = (
-    "soft_schema_contract:native_xml:whole_file_reads:no_content_echo:edit_oldstring:post_tool_continue:agent_tail:dated:v13"
-)
+_MTPLX_TOOL_CONTRACT_POLICY_VERSION = "soft_schema_contract:native_xml:whole_file_reads:no_content_echo:edit_oldstring:post_tool_continue:agent_tail:dated:v13"
 _MTPLX_NO_TOOL_CONTRACT_POLICY_VERSION = "no_tool_direct_reply:v1"
 _MTPLX_POST_TOOL_ANSWER_POLICY_VERSION = "post_tool_full_answer:dated:v2"
 _MTPLX_OPENCODE_AGENT_CONTRACT_PROFILE = "opencode_agent"
@@ -4226,7 +6609,9 @@ def _tool_protocol_error(message: str) -> HTTPException:
     return HTTPException(status_code=422, detail=f"malformed tool_call: {message}")
 
 
-def _normalize_tool_prompt_mode(value: Any, *, default: str = _TOOL_PROMPT_MODE_HYBRID) -> str:
+def _normalize_tool_prompt_mode(
+    value: Any, *, default: str = _TOOL_PROMPT_MODE_HYBRID
+) -> str:
     mode = str(value or default).strip().lower()
     if mode not in _TOOL_PROMPT_MODES:
         allowed = ", ".join(sorted(_TOOL_PROMPT_MODES))
@@ -4489,19 +6874,14 @@ def _initial_orphan_tool_control_state(text: str) -> str:
     stripped = text.lstrip()
     if not stripped:
         return "hold"
-    if (
-        _ORPHAN_TOOL_CONTROL_INITIAL_TAG_RE.match(stripped)
-        or _ORPHAN_TOOL_CONTROL_INITIAL_BARE_RE.match(stripped)
-    ):
+    if _ORPHAN_TOOL_CONTROL_INITIAL_TAG_RE.match(
+        stripped
+    ) or _ORPHAN_TOOL_CONTROL_INITIAL_BARE_RE.match(stripped):
         return "orphan"
     lowered = stripped.lower()
     partial_markers = [
-        f"</{name.lower()}>"
-        for name in _ORPHAN_TOOL_CONTROL_BARE_NAMES
-    ] + [
-        f"<{name.lower()}"
-        for name in _ORPHAN_TOOL_CONTROL_BARE_NAMES
-    ]
+        f"</{name.lower()}>" for name in _ORPHAN_TOOL_CONTROL_BARE_NAMES
+    ] + [f"<{name.lower()}" for name in _ORPHAN_TOOL_CONTROL_BARE_NAMES]
     if lowered.startswith("<"):
         if any(marker.startswith(lowered) for marker in partial_markers):
             return "hold"
@@ -4526,6 +6906,7 @@ class _InitialOrphanToolControlStreamGuard:
     def __init__(self) -> None:
         self._buffer = ""
         self._mode = "undecided"
+        self._orphan_remainder = ""
         self.suppressed = False
 
     def feed(self, text: str) -> str:
@@ -4556,11 +6937,23 @@ class _InitialOrphanToolControlStreamGuard:
         self._buffer = ""
         if self._mode == "orphan":
             self.suppressed = True
-            if _looks_like_tool_control_payload_only(buffered):
-                return ""
-            return _strip_orphan_tool_control_markup(buffered)
+            if not _looks_like_tool_control_payload_only(buffered):
+                # Issue #249: the stripped remainder of an orphan fragment is
+                # usually a tool call's argument VALUES — forwarding it here
+                # duplicated them into delta.content while the end-of-stream
+                # extraction separately emitted the correct tool_calls.
+                # Whether the remainder may reach the content channel depends
+                # on whether the tool parser claims the span, a fact only
+                # known after extraction, so the caller collects it via
+                # take_orphan_remainder() and decides then.
+                self._orphan_remainder = _strip_orphan_tool_control_markup(buffered)
+            return ""
         self._mode = "pass"
         return buffered
+
+    def take_orphan_remainder(self) -> str:
+        remainder, self._orphan_remainder = self._orphan_remainder, ""
+        return remainder
 
 
 def _tool_parse_counters_for(state: Any) -> dict[str, int] | None:
@@ -4875,9 +7268,11 @@ def _tool_example_value(schema: Any) -> str:
         item_props = items.get("properties") if isinstance(items, dict) else None
         if isinstance(item_props, dict) and item_props:
             required = items.get("required")
-            names = [
-                str(name) for name in required if isinstance(name, str)
-            ] if isinstance(required, list) else []
+            names = (
+                [str(name) for name in required if isinstance(name, str)]
+                if isinstance(required, list)
+                else []
+            )
             names = names or [str(key) for key in item_props]
             element = {name: "ARGUMENT_VALUE" for name in names[:2]}
             return json.dumps([element], ensure_ascii=False)
@@ -4897,12 +7292,7 @@ def _tool_example_value(schema: Any) -> str:
 
 def _tool_call_example(tools: list[dict[str, Any]]) -> str:
     if not tools:
-        return (
-            "<tool_call>\n"
-            "<function=tool_name>\n"
-            "</function>\n"
-            "</tool_call>"
-        )
+        return "<tool_call>\n<function=tool_name>\n</function>\n</tool_call>"
     tool = tools[0]
     name = _tool_spec_name(tool) or "tool_name"
     schema = _tool_json_schema(tool)
@@ -4957,31 +7347,104 @@ def _tool_choice_policy_signature(tool_choice: Any) -> str:
     return type(tool_choice).__name__
 
 
+#: Fixed head of the forced-tool-choice sentinel: the transient-suffix
+#: registry keys on the first 48 chars, so the tool-specific tail may vary.
+_MTPLX_FORCED_TOOL_CHOICE_SENTINEL_HEAD = (
+    "MTPLX tool-choice instruction for this turn only (not part of the "
+    "conversation): "
+)
+
+
 def _forced_tool_contract_clause(tool_choice: Any) -> str:
     forced_name = _forced_tool_choice_name(tool_choice)
     if forced_name:
         return (
-            f" This request requires the `{forced_name}` tool call; reason "
+            f"This request requires the `{forced_name}` tool call; reason "
             "internally if needed, then emit that tool call instead of a "
             "normal text answer."
         )
     if _tool_choice_forces_tools(tool_choice):
         return (
-            " This request requires one declared tool call; reason internally "
+            "This request requires one declared tool call; reason internally "
             "if needed, then emit the tool call instead of a normal text answer."
         )
     return ""
 
 
+def _mtplx_forced_tool_choice_text(tool_choice: Any = None) -> str:
+    """Trailing user sentinel carrying a request's forced tool choice.
+
+    With no forced choice it returns the fixed head alone (the registry
+    entry the stable-prefix detector keys on); with one, head + clause.
+    """
+    clause = _forced_tool_contract_clause(tool_choice)
+    return _MTPLX_FORCED_TOOL_CHOICE_SENTINEL_HEAD + clause if clause else (
+        _MTPLX_FORCED_TOOL_CHOICE_SENTINEL_HEAD
+    )
+
+
+def _append_forced_tool_choice_sentinel(
+    messages: list[dict[str, Any]], *, tool_choice: Any
+) -> bool:
+    """Append the forced-choice instruction as the final user turn; True on append.
+
+    Trailing and never echoed back by any client, so the bytes before it are
+    the same stable prefix the next turn resends -- the session's cache
+    identity no longer depends on a per-request tool_choice.
+    """
+    if not messages or not _forced_tool_contract_clause(tool_choice):
+        return False
+    text = _mtplx_forced_tool_choice_text(tool_choice)
+    if any(
+        _MTPLX_FORCED_TOOL_CHOICE_SENTINEL_HEAD in str(message.get("content") or "")
+        for message in messages
+    ):
+        return False
+    messages.append({"role": "user", "content": text})
+    return True
+
+
+_DATE_LINE_IDLE_REFRESH_S = 15 * 60.0
+_DATE_LINE_PIN_LOCK = threading.Lock()
+_DATE_LINE_PIN: dict[str, Any] = {"day": None, "last_use_monotonic": None}
+
+
+def _pinned_render_day() -> str:
+    # Burst-pinned wall-clock day (audit F11 P2 date-pin). The date line
+    # below is part of the rendered system prompt, so the old "fresh
+    # strftime every call" flipped msg0's bytes at local midnight and every
+    # LIVE session re-prefilled its whole transcript cold mid-conversation.
+    # The day now advances only across an idle boundary: while requests
+    # keep arriving (foreground encodes AND their postcommit re-renders,
+    # which share this module-level pin across threads) the pinned day
+    # holds, and after _DATE_LINE_IDLE_REFRESH_S without any date-line use
+    # the next request re-pins to today. Staleness is bounded by continuous
+    # activity — which is exactly the window where changing the date would
+    # have forced the re-prefill this pin exists to prevent. Fresh daemons
+    # always start on today's date.
+    now = time.monotonic()
+    with _DATE_LINE_PIN_LOCK:
+        day = _DATE_LINE_PIN["day"]
+        last_use = _DATE_LINE_PIN["last_use_monotonic"]
+        if day is None or (
+            last_use is not None and (now - last_use) > _DATE_LINE_IDLE_REFRESH_S
+        ):
+            day = time.strftime("%B %d, %Y")
+            _DATE_LINE_PIN["day"] = day
+        _DATE_LINE_PIN["last_use_monotonic"] = now
+        return str(day)
+
+
 def _current_date_line() -> str:
-    # Local wall-clock date, day granularity. Injected into the tool
-    # and post-tool contracts so the model stops anchoring "latest
-    # version" reasoning (and search queries) to its training cutoff —
-    # without it, queries came out as "latest X 2024 2025" and final
-    # answers dismissed fresher tool results (2026-07-03 founder
-    # report). Day granularity keeps prompt bytes stable within a day,
-    # so warm-prefix session reuse is unaffected until midnight.
-    return f"Today's date is {time.strftime('%B %d, %Y')}."
+    # Local wall-clock date, day granularity, burst-pinned (see
+    # _pinned_render_day). Injected into the tool and post-tool contracts
+    # so the model stops anchoring "latest version" reasoning (and search
+    # queries) to its training cutoff — without it, queries came out as
+    # "latest X 2024 2025" and final answers dismissed fresher tool results
+    # (2026-07-03 founder report). Day granularity keeps prompt bytes
+    # stable within a day, and the burst pin keeps them stable across
+    # midnight for sessions that are mid-conversation.
+    return f"Today's date is {_pinned_render_day()}."
 
 
 def _mtplx_tool_contract_text(
@@ -4989,12 +7452,43 @@ def _mtplx_tool_contract_text(
     *,
     tool_choice: Any = None,
 ) -> str:
-    signatures = [signature for tool in tools if (signature := _tool_signature(tool))]
-    allowed = "; ".join(signatures) if signatures else "(none)"
+    pairs = [
+        (signature, _tool_spec_name(tool) or "")
+        for tool in tools
+        if (signature := _tool_signature(tool))
+    ]
+    allowed = "; ".join(signature for signature, _ in pairs) if pairs else "(none)"
     example = _tool_call_example(tools)
     if len(allowed) > 1200:
-        allowed = allowed[:1197].rstrip() + "..."
-    forced_clause = _forced_tool_contract_clause(tool_choice)
+        # Name-preserving fallback (issue #376; adapted from PR #379 by
+        # @ArctifoxNL): the old raw byte cut dropped whole tool names at the
+        # tail, and the "never invent ... undeclared tool" clause below then
+        # treated every dropped name as undeclared — clients lost `task` and
+        # subagents with it. Keep every declared name visible; sacrifice only
+        # per-tool signature detail when the budget runs out (a bare name
+        # still declares the tool).
+        parts: list[str] = []
+        size = 0
+        for signature, name in pairs:
+            for candidate in (signature, name):
+                extra = len(candidate) if not parts else 2 + len(candidate)
+                if candidate and size + extra <= 1200:
+                    parts.append(candidate)
+                    size += extra
+                    break
+            else:
+                if name:
+                    parts.append(name)
+                    size += 2 + len(name)
+        allowed = "; ".join(parts)
+    # The forced-tool clause used to ride here. tool_choice varies per
+    # request while this text sits in msg0, so one `tool_choice: required` /
+    # `{"function": {"name": ...}}` turn changed the first bytes of the
+    # prompt and re-prefilled the WHOLE session cold (agent-session gate,
+    # 2026-09-03: 40,127 tokens re-prefilled twice, 41 s + 44 s, on a forced
+    # write round). It is now a transient trailing user sentinel, like every
+    # other per-request steering text (see _with_mtplx_tool_contract); the
+    # parameter stays for the callers, the text no longer depends on it.
     return (
         f"{_MTPLX_TOOL_CONTRACT_SENTINEL} {_current_date_line()} Your "
         "training data ends before today; treat tool results as more "
@@ -5017,7 +7511,6 @@ def _mtplx_tool_contract_text(
         "sentence of visible text. "
         "Never invent Agent/task/Explore or any undeclared tool. "
         "If no declared tool applies, answer normally."
-        f"{forced_clause}"
     )
 
 
@@ -5035,20 +7528,23 @@ def _mtplx_no_tool_contract_text() -> str:
 def _with_mtplx_no_tool_contract(
     messages: list[ChatMessage],
 ) -> list[ChatMessage]:
+    # PREFIX STABILITY (audit F11 #6): this contract used to be spliced into
+    # the FIRST system message. It flips per turn (tools available on one
+    # request, absent on the next), so msg0's bytes changed under the
+    # session bank and every flip re-prefilled the whole transcript cold —
+    # the same defect class the Pi convergence contract fixed on 2026-07-04.
+    # The contract now travels as a pure suffix: one appended user message,
+    # which is also positionally stronger (closest to generation).
     contract = _mtplx_no_tool_contract_text()
     if not messages:
-        return [ChatMessage(role="system", content=contract)]
+        return [ChatMessage(role="user", content=contract)]
     updated = list(messages)
-    first = updated[0]
-    if str(first.role).lower() == "system":
-        content = str(first.content or "")
-        if _MTPLX_NO_TOOL_CONTRACT_SENTINEL not in content:
-            updated[0] = _copy_chat_message(
-                first,
-                content=(f"{content.rstrip()}\n\n{contract}" if content else contract),
-            )
-        return updated
-    return [ChatMessage(role="system", content=contract), *updated]
+    if not any(
+        _MTPLX_NO_TOOL_CONTRACT_SENTINEL in str(message.content or "")
+        for message in updated
+    ):
+        updated.append(ChatMessage(role="user", content=contract))
+    return updated
 
 
 def _mtplx_post_tool_answer_contract_text() -> str:
@@ -5083,20 +7579,20 @@ def _mtplx_post_tool_answer_contract_text() -> str:
 def _with_mtplx_post_tool_answer_contract(
     messages: list[ChatMessage],
 ) -> list[ChatMessage]:
+    # Suffix contract, same prefix-stability rationale as
+    # _with_mtplx_no_tool_contract above (audit F11 #6): it activates on the
+    # FINAL round of a tool loop, exactly when the session's banked prefix
+    # is largest and a msg0 rewrite was most expensive.
     contract = _mtplx_post_tool_answer_contract_text()
     if not messages:
-        return [ChatMessage(role="system", content=contract)]
+        return [ChatMessage(role="user", content=contract)]
     updated = list(messages)
-    first = updated[0]
-    if str(first.role).lower() == "system":
-        content = str(first.content or "")
-        if _MTPLX_POST_TOOL_ANSWER_SENTINEL not in content:
-            updated[0] = _copy_chat_message(
-                first,
-                content=(f"{content.rstrip()}\n\n{contract}" if content else contract),
-            )
-        return updated
-    return [ChatMessage(role="system", content=contract), *updated]
+    if not any(
+        _MTPLX_POST_TOOL_ANSWER_SENTINEL in str(message.content or "")
+        for message in updated
+    ):
+        updated.append(ChatMessage(role="user", content=contract))
+    return updated
 
 
 def _mtplx_read_only_force_answer_contract_text() -> str:
@@ -5152,8 +7648,25 @@ def _with_mtplx_read_only_force_answer_contract(
     return updated
 
 
+_PI_CONVERGENCE_AFTER_TOOLS_LEGACY = 14
+
+
 def _pi_convergence_after_tools() -> int:
-    return max(0, _env_int("MTPLX_PI_CONVERGENCE_AFTER_TOOLS", 14))
+    """Tool-result count that arms the Pi convergence contract; 0 = never.
+
+    Default OFF since #282: the contract ("do not call grep/find/ls...",
+    "stop gathering more project context") was tuned for Qwen3.6-era
+    models that looped on inspection and it actively restricted real Pi
+    coding sessions. MTPLX_AGENT_REWRITES=on restores the legacy limit;
+    an explicit MTPLX_PI_CONVERGENCE_AFTER_TOOLS always wins.
+    """
+    mode = _agent_rewrites_mode()
+    if mode == "off":
+        return 0
+    explicit = _env_int_optional("MTPLX_PI_CONVERGENCE_AFTER_TOOLS")
+    if explicit is not None:
+        return max(0, explicit)
+    return _PI_CONVERGENCE_AFTER_TOOLS_LEGACY if mode == "on" else 0
 
 
 def _request_should_add_pi_convergence_contract(
@@ -5165,7 +7678,9 @@ def _request_should_add_pi_convergence_contract(
 ) -> bool:
     if not tools_active:
         return False
-    client_hint = str(_request_client_hint_from_headers(headers, metadata) or "").lower()
+    client_hint = str(
+        _request_client_hint_from_request(headers, metadata) or ""
+    ).lower()
     if "pi" not in client_hint:
         return False
     limit = _pi_convergence_after_tools()
@@ -5197,7 +7712,11 @@ def _mtplx_pi_convergence_user_instruction_text() -> str:
         "context now. Use the evidence already gathered to edit, verify, or "
         "finish. The next response must not be another broad read/grep/find/ls "
         "or inspection-only shell command; only one narrow line-range refresh "
-        "is allowed when it is necessary to make the edit apply."
+        "is allowed when it is necessary to make the edit apply. Editing and "
+        "verification tools (edit/write/patch, or shell commands that run "
+        "tests or the build) remain fully allowed and are the expected next "
+        "step — this restriction covers broad inspection only, and it applies "
+        "to this reply only, not to the rest of the session."
     )
 
 
@@ -5228,6 +7747,8 @@ def _with_mtplx_pi_convergence_contract(
 
 
 def _mtplx_coding_agent_tail_contract_text(tools: list[dict[str, Any]]) -> str | None:
+    if not _agent_steering_enabled():
+        return None
     if not _anonymous_coding_agent_tool_request(_tool_names(tools)):
         return None
     return (
@@ -5264,6 +7785,8 @@ def _should_add_mtplx_coding_agent_tail_contract(
     *,
     tools: list[dict[str, Any]],
 ) -> bool:
+    if not _agent_steering_enabled():
+        return False
     if not _anonymous_coding_agent_tool_request(_tool_names(tools)):
         return False
     last_user = _last_user_text(normalized)
@@ -5402,9 +7925,7 @@ _READ_ONLY_FINAL_ANSWER_START_RE = re.compile(
 
 
 def _read_only_force_answer_after_stream_marker(content: str) -> tuple[str, int]:
-    match = _MTPLX_READ_ONLY_FORCE_ANSWER_STREAM_MARKER_RE.search(
-        str(content or "")
-    )
+    match = _MTPLX_READ_ONLY_FORCE_ANSWER_STREAM_MARKER_RE.search(str(content or ""))
     if match is None:
         return str(content or ""), 0
     return str(content or "")[match.end() :].lstrip(), match.end()
@@ -5434,11 +7955,14 @@ def _read_only_force_answer_visible_text(content: str) -> tuple[str, int]:
             marker_stripped_chars,
         )
     reasoning_text, content_text = omlx_extract_thinking(cleaned)
-    visible = "\n\n".join(
-        part.strip()
-        for part in (reasoning_text, content_text)
-        if part and part.strip()
-    ) or cleaned
+    visible = (
+        "\n\n".join(
+            part.strip()
+            for part in (reasoning_text, content_text)
+            if part and part.strip()
+        )
+        or cleaned
+    )
     visible = _strip_read_only_force_answer_visible_control_tags(visible)
     marker_match = re.search(r"(?im)^[ \t]*marker\s*=[^\n\r]+", visible)
     search_end = marker_match.start() if marker_match else len(visible)
@@ -5456,20 +7980,30 @@ def _append_tool_result_continuation_hint(
     messages: list[dict[str, Any]],
     *,
     tools: list[dict[str, Any]],
-) -> None:
+) -> bool:
+    """Append the trailing continuation hint; True ONLY on a real append.
+
+    The return is the injection-only contract's source of truth: the
+    stable-boundary encoder must never treat a user-authored lookalike
+    final message as the internal hint (it would pass any content sniff
+    by construction), so downstream consumers key on this explicit
+    signal, not on message text.
+    """
+    if not _agent_steering_enabled():
+        return False
     if not _anonymous_coding_agent_tool_request(_tool_names(tools)):
-        return
+        return False
     if not messages:
-        return
+        return False
     last = messages[-1]
     if last.get("role") != "tool":
-        return
+        return False
     if any(
         "Continue the active coding task using the tool result immediately above"
         in str(message.get("content") or "")
         for message in messages
     ):
-        return
+        return False
     hint = _mtplx_tool_result_continuation_hint_text()
     # Keep this out of the tool result itself. OpenCode displays model
     # reasoning, and a real app-path QA run showed the model treating an
@@ -5477,6 +8011,7 @@ def _append_tool_result_continuation_hint(
     # instruction is accepted by Qwen's chat template, preserves the
     # cache-friendly prefix, and keeps the evidence boundary clean.
     messages.append({"role": "user", "content": hint})
+    return True
 
 
 def _with_mtplx_tool_contract(
@@ -5484,6 +8019,7 @@ def _with_mtplx_tool_contract(
     *,
     tools: list[dict[str, Any]] | None,
     tool_choice: Any = None,
+    observability: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     if not tools:
         return normalized
@@ -5496,17 +8032,19 @@ def _with_mtplx_tool_contract(
     if not normalized:
         return [{"role": "system", "content": contract}]
     messages = [dict(item) for item in normalized]
-    _append_tool_result_continuation_hint(messages, tools=tools)
+    if _append_tool_result_continuation_hint(messages, tools=tools):
+        if observability is not None:
+            observability["tool_result_continuation_hint_injected"] = True
+    if _append_forced_tool_choice_sentinel(messages, tool_choice=tool_choice):
+        if observability is not None:
+            observability["forced_tool_choice_sentinel_injected"] = True
     first = messages[0]
     if first.get("role") == "system":
         content = str(first.get("content") or "")
         additions: list[str] = []
         if _MTPLX_TOOL_CONTRACT_SENTINEL not in content:
             additions.append(contract)
-        if (
-            tail_contract
-            and _MTPLX_CODING_AGENT_TAIL_SENTINEL not in content
-        ):
+        if tail_contract and _MTPLX_CODING_AGENT_TAIL_SENTINEL not in content:
             additions.append(tail_contract)
         if additions:
             first["content"] = (
@@ -5523,6 +8061,7 @@ def _with_mtplx_native_agent_tail(
     normalized: list[dict[str, Any]],
     *,
     tools: list[dict[str, Any]] | None,
+    observability: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Keep native template tools, but add the coding-agent tool-start nudge.
 
@@ -5536,7 +8075,12 @@ def _with_mtplx_native_agent_tail(
         return normalized, False
     messages = [dict(item) for item in normalized]
     last_is_tool_result = bool(messages and messages[-1].get("role") == "tool")
-    _append_tool_result_continuation_hint(messages, tools=tools)
+    if _append_tool_result_continuation_hint(messages, tools=tools):
+        # Same injection-only contract as the hybrid path: the stable
+        # boundary encoder keys on this explicit signal so native mode
+        # keeps the aligned-boundary metadata too.
+        if observability is not None:
+            observability["tool_result_continuation_hint_injected"] = True
     if last_is_tool_result:
         return messages, False
     tail_contract = (
@@ -5706,6 +8250,8 @@ def _mentions_active_read_only_phase(text: str) -> bool:
         if not _READ_ONLY_NEGATION_TAIL_RE.search(prefix):
             return True
     return False
+
+
 _NO_TOOL_USE_RE = re.compile(
     r"\b(?:do\s+not|don['’]?t|dont|never)\s+"
     r"(?:use|call|invoke)\s+(?:any\s+)?tools?\b"
@@ -5755,8 +8301,7 @@ def _request_disallows_file_mutation(messages: list[ChatMessage]) -> bool:
             # mode-switch reminders describe the phase they LEFT.
             return False
         return bool(
-            _NO_FILE_MUTATION_RE.search(text)
-            or _mentions_active_read_only_phase(text)
+            _NO_FILE_MUTATION_RE.search(text) or _mentions_active_read_only_phase(text)
         )
     return False
 
@@ -5846,17 +8391,42 @@ def _single_tool_call_stream_policy(
     """
     if parallel_tool_calls is not None:
         return not parallel_tool_calls
+    if not _agent_steering_enabled():
+        # #282: the hint sniff is legacy steering. Pi executes every tool
+        # call in an assistant turn (pi-agent-core agent-loop ships both
+        # executeToolCallsSequential and executeToolCallsParallel), so
+        # cutting its stream after the first call strangled real sessions.
+        # A client that wants the cut declares parallel_tool_calls=false.
+        return False
     hint = (client_hint or "").lower()
     return "pi" in hint or ("opencode" in hint and explicit_single_tool)
+
+
+def _read_only_force_answer_enabled() -> bool:
+    """The read-only force-answer machinery is legacy steering (#282).
+
+    Enabled under MTPLX_AGENT_REWRITES=on, or when the operator opted in
+    explicitly via MTPLX_READ_ONLY_INSPECTION_FORCE_ANSWER_AFTER_TOOLS.
+    """
+    mode = _agent_rewrites_mode()
+    if mode == "off":
+        return False
+    if mode == "on":
+        return True
+    return (
+        _env_int_optional("MTPLX_READ_ONLY_INSPECTION_FORCE_ANSWER_AFTER_TOOLS")
+        is not None
+    )
 
 
 def _request_should_force_answer_for_read_only_inspection(
     messages: list[ChatMessage],
 ) -> bool:
-    if (
-        _tool_result_message_count(messages) > 0
-        and _request_explicit_single_tool_then_answer(messages)
-    ):
+    if not _read_only_force_answer_enabled():
+        return False
+    if _tool_result_message_count(
+        messages
+    ) > 0 and _request_explicit_single_tool_then_answer(messages):
         return True
     if not _request_is_static_read_only_inspection(messages):
         return False
@@ -5920,7 +8490,7 @@ def _filter_tool_specs_for_request(
         return tools
     if _tool_choice_forces_tools(tool_choice):
         return tools
-    if _request_disallows_tools(messages):
+    if _agent_steering_enabled() and _request_disallows_tools(messages):
         return []
     if client_manages_tools:
         # Coding-agent clients (OpenCode) curate the toolset per agent mode
@@ -5933,6 +8503,13 @@ def _filter_tool_specs_for_request(
         # reuse at the digest bytes. The client's toolset is authoritative:
         # pass it through byte-stable.
         return tools
+    if not _agent_steering_enabled():
+        # #282: every client's declared toolset is authoritative on the
+        # serving API. Heuristic hiding (subagent/todo suppression,
+        # read-only lockdowns, "no tools" text matches) is legacy opt-in
+        # via MTPLX_AGENT_REWRITES=on; tool_choice keeps its protocol
+        # meaning in every mode.
+        return tools
     hidden_tools: set[str] = set()
     if _request_disallows_subagents(messages):
         hidden_tools.update(_SUBAGENT_TOOL_NAMES)
@@ -5944,8 +8521,7 @@ def _filter_tool_specs_for_request(
         hidden_tools.update(_MUTATING_FILE_TOOL_NAMES)
     if _request_is_narrow_read_only_tool_choreography(messages):
         requested_names = {
-            (_tool_spec_name(tool) or "").strip().lower()
-            for tool in tools
+            (_tool_spec_name(tool) or "").strip().lower() for tool in tools
         }
         if requested_names & _NARROW_READ_ONLY_TOOL_NAMES:
             hidden_tools.update(
@@ -5956,8 +8532,7 @@ def _filter_tool_specs_for_request(
             )
     elif _request_is_local_read_only_project_workflow(messages):
         requested_names = {
-            (_tool_spec_name(tool) or "").strip().lower()
-            for tool in tools
+            (_tool_spec_name(tool) or "").strip().lower() for tool in tools
         }
         if requested_names & _LOCAL_READ_ONLY_TOOL_NAMES:
             hidden_tools.update(
@@ -5978,8 +8553,7 @@ def _filter_tool_specs_for_request(
         # at least one safe-set tool to be present before enforcing the
         # lockdown.
         requested_names = {
-            (_tool_spec_name(tool) or "").strip().lower()
-            for tool in tools
+            (_tool_spec_name(tool) or "").strip().lower() for tool in tools
         }
         static_read_only_tool_names = _static_read_only_inspection_tool_names(messages)
         if requested_names & static_read_only_tool_names:
@@ -6000,6 +8574,8 @@ def _should_add_no_tool_contract(
     tools_active: bool,
     messages: list[ChatMessage],
 ) -> bool:
+    if _agent_rewrites_mode() == "off":
+        return False
     if not requested_tools or tools_active:
         return False
     if _is_simple_chitchat_text(_last_user_text(messages)):
@@ -6238,9 +8814,8 @@ def _decode_tool_parameter_value(value: str, schema: Any | None = None) -> Any:
             "value": "string",
         }
         normalized_tag = aliases.get(tag, tag)
-        if (
-            tag in placeholder_tags
-            and (not expected or normalized_tag in expected or tag == "value")
+        if tag in placeholder_tags and (
+            not expected or normalized_tag in expected or tag == "value"
         ):
             text = wrapper.group(2).strip()
     text = html.unescape(text)
@@ -6252,12 +8827,89 @@ def _decode_tool_parameter_value(value: str, schema: Any | None = None) -> Any:
         return text
 
 
+def _repair_tool_argument_keys_for_schema(
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    tools: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Repair unambiguous near-miss argument keys against the tool schema.
+
+    Qwen3.6 intermittently corrupts an argument key (#197): ``offsets`` for
+    ``offset``, or ``offset `` / ``offset >`` with whitespace/template-close
+    bytes bled into the key. Such keys previously passed straight through
+    (schema validation only rejects unknown keys under
+    ``additionalProperties: false``), and the client silently dropped the
+    argument — every paginated ``read`` returned the top-of-file window.
+
+    A key is renamed only when the mapping is unambiguous:
+    - the raw key is not itself a schema property,
+    - the target resolves via trimming (whitespace / trailing ``>``), letter
+      case, or a single trailing ``s`` to exactly one schema property,
+    - the target is not already supplied, and no other raw key resolves to
+      the same target.
+    Anything else passes through verbatim (pass-through stays the client's
+    contract).
+    """
+    if not arguments:
+        return arguments
+    schema = _tool_schema_for_name(tools, tool_name=tool_name)
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(properties, dict) or not properties:
+        return arguments
+    by_casefold: dict[str, list[str]] = {}
+    for name in properties:
+        by_casefold.setdefault(str(name).casefold(), []).append(str(name))
+
+    def _unique(casefolded: str) -> str | None:
+        matches = by_casefold.get(casefolded)
+        return matches[0] if matches and len(matches) == 1 else None
+
+    def _resolve(key: str) -> str | None:
+        if key in properties:
+            return None
+        trimmed = key.strip().rstrip(">").strip()
+        if trimmed in properties:
+            return trimmed
+        target = _unique(trimmed.casefold())
+        if target is not None:
+            return target
+        if trimmed.casefold().endswith("s"):
+            target = _unique(trimmed.casefold()[:-1])
+            if target is not None:
+                return target
+        return _unique(trimmed.casefold() + "s")
+
+    renames: dict[str, str] = {}
+    for key in arguments:
+        target = _resolve(str(key))
+        if target is None or target in arguments:
+            continue
+        renames[str(key)] = target
+    # Two corrupted keys collapsing onto one property is ambiguous — repair
+    # neither rather than clobber one value with the other.
+    target_counts: dict[str, int] = {}
+    for target in renames.values():
+        target_counts[target] = target_counts.get(target, 0) + 1
+    renames = {
+        key: target for key, target in renames.items() if target_counts[target] == 1
+    }
+    if not renames:
+        return arguments
+    return {renames.get(str(key), key): value for key, value in arguments.items()}
+
+
 def _normalize_tool_arguments_for_schema(
     *,
     tool_name: str,
     arguments: dict[str, Any],
     tools: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    arguments = _repair_tool_argument_keys_for_schema(
+        tool_name=tool_name,
+        arguments=arguments,
+        tools=tools,
+    )
     normalized: dict[str, Any] = {}
     for key, value in arguments.items():
         if isinstance(value, str):
@@ -6413,18 +9065,189 @@ def _parse_invoke_tool_call(block: str) -> tuple[str, Any] | None:
     return name, arguments
 
 
+def _parse_poolside_tool_call(block: str) -> tuple[str, Any] | None:
+    name_match = _POOLSIDE_TOOL_NAME_RE.match(block)
+    if name_match is None:
+        return None
+    name = name_match.group(1)
+    body = block[name_match.end() :]
+    arguments: dict[str, Any] = {}
+    consumed: list[tuple[int, int]] = []
+    for pair in _POOLSIDE_ARGUMENT_PAIR_RE.finditer(body):
+        key = pair.group(1).strip()
+        if not key:
+            raise _tool_protocol_error(f"tool '{name}' contains an empty arg_key")
+        if key in arguments:
+            raise _tool_protocol_error(
+                f"tool '{name}' contains duplicate arg_key '{key}'"
+            )
+        arguments[key] = _decode_tool_parameter_value(pair.group(2))
+        consumed.append(pair.span())
+    residue_parts: list[str] = []
+    cursor = 0
+    for start, end in consumed:
+        residue_parts.append(body[cursor:start])
+        cursor = end
+    residue_parts.append(body[cursor:])
+    if "".join(residue_parts).strip():
+        raise _tool_protocol_error(
+            f"tool '{name}' contains malformed Poolside arguments"
+        )
+    return name, arguments
+
+
+def _scan_bracket_tool_call(
+    text: str,
+    start: int,
+) -> tuple[int, str, Any] | None:
+    """Balanced-scan one `[Calling tool: name({...})]` block at `start`.
+
+    The JSON object is walked with string/escape awareness, so `}` or `)]`
+    sequences inside argument strings (a JS file body, a task_progress
+    checklist) cannot end the block early — the failure mode of the
+    non-greedy regex this replaces. Returns (end_exclusive, name, arguments)
+    for a complete block, or None when no complete well-formed block starts
+    at `start`.
+    """
+    match = re.compile(
+        r"\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)\s*\(",
+        re.IGNORECASE,
+    ).match(text, start)
+    if match is None:
+        return None
+    name = match.group(1)
+    i = match.end()
+    tail = re.compile(r"\s*\)\s*\]").match(text, i)
+    if tail is not None:
+        return tail.end(), name, {}
+    if i >= len(text) or text[i] != "{":
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    j = i
+    while j < len(text):
+        ch = text[j]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                j += 1
+                break
+        j += 1
+    if depth != 0:
+        return None
+    close = re.compile(r"\s*\)\s*\]").match(text, j)
+    if close is None:
+        return None
+    try:
+        arguments = json.loads(text[i:j])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    return close.end(), name, arguments
+
+
+def _classify_bracket_tool_call(text: str, start: int) -> str:
+    """Classify the bracket block starting at `start` (which sits on a full
+    `[Calling tool:`/`[Tool call:` prefix).
+
+    'complete'   — a well-formed call the scanner can extract now.
+    'incomplete' — the available text ends inside a structurally consistent
+                   block; more chunks may complete it (streaming: buffer).
+    'invalid'    — the structure is already broken with text to spare (e.g. a
+                   dangling prefix in prose); never a call, leave it to the
+                   content path and its prefix sanitizer.
+    """
+    if _scan_bracket_tool_call(text, start) is not None:
+        return "complete"
+    tail = text[start:]
+    head = re.match(
+        r"\[(?:Calling tool|Tool call):\s*[A-Za-z_][\w.-]*\s*\(",
+        tail,
+        re.IGNORECASE,
+    )
+    if head is None:
+        after_prefix = re.sub(
+            r"^\[(?:Calling tool|Tool call):",
+            "",
+            tail,
+            flags=re.IGNORECASE,
+        )
+        if re.fullmatch(r"\s*(?:[A-Za-z_][\w.-]*)?\s*\(?", after_prefix):
+            return "incomplete"
+        return "invalid"
+    i = start + head.end()
+    if i >= len(text):
+        return "incomplete"
+    if text[i] != "{":
+        return "incomplete" if re.fullmatch(r"\s*\)?\s*\]?", text[i:]) else "invalid"
+    depth = 0
+    in_string = False
+    escaped = False
+    j = i
+    while j < len(text):
+        ch = text[j]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                j += 1
+                break
+        j += 1
+    if depth != 0:
+        return "incomplete"
+    # Object closed but the scanner rejected it: either the `)]` close is
+    # still arriving, or the payload is truly malformed.
+    return "incomplete" if re.fullmatch(r"\s*\)?\s*", text[j:]) else "invalid"
+
+
+_PYTHONIC_TOOL_MARKER_PAIR = (
+    PYTHONIC_TOOL_CALL_START,
+    PYTHONIC_TOOL_CALL_END,
+)
+
+
 def _tool_marker_pairs_from_tokenizer(tokenizer: Any | None) -> list[tuple[str, str]]:
+    # The LFM pythonic envelope is always recognized: lfm2 tokenizers carry no
+    # tool metadata (mlx-lm has_tool_calling=False) while the special tokens
+    # survive detokenization as literal text, so tokenizer-derived pairs alone
+    # would stream the envelope to clients as content.
+    pairs: list[tuple[str, str]] = [_PYTHONIC_TOOL_MARKER_PAIR]
     if tokenizer is None:
-        return []
+        return pairs
     start = getattr(tokenizer, "tool_call_start", None)
     end = getattr(tokenizer, "tool_call_end", None)
     if not isinstance(start, str) or not start:
-        return []
+        return pairs
     if not isinstance(end, str) or not end:
-        return []
+        return pairs
     if start == "<tool_call>" and end == "</tool_call>":
-        return []
-    return [(start, end)]
+        return pairs
+    if (start, end) != _PYTHONIC_TOOL_MARKER_PAIR:
+        pairs.append((start, end))
+    return pairs
 
 
 def _iter_generated_tool_call_envelopes(
@@ -6444,19 +9267,33 @@ def _iter_generated_tool_call_envelopes(
         )
         for match in pattern.finditer(text):
             envelopes.append((match.start(), match.end(), match.group(1).strip(), None))
-    for match in _BRACKET_TOOL_CALL_RE.finditer(text):
-        name = match.group(1).strip()
-        raw_args = (match.group(2) or "").strip()
-        if raw_args:
-            try:
-                arguments: Any = json.loads(raw_args)
-            except json.JSONDecodeError as exc:
-                raise _tool_protocol_error(
-                    f"bracket tool_call '{name}' arguments are not valid JSON"
-                ) from exc
-        else:
-            arguments = {}
-        envelopes.append((match.start(), match.end(), "", (name, arguments)))
+    # Bracket dialect (`[Calling tool: name({...})]`) via the balanced scanner:
+    # the old non-greedy regex ended the block at the first `})]`, which any
+    # code-file argument contains inside a string, so large bracket calls
+    # always failed JSON decode and fell back to prose.
+    search_from = 0
+    lowered_text = text.lower()
+    while True:
+        candidates = [
+            idx
+            for idx in (
+                lowered_text.find(prefix.lower(), search_from)
+                for prefix in _BRACKET_TOOL_PREFIXES
+            )
+            if idx >= 0
+        ]
+        if not candidates:
+            break
+        found = min(candidates)
+        scanned = _scan_bracket_tool_call(text, found)
+        if scanned is None:
+            # Unterminated or malformed: not an envelope — the text stays
+            # visible content, same terminal state as the old decode error.
+            search_from = found + 1
+            continue
+        end, name, arguments = scanned
+        envelopes.append((found, end, "", (name, arguments)))
+        search_from = end
     envelopes.sort(key=lambda item: item[0])
     for previous, current in zip(envelopes, envelopes[1:]):
         if current[0] < previous[1]:
@@ -6494,7 +9331,10 @@ def _parse_tool_call_payload(
     )
     if parsed is not None:
         return parsed
-    return _parse_invoke_tool_call(block)
+    parsed = _parse_invoke_tool_call(block)
+    if parsed is not None:
+        return parsed
+    return _parse_poolside_tool_call(block)
 
 
 def _repair_unclosed_tool_call_payload(
@@ -6572,23 +9412,28 @@ def _parse_generated_tool_calls(
             raise _tool_protocol_error("unsupported tool_call payload format")
         name, arguments = parsed
         canonical_name = _canonical_tool_name_for_model_output(name, tools)
-        if canonical_name is None:
-            raise _tool_protocol_error(f"unknown tool '{name}'")
         arguments_value = _json_object_value(
             arguments,
             context=f"tool_call[{index}]",
         )
-        arguments_value = _normalize_tool_arguments_for_schema(
-            tool_name=canonical_name,
-            arguments=arguments_value,
-            tools=tools,
-        )
-        _validate_tool_arguments_for_schema(
-            tool_name=canonical_name,
-            arguments=arguments_value,
-            tools=tools,
-            context=f"tool_call[{index}]",
-        )
+        if canonical_name is None:
+            # OpenAI-compatible pass-through: surface the call under its raw
+            # name and let the client own the unknown-tool rejection (the
+            # client answers the model, which self-corrects). There is no
+            # schema to normalize or validate against.
+            canonical_name = str(name)
+        else:
+            arguments_value = _normalize_tool_arguments_for_schema(
+                tool_name=canonical_name,
+                arguments=arguments_value,
+                tools=tools,
+            )
+            _validate_tool_arguments_for_schema(
+                tool_name=canonical_name,
+                arguments=arguments_value,
+                tools=tools,
+                context=f"tool_call[{index}]",
+            )
         calls.append(
             {
                 "id": f"call_{uuid.uuid4().hex[:24]}",
@@ -6727,6 +9572,205 @@ class _ToolCallStreamParser:
         raise NotImplementedError
 
 
+class _SuffixedNativeToolCallStreamParser(_ToolCallStreamParser):
+    """Buffer and translate Hy3's native suffix-token tool protocol."""
+
+    dialect = "suffixed_native"
+    _OPEN_RE = re.compile(r"^<tool_calls?:[A-Za-z_][\w.-]*>", re.IGNORECASE)
+    _WRAPPER_RE = re.compile(
+        r"^<tool_calls(?P<suffix>:[A-Za-z_][\w.-]*)>",
+        re.IGNORECASE,
+    )
+
+    def __init__(
+        self,
+        *,
+        tools: list[dict[str, Any]],
+        tokenizer: Any | None,
+        argument_chunk_chars: int,
+    ) -> None:
+        self._tools = tools
+        self._tokenizer = tokenizer
+        self._argument_chunk_chars = max(1, int(argument_chunk_chars))
+        self._raw = ""
+        self._done = False
+        self._tool_calls: list[dict[str, Any]] | None = None
+        self._fallback_reason: str | None = None
+        self._remaining_text = ""
+
+    @property
+    def tool_calls(self) -> list[dict[str, Any]] | None:
+        return self._tool_calls
+
+    @property
+    def fallback_reason(self) -> str | None:
+        return self._fallback_reason
+
+    @property
+    def raw_text(self) -> str:
+        return self._raw
+
+    @property
+    def started(self) -> bool:
+        return bool(self._OPEN_RE.match(self._raw.lstrip()))
+
+    @property
+    def remaining_text(self) -> str:
+        return self._remaining_text
+
+    def _complete_span(self, *, final: bool) -> tuple[str, str] | None:
+        stripped = self._raw.lstrip()
+        wrapper = self._WRAPPER_RE.match(stripped)
+        if wrapper is not None:
+            suffix = wrapper.group("suffix")
+            close = f"</tool_calls{suffix}>"
+            end = _find_casefold(stripped, close, wrapper.end())
+            if end < 0:
+                if final:
+                    self._fallback_reason = "unclosed suffixed tool_calls block"
+                return None
+            end += len(close)
+            return stripped[:end], stripped[end:]
+
+        call = re.match(
+            r"^<tool_call(?P<suffix>:[A-Za-z_][\w.-]*)>",
+            stripped,
+            re.IGNORECASE,
+        )
+        if call is None:
+            if final:
+                self._fallback_reason = "invalid suffixed tool_call opener"
+            return None
+        close = f"</tool_call{call.group('suffix')}>"
+        end = _find_casefold(stripped, close, call.end())
+        if end < 0:
+            if final:
+                self._fallback_reason = "unclosed suffixed tool_call block"
+            return None
+        end += len(close)
+        return stripped[:end], stripped[end:]
+
+    def _finish_complete(self, complete: str, remaining: str) -> list[dict[str, Any]]:
+        extraction = omlx_parse_tool_calls(
+            complete,
+            self._tokenizer,
+            self._tools,
+        )
+        if not extraction.tool_calls:
+            self._fallback_reason = (
+                extraction.malformed_reason or "unrecognized suffixed native tool call"
+            )
+            return []
+
+        normalized_calls: list[dict[str, Any]] = []
+        try:
+            for index, call in enumerate(extraction.tool_calls):
+                function = call.get("function") if isinstance(call, dict) else None
+                if not isinstance(function, dict):
+                    raise _tool_protocol_error(
+                        f"suffixed tool_call[{index}] has no function"
+                    )
+                canonical_name = _canonical_tool_name_for_model_output(
+                    str(function.get("name") or ""),
+                    self._tools,
+                )
+                if canonical_name is None:
+                    raise _tool_protocol_error(
+                        f"unknown tool '{function.get('name') or ''}'"
+                    )
+                arguments = _json_object_value(
+                    function.get("arguments"),
+                    context=f"tool_call[{index}]",
+                )
+                arguments = _normalize_tool_arguments_for_schema(
+                    tool_name=canonical_name,
+                    arguments=arguments,
+                    tools=self._tools,
+                )
+                _validate_tool_arguments_for_schema(
+                    tool_name=canonical_name,
+                    arguments=arguments,
+                    tools=self._tools,
+                    context=f"tool_call[{index}]",
+                )
+                normalized_calls.append(
+                    {
+                        "id": str(call.get("id") or f"call_{uuid.uuid4().hex[:24]}"),
+                        "type": "function",
+                        "function": {
+                            "name": canonical_name,
+                            "arguments": _json_object_string(
+                                arguments,
+                                context=f"tool_call[{index}]",
+                            ),
+                        },
+                    }
+                )
+        except HTTPException as exc:
+            self._fallback_reason = _tool_protocol_reason(exc)
+            return []
+
+        self._tool_calls = normalized_calls
+        self._remaining_text = remaining
+        self._done = True
+        return list(
+            _stream_tool_call_deltas(
+                normalized_calls,
+                argument_chunk_chars=self._argument_chunk_chars,
+            )
+        )
+
+    def feed(self, text: str) -> list[dict[str, Any]]:
+        if self._done or self._fallback_reason:
+            self._raw += text
+            return []
+        self._raw += text
+        span = self._complete_span(final=False)
+        if span is None:
+            return []
+        return self._finish_complete(*span)
+
+    def finish(self) -> list[dict[str, Any]]:
+        if self._done or self._fallback_reason:
+            return []
+        span = self._complete_span(final=True)
+        if span is None:
+            return []
+        return self._finish_complete(*span)
+
+
+class _PythonicToolCallStreamParser(_SuffixedNativeToolCallStreamParser):
+    """Buffer and translate the LFM pythonic tool envelope.
+
+    Same buffered-envelope contract as the suffixed parser (the envelope is a
+    few dozen tokens; buffering to the end marker costs nothing perceptible),
+    reusing its normalize/validate/delta pipeline via _finish_complete. Only
+    the span recognition differs: a literal marker pair around a python-call
+    list, parsed by the omlx pythonic_marker branch.
+    """
+
+    dialect = "pythonic_marker"
+    _OPEN_RE = re.compile(re.escape(PYTHONIC_TOOL_CALL_START))
+
+    @property
+    def started(self) -> bool:
+        return self._raw.lstrip().startswith(PYTHONIC_TOOL_CALL_START)
+
+    def _complete_span(self, *, final: bool) -> tuple[str, str] | None:
+        stripped = self._raw.lstrip()
+        if not stripped.startswith(PYTHONIC_TOOL_CALL_START):
+            if final:
+                self._fallback_reason = "invalid pythonic tool call opener"
+            return None
+        end = stripped.find(PYTHONIC_TOOL_CALL_END)
+        if end < 0:
+            if final:
+                self._fallback_reason = "unclosed pythonic tool call envelope"
+            return None
+        end += len(PYTHONIC_TOOL_CALL_END)
+        return stripped[:end], stripped[end:]
+
+
 class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
     """Incrementally translate Qwen XML tool calls into OpenAI deltas.
 
@@ -6741,6 +9785,12 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
     _PARAM_CLOSE = "</parameter>"
     _FUNCTION_CLOSE = "</function>"
     _TOOL_CALL_CLOSE = "</tool_call>"
+    # Compiled case-insensitive searches for the per-feed hot loops: the
+    # _find_casefold equivalent allocated a lowered copy of the whole buffer
+    # on every call — O(n^2) while a large JSON tool body streams.
+    _FUNCTION_CLOSE_SEARCH_RE = re.compile(r"</function>", re.IGNORECASE)
+    _FUNCTION_OPEN_SEARCH_RE = re.compile(r"<function=", re.IGNORECASE)
+    _PARAMETER_OPEN_SEARCH_RE = re.compile(r"<parameter=", re.IGNORECASE)
 
     def __init__(
         self,
@@ -6807,9 +9857,12 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
         """
         search_from = 0
         while True:
-            close = _find_casefold(self._buf, self._FUNCTION_CLOSE, search_from)
-            if close < 0:
+            close_match = self._FUNCTION_CLOSE_SEARCH_RE.search(
+                self._buf, search_from
+            )
+            if close_match is None:
                 return "wait" if not self._finishing else "failed"
+            close = close_match.start()
             if self._adopt_json_object_body(self._buf[:close]):
                 self._buf = self._buf[close + len(self._FUNCTION_CLOSE) :]
                 self._stage = "after_function"
@@ -6822,11 +9875,21 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
 
     @property
     def in_known_tool_parameter(self) -> bool:
+        if not (self._started and self._name and self._name in self._known):
+            return False
+        if self._stage == "in_parameter":
+            return True
+        # A JSON-dialect function body (#170) is argument payload too. While
+        # the object streams, the parser waits in "find_parameter" for its
+        # closing </function>, so the hidden-tool guard must stand down here
+        # exactly as it does inside <parameter=> values — otherwise a large
+        # write body crosses the guard's token/time budget and generation is
+        # cancelled mid-call as "malformed tool_call: unterminated stream"
+        # (#196).
         return (
-            bool(self._started)
-            and bool(self._name)
-            and self._name in self._known
-            and self._stage == "in_parameter"
+            self._stage == "find_parameter"
+            and not self._params
+            and self._buf.lstrip().startswith("{")
         )
 
     def _finish_call(self, deltas: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -6882,7 +9945,8 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
         deltas: list[dict[str, Any]] = []
         while True:
             if self._stage == "find_function":
-                function_start = _find_casefold(self._buf, "<function=")
+                open_match = self._FUNCTION_OPEN_SEARCH_RE.search(self._buf)
+                function_start = open_match.start() if open_match else -1
                 if function_start < 0:
                     return deltas
                 function_end = self._buf.find(">", function_start)
@@ -6898,8 +9962,8 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
                     self._tools,
                 )
                 if canonical_name is None:
-                    self._fallback_reason = f"unknown tool '{name}'"
-                    return deltas
+                    # Pass-through: the client owns unknown-tool rejection.
+                    canonical_name = name
                 self._name = canonical_name
                 self._started = True
                 self._buf = self._buf[function_end + 1 :]
@@ -6920,8 +9984,10 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
                         f"tool '{self._name}' contains unwrapped parameter text"
                     )
                     return deltas
-                param_start = _find_casefold(self._buf, "<parameter=")
-                function_close = _find_casefold(self._buf, self._FUNCTION_CLOSE)
+                param_match = self._PARAMETER_OPEN_SEARCH_RE.search(self._buf)
+                param_start = param_match.start() if param_match else -1
+                close_match = self._FUNCTION_CLOSE_SEARCH_RE.search(self._buf)
+                function_close = close_match.start() if close_match else -1
                 if function_close >= 0 and (
                     param_start < 0 or function_close < param_start
                 ):
@@ -6929,13 +9995,10 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
                     # body text is a loud protocol fallback, never a silent
                     # drop that finishes the call with empty arguments.
                     if self._buf[:function_close].strip():
-                        self._fallback_reason = (
-                            f"tool '{self._name}' contains "
-                            + (
-                                "text outside parameters"
-                                if self._params
-                                else "unwrapped parameter text"
-                            )
+                        self._fallback_reason = f"tool '{self._name}' contains " + (
+                            "text outside parameters"
+                            if self._params
+                            else "unwrapped parameter text"
                         )
                         return deltas
                     self._buf = self._buf[function_close + len(self._FUNCTION_CLOSE) :]
@@ -7124,6 +10187,12 @@ class _ToolAwareContentStreamTranslator:
         self._repair_unclosed_complete = bool(repair_unclosed_complete)
         self._suppress_tool_call_preamble = bool(suppress_tool_call_preamble)
         self._marker_pairs = _tool_marker_pairs_from_tokenizer(tokenizer)
+        # Lowered start markers, computed once: _find_tool_start runs per
+        # chunk and previously re-lowercased the whole buffer per marker pair
+        # (via _find_casefold) on the agentic hot path.
+        self._marker_starts_lower = tuple(
+            start.lower() for start, _end in self._marker_pairs
+        )
         self._pending = ""
         self._trailing = ""
         self._mode = "passthrough" if not tools else "undecided"
@@ -7318,6 +10387,7 @@ class _ToolAwareContentStreamTranslator:
 
     def _find_tool_start(self, text: str) -> int:
         candidates: list[int] = []
+        # One lowered copy per scan, shared by every marker family below.
         lowered = text.lower()
         idx = lowered.find(self._START_MARKER)
         if idx >= 0:
@@ -7325,19 +10395,23 @@ class _ToolAwareContentStreamTranslator:
         ns_match = _NAMESPACED_TOOL_CALL_START_RE.search(text)
         if ns_match:
             candidates.append(ns_match.start())
-        for prefix in _BRACKET_TOOL_PREFIXES:
-            bracket_idx = lowered.find(prefix.lower())
+        for prefix_lower in _BRACKET_TOOL_PREFIXES_LOWER:
+            bracket_idx = lowered.find(prefix_lower)
             while bracket_idx >= 0:
-                candidate = text[bracket_idx:]
-                if _BRACKET_TOOL_CALL_RE.match(candidate):
+                # The old gate demanded a complete regex match mid-stream and
+                # skipped ahead on any early `]` (present in every
+                # task_progress checklist), so bracket-call text streamed to
+                # the client as content AND the finish-time rescue emitted the
+                # same call — a double delivery that also taught the model its
+                # drift dialect was accepted. Buffer on complete AND
+                # still-completing blocks; only structurally-dead prefixes
+                # stay on the content path for the prefix sanitizer.
+                if _classify_bracket_tool_call(text, bracket_idx) != "invalid":
                     candidates.append(bracket_idx)
                     break
-                close_idx = candidate.find("]")
-                if close_idx < 0:
-                    break
-                bracket_idx = lowered.find(prefix.lower(), bracket_idx + 1)
-        for start_marker, _end_marker in self._marker_pairs:
-            custom_idx = _find_casefold(text, start_marker)
+                bracket_idx = lowered.find(prefix_lower, bracket_idx + 1)
+        for start_marker_lower in self._marker_starts_lower:
+            custom_idx = lowered.find(start_marker_lower)
             if custom_idx >= 0:
                 candidates.append(custom_idx)
         return min(candidates) if candidates else -1
@@ -7473,23 +10547,41 @@ class _ToolAwareContentStreamTranslator:
             self._pending = ""
             self._mode = "content"
             deltas = self._content_delta(content)
-            if (
-                self._suppress_tool_call_preamble
-                and not defer_content_resolution
-            ):
+            if self._suppress_tool_call_preamble and not defer_content_resolution:
                 deltas.extend(self._flush_deferred_content())
             return deltas
         if defer_content_resolution and self._suppress_tool_call_preamble:
             return []
         return self._flush_deferred_content()
 
+    def _make_tool_parser(self, pending: str) -> _ToolCallStreamParser:
+        stripped = pending.lstrip()
+        lowered = stripped.lower()
+        if stripped.startswith(PYTHONIC_TOOL_CALL_START):
+            return _PythonicToolCallStreamParser(
+                tools=self._tools,
+                tokenizer=self._tokenizer,
+                argument_chunk_chars=self._argument_chunk_chars,
+            )
+        if lowered.startswith("<tool_call:") or lowered.startswith("<tool_calls:"):
+            return _SuffixedNativeToolCallStreamParser(
+                tools=self._tools,
+                tokenizer=self._tokenizer,
+                argument_chunk_chars=self._argument_chunk_chars,
+            )
+        return _QwenXMLToolCallStreamParser(
+            tools=self._tools,
+            call_index=len(self.tool_calls or []),
+            repair_unclosed_complete=self._repair_unclosed_complete,
+        )
+
     def _tool_deltas_if_complete(self, *, final: bool) -> list[dict[str, Any]]:
         if self._tool_parser is None:
-            self._tool_parser = _QwenXMLToolCallStreamParser(
-                tools=self._tools,
-                call_index=len(self.tool_calls or []),
-                repair_unclosed_complete=self._repair_unclosed_complete,
-            )
+            stripped_pending = self._pending.lstrip()
+            lowered_pending = stripped_pending.lower()
+            if lowered_pending in {"<tool_call", "<tool_calls"} and not final:
+                return []
+            self._tool_parser = self._make_tool_parser(self._pending)
             self.tool_parser_dialect = self._tool_parser.dialect
         chunk = self._pending
         self._pending = ""
@@ -7519,11 +10611,7 @@ class _ToolAwareContentStreamTranslator:
                     return deltas
                 idx = self._find_tool_start(remaining)
                 if idx >= 0 and not remaining[:idx].strip():
-                    self._tool_parser = _QwenXMLToolCallStreamParser(
-                        tools=self._tools,
-                        call_index=len(self.tool_calls or []),
-                        repair_unclosed_complete=self._repair_unclosed_complete,
-                    )
+                    self._tool_parser = self._make_tool_parser(remaining[idx:])
                     self.tool_parser_dialect = self._tool_parser.dialect
                     chunk = remaining[idx:]
                     self._mode = "tool"
@@ -7562,11 +10650,7 @@ class _ToolAwareContentStreamTranslator:
                     return deltas
                 idx = self._find_tool_start(remaining)
                 if idx >= 0 and not remaining[:idx].strip():
-                    self._tool_parser = _QwenXMLToolCallStreamParser(
-                        tools=self._tools,
-                        call_index=len(self.tool_calls or []),
-                        repair_unclosed_complete=self._repair_unclosed_complete,
-                    )
+                    self._tool_parser = self._make_tool_parser(remaining[idx:])
                     self.tool_parser_dialect = self._tool_parser.dialect
                     chunk = remaining[idx:]
                     self._mode = "tool"
@@ -7735,7 +10819,9 @@ def _collapse_repeated_simple_chitchat_text(text: str) -> str | None:
     if not compact or len(compact) > 160:
         return None
     for key, canonical in sorted(
-        _SIMPLE_CHITCHAT_COMPACT_CANONICAL.items(), key=lambda item: len(item[0]), reverse=True
+        _SIMPLE_CHITCHAT_COMPACT_CANONICAL.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
     ):
         if not key or len(compact) <= len(key) or len(compact) % len(key) != 0:
             continue
@@ -7772,6 +10858,25 @@ def _collapse_repeated_user_text(text: str) -> str | None:
     return None
 
 
+def _message_has_nontext_parts(message: ChatMessage) -> bool:
+    """True when structured content carries non-text parts (images, audio).
+
+    Multimodal turns are never retry pollution: collapsing or merging them
+    through the text-only paths would silently drop the attachment before the
+    vision extractor runs (#327).
+    """
+    content = getattr(message, "content", None)
+    if not isinstance(content, list):
+        return False
+    for item in content:
+        if isinstance(item, dict):
+            if item.get("type") not in (None, "text") or "image_url" in item:
+                return True
+        elif not isinstance(item, str):
+            return True
+    return False
+
+
 def _canonicalize_user_retry_pollution(
     messages: list[ChatMessage],
     stats: AgentTranscriptCanonicalization,
@@ -7782,20 +10887,23 @@ def _canonicalize_user_retry_pollution(
     for message in messages:
         role = str(message.role).lower()
         candidate = message
-        if role == "user":
+        if role == "user" and not _message_has_nontext_parts(candidate):
             text = _content_to_text(candidate.content)
             collapsed = _collapse_repeated_user_text(text)
             if collapsed is not None:
                 candidate = _copy_chat_message(candidate, content=collapsed)
                 stats.collapsed_repeated_user_messages += 1
-                stats.collapsed_repeated_user_chars += max(0, len(text) - len(collapsed))
+                stats.collapsed_repeated_user_chars += max(
+                    0, len(text) - len(collapsed)
+                )
 
-        if (
-            role == "user"
-            and canonical
-            and str(canonical[-1].role).lower() == "user"
-        ):
+        if role == "user" and canonical and str(canonical[-1].role).lower() == "user":
             previous = canonical[-1]
+            if _message_has_nontext_parts(previous) or _message_has_nontext_parts(
+                candidate
+            ):
+                canonical.append(candidate)
+                continue
             previous_text = _content_to_text(previous.content).strip()
             current_text = _content_to_text(candidate.content).strip()
             previous_key = _retry_user_key(previous_text)
@@ -7896,7 +11004,10 @@ def _replace_client_system_prompt(
         and _content_to_text(leading_system[0].content) == replacement
     ):
         return messages
-    updated = [ChatMessage(role="system", content=replacement), *messages[first_non_system:]]
+    updated = [
+        ChatMessage(role="system", content=replacement),
+        *messages[first_non_system:],
+    ]
     stats.replaced_client_system_messages += len(leading_system)
     stats.replaced_client_system_chars += sum(
         len(_content_to_text(message.content)) for message in leading_system
@@ -7923,10 +11034,15 @@ def _with_backend_chat_policy(
             return messages, False
         updated[0] = _copy_chat_message(
             first,
-            content=f"{content}\n\n{_MTPLX_STEP_LANGUAGE_POLICY}" if content else _MTPLX_STEP_LANGUAGE_POLICY,
+            content=f"{content}\n\n{_MTPLX_STEP_LANGUAGE_POLICY}"
+            if content
+            else _MTPLX_STEP_LANGUAGE_POLICY,
         )
         return updated, True
-    return [ChatMessage(role="system", content=_MTPLX_STEP_LANGUAGE_POLICY), *updated], True
+    return [
+        ChatMessage(role="system", content=_MTPLX_STEP_LANGUAGE_POLICY),
+        *updated,
+    ], True
 
 
 def _message_declares_aborted_assistant_turn(message: ChatMessage) -> bool:
@@ -8020,6 +11136,80 @@ _ACTIVE_READ_INSPECTION_MULTI_FILE_LINE_MAX_CHARS = 150
 _ACTIVE_TOOL_RESULT_COMPACT_THRESHOLD_CHARS = 4_000
 _ACTIVE_TOOL_RESULT_COMPACT_HEAD_LINES = 8
 _ACTIVE_TOOL_RESULT_COMPACT_TAIL_LINES = 4
+
+_AGENT_REWRITES_ENV = "MTPLX_AGENT_REWRITES"
+
+
+def _agent_rewrites_mode() -> str:
+    """Agent-rewrite posture for the serving endpoints: on | off | default.
+
+    The #282 contract: client transcripts and toolsets pass through the
+    OpenAI/Anthropic endpoints untouched apart from chat-template and
+    protocol translation. "on" restores the full legacy machinery
+    (content compaction, steering contracts, heuristic message drops and
+    toolset filtering). "off" is a hard passthrough guarantee and wins
+    over every per-feature opt-in. Unset ("default") keeps passthrough
+    while explicit per-feature env limits may re-enable an individual
+    compactor at the chosen limit.
+    """
+    raw = os.environ.get(_AGENT_REWRITES_ENV, "").strip().lower()
+    if raw in {"on", "1", "true", "yes", "legacy"}:
+        return "on"
+    if raw in {"off", "0", "false", "no", "passthrough"}:
+        return "off"
+    return "default"
+
+
+def _agent_steering_enabled() -> bool:
+    """Legacy behavior-steering rewrites: only under MTPLX_AGENT_REWRITES=on."""
+    return _agent_rewrites_mode() == "on"
+
+
+def _env_int_optional(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _compact_threshold_chars(env_name: str, legacy_default: int) -> int | None:
+    """Threshold for one content compactor, or None when it must not run.
+
+    Default posture (#282): compactors are OFF. An explicit env limit
+    enables that one compactor at the chosen limit;
+    MTPLX_AGENT_REWRITES=on restores the legacy default;
+    MTPLX_AGENT_REWRITES=off disables even explicitly-set limits.
+    """
+    mode = _agent_rewrites_mode()
+    if mode == "off":
+        return None
+    explicit = _env_int_optional(env_name)
+    if explicit is not None:
+        return max(1, explicit)
+    if mode == "on":
+        return max(1, legacy_default)
+    return None
+
+
+def _repeated_timeout_compaction_enabled() -> bool:
+    return _agent_steering_enabled()
+
+
+def _repeated_inspection_read_compaction_enabled() -> bool:
+    # The repeated-read dedup is part of the inspection-read budget system;
+    # it runs exactly when that compactor is engaged.
+    return (
+        _compact_threshold_chars(
+            "MTPLX_ACTIVE_READ_INSPECTION_COMPACT_THRESHOLD_CHARS",
+            _ACTIVE_READ_INSPECTION_COMPACT_THRESHOLD_CHARS,
+        )
+        is not None
+    )
+
+
 def _historical_read_budget() -> tuple[int, int]:
     """Fixed prefix-stable budget for HISTORICAL inspection-segment reads.
 
@@ -8074,6 +11264,8 @@ def _segment_inspection_flags(messages: list[ChatMessage]) -> list[bool]:
                 current = _is_read_only_inspection_request(text)
         flags.append(current)
     return flags
+
+
 _ACTIVE_TOOL_RESULT_COMPACT_MAX_LINES = 48
 _ACTIVE_TOOL_RESULT_LINE_MAX_CHARS = 280
 _LINE_NUMBERED_CONTENT_RE = re.compile(r"^\s*(\d+):\s?(.*)$")
@@ -8317,9 +11509,7 @@ def _looks_like_verbatim_tool_output_assistant_dump(content: str) -> bool:
     if len(lines) < 24:
         return False
     sampled = lines[: min(96, len(lines))]
-    numbered_count = sum(
-        1 for line in sampled if _LINE_NUMBERED_CONTENT_RE.match(line)
-    )
+    numbered_count = sum(1 for line in sampled if _LINE_NUMBERED_CONTENT_RE.match(line))
     if numbered_count < 20:
         return False
     first_is_numbered = bool(_LINE_NUMBERED_CONTENT_RE.match(sampled[0]))
@@ -8333,7 +11523,10 @@ def _is_read_only_inspection_request(text: str) -> bool:
     recommendation_request = bool(
         _READ_ONLY_RECOMMENDATION_REQUEST_RE.search(normalized)
     )
-    if not _READ_ONLY_INSPECTION_REQUEST_RE.search(normalized) and not recommendation_request:
+    if (
+        not _READ_ONLY_INSPECTION_REQUEST_RE.search(normalized)
+        and not recommendation_request
+    ):
         return False
     if _MUTATING_REQUEST_RE.search(normalized):
         return recommendation_request or bool(
@@ -8455,22 +11648,23 @@ def _latest_assistant_step_index(messages: list[ChatMessage]) -> int | None:
 
 
 def _compact_tool_result_text(text: str) -> str | None:
-    threshold = max(
-        1,
-        _env_int(
-            "MTPLX_TOOL_RESULT_COMPACT_THRESHOLD_CHARS",
-            _TOOL_RESULT_COMPACT_THRESHOLD_CHARS,
-        ),
+    threshold = _compact_threshold_chars(
+        "MTPLX_TOOL_RESULT_COMPACT_THRESHOLD_CHARS",
+        _TOOL_RESULT_COMPACT_THRESHOLD_CHARS,
     )
-    if len(text) <= threshold:
+    if threshold is None or len(text) <= threshold:
         return None
     head_chars = max(
         0,
-        _env_int("MTPLX_TOOL_RESULT_COMPACT_HEAD_CHARS", _TOOL_RESULT_COMPACT_HEAD_CHARS),
+        _env_int(
+            "MTPLX_TOOL_RESULT_COMPACT_HEAD_CHARS", _TOOL_RESULT_COMPACT_HEAD_CHARS
+        ),
     )
     tail_chars = max(
         0,
-        _env_int("MTPLX_TOOL_RESULT_COMPACT_TAIL_CHARS", _TOOL_RESULT_COMPACT_TAIL_CHARS),
+        _env_int(
+            "MTPLX_TOOL_RESULT_COMPACT_TAIL_CHARS", _TOOL_RESULT_COMPACT_TAIL_CHARS
+        ),
     )
     head = text[:head_chars].rstrip() if head_chars else ""
     tail = text[-tail_chars:].lstrip() if tail_chars else ""
@@ -8530,7 +11724,7 @@ def _render_next_read_hints(
         return ""
     safe_path = html.escape(path)
     lines = ["<next_read_hints>"]
-    for start, end in ranges[:max(1, max_hints)]:
+    for start, end in ranges[: max(1, max_hints)]:
         limit = max(1, end - start + 1)
         lines.append(
             f'<range start="{start}" end="{end}" limit="{limit}">'
@@ -8595,7 +11789,9 @@ def _compressed_int_ranges(values: Iterable[int], *, max_ranges: int = 4) -> str
     return ",".join(parts)
 
 
-def _cluster_source_lines(lines: Iterable[int], *, max_gap: int = 80) -> list[list[int]]:
+def _cluster_source_lines(
+    lines: Iterable[int], *, max_gap: int = 80
+) -> list[list[int]]:
     clusters: list[list[int]] = []
     for line_no in sorted({int(line) for line in lines if int(line) > 0}):
         if not clusters or line_no > clusters[-1][-1] + max_gap:
@@ -8716,14 +11912,11 @@ def _active_tool_result_read_hint_count(compacted: str) -> int:
 def _compact_active_tool_result_text(text: str) -> str | None:
     """Compact large current grep/glob/bash outputs without hiding useful paths."""
 
-    threshold = max(
-        1,
-        _env_int(
-            "MTPLX_ACTIVE_TOOL_RESULT_COMPACT_THRESHOLD_CHARS",
-            _ACTIVE_TOOL_RESULT_COMPACT_THRESHOLD_CHARS,
-        ),
+    threshold = _compact_threshold_chars(
+        "MTPLX_ACTIVE_TOOL_RESULT_COMPACT_THRESHOLD_CHARS",
+        _ACTIVE_TOOL_RESULT_COMPACT_THRESHOLD_CHARS,
     )
-    if len(text) <= threshold:
+    if threshold is None or len(text) <= threshold:
         return None
     lines = text.splitlines()
     if not lines:
@@ -8824,7 +12017,7 @@ def _compact_active_tool_result_text(text: str) -> str | None:
         f"kept_lines={len(kept)} omitted_lines={omitted_lines} "
         f"read_hint_count={len(read_hints)} source_path_count={source_path_count} "
         f'anchor="{anchor}">\n'
-        "[Large current tool output abbreviated to keep OpenCode responsive. "
+        "[Large current tool output abbreviated to keep the coding agent responsive. "
         "Important source paths, errors, and match lines are prioritized. Use "
         "the next_read_hints for exact follow-up reads; do not rerun broad "
         "list/grep/build commands unchanged.]\n"
@@ -8892,7 +12085,9 @@ def _read_tool_content_meta(text: str) -> _ReadToolContentMeta | None:
     )
 
 
-def _inspection_read_budget_for_count(candidate_count: int) -> tuple[int | None, int | None]:
+def _inspection_read_budget_for_count(
+    candidate_count: int,
+) -> tuple[int | None, int | None]:
     if candidate_count <= 1:
         return None, None
     total_lines = max(
@@ -8997,18 +12192,20 @@ def _compact_active_read_tool_result_text(
     rerun `read` narrowly for omitted exact text.
     """
 
-    force_compact = bool(_READ_CONTINUATION_HINT_RE.search(text))
     threshold = (
-        max(
-            1,
-            _env_int(
-                "MTPLX_ACTIVE_READ_INSPECTION_COMPACT_THRESHOLD_CHARS",
-                _ACTIVE_READ_INSPECTION_COMPACT_THRESHOLD_CHARS,
-            ),
+        _compact_threshold_chars(
+            "MTPLX_ACTIVE_READ_INSPECTION_COMPACT_THRESHOLD_CHARS",
+            _ACTIVE_READ_INSPECTION_COMPACT_THRESHOLD_CHARS,
         )
         if inspection_request
-        else _ACTIVE_READ_COMPACT_THRESHOLD_CHARS
+        else _compact_threshold_chars(
+            "MTPLX_ACTIVE_READ_COMPACT_THRESHOLD_CHARS",
+            _ACTIVE_READ_COMPACT_THRESHOLD_CHARS,
+        )
     )
+    if threshold is None:
+        return None
+    force_compact = bool(_READ_CONTINUATION_HINT_RE.search(text))
     if len(text) <= threshold and not force_compact:
         return None
     if "<content>" not in text or "</content>" not in text:
@@ -9064,7 +12261,9 @@ def _compact_active_read_tool_result_text(
             ),
         )
         if inspection_line_max_chars is not None:
-            line_max_chars = min(line_max_chars, max(120, int(inspection_line_max_chars)))
+            line_max_chars = min(
+                line_max_chars, max(120, int(inspection_line_max_chars))
+            )
     else:
         head_lines = max(
             0,
@@ -9169,9 +12368,7 @@ def _compact_active_read_tool_result_text(
         else _ACTIVE_READ_PRIORITY_ANCHOR_RE
     )
     priority_anchor_lines = [
-        line_no
-        for line_no, line in numbered
-        if priority_anchor_re.search(line)
+        line_no for line_no, line in numbered if priority_anchor_re.search(line)
     ]
     generic_anchor_lines = [
         line_no for line_no, line in numbered if _ACTIVE_READ_ANCHOR_RE.search(line)
@@ -9192,12 +12389,16 @@ def _compact_active_read_tool_result_text(
     previous: int | None = None
     for line_no in kept:
         if previous is not None and line_no > previous + 1:
-            excerpt.append(f"... [MTPLX omitted lines {previous + 1}-{line_no - 1}] ...")
+            excerpt.append(
+                f"... [MTPLX omitted lines {previous + 1}-{line_no - 1}] ..."
+            )
         line = _compact_tool_excerpt_line(line_by_no[line_no], line_max_chars)
         excerpt.append(f"{line_no}: {line}")
         previous = line_no
     if previous is not None and previous < numbered[-1][0]:
-        excerpt.append(f"... [MTPLX omitted lines {previous + 1}-{numbered[-1][0]}] ...")
+        excerpt.append(
+            f"... [MTPLX omitted lines {previous + 1}-{numbered[-1][0]}] ..."
+        )
 
     omitted_lines = max(0, len(numbered) - len(kept))
     if inspection_request:
@@ -9256,7 +12457,7 @@ def _compact_active_read_tool_result_text(
         "|".join(str(line_no) for line_no in kept[:24]),
     )
     guidance = (
-        "[Large current read abbreviated to keep OpenCode tool loops responsive. "
+        "[Large current read abbreviated to keep coding-agent tool loops responsive. "
         "The excerpt preserves file line numbers, definitions, and likely "
         "collision/navigation/runtime anchors. For review or evaluation, answer "
         "from this excerpt when the relevant anchors are visible; do not "
@@ -9308,7 +12509,9 @@ def _assistant_reasoning_history_stats(
                 chars += len(thinking)
                 structured_blocks += 1
     elif isinstance(content, str):
-        chars += sum(len(match.group(0)) for match in _REASONING_TAG_RE.finditer(content))
+        chars += sum(
+            len(match.group(0)) for match in _REASONING_TAG_RE.finditer(content)
+        )
     return (1 if chars > 0 else 0), chars, structured_blocks
 
 
@@ -9405,26 +12608,45 @@ def _canonicalize_agent_transcript(
                 if _message_declares_aborted_assistant_turn(message):
                     stats.skipped_aborted_assistant_messages += 1
                     continue
-                if _looks_like_orphan_chitchat_assistant_turn(source_messages, index):
+                if _agent_steering_enabled() and _looks_like_orphan_chitchat_assistant_turn(
+                    source_messages, index
+                ):
                     stats.skipped_orphan_chitchat_assistant_messages += 1
                     continue
                 if (
                     message.tool_calls
                     and content.strip()
                     and (
-                        (segment_inspection[index] or strip_tool_call_preamble_text)
+                        # The inspection-driven strip legs are legacy steering
+                        # (#282); the managed-client strip flag (OpenCode)
+                        # keeps its tuned lane behavior in every mode.
+                        (
+                            (
+                                _agent_steering_enabled()
+                                and segment_inspection[index]
+                            )
+                            or strip_tool_call_preamble_text
+                        )
                         if historical
-                        else (inspection_request or strip_tool_call_preamble_text)
+                        else (
+                            (_agent_steering_enabled() and inspection_request)
+                            or strip_tool_call_preamble_text
+                        )
                     )
                 ):
                     stats.stripped_tool_preamble_messages += 1
                     stats.stripped_tool_preamble_chars += len(content)
                     message = _copy_chat_message(message, content="")
                     content = ""
-                if not message.tool_calls:
+                if not message.tool_calls and _agent_steering_enabled():
+                    # Content-heuristic assistant drops are legacy rewrites
+                    # (#282): a client-authored message is never discarded on
+                    # a text sniff unless MTPLX_AGENT_REWRITES=on.
                     if _looks_like_verbatim_tool_output_assistant_dump(content):
                         stats.skipped_verbatim_tool_output_assistant_messages += 1
-                        stats.skipped_verbatim_tool_output_assistant_chars += len(content)
+                        stats.skipped_verbatim_tool_output_assistant_chars += len(
+                            content
+                        )
                         continue
                     if _looks_like_repeated_agent_preamble(content):
                         stats.skipped_repeated_assistant_messages += 1
@@ -9441,7 +12663,11 @@ def _canonicalize_agent_transcript(
                     or ""
                 ).strip()
                 signature = tool_calls_by_id.get(tool_call_id)
-                if signature is not None and _tool_result_is_timeout(text):
+                if (
+                    signature is not None
+                    and _repeated_timeout_compaction_enabled()
+                    and _tool_result_is_timeout(text)
+                ):
                     tool_name, key_payload, command = signature
                     timeout_key = f"{tool_name}\n{key_payload}"
                     repeat_count = timeout_counts_by_key.get(timeout_key, 0) + 1
@@ -9499,12 +12725,18 @@ def _canonicalize_agent_transcript(
                             3,
                             int(len(read_meta.line_numbers) * 0.08),
                         )
-                        if prior_lines and len(new_lines) <= duplicate_threshold:
-                            compacted = _compact_repeated_inspection_read_tool_result_text(
-                                read_text,
-                                meta=read_meta,
-                                prior_covered_lines=len(prior_lines),
-                                new_lines=len(new_lines),
+                        if (
+                            prior_lines
+                            and len(new_lines) <= duplicate_threshold
+                            and _repeated_inspection_read_compaction_enabled()
+                        ):
+                            compacted = (
+                                _compact_repeated_inspection_read_tool_result_text(
+                                    read_text,
+                                    meta=read_meta,
+                                    prior_covered_lines=len(prior_lines),
+                                    new_lines=len(new_lines),
+                                )
                             )
                             prior_lines.update(read_meta.line_numbers)
                             canonical.append(
@@ -9516,7 +12748,9 @@ def _canonicalize_agent_transcript(
                             stats.compacted_active_read_inspection_messages += 1
                             stats.compacted_active_read_inspection_chars += saved_chars
                             stats.compacted_repeated_read_inspection_messages += 1
-                            stats.compacted_repeated_read_inspection_chars += saved_chars
+                            stats.compacted_repeated_read_inspection_chars += (
+                                saved_chars
+                            )
                             continue
                         prior_lines.update(read_meta.line_numbers)
                     historical_max_lines, historical_line_chars = (
@@ -9558,12 +12792,18 @@ def _canonicalize_agent_transcript(
                             3,
                             int(len(read_meta.line_numbers) * 0.08),
                         )
-                        if prior_lines and len(new_lines) <= duplicate_threshold:
-                            compacted = _compact_repeated_inspection_read_tool_result_text(
-                                read_text,
-                                meta=read_meta,
-                                prior_covered_lines=len(prior_lines),
-                                new_lines=len(new_lines),
+                        if (
+                            prior_lines
+                            and len(new_lines) <= duplicate_threshold
+                            and _repeated_inspection_read_compaction_enabled()
+                        ):
+                            compacted = (
+                                _compact_repeated_inspection_read_tool_result_text(
+                                    read_text,
+                                    meta=read_meta,
+                                    prior_covered_lines=len(prior_lines),
+                                    new_lines=len(new_lines),
+                                )
                             )
                             prior_lines.update(read_meta.line_numbers)
                             canonical.append(
@@ -9575,7 +12815,9 @@ def _canonicalize_agent_transcript(
                             stats.compacted_active_read_inspection_messages += 1
                             stats.compacted_active_read_inspection_chars += saved_chars
                             stats.compacted_repeated_read_inspection_messages += 1
-                            stats.compacted_repeated_read_inspection_chars += saved_chars
+                            stats.compacted_repeated_read_inspection_chars += (
+                                saved_chars
+                            )
                             continue
                         prior_lines.update(read_meta.line_numbers)
                     inspection_max_lines, inspection_line_max_chars = (
@@ -9643,7 +12885,9 @@ def _canonicalize_agent_transcript(
                 if compacted is not None:
                     canonical.append(_copy_chat_message(message, content=compacted))
                     stats.compacted_active_tool_result_messages += 1
-                    stats.compacted_active_tool_result_chars += len(text) - len(compacted)
+                    stats.compacted_active_tool_result_chars += len(text) - len(
+                        compacted
+                    )
                     stats.compacted_active_tool_result_read_hints += (
                         _active_tool_result_read_hint_count(compacted)
                     )
@@ -9662,6 +12906,7 @@ def _message_to_template_dict(
     *,
     strip_assistant_reasoning_history: bool,
     include_reasoning_content: bool = False,
+    allow_committed_reasoning: bool = False,
 ) -> dict[str, Any] | None:
     if not message.role:
         return None
@@ -9675,23 +12920,49 @@ def _message_to_template_dict(
             ).strip()
         )
     item: dict[str, Any] = {"role": message.role, "content": content}
-    if include_reasoning_content and message.role == "assistant":
-        # Scoped reasoning history carries the client's structured reasoning
-        # fields through to the chat template so its rolling checkpoint can
-        # keep them inside the active agent round (interleaved-thinking
-        # continuity) and drop them for completed turns. The legacy
-        # preserve/strip modes keep their historical behavior: the field is
-        # dropped here, so `on` stays byte-identical as the rollback path.
+    committed_body_rendered = False
+    if (
+        include_reasoning_content
+        and message.role == "assistant"
+        and not content.lstrip().startswith("<think>")
+    ):
+        # Structured reasoning echoes ride to the chat template for scoped
+        # mode (its rolling checkpoint governs retention) AND for
+        # preserve-mode echo-carry (base render for turns the committed
+        # stream hasn't covered; the committed substitution below overwrites
+        # covered turns with KV-exact bytes). Policy `--preserve-thinking on`
+        # never sets the flag, so it stays byte-identical legacy (the drop)
+        # as the rollback path. Content that already STARTS with an inline
+        # think block keeps it as the single reasoning source — rendering
+        # the field too would put the turn's thinking in twice.
         for key in ("reasoning_content", "reasoning"):
             reasoning = _message_extra(message, key)
             if reasoning:
                 item["reasoning_content"] = str(reasoning)
                 break
+    if allow_committed_reasoning and message.role == "assistant":
+        # Server-built canonicalization only: the committed-think field is
+        # set by _maybe_canonicalize_committed_reasoning (inbound copies are
+        # scrubbed there), and it flows to the template ONLY on encode paths
+        # that opt in via this flag — client-sent reasoning fields keep the
+        # exact legacy preserve/strip behavior above.
+        committed = _message_extra(message, _COMMITTED_REASONING_FIELD)
+        if committed:
+            item["reasoning_content"] = str(committed)
+        committed_body = _message_extra(message, _COMMITTED_TURN_BODY_FIELD)
+        if committed_body and str(committed_body).strip():
+            # The committed post-think body already carries this turn's
+            # tool-call markup as generated; the template must render it as
+            # content and NOT append its own re-render of tool_calls, or the
+            # calls would appear twice. Same trim the template applies.
+            content = str(committed_body).strip()
+            item["content"] = content
+            committed_body_rendered = True
     if message.name:
         item["name"] = message.name
     if message.tool_call_id:
         item["tool_call_id"] = message.tool_call_id
-    if message.tool_calls:
+    if message.tool_calls and not committed_body_rendered:
         item["tool_calls"] = [_template_tool_call(call) for call in message.tool_calls]
     if content or message.role == "tool" or message.tool_calls:
         return item
@@ -9740,17 +13011,31 @@ def _encode_rendered_chat_text(tokenizer: Any, text: str) -> list[int]:
 
 
 def _encode_plain_text(tokenizer: Any, text: str) -> list[int]:
-    return _coerce_token_ids(tokenizer.encode(text))
+    # Pinned, not tokenizer-config luck: a RAW /v1/completions prompt keeps
+    # the family's standard special tokens (BOS where the family uses one)
+    # — the HF default this call always relied on, now explicit. Rendered
+    # chat text pins False above (the template carries its own specials),
+    # and _count_text_tokens pins False (it counts template-interior text).
+    try:
+        return _coerce_token_ids(tokenizer.encode(text, add_special_tokens=True))
+    except TypeError:
+        return _coerce_token_ids(tokenizer.encode(text))
 
 
+# SCOPE (audit F11 P2): these are Qwen-family ChatML+think template
+# specials. Every consumer (generation-boundary segmentation, committed-turn
+# parsing, postcommit boundary cuts, the committed-reasoning gate) does
+# find()-based detection, so on a non-matching family (Gemma4's
+# <start_of_turn>, plain-ChatML no-think templates) they match nothing and
+# the machinery degrades to an explicit no-op — pinned by the Gemma4-inert
+# canonicalization test. Deriving them from the live template is the larger
+# follow-up; until then this note is the true statement of scope.
 _QWEN_ASSISTANT_THINK_PROMPT = "<|im_start|>assistant\n<think>\n"
 _QWEN_IM_END = "<|im_end|>"
 _DISABLED_THINK_GENERATION_PROMPT_RE = re.compile(
     r"(?is)(<\|im_start\|>assistant[^\n\r]*[\r\n]+)<think>\s*$"
 )
-_DISABLED_THINK_GENERATION_PROMPT_REPLACEMENT = (
-    r"\1<think>\n\n</think>\n\n"
-)
+_DISABLED_THINK_GENERATION_PROMPT_REPLACEMENT = r"\1<think>\n\n</think>\n\n"
 
 
 def _render_messages_with_chat_template(
@@ -9896,6 +13181,511 @@ def _qwen_assistant_generation_boundaries(rendered: str) -> list[int]:
     return boundaries
 
 
+_COMMITTED_REASONING_FIELD = "_mtplx_committed_reasoning"
+#: Server-built companion of the reasoning field: the exact post-think body
+#: (visible text + tool-call markup, as generated) of a committed turn that
+#: made tool calls. The template renders it as the turn's content in place of
+#: re-rendering the parsed tool_calls, whose arguments are NOT byte-stable
+#: through parse -> client -> re-render (2026-09-03 receipt: the live parser
+#: strips parameter values, so a file whose content ended in "\n" came back
+#: one token short -- `271 "\n\n"` became `198 "\n"` -- and every write turn's
+#: generation-final snapshot was refused for a one-token seam 11 tokens before
+#: the end of a 2,337-token turn; the postcommit then re-prefilled the whole
+#: turn on the GPU with the next request waiting on it).
+_COMMITTED_TURN_BODY_FIELD = "_mtplx_committed_turn_body"
+_COMMITTED_TURN_OPEN = "<|im_start|>assistant\n"
+_COMMITTED_TURN_CLOSE = "<|im_end|>"
+_COMMITTED_THINK_OPEN = "<think>\n"
+_COMMITTED_THINK_CLOSE = "</think>"
+
+
+def _committed_reasoning_canonicalization_enabled() -> bool:
+    raw = os.environ.get("MTPLX_COMMITTED_THINK_CANONICALIZATION", "on")
+    return str(raw).strip().lower() not in {"off", "0", "false", "no"}
+
+
+def _common_prefix_len(a: Sequence[int], b: Sequence[int]) -> int:
+    n = min(len(a), len(b))
+    for i in range(n):
+        if a[i] != b[i]:
+            return i
+    return n
+
+
+class _CommittedTurn(tuple):
+    """``(think_interior, gate, tool_markup)`` plus the exact post-think body.
+
+    A plain 3-tuple to every existing consumer (unpacking, indexing and
+    equality are tuple's); ``body`` carries the bytes the gate/markup split
+    discards -- the whitespace between the visible text and the first
+    ``<tool_call`` -- so a substituted turn can be re-rendered byte-exactly.
+    """
+
+    def __new__(cls, interior, gate, markup, body=""):
+        self = super().__new__(cls, (interior, gate, markup))
+        self.body = body
+        return self
+
+
+def _committed_assistant_turns(
+    committed_text: str,
+) -> list[tuple[str | None, str, str]]:
+    """Per assistant turn of a decoded committed stream, in order:
+    (think_interior, visible_content_gate, tool_call_markup).
+
+    think_interior is the exact bytes between ``<think>\\n`` and the next
+    ``</think>`` (None when the turn opens without a think scaffold — e.g. a
+    reasoning-off turn); the gate is the post-think text before any
+    ``<tool_call`` markup, stripped, used to refuse substitution onto a turn
+    the client has rewritten; tool_call_markup is the raw remainder from the
+    first ``<tool_call`` on ("" when the turn made no tool calls), so the
+    substitution gate can refuse a branch switch that changed ONLY the tool
+    calls (identical visible text, different call → the committed reasoning
+    argues for the OLD call and must not be substituted). Parsing is
+    marker-based on the same template specials the boundary helpers above
+    rely on.
+    """
+    turns: list[tuple[str | None, str, str]] = []
+    search_from = 0
+    while True:
+        turn_at = committed_text.find(_COMMITTED_TURN_OPEN, search_from)
+        if turn_at < 0:
+            break
+        body_start = turn_at + len(_COMMITTED_TURN_OPEN)
+        turn_end = committed_text.find(_COMMITTED_TURN_CLOSE, body_start)
+        body = (
+            committed_text[body_start:turn_end]
+            if turn_end >= 0
+            else committed_text[body_start:]
+        )
+        think_interior: str | None = None
+        content_part = body
+        if body.startswith(_COMMITTED_THINK_OPEN):
+            close_at = body.find(_COMMITTED_THINK_CLOSE, len(_COMMITTED_THINK_OPEN))
+            if close_at >= 0:
+                interior = body[len(_COMMITTED_THINK_OPEN) : close_at]
+                # The template re-renders '<think>\n' + rc|trim + '\n</think>':
+                # a generated interior of the shape '{rc}\n' round-trips
+                # byte-exactly with rc stripped of the single trailing newline.
+                think_interior = interior[:-1] if interior.endswith("\n") else interior
+                content_part = body[close_at + len(_COMMITTED_THINK_CLOSE) :]
+        markup_at = content_part.find("<tool_call")
+        if markup_at >= 0:
+            gate = content_part[:markup_at].strip()
+            tool_markup = content_part[markup_at:]
+        else:
+            gate = content_part.strip()
+            tool_markup = ""
+        turns.append(_CommittedTurn(think_interior, gate, tool_markup, content_part))
+        search_from = body_start if turn_end < 0 else turn_end
+        if turn_end < 0:
+            break
+    return turns
+
+
+_COMMITTED_TOOL_CALL_BLOCK_RE = re.compile(
+    r"<tool_call>\s*(.*?)\s*(?:</tool_call>|\Z)",
+    re.DOTALL,
+)
+_COMMITTED_FUNCTION_NAME_RE = re.compile(r"<function=([^>\s]+)\s*>")
+_COMMITTED_PARAMETER_RE = re.compile(
+    r"<parameter=([^>\s]+)\s*>\n?(.*?)\n?</parameter>",
+    re.DOTALL,
+)
+
+
+def _committed_turn_tool_keys(tool_markup: str) -> list[tuple[str, str, str]] | None:
+    """Loop keys of a committed turn's tool-call markup, or None if the
+    markup cannot be parsed confidently.
+
+    Committed streams carry two markup dialects: the template's native
+    ``<tool_call>\\n{json}\\n</tool_call>`` re-render of structured history
+    and the contract's ``<function=name><parameter=k>v`` form the model
+    emits live. Both reduce to the same :func:`_tool_call_loop_key`
+    identity used for the incoming structured tool_calls, so the gate
+    compares like with like. None (unparseable) must be treated as a
+    mismatch by callers — refusing substitution is always safe; guessing
+    is not.
+    """
+    if not tool_markup:
+        return []
+    if "<tool_call" not in tool_markup:
+        return []
+    keys: list[tuple[str, str, str]] = []
+    matched_any = False
+    for match in _COMMITTED_TOOL_CALL_BLOCK_RE.finditer(tool_markup):
+        matched_any = True
+        body = match.group(1).strip()
+        if not body:
+            return None
+        call: dict[str, Any] | None = None
+        if body.startswith("{"):
+            try:
+                parsed = json.loads(body)
+            except Exception:
+                return None
+            if not isinstance(parsed, dict):
+                return None
+            call = parsed
+        elif "<function=" in body:
+            name_match = _COMMITTED_FUNCTION_NAME_RE.search(body)
+            if name_match is None:
+                return None
+            params = {
+                key: value
+                for key, value in _COMMITTED_PARAMETER_RE.findall(body)
+            }
+            call = {"name": name_match.group(1), "arguments": params}
+        else:
+            return None
+        key = _tool_call_loop_key(call)
+        if key is None:
+            return None
+        keys.append(key)
+    if not matched_any:
+        return None
+    return keys
+
+
+def _incoming_tool_loop_keys(
+    tool_calls: list[dict[str, Any]] | None,
+) -> list[tuple[str, str, str]] | None:
+    """Loop keys of an incoming turn's structured tool_calls; None when any
+    call has no confident identity (callers must treat None as mismatch)."""
+    if not tool_calls:
+        return []
+    keys: list[tuple[str, str, str]] = []
+    for tool_call in tool_calls:
+        key = _tool_call_loop_key(tool_call)
+        if key is None:
+            return None
+        keys.append(key)
+    return keys
+
+
+def _canonical_turn_gate_text(
+    text: str,
+    *,
+    has_tool_calls: bool,
+    strip_tool_call_preamble: bool,
+) -> str:
+    """Single normalization choke point for the substitution gate.
+
+    The committed stream holds the bytes the MODEL generated; the incoming
+    turn holds the bytes the CLIENT echoes after its own laundering
+    (OpenCode strips tool-call preambles; force-answer flows strip the
+    <mtplx_final_answer> marker; some clients inline <think> blocks into
+    content). The gate must compare both sides through the SAME normalizer
+    or every laundered turn reads as "rewritten by the client" and the
+    canonicalization silently no-ops for exactly the agent clients it was
+    built for (audit F11 #4).
+    """
+    if strip_tool_call_preamble and has_tool_calls:
+        # Mirrors _canonicalize_agent_transcript's preamble strip: on
+        # clients that never echo the preamble the canonical turn carries
+        # empty visible content, so the committed side must gate on the
+        # same emptiness.
+        return ""
+    gate = _strip_assistant_history_baggage(str(text or ""))
+    gate = _MTPLX_READ_ONLY_FORCE_ANSWER_STREAM_MARKER_RE.sub("", gate)
+    return gate.strip()
+
+
+def _substitute_committed_reasoning_messages(
+    messages: list[ChatMessage],
+    committed_turns: list[tuple[str | None, str, str]],
+    *,
+    strip_tool_call_preamble_text: bool = False,
+) -> tuple[list[ChatMessage], int]:
+    """Positionally substitute committed think interiors onto matching
+    assistant turns. Shared by the foreground gate and the postcommit
+    producer so both build the SAME canonical messages (single choke
+    point). Returns (messages, turns_substituted).
+
+    Substitution is prefix-ruled: the first turn whose visible gate or
+    tool-call identity mismatches the committed turn closes substitution
+    for itself and every later turn. Assistant messages that render to
+    nothing (no content, no tool_calls) consume no committed ordinal —
+    the template drops them, so the committed stream never saw them.
+    """
+    canon_messages: list[ChatMessage] = []
+    substituted = 0
+    assistant_ordinal = 0
+    substitution_open = True
+    for message in messages:
+        message = _scrub_inbound_committed_reasoning(message)
+        if message.role != "assistant":
+            canon_messages.append(message)
+            continue
+        content = _content_to_text(message.content)
+        if not content.strip() and not message.tool_calls:
+            # _message_to_template_dict drops this message: it has no
+            # rendered turn in the committed stream, so it must not shift
+            # the positional mapping.
+            canon_messages.append(message)
+            continue
+        ordinal = assistant_ordinal
+        assistant_ordinal += 1
+        if not substitution_open or ordinal >= len(committed_turns):
+            canon_messages.append(message)
+            continue
+        interior, gate, tool_markup = committed_turns[ordinal]
+        incoming_keys = _incoming_tool_loop_keys(message.tool_calls)
+        committed_keys = _committed_turn_tool_keys(tool_markup)
+        if (
+            incoming_keys is None
+            or committed_keys is None
+            or incoming_keys != committed_keys
+        ):
+            # Tool-call identity is part of the gate: a branch switch that
+            # changed ONLY the tool calls must not inherit reasoning that
+            # argued for the old calls (prefix rule, mirrors restore).
+            substitution_open = False
+            canon_messages.append(message)
+            continue
+        incoming_gate = _canonical_turn_gate_text(
+            content,
+            has_tool_calls=bool(message.tool_calls),
+            strip_tool_call_preamble=strip_tool_call_preamble_text,
+        )
+        committed_gate = _canonical_turn_gate_text(
+            gate,
+            has_tool_calls=bool(tool_markup),
+            strip_tool_call_preamble=strip_tool_call_preamble_text,
+        )
+        if incoming_gate != committed_gate:
+            # Client rewrote this turn's visible content: stop substituting
+            # here and for every later turn (prefix rule, mirrors restore).
+            substitution_open = False
+            canon_messages.append(message)
+            continue
+        fields: dict[str, Any] = {}
+        if interior:
+            fields[_COMMITTED_REASONING_FIELD] = interior
+        committed_body = getattr(committed_turns[ordinal], "body", "")
+        if tool_markup and committed_body and committed_body.strip():
+            # The gate has just proven this turn's calls ARE the committed
+            # calls, so its content is re-rendered from the committed bytes
+            # rather than from the parsed tool_calls: parameter values do
+            # not survive parse -> client -> re-render byte-exactly, and a
+            # one-token seam anywhere in the turn refuses the O(1)
+            # generation-final snapshot (2026-09-03 write-turn receipt).
+            fields[_COMMITTED_TURN_BODY_FIELD] = committed_body
+        if not fields:
+            canon_messages.append(message)
+            continue
+        canon_messages.append(_copy_chat_message(message, **fields))
+        substituted += 1
+    return canon_messages, substituted
+
+
+def _transcript_dropped_assistant_turns(transcript_stats: Any) -> int:
+    """Assistant turns the transcript canonicalization removed this request.
+
+    Any dropped assistant turn shifts every later positional ordinal, so
+    the committed-think substitution would put the WRONG turn's reasoning
+    in front of the model (audit F11 #2 — ordinal drift). Refusing when
+    the count is nonzero costs a cold prefill and keeps the output correct;
+    substituting wrongly is an exactness violation.
+    """
+    if transcript_stats is None:
+        return 0
+    total = 0
+    for field_name in (
+        "skipped_aborted_assistant_messages",
+        "skipped_orphan_chitchat_assistant_messages",
+        "skipped_repeated_assistant_messages",
+        "skipped_stalled_agent_preamble_messages",
+        "skipped_verbatim_tool_output_assistant_messages",
+        "dropped_simple_chitchat_history_messages",
+    ):
+        try:
+            total += int(getattr(transcript_stats, field_name, 0) or 0)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def _scrub_inbound_committed_reasoning(message: ChatMessage) -> ChatMessage:
+    """Drop a client-supplied canonicalization field so only server-built
+    substitutions ever reach the template (deterministic vs today, where the
+    preserve mode drops client reasoning fields entirely)."""
+    if (
+        _message_extra(message, _COMMITTED_REASONING_FIELD) is None
+        and _message_extra(message, _COMMITTED_TURN_BODY_FIELD) is None
+    ):
+        return message
+    try:
+        data = message.model_dump()
+    except AttributeError:
+        data = message.dict()
+    data.pop(_COMMITTED_REASONING_FIELD, None)
+    data.pop(_COMMITTED_TURN_BODY_FIELD, None)
+    return ChatMessage(**data)
+
+
+def _maybe_canonicalize_committed_reasoning(
+    state: "ServerState",
+    *,
+    messages: list[ChatMessage],
+    prompt_ids: list[int],
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+    request: "ChatCompletionRequest",
+    thinking_enabled: bool,
+    reasoning_effort: str | None,
+    tools: list[dict[str, Any]] | None,
+    tool_choice: Any,
+    tool_prompt_mode: str,
+    template_observability: dict[str, Any],
+    request_observability: dict[str, Any] | None = None,
+    transcript_stats: Any | None = None,
+    strip_tool_call_preamble_text: bool = False,
+    session_id: str | None = None,
+) -> tuple[list[ChatMessage], list[int]] | None:
+    """Session-owned committed-think canonicalization (2.8 headline, defect B).
+
+    When a resent conversation matches the session's committed transcript
+    modulo think-block interiors, substitute the committed think bytes before
+    encode so the encoded prompt extends the committed stream byte-exactly and
+    restores track the live frontier. Self-heals every client that strips,
+    truncates, or summarizes reasoning history (OpenCode, OMP, Pi, Cline).
+
+    Fail-open by construction: the canonicalized encode is served ONLY when it
+    demonstrably matches the committed stream further than the raw encode —
+    otherwise the raw encode stands and behavior is byte-identical to today.
+    Preserve-mode only; per-turn substitution is gated on the visible content
+    AND the tool-call identity matching the committed turn, so a
+    client-rewritten turn (and everything after it) is never mixed with stale
+    reasoning. ``session_id`` accepts the endpoint's already-resolved id so
+    resolution (and its prefix-scan side effects) runs once per request.
+    """
+    def _declined(reason: str, **extra: Any) -> None:
+        # Every early exit leaves a receipt: a warm turn that re-prefilled
+        # its whole assistant turn is only diagnosable if the gate says WHY
+        # it stood aside (2026-09-03: three OpenCode turns carried no
+        # canonicalization record at all and the cause had to be inferred).
+        record = {"applied": False, "declined": reason, **extra}
+        if template_observability is not None:
+            template_observability["committed_reasoning_canonicalization"] = record
+        if request_observability is not None:
+            request_observability["committed_reasoning_canonicalization"] = record
+
+    if not _committed_reasoning_canonicalization_enabled():
+        return None
+    if not thinking_enabled:
+        _declined("thinking_disabled")
+        return None
+    if getattr(state.args, "strip_assistant_reasoning_history", False):
+        _declined("reasoning_history_stripped")
+        return None
+    if _reasoning_history_scoped_active(state):
+        _declined("reasoning_history_scoped")
+        return None
+    # Prologue scrub (audit F11 P2): a client-planted committed-reasoning
+    # field must never survive into any later encode, including when this
+    # gate declines below — gate-outs used to return the caller's original
+    # messages with the client field still attached.
+    messages = [_scrub_inbound_committed_reasoning(message) for message in messages]
+    sessions = getattr(state, "sessions", None)
+    if sessions is None:
+        return None  # inert: nothing to canonicalize against, no receipt
+    try:
+        if session_id is None:
+            session_id, _source = sessions.resolve_session_id(
+                headers=headers,
+                metadata=metadata,
+                user=_request_extra(request, "user"),
+                chat_id=_request_extra(request, "chat_id"),
+                conversation_id=_request_extra(request, "conversation_id"),
+                prompt_ids=prompt_ids,
+            )
+        session = sessions.peek(session_id)
+    except Exception:
+        return None
+    if session is None:
+        return None  # inert (first turn / anonymous): no receipt by contract
+    committed = tuple(getattr(session, "committed_token_ids", ()) or ())
+    if not committed:
+        _declined("no_committed_stream", session_id=session_id)
+        return None
+    cp_raw = _common_prefix_len(prompt_ids, committed)
+    if cp_raw >= min(len(committed), len(prompt_ids)):
+        # already extends (or is contained in) the committed stream: the
+        # healthy no-op, silent by contract (byte-identical resend test)
+        return None
+
+    outcome: dict[str, Any] = {
+        "applied": False,
+        "cp_raw": int(cp_raw),
+        "committed_len": int(len(committed)),
+    }
+
+    def _record(target: dict[str, Any] | None) -> None:
+        if target is not None:
+            target["committed_reasoning_canonicalization"] = outcome
+
+    dropped_assistant_turns = _transcript_dropped_assistant_turns(transcript_stats)
+    if dropped_assistant_turns > 0:
+        # Ordinal-drift refusal (audit F11 #2): transcript canonicalization
+        # removed assistant turns this request, so positional mapping onto
+        # the committed turns is shifted and substitution could put the
+        # WRONG turn's reasoning in front of the model. Refusing costs a
+        # cold prefill and keeps the output correct.
+        outcome["turns_substituted"] = 0
+        outcome["refused_reason"] = "transcript_assistant_turns_dropped"
+        outcome["dropped_assistant_turns"] = int(dropped_assistant_turns)
+        _record(template_observability)
+        _record(request_observability)
+        return None
+    try:
+        committed_text = state.runtime.tokenizer.decode(list(committed))
+    except Exception:
+        return None
+    committed_turns = _committed_assistant_turns(committed_text)
+    if not any(interior for interior, _gate, _markup in committed_turns):
+        return None
+
+    canon_messages, substituted = _substitute_committed_reasoning_messages(
+        messages,
+        committed_turns,
+        strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+    )
+    outcome["turns_substituted"] = int(substituted)
+
+    if substituted == 0:
+        _record(template_observability)
+        _record(request_observability)
+        return None
+    canon_observability: dict[str, Any] = {}
+    canon_ids = _encode_messages(
+        state.runtime.tokenizer,
+        canon_messages,
+        enable_thinking=thinking_enabled,
+        reasoning_effort=reasoning_effort,
+        strip_assistant_reasoning_history=False,
+        scoped_reasoning_history=False,
+        preserve_reasoning_history=_reasoning_history_preserve_echo_active(state),
+        tools=tools,
+        tool_choice=tool_choice,
+        tool_prompt_mode=tool_prompt_mode,
+        template_observability=canon_observability,
+        allow_committed_reasoning=True,
+    )
+    cp_canon = _common_prefix_len(canon_ids, committed)
+    outcome["cp_canon"] = int(cp_canon)
+    if cp_canon <= cp_raw:
+        _record(template_observability)
+        _record(request_observability)
+        return None
+    outcome["applied"] = True
+    template_observability.clear()
+    template_observability.update(canon_observability)
+    _record(template_observability)
+    _record(request_observability)
+    return canon_messages, canon_ids
+
+
 def _qwen_plain_assistant_content_boundaries(rendered: str) -> list[int]:
     """Find Qwen no-thinking plain-text assistant generation boundaries.
 
@@ -9940,6 +13730,8 @@ def _encode_rendered_chat_text_segmented(
     tokenizer: Any,
     rendered: str,
     boundaries: list[int],
+    *,
+    token_counts_at: dict[int, int] | None = None,
 ) -> list[int]:
     if not boundaries:
         return _encode_rendered_chat_text(tokenizer, rendered)
@@ -9952,6 +13744,10 @@ def _encode_rendered_chat_text_segmented(
             _encode_rendered_chat_text(tokenizer, rendered[start:boundary])
         )
         start = boundary
+        if token_counts_at is not None and boundary in token_counts_at:
+            # Cumulative token count at this char boundary — token-exact
+            # because the segment split IS the encode split.
+            token_counts_at[boundary] = len(token_ids)
     if start < len(rendered):
         token_ids.extend(_encode_rendered_chat_text(tokenizer, rendered[start:]))
     return token_ids
@@ -9987,7 +13783,164 @@ def _encode_generation_compatible_tool_history(
     boundaries = _qwen_assistant_generation_boundaries(rendered)
     if not boundaries:
         return None
-    return _encode_rendered_chat_text_segmented(tokenizer, rendered, boundaries)
+    # The registry-backed detector self-guards on tail position, so it runs
+    # unconditionally: force-answer and Pi convergence suffixes (which never
+    # set the hint-injected flag) now get the same stable-prefix boundary as
+    # the tool-continuation nudge (audit F11 #5).
+    hint_boundary = _trailing_tool_hint_char_boundary(rendered)
+    if hint_boundary is None:
+        return _encode_rendered_chat_text_segmented(tokenizer, rendered, boundaries)
+    # Report where the transient trailing tool-continuation hint's user turn
+    # begins, in TOKENS. Splitting the segmented encode at the turn's
+    # <|im_start|> (a special token, so the split is merge-safe like every
+    # existing boundary here) makes the cumulative count token-exact. The
+    # rendered text, ids, and behavior are unchanged; downstream prefill
+    # span planning uses the count as a mandatory chunk edge so the
+    # gdn-boundary capture records recurrent state exactly at the stable
+    # prompt prefix (aligned-boundary design, 2026-08-06).
+    token_counts: dict[int, int] = {hint_boundary: -1}
+    token_ids = _encode_rendered_chat_text_segmented(
+        tokenizer,
+        rendered,
+        [*boundaries, hint_boundary],
+        token_counts_at=token_counts,
+    )
+    stable_prefix_len = int(token_counts.get(hint_boundary, -1))
+    if template_observability is not None and 0 < stable_prefix_len < len(token_ids):
+        template_observability["stable_prefix_len"] = stable_prefix_len
+    return token_ids
+
+
+def _encode_with_stable_hint_boundary(
+    tokenizer: Any,
+    normalized: list[dict[str, Any]],
+    *,
+    add_generation_prompt: bool,
+    enable_thinking: bool | None,
+    reasoning_effort: str | None,
+    preserve_thinking: bool,
+    tools: list[dict[str, Any]] | None,
+    template_observability: dict[str, Any],
+) -> list[int] | None:
+    """Plain-path stable-prefix reporting for the injected trailing hint.
+
+    Returns the full prompt ids with template_observability gaining
+    stable_prefix_len (tokens before the hint turn's <|im_start|>), or None
+    to fall through to the unchanged single-call encode.
+    """
+    rendered = _render_messages_with_chat_template(
+        tokenizer,
+        normalized,
+        add_generation_prompt=add_generation_prompt,
+        enable_thinking=enable_thinking,
+        reasoning_effort=reasoning_effort,
+        preserve_thinking=preserve_thinking,
+        tools=tools,
+        template_observability=template_observability,
+    )
+    if not rendered:
+        return None
+    boundary = _trailing_tool_hint_char_boundary(rendered)
+    if boundary is None:
+        return None
+    token_counts: dict[int, int] = {boundary: -1}
+    token_ids = _encode_rendered_chat_text_segmented(
+        tokenizer,
+        rendered,
+        [boundary],
+        token_counts_at=token_counts,
+    )
+    stable_prefix_len = int(token_counts.get(boundary, -1))
+    if 0 < stable_prefix_len < len(token_ids):
+        template_observability["stable_prefix_len"] = stable_prefix_len
+    return token_ids
+
+
+def _transient_trailing_user_sentinel_texts() -> tuple[str, ...]:
+    """Registry of transient user-turn suffixes MTPLX itself appends.
+
+    Every entry is injected ONLY as the final user message of a single
+    request and never echoed back by the client, so the bytes before it are
+    the stable prompt prefix the next turn will resend. The trailing
+    boundary detector below keys on the first 48 chars of each text
+    (stable constants: the sentinel prefix of the message content).
+    """
+    return (
+        _mtplx_tool_result_continuation_hint_text(),
+        _mtplx_read_only_force_answer_contract_text(),
+        _mtplx_pi_convergence_contract_text(),
+        _mtplx_forced_tool_choice_text(),
+    )
+
+
+def _trailing_tool_hint_char_boundary(rendered: str) -> int | None:
+    """Char position where a transient trailing MTPLX user turn begins, or
+    None when no transient suffix was injected.
+
+    Generalized (audit F11 #5) over the sentinel registry above: the
+    tool-continuation nudge, the read-only force-answer instruction, and
+    the Pi convergence instruction are all injected ONLY as the final
+    message and never when their text already appears in the transcript,
+    so a genuine injection is the LAST user turn before the generation
+    prompt. The tail guard rejects lookalikes (an echoed sentinel would
+    have suppressed injection and would not sit in tail position with only
+    the generation prompt after it).
+
+    SHARED-MARKER INCLUSION: the boundary sits immediately AFTER the
+    turn's <|im_start|> special token. Both this render and the next
+    turn's render share that token at the same position — they diverge
+    on the FOLLOWING role token (user vs assistant) — so including it
+    makes the captured boundary equal the live common prefix
+    (actual_restore_point == requested matched), leaving no valid
+    token behind. Splitting after a special token stays merge-safe on
+    both sides: specials never merge with neighbors.
+    """
+    turn_open = "<|im_start|>"
+    best: int | None = None
+    for sentinel_text in _transient_trailing_user_sentinel_texts():
+        marker = turn_open + "user\n" + sentinel_text[:48]
+        pos = rendered.rfind(marker)
+        if pos <= 0:
+            continue
+        if rendered.count(turn_open, pos + len(marker)) != 1:
+            continue
+        if best is None or pos > best:
+            best = pos
+    if best is None:
+        return None
+    return best + len(turn_open)
+
+
+_CHAT_ENCODE_TOKENIZER_IDS: "weakref.WeakKeyDictionary[Any, str]" = (
+    weakref.WeakKeyDictionary()
+)
+_CHAT_ENCODE_TOKENIZER_IDS_LOCK = threading.Lock()
+
+
+def _chat_encode_tokenizer_key(tokenizer: Any) -> str | None:
+    """Identity component of the encode-cache key.
+
+    Two parts, both required for correctness:
+    - a per-INSTANCE uuid (weakref registry): two tokenizers with identical
+      templates but different vocabs must never share entries;
+    - the current template hash, computed EVERY call: template swaps on a
+      live tokenizer (chat_template_profile application) must change the key
+      immediately — no memoized value to go stale.
+    Returns None (→ caller skips caching) for non-weakref-able tokenizers.
+    """
+    try:
+        with _CHAT_ENCODE_TOKENIZER_IDS_LOCK:
+            uid = _CHAT_ENCODE_TOKENIZER_IDS.get(tokenizer)
+            if uid is None:
+                uid = uuid.uuid4().hex[:12]
+                _CHAT_ENCODE_TOKENIZER_IDS[tokenizer] = uid
+    except TypeError:
+        return None
+    template = getattr(tokenizer, "chat_template", None) or ""
+    tmpl_sha = hashlib.sha256(
+        str(template).encode("utf-8", errors="surrogatepass")
+    ).hexdigest()[:16]
+    return f"{type(tokenizer).__name__}:{uid}:{tmpl_sha}"
 
 
 def _encode_messages(
@@ -9998,11 +13951,123 @@ def _encode_messages(
     reasoning_effort: str | None = None,
     strip_assistant_reasoning_history: bool = False,
     scoped_reasoning_history: bool = False,
+    preserve_reasoning_history: bool = False,
     add_generation_prompt: bool = True,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
     tool_prompt_mode: str = _TOOL_PROMPT_MODE_HYBRID,
     template_observability: dict[str, Any] | None = None,
+    allow_committed_reasoning: bool = False,
+) -> list[int]:
+    """Memoizing front for :func:`_encode_messages_uncached`.
+
+    Exact-match only: the key covers every argument that affects the rendered
+    prompt, so a hit is byte-identical by construction. Agent clients resend
+    the full transcript every turn — without this, the whole Jinja render +
+    BPE tokenize re-runs per request and lands in TTFT.
+    """
+    if not GLOBAL_CHAT_ENCODE_CACHE.enabled():
+        return _encode_messages_uncached(
+            tokenizer,
+            messages,
+            enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
+            strip_assistant_reasoning_history=strip_assistant_reasoning_history,
+            scoped_reasoning_history=scoped_reasoning_history,
+            preserve_reasoning_history=preserve_reasoning_history,
+            add_generation_prompt=add_generation_prompt,
+            tools=tools,
+            tool_choice=tool_choice,
+            tool_prompt_mode=tool_prompt_mode,
+            template_observability=template_observability,
+            allow_committed_reasoning=allow_committed_reasoning,
+        )
+    try:
+        tokenizer_key = _chat_encode_tokenizer_key(tokenizer)
+        if tokenizer_key is None:
+            key = None
+        else:
+            payload = {
+                "messages": [
+                    m.model_dump(exclude_none=True) if hasattr(m, "model_dump") else m
+                    for m in messages
+                ],
+                "enable_thinking": bool(enable_thinking),
+                "reasoning_effort": reasoning_effort,
+                "strip": bool(strip_assistant_reasoning_history),
+                "scoped": bool(scoped_reasoning_history),
+                "preserve_echo": bool(preserve_reasoning_history),
+                "gen_prompt": bool(add_generation_prompt),
+                "tools": tools,
+                "tool_choice": tool_choice,
+                "tool_prompt_mode": tool_prompt_mode,
+                "committed_reasoning": bool(allow_committed_reasoning),
+                # The rendered prompt embeds the current date (tool contract's
+                # burst-pinned _current_date_line; hypothetically also
+                # strftime_now-style templates reading the raw wall clock).
+                # Key on BOTH days so the key flips whenever either source
+                # can change the render: raw wall clock covers
+                # template-embedded dates at midnight, the pinned day covers
+                # the contract line at pin refresh. A flip only re-renders
+                # once — the pinned contract bytes stay identical across
+                # midnight, so session/bank prefixes are unaffected.
+                "render_day": (
+                    f"{time.strftime('%Y-%m-%d')}:{_pinned_render_day()}"
+                ),
+            }
+            key = ChatEncodeCache.make_key(
+                tokenizer_key=tokenizer_key,
+                payload=payload,
+            )
+    except Exception:
+        key = None
+    if key is not None:
+        cached = GLOBAL_CHAT_ENCODE_CACHE.get(key)
+        if cached is not None:
+            ids, stored_observability = cached
+            if template_observability is not None:
+                template_observability.update(stored_observability)
+                template_observability["chat_encode_cache"] = "hit"
+            return ids
+    fresh_observability: dict[str, Any] = {}
+    ids = _encode_messages_uncached(
+        tokenizer,
+        messages,
+        enable_thinking=enable_thinking,
+        reasoning_effort=reasoning_effort,
+        strip_assistant_reasoning_history=strip_assistant_reasoning_history,
+        scoped_reasoning_history=scoped_reasoning_history,
+        preserve_reasoning_history=preserve_reasoning_history,
+        add_generation_prompt=add_generation_prompt,
+        tools=tools,
+        tool_choice=tool_choice,
+        tool_prompt_mode=tool_prompt_mode,
+        template_observability=fresh_observability,
+        allow_committed_reasoning=allow_committed_reasoning,
+    )
+    if key is not None:
+        GLOBAL_CHAT_ENCODE_CACHE.put(key, ids, fresh_observability)
+    if template_observability is not None:
+        template_observability.update(fresh_observability)
+        template_observability["chat_encode_cache"] = "miss"
+    return ids
+
+
+def _encode_messages_uncached(
+    tokenizer: Any,
+    messages: list[ChatMessage],
+    *,
+    enable_thinking: bool,
+    reasoning_effort: str | None = None,
+    strip_assistant_reasoning_history: bool = False,
+    scoped_reasoning_history: bool = False,
+    preserve_reasoning_history: bool = False,
+    add_generation_prompt: bool = True,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: Any = None,
+    tool_prompt_mode: str = _TOOL_PROMPT_MODE_HYBRID,
+    template_observability: dict[str, Any] | None = None,
+    allow_committed_reasoning: bool = False,
 ) -> list[int]:
     # Scoped mode keeps reasoning_content on the normalized messages and
     # passes preserve_thinking=False so the template's own rolling checkpoint
@@ -10011,12 +14076,26 @@ def _encode_messages(
     template_preserve_thinking = (
         not strip_assistant_reasoning_history and not scoped_reasoning_history
     )
+    # Preserve-mode echo-carry (2026-08-21): thinking transcripts render the
+    # client's echoed reasoning as the BASE history, so a turn the committed
+    # stream doesn't cover shows the model its own prior thinking instead of
+    # an empty scaffold (postcommit-starvation receipts: committed froze at
+    # 15,389 while the stream passed 76k and the model re-derived a 57.8k-token
+    # turn from scratch). Committed-think substitution still overwrites covered
+    # turns inside _message_to_template_dict, so KV-exact bytes win wherever
+    # they exist. Thinking-off and strip keep their pinned legacy renders.
+    include_reasoning = scoped_reasoning_history or (
+        preserve_reasoning_history
+        and enable_thinking
+        and not strip_assistant_reasoning_history
+    )
     prepared_messages: list[dict[str, Any]] = []
     for message in messages:
         item = _message_to_template_dict(
             message,
             strip_assistant_reasoning_history=strip_assistant_reasoning_history,
-            include_reasoning_content=scoped_reasoning_history,
+            include_reasoning_content=include_reasoning,
+            allow_committed_reasoning=allow_committed_reasoning,
         )
         if item is not None:
             prepared_messages.append(item)
@@ -10039,11 +14118,13 @@ def _encode_messages(
             normalized,
             tools=tools,
             tool_choice=tool_choice,
+            observability=template_observability,
         )
     elif effective_tool_prompt_mode == _TOOL_PROMPT_MODE_NATIVE and tools:
         normalized, native_tail_added = _with_mtplx_native_agent_tail(
             normalized,
             tools=tools,
+            observability=template_observability,
         )
         if template_observability is not None:
             template_observability["native_agent_tail_contract_active"] = bool(
@@ -10085,6 +14166,60 @@ def _encode_messages(
     )
     if segmented_tool_history is not None:
         return segmented_tool_history
+    # One segmentation policy (2026-08-21): every THINKING encode of a
+    # transcript with assistant generation seams splits at them,
+    # canonicalized or not. Generation begins right after '<think>\n', so a
+    # single-pass BPE of a re-rendered history merges that seam newline with
+    # what follows and diverges from the live committed stream in TOKENS
+    # while matching in bytes. The raw path used to plain-tokenize whenever
+    # native template tools were off, so on the compact OpenCode lane the
+    # raw prompt, the canonical encode, and the postcommit all disagreed at
+    # every assistant turn and the committed prefix died at the first seam
+    # each request (founder-session walls 3913/4041/4444, 2026-08-21).
+    # Thinking-off keeps its pinned legacy contract (plain encode — "must
+    # not split inside the empty think scaffold") except on the
+    # canonicalized path, which always segmented. Seam-less renders are
+    # reused below so this branch never adds a second template pass.
+    seam_rendered: str | None = None
+    # Generation seams only exist under an assistant HISTORY turn, so
+    # first-turn requests never pay the extra render.
+    if (enable_thinking or allow_committed_reasoning) and any(
+        message.get("role") == "assistant" for message in normalized
+    ):
+        seam_rendered = _render_messages_with_chat_template(
+            tokenizer,
+            normalized,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
+            preserve_thinking=template_preserve_thinking,
+            tools=template_tools,
+            template_observability=template_observability,
+        )
+        if seam_rendered:
+            canon_boundaries = _qwen_assistant_generation_boundaries(seam_rendered)
+            if canon_boundaries:
+                # Registry-backed and tail-guarded; see
+                # _encode_generation_compatible_tool_history (audit F11 #5).
+                hint_boundary = _trailing_tool_hint_char_boundary(seam_rendered)
+                if hint_boundary is None:
+                    return _encode_rendered_chat_text_segmented(
+                        tokenizer, seam_rendered, canon_boundaries
+                    )
+                token_counts: dict[int, int] = {hint_boundary: -1}
+                token_ids = _encode_rendered_chat_text_segmented(
+                    tokenizer,
+                    seam_rendered,
+                    [*canon_boundaries, hint_boundary],
+                    token_counts_at=token_counts,
+                )
+                stable_prefix_len = int(token_counts.get(hint_boundary, -1))
+                if (
+                    template_observability is not None
+                    and 0 < stable_prefix_len < len(token_ids)
+                ):
+                    template_observability["stable_prefix_len"] = stable_prefix_len
+                return token_ids
     if not enable_thinking:
         rendered = _render_messages_with_chat_template(
             tokenizer,
@@ -10098,6 +14233,36 @@ def _encode_messages(
         )
         if rendered is not None:
             return _encode_rendered_chat_text(tokenizer, rendered)
+    if (
+        template_observability is not None
+        and template_observability.get("tool_result_continuation_hint_injected") is True
+    ):
+        # Hybrid tool mode encodes through this plain single-call path, so
+        # the stable-prefix report for the injected trailing hint lives
+        # here: render once with identical kwargs, split the encode at the
+        # hint turn's <|im_start|> (a special token — merge-safe), record
+        # the cumulative count. Ids are identical; any irregularity falls
+        # through to the untouched single-call path. Gated on the
+        # injector's EXPLICIT append signal (never message-content
+        # sniffing): a user-authored lookalike final message must not
+        # perturb chunk layout or telemetry.
+        stable_ids = _encode_with_stable_hint_boundary(
+            tokenizer,
+            normalized,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
+            preserve_thinking=template_preserve_thinking,
+            tools=template_tools,
+            template_observability=template_observability,
+        )
+        if stable_ids is not None:
+            return stable_ids
+    if seam_rendered and enable_thinking:
+        # Seam-less thinking render (single-turn / no assistant history):
+        # identical bytes to the template call below — encode the render the
+        # unified branch already produced instead of rendering twice.
+        return _encode_rendered_chat_text(tokenizer, seam_rendered)
     template_kwargs: dict[str, Any] = {
         "tokenize": True,
         "add_generation_prompt": add_generation_prompt,
@@ -10129,7 +14294,7 @@ def _encode_messages(
                     **fallback_kwargs,
                 )
             )
-        except (TypeError, Exception):
+        except (TypeError, Exception) as chat_template_exc:
             if template_tools:
                 try:
                     if template_observability is not None:
@@ -10149,8 +14314,10 @@ def _encode_messages(
                             f"tool schemas: {schema_free_exc}"
                         ),
                     ) from schema_free_exc
-            pass
-    except Exception:
+            _raise_unless_templateless_render(
+                tokenizer, chat_template_exc, template_observability
+            )
+    except Exception as chat_template_exc:
         if template_tools:
             try:
                 if template_observability is not None:
@@ -10170,11 +14337,43 @@ def _encode_messages(
                         f"tool schemas: {schema_free_exc}"
                     ),
                 ) from schema_free_exc
-            pass
+            _raise_unless_templateless_render(
+                tokenizer, chat_template_exc, template_observability
+            )
     prompt = "\n".join(f"{item['role']}: {item['content']}" for item in normalized)
     if add_generation_prompt:
         prompt += "\nassistant:"
     return _encode_rendered_chat_text(tokenizer, prompt)
+
+
+_TEMPLATELESS_RENDER_WARNED = False
+
+
+def _raise_unless_templateless_render(
+    tokenizer: Any,
+    template_exc: Exception,
+    template_observability: dict[str, Any] | None,
+) -> None:
+    """A chat-template failure must never silently de-template a request.
+
+    Tokenizers that ship no chat template at all (generic AR backends) keep the
+    plain role-prefixed render as their only lane; everything else gets the same
+    hard failure the tool-schema legs raise.
+    """
+    if getattr(tokenizer, "chat_template", None):
+        raise HTTPException(
+            status_code=500,
+            detail=f"tokenizer chat template failed for chat request: {template_exc}",
+        ) from template_exc
+    global _TEMPLATELESS_RENDER_WARNED
+    if not _TEMPLATELESS_RENDER_WARNED:
+        _TEMPLATELESS_RENDER_WARNED = True
+        LOGGER.warning(
+            "tokenizer has no chat template; rendering plain role-prefixed text "
+            "(base-model lane)"
+        )
+    if template_observability is not None:
+        template_observability["plain_text_render"] = True
 
 
 def _render_messages_for_postcommit(
@@ -10268,10 +14467,19 @@ def _postcommit_next_turn_prefix_ids(
     reasoning_effort: str | None = None,
     strip_assistant_reasoning_history: bool,
     scoped_reasoning_history: bool = False,
+    preserve_reasoning_history: bool = False,
     tools: list[dict[str, Any]] | None,
     assistant_tool_calls: list[dict[str, Any]] | None,
     tool_prompt_mode: str = _TOOL_PROMPT_MODE_HYBRID,
 ) -> list[int] | None:
+    # Same echo-carry rule as _encode_messages_uncached: the postcommit
+    # prediction must render the exact bytes the next request's encode will,
+    # or the banked prefix diverges at the first uncovered echoed turn.
+    include_reasoning = scoped_reasoning_history or (
+        preserve_reasoning_history
+        and enable_thinking
+        and not strip_assistant_reasoning_history
+    )
     sentinel_role = "user"
     sentinel_message = ChatMessage(role="user", content=_POSTCOMMIT_SENTINEL_CONTENT)
     if assistant_tool_calls:
@@ -10289,7 +14497,13 @@ def _postcommit_next_turn_prefix_ids(
         item = _message_to_template_dict(
             message,
             strip_assistant_reasoning_history=strip_assistant_reasoning_history,
-            include_reasoning_content=scoped_reasoning_history,
+            include_reasoning_content=include_reasoning,
+            # Postcommit predicts the NEXT turn's render: when this request
+            # served canonicalized history (committed-think substitution),
+            # the prediction must render the same substituted bytes or the
+            # banked entry diverges from every future canonicalized encode.
+            # The field only exists on server-built message copies.
+            allow_committed_reasoning=True,
         )
         if item is not None:
             normalized.append(item)
@@ -10297,7 +14511,7 @@ def _postcommit_next_turn_prefix_ids(
     item = _message_to_template_dict(
         sentinel_message,
         strip_assistant_reasoning_history=strip_assistant_reasoning_history,
-        include_reasoning_content=scoped_reasoning_history,
+        include_reasoning_content=include_reasoning,
     )
     if item is not None:
         normalized.append(item)
@@ -10343,24 +14557,25 @@ def _postcommit_next_turn_prefix_ids(
     prefix_text = rendered[:turn_start]
     if not prefix_text:
         return None
-    # Match _encode_messages(): assistant-boundary segmentation is only used
-    # when native template tools are active. Compact OpenCode history uses the
-    # schema-free contract and the normal prompt path plain-tokenizes the
-    # rendered chat, so segmenting here would create a different cache key for
-    # identical rendered text.
+    # Match _encode_messages(): one segmentation policy (2026-08-21). Thinking
+    # transcripts split at EVERY assistant generation seam — the same
+    # boundaries the raw prompt and the canonical encode use — because the
+    # live committed stream carries generation-time tokens and a plain BPE
+    # merges the '<think>\n' seam into a different id. The old
+    # template-tools-only gate left this postcommit plain on the compact
+    # OpenCode lane, so the banked prefix could never byte-match the next
+    # request's encode (founder-session walls, 2026-08-21). Thinking-off
+    # keeps its exact legacy boundaries.
     template_tools = _template_tools_for_prompt_mode(
         tools,
         tool_prompt_mode=tool_prompt_mode,
     )
     boundaries: list[int] = []
-    if template_tools:
+    if enable_thinking:
+        boundaries = _qwen_assistant_generation_boundaries(prefix_text)
+    elif template_tools:
         boundaries = _tool_history_generation_boundaries(prefix_text)
-        if not enable_thinking:
-            boundaries.extend(_qwen_plain_assistant_content_boundaries(prefix_text))
-        elif last_history_role == "assistant":
-            boundary = _last_qwen_assistant_generation_boundary(prefix_text)
-            if boundary is not None:
-                boundaries.append(boundary)
+        boundaries.extend(_qwen_plain_assistant_content_boundaries(prefix_text))
     return _encode_rendered_chat_text_segmented(tokenizer, prefix_text, boundaries)
 
 
@@ -10395,12 +14610,85 @@ def _count_text_tokens(tokenizer: Any, text: str) -> int:
 _REQUEST_LOG_LOCK = threading.Lock()
 
 
+_REQUEST_LOG_MAX_BYTES = 64 * 1024 * 1024
+_REQUEST_LOG_KEEP_GENERATIONS = 4
+
+
 def _request_log_path(state: "ServerState") -> str | None:
     raw = getattr(state.args, "request_log_jsonl", None) or os.environ.get(
         "MTPLX_REQUEST_LOG_JSONL"
     )
     raw = str(raw or "").strip()
-    return raw or None
+    if raw.lower() in {"0", "off", "false", "no", "none", "disabled"}:
+        return None
+    if raw.lower() in {"1", "on", "true", "yes", "enabled"}:
+        # Truthy switch, not a path: MTPLX_REQUEST_LOG_JSONL=1 must mean
+        # "log to the default per-port file", not a file literally named 1
+        # in the daemon cwd.
+        raw = ""
+    if raw:
+        return raw
+    # Default ON: agent-session incidents cannot be diagnosed after the fact
+    # without a durable per-request trail. Records are numeric/hash telemetry
+    # only — no prompt or completion content (the user-preview field is
+    # digest-redacted at the sink; MTPLX_REQUEST_LOG_CONTENT=1 opts back into
+    # literal previews) — size-capped by rotation below,
+    # and disabled with MTPLX_REQUEST_LOG_JSONL=off. Per-port files so
+    # parallel serves never interleave. Live forensics repeatedly stalled on
+    # the 15-entry RAM ring; this keeps the durable trail by default.
+    try:
+        port = int(getattr(state.args, "port", 0) or 0)
+        log_dir = os.path.join(os.path.expanduser("~"), ".mtplx", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        return os.path.join(log_dir, f"request-log-{port}.jsonl")
+    except Exception:
+        return None
+
+
+_REQUEST_LOG_CONTENT_KEYS = ("request_last_user_preview",)
+
+
+def _request_log_content_opt_in() -> bool:
+    raw = os.environ.get("MTPLX_REQUEST_LOG_CONTENT", "")
+    return str(raw).strip().lower() in {"1", "on", "true", "yes"}
+
+
+def _redact_request_log_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Keep the durable JSONL's "no prompt or completion content" promise (#326).
+
+    Literal prompt text stays on the in-RAM surfaces (dashboard ring, trace
+    labels); the durable line carries a short non-reversible digest under the
+    same key so forensics can still correlate turns. MTPLX_REQUEST_LOG_CONTENT=1
+    opts back into literal previews for local debugging.
+    """
+    if _request_log_content_opt_in():
+        return record
+    redacted = record
+    for key in _REQUEST_LOG_CONTENT_KEYS:
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            if redacted is record:
+                redacted = dict(record)
+            digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+            redacted[key] = f"sha256:{digest}"
+    return redacted
+
+
+def _rotate_request_log_if_needed(path: str) -> None:
+    """Cascade path -> .1 -> .2 ... keeping a bounded on-disk history."""
+    try:
+        if os.path.getsize(path) < _REQUEST_LOG_MAX_BYTES:
+            return
+    except OSError:
+        return
+    try:
+        for gen in range(_REQUEST_LOG_KEEP_GENERATIONS - 1, 0, -1):
+            older = f"{path}.{gen}"
+            if os.path.exists(older):
+                os.replace(older, f"{path}.{gen + 1}")
+        os.replace(path, f"{path}.1")
+    except OSError:
+        pass
 
 
 def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> None:
@@ -10413,19 +14701,53 @@ def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> Non
     investigation had to reconstruct history from a 32-entry RAM ring; this
     keeps the full trail. Best-effort: telemetry must never fail a request.
     """
+    try:
+        # Route observability (2026-08-26): the packed-SDPA route declines
+        # silently unless its TRACE env is set — the 147.4k decode cliff hid
+        # behind that silence. Cumulative-since-boot module counters; a delta
+        # between consecutive rows isolates one request.
+        from ..attention_split import gqa_packed_route_bail_counts
+        from ..kernels.sdpa_gqa_packed import gqa_packed_bail_counts
+
+        record.setdefault(
+            "gqa_packed_route_bail_counts", dict(gqa_packed_route_bail_counts)
+        )
+        record.setdefault(
+            "gqa_packed_kernel_bail_counts", dict(gqa_packed_bail_counts)
+        )
+    except Exception:
+        pass
     safe = _json_safe(record)
-    state.last_metrics.append(safe)
-    state.last_metrics = state.last_metrics[-100:]
+    # Warmup generations (startup pass and the idle background ladder) are
+    # not user requests: keep them out of the RAM ring that feeds the
+    # dashboard's `latest`/`recent` — the same contract
+    # _dashboard_record_completion enforces for the bus and rolling gauge.
+    # A ladder rung firing minutes after a real request was replacing that
+    # request's receipt as /v1/mtplx/snapshot `latest`, handing the app a
+    # warmup row (request_id null) in place of the user's acceptance
+    # counters. Flight end + the durable JSONL below still record warmup
+    # rows so forensics keeps the full trail.
+    if not bool(safe.get("warmup")):
+        state.last_metrics.append(safe)
+        state.last_metrics = state.last_metrics[-100:]
+    # Flight recorder terminal event: every completion path (normal, cancel,
+    # disconnect) funnels through this sink, so the flight "end" is written
+    # even for requests whose client-side accounting is lost (turn-13 class).
+    try:
+        _flight(state).end(safe.get("request_id"), safe)
+    except Exception:
+        pass
     path = _request_log_path(state)
     if not path:
         return
     try:
         line = json.dumps(
-            {"logged_at_s": time.time(), **safe},
+            {"logged_at_s": time.time(), **_redact_request_log_record(safe)},
             ensure_ascii=False,
             default=str,
         )
         with _REQUEST_LOG_LOCK:
+            _rotate_request_log_if_needed(path)
             with open(path, "a", encoding="utf-8") as sink:
                 sink.write(line + "\n")
     except Exception:
@@ -10478,6 +14800,32 @@ def _response_id_from_client_hint(
         return f"{prefix}-{uuid.uuid4().hex}"
     prefix_with_dash = f"{prefix}-"
     return hint if hint.startswith(prefix_with_dash) else f"{prefix_with_dash}{hint}"
+
+
+# hermes-agent's custom provider serializes this floor on every request when
+# the user has not set model.max_tokens — the client cannot express "no cap".
+_HERMES_INJECTED_DEFAULT_MAX_TOKENS = 65_536
+
+
+def _strip_client_injected_output_cap(
+    request_max_tokens: int | None,
+    *,
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+) -> tuple[int | None, bool]:
+    """Strip exactly hermes's injected default cap for hermes-hinted requests.
+
+    Same contract as the OpenCode plugin's 32,000 strip and Pi's
+    request-policy extension: MTPLX owns the uncapped generation contract for
+    the known client-injected value, while any other value is a deliberate
+    client choice and passes through untouched.
+    """
+
+    if request_max_tokens == _HERMES_INJECTED_DEFAULT_MAX_TOKENS and _is_hermes_client(
+        headers=headers, metadata=metadata
+    ):
+        return None, True
+    return request_max_tokens, False
 
 
 def _request_max_tokens(request: BaseModel) -> int | None:
@@ -10711,10 +15059,15 @@ def _request_draft_control_value(
     return None
 
 
-def _request_client_hint_from_headers(
+def _request_client_hint_from_request(
     headers: Mapping[str, str],
     metadata: Mapping[str, Any],
 ) -> str | None:
+    """Client hint derived from PER-REQUEST evidence only (header, body
+    metadata, user agent, surface-specific headers). This — never the
+    launch environment — is what client-policy decisions key on: a daemon
+    launched for one surface still serves anonymous OpenAI-API traffic,
+    and that traffic must keep OpenAI semantics (issue #241 class)."""
     user_agent = headers.get("user-agent") or headers.get("User-Agent") or ""
     user_agent_lower = user_agent.lower()
     explicit_client = (
@@ -10727,15 +15080,39 @@ def _request_client_hint_from_headers(
     )
     if explicit_client:
         return str(explicit_client).strip().lower().replace(" ", "_")
-    launch_client = os.getenv("MTPLX_CLIENT", "").strip()
-    if launch_client:
-        return launch_client.lower().replace(" ", "_")
+    if "claude-cli" in user_agent_lower:
+        # Claude Code sends "claude-cli/<version> (external, cli)".
+        return "claude_code"
     if "opencode" in user_agent_lower:
         return "opencode"
     if "android" in user_agent_lower or "jetbrains" in user_agent_lower:
         return "android_studio"
     if "ai-sdk" in user_agent_lower:
         return "ai_sdk_agent"
+    if any(
+        key.lower().startswith("x-openwebui-") for key in headers
+    ):
+        # Open WebUI sends no client header but its session headers are
+        # unmistakable per-request evidence.
+        return "openwebui"
+    return None
+
+
+def _request_client_hint_from_headers(
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+) -> str | None:
+    """Observability client label: per-request evidence first, then the
+    MTPLX_CLIENT launch env var as a LAST-RESORT LABEL for headerless
+    traffic. The env var never participates in control ownership — a
+    launch surface label must not deny an anonymous benchmarker's
+    explicit sampler params (the silent temp:0 hijack)."""
+    hint = _request_client_hint_from_request(headers, metadata)
+    if hint:
+        return hint
+    launch_client = os.getenv("MTPLX_CLIENT", "").strip()
+    if launch_client:
+        return launch_client.lower().replace(" ", "_")
     return None
 
 
@@ -10762,7 +15139,9 @@ def _app_managed_client_hint(
     headers: Mapping[str, str],
     metadata: Mapping[str, Any],
 ) -> str | None:
-    hint = _request_client_hint_from_headers(headers, metadata)
+    # Control ownership requires REAL per-request evidence; the launch env
+    # label alone never classifies a request as managed (F1).
+    hint = _request_client_hint_from_request(headers, metadata)
     if not hint:
         return None
     normalized = str(hint).strip().lower().replace("-", "_").replace(" ", "_")
@@ -10771,6 +15150,53 @@ def _app_managed_client_hint(
     if normalized.startswith("mtplx_"):
         return normalized
     return None
+
+
+def _client_controls_default() -> str:
+    """Policy for ANONYMOUS (non-managed) clients' request controls.
+
+    'honor'  — default since 2.5.3: OpenAI-API semantics. Explicit body
+               params (temperature/top_p/enable_thinking) from anonymous
+               clients are applied. Managed MTPLX surfaces (app/browser/
+               OpenCode hints) are ALWAYS server-owned either way — agent
+               lanes keep the curated sampler policy.
+    'hints'  — pre-2.5.3 behavior: anonymous body params are observability
+               hints unless the caller opts in per-request via
+               X-MTPLX-Allow-Client-Controls. MTPLX launch settings rule.
+               Restore with MTPLX_CLIENT_CONTROLS_DEFAULT=hints.
+
+    Why the flip (2026-08-05/06 receipts, issue #241): external tools send
+    temperature:0 expecting OpenAI semantics, were silently served the 0.6
+    coding sampler, and published 'MTPLX does not respect temp=0'. Honoring
+    explicit anonymous params is the API-contract behavior; server ownership
+    remains intact everywhere MTPLX manages the client.
+    """
+    value = (
+        str(os.environ.get("MTPLX_CLIENT_CONTROLS_DEFAULT", "honor")).strip().lower()
+    )
+    return "hints" if value == "hints" else "honor"
+
+
+def _reject_non_finite_sampler_controls(request: BaseModel) -> None:
+    """400 on NaN/Infinity sampler params instead of a deep per-request 500.
+
+    Honored-by-default body params (2.5.3) mean a JSON `NaN` temperature
+    would otherwise reach the softmax and die mid-generation. Only called
+    when controls are actually applied, so hints-mode requests keep their
+    old accept-and-ignore behavior.
+    """
+    for name in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
+        value = getattr(request, name, None)
+        if value is None:
+            continue
+        try:
+            finite = math.isfinite(float(value))
+        except (TypeError, ValueError):
+            finite = False
+        if not finite:
+            raise HTTPException(
+                status_code=400, detail=f"{name} must be a finite number"
+            )
 
 
 def _client_controls_allowed(
@@ -10785,7 +15211,23 @@ def _client_controls_allowed(
         or metadata.get("allow_client_controls")
         or metadata.get("mtplx_allow_client_controls")
     )
-    return _truthy_control_value(value)
+    if _truthy_control_value(value):
+        return True
+    return _client_controls_default() == "honor"
+
+
+def _client_thinking_controls_allowed(
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+) -> bool:
+    """Thinking controls (enable_thinking / reasoning_effort) are user intent,
+    not sampler policy: managed MTPLX surfaces honor them so the client-side
+    effort picker governs the request, while their sampler params stay
+    server-owned. Anonymous clients keep the _client_controls_allowed
+    contract unchanged."""
+    if _app_managed_client_hint(headers, metadata):
+        return True
+    return _client_controls_allowed(headers, metadata)
 
 
 def _ignored_client_control_fields(request: BaseModel) -> list[str]:
@@ -10848,7 +15290,9 @@ def _request_depth_for_generation(
     try:
         depth = int(value)
     except (TypeError, ValueError) as exc:
-        detail = f"{descriptor.draft_semantics.display_label.lower()} must be an integer"
+        detail = (
+            f"{descriptor.draft_semantics.display_label.lower()} must be an integer"
+        )
         raise HTTPException(status_code=400, detail=detail) from exc
     minimum = descriptor.draft_semantics.minimum
     maximum = descriptor.draft_semantics.maximum
@@ -10870,7 +15314,7 @@ def _opencode_short_context_depth_policy(
     request_depth: int,
     prompt_tokens: int,
 ) -> tuple[int, dict[str, Any]]:
-    client_hint = _request_client_hint_from_headers(headers, metadata)
+    client_hint = _request_client_hint_from_request(headers, metadata)
     policy = {
         "active": False,
         "client": client_hint,
@@ -10916,6 +15360,204 @@ def _long_context_mtp_depth_policy_for_request(
     return int(effective_depth), dict(policy)
 
 
+def _producer_gap_census(token_times: list[float]) -> dict[str, Any]:
+    """Producer-side emit-gap census (2026-08-18).
+
+    Mean TPS hid 200-500 ms emit silences that users feel as
+    freeze-then-catch-up; sliding-window averages blur them. These make
+    the felt-smoothness regime auditable in every request record: a gap
+    here is the GENERATOR going quiet (verify stall, cache
+    housekeeping), as opposed to delivery-side batching downstream.
+    Shared by completed AND cancelled records — the founder's stutter
+    run was cancelled mid-stream and previously logged no census.
+    """
+    census: dict[str, Any] = {
+        "producer_gap_ms_p95": None,
+        "producer_gap_ms_max": None,
+        "producer_gaps_over_200ms": 0,
+    }
+    if len(token_times) >= 2:
+        gaps = sorted(
+            (later - earlier) * 1000.0
+            for earlier, later in zip(token_times, token_times[1:])
+        )
+        census["producer_gap_ms_p95"] = gaps[min(len(gaps) - 1, int(len(gaps) * 0.95))]
+        census["producer_gap_ms_max"] = gaps[-1]
+        census["producer_gaps_over_200ms"] = sum(1 for gap in gaps if gap >= 200.0)
+    return census
+
+
+# Visible-emit census (2026-08-19, MTPLX_STREAM_CENSUS=1). The producer
+# census above stamps token COMMIT time — upstream of the incremental
+# decoder — and read zero gaps while the founder's visible stream froze
+# for 500 ms (the decoder was withholding text at whitespace boundaries).
+# This is the other half of the pair: the post-decoder SSE-write timeline
+# the client's eye actually sees. Diagnostic only; inert unless enabled.
+# GIL switch interval for the serving process. The SSE consumer lives on
+# the asyncio event-loop thread; the generation thread's Python-level graph
+# construction holds the GIL in long stretches at high accept rates, so
+# `call_soon_threadsafe` deliveries pile up and the visible stream freezes
+# ~250 ms then dumps ~20 tokens (2026-08-19 cache-hit lumps — the faster
+# the decode, the lumpier the emit). Lowering the switch interval shortens
+# how long the loop thread can be denied the GIL. Diagnostic/experiment
+# gate: unset = CPython default (5 ms). Any change to the default must
+# pass the decode-TPS A/B gate first (AGENTS.md regression rules).
+_raw_switch_ms = os.environ.get("MTPLX_PY_SWITCH_INTERVAL_MS", "").strip()
+if _raw_switch_ms:
+    try:
+        sys.setswitchinterval(max(0.05, float(_raw_switch_ms)) / 1000.0)
+    except (ValueError, OverflowError):
+        pass
+del _raw_switch_ms
+
+_STREAM_CENSUS_DIR: str | None = None
+if str(os.environ.get("MTPLX_STREAM_CENSUS", "")).strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+):
+    _STREAM_CENSUS_DIR = (
+        os.environ.get("MTPLX_STREAM_CENSUS_DIR", "").strip()
+        or "/tmp/mtplx-stream-census"
+    )
+    try:
+        os.makedirs(_STREAM_CENSUS_DIR, exist_ok=True)
+    except OSError:
+        _STREAM_CENSUS_DIR = None
+
+
+def _stream_census_record(
+    response_id: str,
+    chunk: str,
+    queue_age_ms: float | None = None,
+) -> None:
+    """Append one visible-emit record for an SSE write (one JSONL/request).
+
+    Append-per-record keeps the file durable if the process dies and
+    leaves no handle lifecycle to manage. Never raises into serving.
+
+    ``queue_age_ms`` is the residency of the token item this write drains:
+    send-side perf_counter minus the generation thread's enqueue stamp.
+    It is the arbiter between "the worker bursts" and "the event loop is
+    starved" — under GIL starvation the first writes of a drain show the
+    full silence (~250 ms) and the last show ~0 (2026-08-19 cache-hit
+    lumps, Opus audit).
+    """
+    try:
+        t_mono = time.perf_counter()
+        t_wall = time.time()
+        body = chunk[6:].strip() if chunk.startswith("data: ") else chunk.strip()
+        channel = "other"
+        chars = 0
+        if body == "[DONE]":
+            channel = "done"
+        else:
+            payload = json.loads(body)
+            progress = payload.get("mtplx_progress")
+            if isinstance(progress, dict):
+                channel = "heartbeat" if progress.get("heartbeat") else "progress"
+            else:
+                choices = payload.get("choices") or []
+                delta = (choices[0].get("delta") or {}) if choices else {}
+                if delta.get("content"):
+                    channel, chars = "content", len(delta["content"])
+                elif delta.get("reasoning_content"):
+                    channel, chars = "reasoning", len(delta["reasoning_content"])
+                elif delta.get("tool_calls"):
+                    channel = "tool_calls"
+                    chars = sum(
+                        len(((call.get("function") or {}).get("arguments")) or "")
+                        for call in delta["tool_calls"]
+                        if isinstance(call, dict)
+                    )
+                elif delta.get("role"):
+                    channel = "role"
+                elif choices and choices[0].get("finish_reason"):
+                    channel = "finish"
+        record = {
+            "t_mono": t_mono,
+            "t_wall": t_wall,
+            "channel": channel,
+            "chars": chars,
+            "bytes": len(chunk),
+        }
+        if queue_age_ms is not None:
+            record["q_ms"] = round(queue_age_ms, 3)
+        line = json.dumps(record, separators=(",", ":"))
+        path = os.path.join(
+            _STREAM_CENSUS_DIR or "", response_id.replace(":", "_") + ".jsonl"
+        )
+        with open(path, "a", encoding="utf-8") as sink:
+            sink.write(line + "\n")
+    except BaseException:
+        pass
+
+
+def _stream_pacer_enabled() -> bool:
+    """Release pacer for block-sized token batches (MTPLX_STREAM_PACER, default on).
+
+    A context-copy round commits up to 25 tokens at once and the stream used
+    to hand the client one frame per round: two lines, then nothing until the
+    next round (2026-09-02 wire receipt: 24 tokens every ~113 ms on
+    Flash-Next). With the pacer on, a batch of at least
+    MTPLX_STREAM_PACER_MIN_TOKENS tokens is released token by token across
+    the expected gap to the next batch, so every client sees a flow instead
+    of a paste. Batches below the floor (a normal MTP round) are untouched,
+    a cancel or stop flushes the rest at once, and the final bytes are the
+    same: only the write cadence changes.
+    """
+
+    return os.environ.get("MTPLX_STREAM_PACER", "1").strip().lower() not in {
+        "0", "false", "no", "off", ""
+    }
+
+
+def _stream_pacer_min_tokens() -> int:
+    raw = os.environ.get("MTPLX_STREAM_PACER_MIN_TOKENS", "6").strip()
+    try:
+        return max(2, int(raw))
+    except ValueError:
+        return 6
+
+
+def _stream_pacer_interval(pieces: int, gap_ema_s: float) -> float:
+    """Seconds between released pieces so a batch drains in ~90% of the
+    expected inter-batch gap; never slower than 30 ms per piece."""
+
+    if pieces <= 1:
+        return 0.0
+    gap = gap_ema_s if gap_ema_s > 0 else 0.1
+    return max(0.001, min(0.030, gap * 0.9 / pieces))
+
+
+def _coalesce_stream_fields(
+    chunks: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """Merge ADJACENT same-field (field, text) runs into one tuple each.
+
+    At ``stream_interval=1`` every token used to become its own SSE write
+    (~3 visible chars wrapped in ~80 bytes of envelope), and when a GIL-
+    starved event loop finally drained its queue the client paid one
+    main-queue hop per token of backlog (2026-08-19 cache-hit lumps:
+    ~20-token bursts as 20 writes in 0.7 ms). This runs AFTER the
+    reasoning/content splitter, so channel boundaries are preserved by
+    construction — a reasoning→content flip always lands in different
+    tuples and is never merged across. Concatenation per field is the
+    identity: reassembled bytes are unchanged, only write granularity.
+    """
+    if len(chunks) < 2:
+        return chunks
+    merged: list[tuple[str, str]] = [chunks[0]]
+    for field, text in chunks[1:]:
+        last_field, last_text = merged[-1]
+        if last_field == field:
+            merged[-1] = (field, last_text + text)
+        else:
+            merged.append((field, text))
+    return merged
+
+
 def _token_window_rate(token_times: list[float], window: int) -> float | None:
     if len(token_times) < 2:
         return None
@@ -10943,6 +15585,8 @@ def _token_window_rate_first(token_times: list[float], window: int) -> float | N
 MAINTENANCE_TIMING_STATS_KEYS = (
     "mtp_history_materialize_every",
     "mtp_history_materialize_events",
+    "mtp_history_live_resets",
+    "mtp_history_live_reset_threshold",
     "clear_cache_every",
     "clear_cache_events",
     "clear_cache_time_s",
@@ -10985,11 +15629,33 @@ MAINTENANCE_TIMING_STATS_KEYS = (
 
 
 def _maintenance_timing_stats(stats: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: stats[key]
-        for key in MAINTENANCE_TIMING_STATS_KEYS
-        if key in stats
-    }
+    return {key: stats[key] for key in MAINTENANCE_TIMING_STATS_KEYS if key in stats}
+
+
+def _round_timing_series(stats: dict[str, Any]) -> list[dict[str, float]]:
+    """Per-round timing_s rows (milliseconds) for decode-decay attribution.
+
+    Non-empty only when the engine kept per-round events (MTPLX_DROP_EVENTS=0,
+    an operator/debug launch); product launches drop events and this stays [].
+    """
+    events = stats.get("events")
+    if not isinstance(events, list):
+        return []
+    series: list[dict[str, float]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        timing = event.get("timing_s")
+        if not isinstance(timing, dict) or not timing:
+            continue
+        row = {
+            key: round(float(value) * 1000.0, 3)
+            for key, value in timing.items()
+            if isinstance(value, (int, float))
+        }
+        if row:
+            series.append(row)
+    return series
 
 
 def _metrics_envelope(
@@ -11021,6 +15687,10 @@ def _metrics_envelope(
     # The sliding-window rates below remain available for diagnostics, but
     # consumer UI must not present a token-window burst as "TPS".
     display_decode_tok_s = decode_tok_s
+    producer_census = _producer_gap_census(token_times)
+    producer_gap_ms_p95 = producer_census["producer_gap_ms_p95"]
+    producer_gap_ms_max = producer_census["producer_gap_ms_max"]
+    producer_gaps_over_200ms = producer_census["producer_gaps_over_200ms"]
     prompt_eval_time_s = float(stats.get("prompt_eval_time_s") or 0.0)
     ttft_s = max(0.0, token_times[0] - request_started_s) if token_times else None
     cached_tokens = int(stats.get("cached_tokens") or 0)
@@ -11032,11 +15702,13 @@ def _metrics_envelope(
         if prompt_eval_time_s > 0
         else None
     )
-    return {
+    envelope = {
         "prompt_tokens": int(prompt_tokens),
         "cached_tokens": cached_tokens,
         "new_prefill_tokens": max(0, new_prefill_tokens),
-        "cache_source": str(stats.get("cache_source") or ("ram" if session_cache_hit else "none")),
+        "cache_source": str(
+            stats.get("cache_source") or ("ram" if session_cache_hit else "none")
+        ),
         "ssd_cache_hit": bool(stats.get("ssd_cache_hit") or False),
         "ssd_cached_tokens": int(stats.get("ssd_cached_tokens") or 0),
         "ssd_restore_s": float(stats.get("ssd_restore_s") or 0.0),
@@ -11067,12 +15739,22 @@ def _metrics_envelope(
         "sliding_decode_tok_s_last_64": sliding_decode_tok_s_last_64,
         "sliding_decode_tok_s_last_128": sliding_decode_tok_s_last_128,
         "sliding_decode_tok_s_last_256": sliding_decode_tok_s_last_256,
+        "producer_gap_ms_p95": producer_gap_ms_p95,
+        "producer_gap_ms_max": producer_gap_ms_max,
+        "producer_gaps_over_200ms": producer_gaps_over_200ms,
         "mtp_depth": int(mtp_depth),
         "verify_calls": int(stats.get("verify_calls") or 0),
         "accepted_by_depth": stats.get("accepted_by_depth") or [],
         "drafted_by_depth": stats.get("drafted_by_depth") or [],
         "mean_accept_probability_by_depth": (
             stats.get("mean_accept_probability_by_depth") or []
+        ),
+        # Fork-EV shadow telemetry (MTPLX_FORKEV_TELEMETRY): present only when
+        # the instrument ran, so request-log rows stay byte-identical when off.
+        **(
+            {"forkev": stats["forkev"]}
+            if isinstance(stats.get("forkev"), dict) and stats.get("forkev")
+            else {}
         ),
         "correction_tokens": int(stats.get("correction_tokens") or 0),
         "bonus_tokens": int(stats.get("bonus_tokens") or 0),
@@ -11085,6 +15767,21 @@ def _metrics_envelope(
         "verify_hidden_eval_time_s": float(
             stats.get("verify_hidden_eval_time_s") or 0.0
         ),
+        "round_timing_ms": _round_timing_series(stats),
+        "context_copy_active": bool(stats.get("context_copy_active") or False),
+        "context_copy_probes": int(stats.get("context_copy_probes") or 0),
+        "context_copy_rounds": int(stats.get("context_copy_rounds") or 0),
+        "context_copy_drafted_tokens": int(
+            stats.get("context_copy_drafted_tokens") or 0
+        ),
+        "context_copy_accepted_blocks": int(
+            stats.get("context_copy_accepted_blocks") or 0
+        ),
+        "context_copy_accepted_tokens": int(
+            stats.get("context_copy_accepted_tokens") or 0
+        ),
+        "context_copy_suspensions": int(stats.get("context_copy_suspensions") or 0),
+        "context_copy_disabled_reason": stats.get("context_copy_disabled_reason"),
         "verify_joint_eval_time_s": float(stats.get("verify_joint_eval_time_s") or 0.0),
         "verify_target_distribution_time_s": float(
             stats.get("verify_target_distribution_time_s") or 0.0
@@ -11099,9 +15796,7 @@ def _metrics_envelope(
             stats.get("target_distribution_share") or 0.0
         ),
         "lazy_bonus_verify_calls": int(stats.get("lazy_bonus_verify_calls") or 0),
-        "lazy_bonus_commit_time_s": float(
-            stats.get("lazy_bonus_commit_time_s") or 0.0
-        ),
+        "lazy_bonus_commit_time_s": float(stats.get("lazy_bonus_commit_time_s") or 0.0),
         "verify_eval_unattributed_time_s": float(
             stats.get("verify_eval_unattributed_time_s") or 0.0
         ),
@@ -11110,16 +15805,40 @@ def _metrics_envelope(
         "accept_time_s": float(stats.get("accept_time_s") or 0.0),
         "repair_time_s": float(stats.get("repair_time_s") or 0.0),
         "mtp_history_policy": str(stats.get("mtp_history_policy") or ""),
-        "mtp_history_window_tokens": int(
-            stats.get("mtp_history_window_tokens") or 0
-        ),
-        "mtp_history_position_base": int(
-            stats.get("mtp_history_position_base") or 0
-        ),
+        "mtp_history_window_tokens": int(stats.get("mtp_history_window_tokens") or 0),
+        "mtp_history_position_base": int(stats.get("mtp_history_position_base") or 0),
+        **({"fixed_m4_admission": stats["fixed_m4_admission"]}
+           if stats.get("fixed_m4_admission") else {}),
+        **({"compiled_verify": stats["graphbank"]["compiled_verify"]}
+           if (stats.get("graphbank") or {}).get("compiled_verify") else {}),
         **_maintenance_timing_stats(stats),
         "session_cache_hit": bool(session_cache_hit),
         "cache_miss_reason": cache_miss_reason,
         "session_restore_mode": session_restore_mode,
+        # Pre-first-token attribution (2026-08-06): these existed on
+        # GenerationStats (or are new additive timers) but never reached
+        # this envelope, so the request-log JSONL — the only trail for
+        # footerless agent clients like pi — could not attribute the
+        # restore-return -> first-token phase.
+        "session_prompt_prefix_bank_commit": (
+            stats.get("session_prompt_prefix_bank_commit") or {}
+        ),
+        "session_prefill_store": stats.get("session_prefill_store") or {},
+        "pre_first_token_setup_s": float(stats.get("pre_first_token_setup_s") or 0.0),
+        # Passive probe (2026-08-06): served-entry truth vs resolution
+        # diagnostics, prompt-state wall decomposition, first-primary-sample
+        # latency, round-1 timer snapshot.
+        "session_restore_served": stats.get("session_restore_served") or {},
+        "prompt_state_total_time_s": float(
+            stats.get("prompt_state_total_time_s") or 0.0
+        ),
+        "prompt_state_unattributed_time_s": float(
+            stats.get("prompt_state_unattributed_time_s") or 0.0
+        ),
+        "first_primary_sample_time_s": float(
+            stats.get("first_primary_sample_time_s") or 0.0
+        ),
+        "first_round": stats.get("first_round") or {},
         "context_len": int(prompt_tokens + completion_tokens),
         "repetition_stop_triggered": bool(
             stats.get("repetition_stop_triggered") or False
@@ -11132,15 +15851,27 @@ def _metrics_envelope(
         "repetition_stop_trimmed_tokens": int(
             stats.get("repetition_stop_trimmed_tokens") or 0
         ),
-        "repetition_stop_raw_tokens": int(
-            stats.get("repetition_stop_raw_tokens") or 0
-        ),
+        "repetition_stop_raw_tokens": int(stats.get("repetition_stop_raw_tokens") or 0),
+        # #414: which speculative branch emitted the stop token. Null on
+        # length/aborted finishes; stamped unconditionally here because
+        # the JSONL is the forensics surface the release note names.
+        "finish_stop_origin": stats.get("finish_stop_origin"),
         "loop_guard": dict(stats.get("loop_guard") or {}),
         "thinking_guard": dict(stats.get("thinking_guard") or {}),
         "lock_wait_time_s": lock_wait_time_s,
         "session_id": session_id,
         **generation_limits,
     }
+    # Adaptive draft-temperature trajectory (MTPLX_ADAPTIVE_DTEMP): stamped
+    # only when the engine produced a summary, so quiet request-log rows stay
+    # byte-stable (same idiom as the draft_sampler truth keys). This is the
+    # harvest surface: draft_sampler_resolved_temperature stays the request-
+    # resolved base, and this block carries current_temperature, the EMA, the
+    # transition count, and the transition log (the per-round trajectory).
+    adaptive_dtemp = stats.get("draft_sampler_adaptive_dtemp")
+    if adaptive_dtemp:
+        envelope["draft_sampler_adaptive_dtemp"] = adaptive_dtemp
+    return envelope
 
 
 def _effective_completion_tokens(
@@ -11196,23 +15927,29 @@ def _machine_info() -> dict[str, Any]:
     model: str | None = None
     mem_bytes: int | None = None
     try:
-        chip = subprocess.run(
-            ["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"],
-            check=True,
-            text=True,
-            capture_output=True,
-            timeout=1.0,
-        ).stdout.strip() or None
+        chip = (
+            subprocess.run(
+                ["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"],
+                check=True,
+                text=True,
+                capture_output=True,
+                timeout=1.0,
+            ).stdout.strip()
+            or None
+        )
     except Exception:
         pass
     try:
-        model = subprocess.run(
-            ["/usr/sbin/sysctl", "-n", "hw.model"],
-            check=True,
-            text=True,
-            capture_output=True,
-            timeout=1.0,
-        ).stdout.strip() or None
+        model = (
+            subprocess.run(
+                ["/usr/sbin/sysctl", "-n", "hw.model"],
+                check=True,
+                text=True,
+                capture_output=True,
+                timeout=1.0,
+            ).stdout.strip()
+            or None
+        )
     except Exception:
         pass
     try:
@@ -11285,16 +16022,20 @@ def _memory_attribution(state: Any) -> dict[str, Any]:
     weights = getattr(state, "_model_weights_bytes_cache", None)
     if weights is None:
         try:
-            from mtplx.engine_session import model_weights_bytes
+            from mtplx.engine_session import model_weights_bytes, ngram_table_bytes
+            from mtplx.memory_plan import ngram_table_resident_policy
 
             root = Path(str(state.args.model))
+            # model_weights_bytes scans recursively and already counts the
+            # nested MTP sidecar — no manual add, or it double-counts. The
+            # n-gram table is excluded from that scan; it belongs in this
+            # wired-weights bucket only when the resident policy actually
+            # materialized it (streamed mode reads file-backed pages that
+            # never enter allocator active — counting them here made
+            # "weights" exceed "active total" in the app).
             weights = int(model_weights_bytes(root) or 0)
-            mtp_dir = root / "mtp"
-            if mtp_dir.is_dir():
-                weights += sum(
-                    shard.stat().st_size
-                    for shard in mtp_dir.glob("*.safetensors")
-                )
+            if ngram_table_resident_policy():
+                weights += ngram_table_bytes(root)
         except Exception:
             weights = 0
         state._model_weights_bytes_cache = weights
@@ -11480,6 +16221,14 @@ def _dashboard_publish_prefill(
         enriched["session_id"] = session_id
         # Live tok/s during chunked prefill (completion provides its own).
         if enriched.get("phase") == "chunk":
+            # Use exactly the measured work shown by the live gauge. A
+            # completed request's prompt timer also includes MTP history and
+            # other setup; averaging it is not an average of live prefill.
+            if dashboard.in_flight.get(request_id) is not None:
+                dashboard.prefill_history.record_chunk(
+                    int(enriched.get("chunk_size") or 0),
+                    float(enriched.get("chunk_elapsed_s") or 0.0),
+                )
             tokens_done = float(enriched.get("tokens_done") or 0)
             elapsed = float(enriched.get("elapsed_s") or 0)
             if tokens_done > 0 and elapsed > 0:
@@ -11533,6 +16282,12 @@ def _dashboard_publish_progress(
             return None
 
         enriched = dict(payload)
+        # The decoder already publishes these counters at ~1 Hz. Progress
+        # used to omit them, clearing the app's waterfall on every new turn.
+        # Reuse the same request-scoped host snapshot; never evaluate the GPU.
+        recorder = getattr(state, "flight", None)
+        if recorder is not None:
+            enriched.update(recorder.live_depth_snapshot(request_id))
         enriched["dashboard_progress_published"] = True
         registry_started_s = time.perf_counter()
         dashboard.in_flight.update_progress(request_id, enriched)
@@ -11576,12 +16331,8 @@ def _dashboard_publish_progress(
             bus_publish_time_s=bus_publish_time_s,
         )
         enriched["dashboard_progress_decision_time_s"] = decision_time_s
-        enriched["dashboard_progress_registry_update_time_s"] = (
-            registry_update_time_s
-        )
-        enriched["dashboard_progress_rolling_update_time_s"] = (
-            rolling_update_time_s
-        )
+        enriched["dashboard_progress_registry_update_time_s"] = registry_update_time_s
+        enriched["dashboard_progress_rolling_update_time_s"] = rolling_update_time_s
         enriched["dashboard_progress_bus_publish_time_s"] = bus_publish_time_s
         return enriched
     except Exception as exc:
@@ -11628,6 +16379,7 @@ DASHBOARD_MUTABLE_SETTINGS_KEYS: tuple[str, ...] = (
     "draft_temperature",
     "draft_top_p",
     "draft_top_k",
+    "adaptive_policy",
 )
 DASHBOARD_READ_ONLY_SETTINGS_KEYS: tuple[str, ...] = (
     # Every informational key the settings GET echoes must be listed here so
@@ -11662,6 +16414,7 @@ DASHBOARD_READ_ONLY_SETTINGS_KEYS: tuple[str, ...] = (
     "tool_contract_policy_version",
     "tool_prompt_mode",
     "tune_policy",
+    "adaptive_depth_supported",
 )
 DASHBOARD_RESTART_REQUIRED_KEYS: tuple[str, ...] = (
     "profile",
@@ -11694,6 +16447,7 @@ DASHBOARD_API_VERSION = 1
 DASHBOARD_SNAPSHOT_INTERVAL_DEFAULT_MS = 200
 DASHBOARD_SNAPSHOT_INTERVAL_MIN_MS = 100
 DASHBOARD_SNAPSHOT_INTERVAL_MAX_MS = 5000
+DASHBOARD_SNAPSHOT_INTERVAL_IDLE_MIN_MS = 1000
 
 
 def _dashboard_snapshot_interval_s(snapshot_interval_ms: int | None) -> float:
@@ -11708,6 +16462,21 @@ def _dashboard_snapshot_interval_s(snapshot_interval_ms: int | None) -> float:
         min(DASHBOARD_SNAPSHOT_INTERVAL_MAX_MS, value),
     )
     return value / 1000.0
+
+
+def _dashboard_snapshot_interval_for_activity_s(
+    requested_interval_s: float,
+    *,
+    active_requests: int,
+) -> float:
+    """Keep live metrics responsive without rebuilding idle snapshots at 10 Hz."""
+
+    if active_requests > 0:
+        return requested_interval_s
+    return max(
+        requested_interval_s,
+        DASHBOARD_SNAPSHOT_INTERVAL_IDLE_MIN_MS / 1000.0,
+    )
 
 
 def _mtplx_app_capabilities() -> dict[str, Any]:
@@ -11726,6 +16495,7 @@ def _mtplx_app_capabilities() -> dict[str, Any]:
         "snapshot": "/v1/mtplx/snapshot",
         "metrics_stream": "/v1/mtplx/metrics/stream",
         "prefill_history": "/v1/mtplx/prefill_history",
+        "flight": "/v1/mtplx/flight",
         "settings": "/v1/mtplx/settings",
         "cancel": "/v1/mtplx/cancel/{request_id}",
         "dashboard": "/dashboard/",
@@ -11742,6 +16512,7 @@ def _mtplx_app_capabilities() -> dict[str, Any]:
             "default_ms": DASHBOARD_SNAPSHOT_INTERVAL_DEFAULT_MS,
             "min_ms": DASHBOARD_SNAPSHOT_INTERVAL_MIN_MS,
             "max_ms": DASHBOARD_SNAPSHOT_INTERVAL_MAX_MS,
+            "idle_min_ms": DASHBOARD_SNAPSHOT_INTERVAL_IDLE_MIN_MS,
             "native_default_ms": 500,
             "performance_lock_ms": 1000,
         },
@@ -11785,7 +16556,7 @@ def _mtplx_app_capabilities() -> dict[str, Any]:
             "legacy_bridge_default": False,
         },
         "scheduler": {
-            "modes": list(SCHEDULER_MODE_CHOICES),
+            "modes": list(ADVERTISED_SCHEDULER_MODES),
             "presets": list(BATCHING_PRESET_CHOICES),
             "v1_done_path": "path_a_solo_mtp_plus_cooperative_ar",
             "default_ux": "coding_agents",
@@ -11859,6 +16630,169 @@ def _startup_health_payload(state: "ServerState") -> dict[str, Any]:
     }
 
 
+def _health_degradation_payload(state: Any) -> dict[str, Any]:
+    """Truth block for the benchmark harness gate (#F23-surface).
+
+    Surfaces the known ways the runtime can silently run slower than its
+    profile advertises: compiled-verify fallback state, profile env keys the
+    environment overrode, and NAX kernel availability/bail counters. Every
+    read is DEFENSIVE — the enriched state lives in modules another lane owns
+    (graphbank / profiles / nax_verify), so missing state degrades to honest
+    "unknown"/empty defaults instead of guessing, lying, or crashing. The
+    block is additive: nothing existing in /health moves or renames.
+    """
+    compiled_verify: dict[str, Any] = {
+        "mode": "unknown",
+        "permanent_eager": "unknown",
+        "reason": "unknown",
+    }
+    try:
+        from mtplx.graphbank import compiled_verify_mode
+
+        compiled_verify["mode"] = str(compiled_verify_mode())
+    except BaseException:
+        pass
+    snapshot_data: Any = None
+    module_status: Any = None
+    try:
+        import mtplx.graphbank as _graphbank_module
+
+        snapshot = getattr(_graphbank_module, "compiled_verify_health_snapshot", None)
+        snapshot_data = snapshot() if callable(snapshot) else None
+        module_status = getattr(_graphbank_module, "compiled_verify_status", None)
+    except BaseException:
+        snapshot_data = None
+    for source in (
+        snapshot_data,
+        module_status,
+        getattr(state, "compiled_verify_status", None),
+    ):
+        if isinstance(source, Mapping):
+            for key in (
+                "mode",
+                "permanent_eager",
+                "reason",
+                "flip_count",
+                "transient_exception_count",
+            ):
+                value = source.get(key)
+                if value is not None:
+                    compiled_verify[key] = value
+
+    profile_env_overridden: list[str] = []
+    try:
+        from mtplx.profiles import profile_env_status
+
+        status = profile_env_status(
+            getattr(getattr(state, "profile", None), "name", None),
+            runtime_env_overrides=getattr(
+                state, "model_runtime_env_overrides", None
+            ),
+        )
+        for key in sorted(status):
+            item = status.get(key) or {}
+            observed = item.get("observed")
+            if observed is not None and str(observed) != str(item.get("expected")):
+                profile_env_overridden.append(str(key))
+    except BaseException:
+        profile_env_overridden = []
+
+    nax: dict[str, Any] = {
+        "env_enabled": "unknown",
+        "available": "unknown",
+        "counters": "unknown",
+        "bail_counters": "unknown",
+    }
+    try:
+        import mtplx.nax_verify as _nax_module
+
+        try:
+            nax["env_enabled"] = bool(_nax_module.nax_env_enabled())
+        except BaseException:
+            pass
+        try:
+            nax["available"] = bool(_nax_module.nax_available())
+        except BaseException:
+            pass
+        for target_key, attr_names in (
+            (
+                "counters",
+                (
+                    "nax_health_counters",
+                    "nax_counters",
+                    "nax_qlinear_fallback_counts",
+                ),
+            ),
+            ("bail_counters", ("nax_bail_counters", "bail_counters")),
+        ):
+            for attr_name in attr_names:
+                candidate = getattr(_nax_module, attr_name, None)
+                if candidate is None:
+                    continue
+                try:
+                    value = candidate() if callable(candidate) else candidate
+                except BaseException:
+                    continue
+                if isinstance(value, Mapping):
+                    nax[target_key] = dict(value)
+                    break
+    except BaseException:
+        pass
+    for target_key, state_attr in (
+        ("counters", "nax_health_counters"),
+        ("bail_counters", "nax_bail_counters"),
+    ):
+        state_value = getattr(state, state_attr, None)
+        if isinstance(state_value, Mapping):
+            nax[target_key] = dict(state_value)
+    if nax["bail_counters"] == "unknown":
+        # The GQA bail counters live in the kernel modules themselves.
+        kernel_bails: dict[str, Any] = {}
+        for module_name, attr_name in (
+            ("mtplx.kernels.sdpa_gqa_packed", "gqa_packed_bail_counts"),
+            ("mtplx.attention_split", "gqa_packed_route_bail_counts"),
+            ("mtplx.kernels.sdpa_nax_flash", "nax_flash_bail_counts"),
+            ("mtplx.kernels.sdpa_nax_flash_dsplit", "nax_flash_dsplit_bail_counts"),
+            ("mtplx.kernels.sdpa_nax_tile", "nax_tile_bail_counts"),
+        ):
+            try:
+                from importlib import import_module
+
+                value = getattr(import_module(module_name), attr_name, None)
+            except BaseException:
+                continue
+            if isinstance(value, Mapping):
+                kernel_bails[attr_name] = dict(value)
+        if kernel_bails:
+            nax["bail_counters"] = kernel_bails
+    # The positive receipt: how often the flash-decoding route actually
+    # dispatched on this GPU. With the hardware gate (#458/#459) an M1-M4
+    # Mac shows zero here and gpu_family_or_os bails above; an M5 shows
+    # the dispatch count climbing once a session passes the 8192-token
+    # KV bucket.
+    flash_dispatches: dict[str, Any] = {}
+    for module_name, attr_name in (
+        ("mtplx.kernels.sdpa_nax_flash", "nax_flash_dispatch_counts"),
+        ("mtplx.kernels.sdpa_nax_flash_dsplit", "nax_flash_dsplit_dispatch_counts"),
+    ):
+        try:
+            from importlib import import_module
+
+            value = getattr(import_module(module_name), attr_name, None)
+        except BaseException:
+            continue
+        if isinstance(value, Mapping):
+            flash_dispatches[attr_name] = dict(value)
+    if flash_dispatches:
+        nax["flash_dispatch_counters"] = flash_dispatches
+
+    return {
+        "compiled_verify": compiled_verify,
+        "profile_env_overridden": profile_env_overridden,
+        "nax": nax,
+    }
+
+
 def _server_fan_mode(state: Any) -> str:
     try:
         return normalize_fan_mode(
@@ -11890,11 +16824,14 @@ def _smart_fan_status(state: Any) -> dict[str, Any]:
         }
 
 
-def _thermal_health_payload(*, fan_mode: str, smart_status: dict[str, Any] | None = None) -> dict[str, Any]:
+def _thermal_health_payload(
+    *, fan_mode: str, smart_status: dict[str, Any] | None = None
+) -> dict[str, Any]:
     max_verified = _json_env("MTPLX_MAX_VERIFIED_JSON")
     fan_summary = (
         max_verified.get("after")
-        if isinstance(max_verified, dict) and isinstance(max_verified.get("after"), dict)
+        if isinstance(max_verified, dict)
+        and isinstance(max_verified.get("after"), dict)
         else None
     )
     actual_ramp_verified = os.environ.get("MTPLX_MAX_ACTUAL_RAMP_VERIFIED") == "1"
@@ -11906,7 +16843,8 @@ def _thermal_health_payload(*, fan_mode: str, smart_status: dict[str, Any] | Non
         "max_requested": fan_mode == FAN_MODE_MAX
         or smart_boost_active
         or os.environ.get("MTPLX_MAX_REQUESTED") == "1",
-        "max_verified": fan_mode == FAN_MODE_MAX and bool(max_verified is None or max_verified.get("ok", True)),
+        "max_verified": fan_mode == FAN_MODE_MAX
+        and bool(max_verified is None or max_verified.get("ok", True)),
         "actual_ramp_verified": actual_ramp_verified,
         "smart": smart,
         "fan_summary": fan_summary,
@@ -11939,6 +16877,13 @@ def _coerce_setting(name: str, value: Any) -> Any:
         if name == "draft_top_k" and coerced < 0:
             raise ValueError("draft_top_k must be non-negative")
         return coerced
+    if name == "adaptive_policy":
+        text = str(value).strip().lower()
+        if text not in {"none", "streak", "expected_value", "cost"}:
+            raise ValueError(
+                "adaptive_policy must be one of none, streak, expected_value, cost"
+            )
+        return text
     if name == "generation_mode":
         text = str(value).strip().lower()
         if text not in {"mtp", "ar"}:
@@ -11970,18 +16915,14 @@ def _coerce_setting(name: str, value: Any) -> Any:
         return bool(value)
     if name == "reasoning_parser":
         text = str(value)
-        if text not in {"qwen3", "step3p5", "gemma4", "none"}:
+        if text not in {"qwen3", "step3p5", "gemma4", "poolside_v1", "lfm2", "none"}:
             raise ValueError(
-                "reasoning_parser must be 'qwen3', 'step3p5', 'gemma4', or 'none'"
+                "reasoning_parser must be 'qwen3', 'step3p5', 'gemma4', "
+                "'poolside_v1', 'lfm2', or 'none'"
             )
         return text
     if name == "reasoning_effort":
-        text = str(value).strip().lower()
-        if text not in {"auto", "low", "medium", "high"}:
-            raise ValueError(
-                "reasoning_effort must be 'auto', 'low', 'medium', or 'high'"
-            )
-        return text
+        return _normalize_reasoning_effort(value)
     return value
 
 
@@ -12047,6 +16988,15 @@ def _mtplx_apply_settings_payload(
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             if key == "depth":
+                if (
+                    _scheduler_config_from_args(state.args).mode
+                    == SchedulerMode.MTP_BATCH
+                    and int(value) != 1
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="mtp_batch has a fixed installed depth of 1",
+                    )
                 minimum = int(backend.draft_semantics.minimum)
                 maximum = int(backend.draft_semantics.maximum)
                 if not minimum <= int(value) <= maximum:
@@ -12058,9 +17008,23 @@ def _mtplx_apply_settings_payload(
                         ),
                     )
             if (
+                key == "adaptive_policy"
+                and value != "none"
+                and not backend.supports("native_adaptive_depth_policy")
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"{backend.backend_id} owns its draft policy; "
+                        "adaptive_policy must be 'none' for the loaded model"
+                    ),
+                )
+            if (
                 key == "generation_mode"
                 and value == "mtp"
-                and not bool(getattr(getattr(state, "runtime", None), "mtp_enabled", False))
+                and not bool(
+                    getattr(getattr(state, "runtime", None), "mtp_enabled", False)
+                )
             ):
                 raise HTTPException(
                     status_code=400,
@@ -12115,6 +17079,12 @@ def _mtplx_apply_settings_payload(
                 top_p=float(draft_top_p),
                 top_k=int(draft_top_k),
             )
+            if {"draft_temperature", "draft_top_p", "draft_top_k"} & set(applied):
+                # An explicit live-settings draft value pins the sampler and
+                # disables the family curve. The implicit temperature->draft
+                # mirror above deliberately does NOT pin: it is bookkeeping,
+                # not a user decision about draft policy.
+                state.draft_sampler_pinned = True
     return applied
 
 
@@ -12125,7 +17095,9 @@ def _env_bool_setting(name: str, *, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _effective_ram_session_cache_settings() -> dict[str, Any]:
+def _effective_ram_session_cache_settings(
+    state: "ServerState | None" = None,
+) -> dict[str, Any]:
     entries_raw = os.environ.get("MTPLX_SESSION_BANK_MAX_ENTRIES")
     max_bytes = os.environ.get("MTPLX_SESSION_BANK_MAX_BYTES") or "8G"
     per_session_bytes = os.environ.get("MTPLX_SESSION_BANK_PER_SESSION_BYTES") or "4G"
@@ -12148,12 +17120,55 @@ def _effective_ram_session_cache_settings() -> dict[str, Any]:
         policy = "minimal"
     else:
         policy = "bounded"
+    # Report the budgets the bank is actually RUNNING, not the env echo:
+    # with nothing configured the engine auto-sizes from the machine plan
+    # (or the half-surplus formula), and this surface used to invent
+    # "8G/4G" — the dashboard disagreeing with the daemon's own budget
+    # line is exactly how config bugs hide.
+    bank = getattr(getattr(state, "sessions", None), "bank", None)
+    if bank is not None:
+        entries = int(getattr(bank, "max_entries", entries))
+        max_bytes = f"{int(bank.max_bytes) / 2**30:.1f}G"
+        per_session_bytes = f"{int(bank.per_session_max_bytes) / 2**30:.1f}G"
     return {
         "ram_session_cache_policy": policy,
         "ram_session_block_prefix_restore": block_prefix_restore,
         "ram_session_cache_max_entries": entries,
         "ram_session_cache_max_size": max_bytes,
         "ram_session_cache_per_session_max_size": per_session_bytes,
+    }
+
+
+def _paged_kv_quantization_detail() -> dict[str, Any]:
+    """Honest contract surface for the KV-quantization mode.
+
+    KV quant is a decode-memory feature with real tradeoffs: it detaches the
+    compiled-verify graph bank and the dense two-pass/dense-prefill layouts,
+    and prefill still runs unquantized (peak prefill memory is unchanged).
+    Hiding those tradeoffs made the toggle look free; state them where the
+    app and dashboard read health.
+    """
+
+    mode = _effective_paged_kv_quantization()
+    if mode == "off":
+        return {"mode": "off"}
+    q8_kernel_enabled = (
+        os.environ.get("MTPLX_KV_QUANT_2PASS_KERNEL") or "1"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    return {
+        "mode": mode,
+        "decode_kernel": (
+            "sdpa_2pass_paged_q8"
+            if mode == "q8" and q8_kernel_enabled
+            else "dequant_fallback_memoized"
+        ),
+        "detached_fast_paths": [
+            "compiled_verify_graphbank",
+            "dense_two_pass_paged",
+            "dense_decode_prefill_layout",
+        ],
+        "prefill": "unquantized (peak prefill memory unchanged)",
+        "contract": "decode-memory feature; long-context decode KV bytes shrink",
     }
 
 
@@ -12171,7 +17186,9 @@ def _mtplx_current_settings(state: "ServerState") -> dict[str, Any]:
 
     args = state.args
     backend = _backend_descriptor(state)
-    model_ref = str(getattr(args, "model", None) or getattr(state, "model_id", None) or "")
+    model_ref = str(
+        getattr(args, "model", None) or getattr(state, "model_id", None) or ""
+    )
     model_context_window_max = getattr(state, "model_context_window_max", None)
     model_controls = model_controls_for_descriptor(
         backend,
@@ -12206,6 +17223,12 @@ def _mtplx_current_settings(state: "ServerState") -> dict[str, Any]:
         "generation_mode": str(getattr(args, "generation_mode", "mtp") or "mtp"),
         "depth": int(getattr(args, "depth", 3) or 3),
         "depth_max": int(backend.draft_semantics.maximum),
+        # Live-mutable like depth: the daemon builds its depth policy per
+        # request from state.args, so the app's Adaptive depth toggle needs
+        # no restart. A family that owns its own draft policy reports
+        # unsupported and the toggle stays hidden.
+        "adaptive_policy": str(getattr(args, "adaptive_policy", "none") or "none"),
+        "adaptive_depth_supported": bool(backend.supports("native_adaptive_depth_policy")),
         "draft_control": backend.draft_semantics.to_dict(),
         "backend_id": backend.backend_id,
         "architecture_id": backend.architecture_id,
@@ -12269,7 +17292,7 @@ def _mtplx_current_settings(state: "ServerState") -> dict[str, Any]:
             "paged_kv_quantization",
             "ssd_session_cache",
         ],
-        **_effective_ram_session_cache_settings(),
+        **_effective_ram_session_cache_settings(state),
     }
 
 
@@ -12297,9 +17320,12 @@ def _scheduler_config_from_args(args: Any) -> BatchSchedulerConfig:
 
 
 def _scheduler_policy_label(config: BatchSchedulerConfig) -> str:
+    if config.mode == SchedulerMode.HYPER:
+        return "hyper_singleton_admission_1"
+    if config.mode == SchedulerMode.MTP_BATCH:
+        return "fixed_mtp_batch_width_8"
     if (
-        config.mode
-        in {SchedulerMode.AR_BATCH, SchedulerMode.MTP_COHORT_EXPERIMENTAL}
+        config.mode in {SchedulerMode.AR_BATCH, SchedulerMode.MTP_COHORT_EXPERIMENTAL}
         and config.preset == SchedulerPreset.AGENT
     ):
         return "open_code_fair"
@@ -12310,6 +17336,28 @@ def _scheduler_policy_label(config: BatchSchedulerConfig) -> str:
     if config.mode == SchedulerMode.COOPERATIVE:
         return "cooperative"
     return "solo_mtp_oracle"
+
+
+_MTP_BATCH_CONSTRUCTION_RECEIPT_KEYS = (
+    "ok",
+    "numerics_profile",
+    "balanced_l0_qkv_z_b_b1_bitwise",
+    "geometry_relative_limit",
+    "compiled_eager_argmax_parity",
+    "heterogeneous_argmax_parity",
+    "row_isolation_parity",
+    "b1_exact_bitwise",
+    "b1_exact_execution",
+)
+
+
+def _mtp_batch_construction_receipt(lane: Any) -> dict[str, Any]:
+    selfcheck = getattr(lane, "selfcheck", {}) or {}
+    return {
+        key: selfcheck[key]
+        for key in _MTP_BATCH_CONSTRUCTION_RECEIPT_KEYS
+        if key in selfcheck
+    }
 
 
 def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
@@ -12328,6 +17376,18 @@ def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
             ar_batch_stats = dict(ar_batch_service.snapshot())
         except Exception as exc:
             ar_batch_stats = {"error": str(exc)}
+    mtp_batch_stats: dict[str, Any] = {}
+    mtp_batch_lane = getattr(state, "mtp_batch_lane", None)
+    mtp_batch_service = getattr(state, "mtp_batch_service", None)
+    b1_exact_serial = bool(
+        config.mode == SchedulerMode.MTP_BATCH
+        and getattr(mtp_batch_lane, "numerics_profile", None) == "b1-exact"
+    )
+    if mtp_batch_service is not None and hasattr(mtp_batch_service, "snapshot"):
+        try:
+            mtp_batch_stats = dict(mtp_batch_service.snapshot())
+        except Exception as exc:
+            mtp_batch_stats = {"error": str(exc)}
     try:
         active_requests = int(state.dashboard.in_flight.count())
     except Exception:
@@ -12341,7 +17401,36 @@ def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
         getattr(getattr(state, "runtime", None), "mtp_enabled", False)
         and str(getattr(state.args, "generation_mode", "mtp")) == "mtp"
     )
-    if active_requests <= 1 and mtp_available:
+    mtp_batch_has_cohort = bool(
+        config.mode == SchedulerMode.MTP_BATCH
+        and (
+            int(mtp_batch_stats.get("active") or 0) > 1
+            or int(mtp_batch_stats.get("last_real_width") or 0) > 1
+        )
+    )
+    if config.mode == SchedulerMode.HYPER:
+        # Hyper never disables MTP for concurrency: extra requests queue FIFO
+        # behind the singleton exactly like serial, so queued depth must never
+        # be labeled as an AR fallback.
+        active_lane = "hyper_singleton" if mtp_available else "hyper_singleton_ar"
+        mtp_disabled_reason = None if mtp_available else "generation_mode_ar"
+    elif b1_exact_serial and mtp_available:
+        active_lane = "mtp_batch_b1_exact_serial"
+        mtp_disabled_reason = None
+    elif mtp_batch_has_cohort and mtp_available:
+        active_lane = "mtp_batch_width_8"
+        mtp_disabled_reason = None
+    elif config.mode == SchedulerMode.MTP_BATCH and mtp_available:
+        active_lane = (
+            "mtp_batch_gathering"
+            if active_requests > 1 or int(mtp_batch_stats.get("pending") or 0) > 1
+            else "solo_mtp"
+        )
+        mtp_disabled_reason = None
+    elif config.mode == SchedulerMode.SERIAL and mtp_available:
+        active_lane = "solo_mtp"
+        mtp_disabled_reason = None
+    elif active_requests <= 1 and mtp_available:
         active_lane = "solo_mtp"
         mtp_disabled_reason = None
     elif active_requests > 1 and mtp_available:
@@ -12358,16 +17447,50 @@ def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
     else:
         active_lane = "serial_ar" if not mtp_available else "serial_mtp"
         mtp_disabled_reason = None if mtp_available else "generation_mode_ar"
+    hyper_stats: dict[str, Any] = {}
+    hyper_gate = getattr(state, "hyper_gate", None)
+    if hyper_gate is not None and hasattr(hyper_gate, "snapshot"):
+        try:
+            hyper_stats = dict(hyper_gate.snapshot())
+        except Exception as exc:
+            hyper_stats = {"error": str(exc)}
+    telemetry = dict(scheduler_stats)
+    if config.mode == SchedulerMode.MTP_BATCH:
+        telemetry.update(mtp_batch_stats)
+    elif config.mode == SchedulerMode.HYPER:
+        telemetry.update(hyper_stats)
     return {
         "config": config.to_dict(),
         "mode": config.mode.value,
         "preset": config.preset.value,
-        "scheduler_policy": _scheduler_policy_label(config),
+        "scheduler_policy": (
+            "serial_b1_exact" if b1_exact_serial else _scheduler_policy_label(config)
+        ),
         "active_lane": active_lane,
         "active_requests": active_requests,
         "mtp_available": mtp_available,
         "mtp_disabled_reason": mtp_disabled_reason,
-        "path": "path_a",
+        "mtp_batch_numerics": getattr(mtp_batch_lane, "numerics_profile", None),
+        "mtp_batch_route_id": getattr(mtp_batch_lane, "route_id", None),
+        "mtp_batch_config_fingerprint": getattr(
+            mtp_batch_lane, "config_fingerprint", None
+        ),
+        "mtp_batch_construction_receipt": _mtp_batch_construction_receipt(
+            mtp_batch_lane
+        ),
+        "mtp_batch_installed_widths": sorted(
+            int(width) for width in (getattr(state, "mtp_batch_lanes", None) or {})
+        ),
+        "mtp_batch_width_routes": {
+            str(width): getattr(lane, "route_id", None)
+            for width, lane in sorted(
+                (getattr(state, "mtp_batch_lanes", None) or {}).items()
+            )
+        },
+        "path": "mtp_batch" if config.mode == SchedulerMode.MTP_BATCH else "path_a",
+        "ar_batch_unavailable_reason": getattr(
+            state, "ar_batch_unavailable_reason", None
+        ),
         "path_a": {
             "solo_mtp_protected": True,
             "concurrent_strategy": "cooperative_ar_batch",
@@ -12377,8 +17500,13 @@ def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
             "experimental_mtp_cohorts": bool(config.experimental_mtp_cohorts),
             "default_enabled": False,
         },
-        "telemetry": scheduler_stats,
+        "telemetry": telemetry,
         "ar_batch": ar_batch_stats,
+        "mtp_batch": mtp_batch_stats,
+        # Hyper chassis stats (empty outside scheduler_mode=hyper). H0 ships
+        # width=1 + admission accounting; the width_stats sub-block is the
+        # stable home for H1/H2 receipts (see mtplx/server/hyper.py).
+        "hyper": hyper_stats,
     }
 
 
@@ -12399,9 +17527,13 @@ def _mtplx_dashboard_snapshot(state: "ServerState") -> dict[str, Any]:
             "error": str(exc),
         }
         bank_dict = {}
+    retrieval = getattr(state, "retrieval", None)
     return {
         "ts": time.time(),
         "model_id": state.model_id,
+        # Always present, so a client can tell "no retrieval configured" apart
+        # from "this build has no retrieval support".
+        "retrieval": retrieval.status() if retrieval is not None else {"enabled": False, "models": []},
         "profile": state.profile.to_dict()
         if hasattr(state.profile, "to_dict")
         else {"name": getattr(state.profile, "name", "unknown")},
@@ -12410,6 +17542,7 @@ def _mtplx_dashboard_snapshot(state: "ServerState") -> dict[str, Any]:
         "in_flight": dashboard.in_flight.snapshot(),
         "latest": state.last_metrics[-1] if state.last_metrics else None,
         "recent": state.last_metrics[-32:],
+        "prefill_rates": dashboard.prefill_history.rates(),
         "rolling": dashboard.rolling.snapshot(),
         "lifetime": dashboard.lifetime.snapshot(),
         "sessions": sessions_dict,
@@ -12420,6 +17553,21 @@ def _mtplx_dashboard_snapshot(state: "ServerState") -> dict[str, Any]:
         "memory_pressure_level": int(
             getattr(dashboard, "last_memory_pressure_level", 0) or 0
         ),
+        "memory_pressure_source": str(
+            getattr(dashboard, "last_memory_pressure_source", "macos") or "macos"
+        ),
+        "allocator_fraction": float(
+            getattr(dashboard, "last_allocator_fraction", 0.0) or 0.0
+        ),
+        "memory_plan": (
+            state.memory_plan.to_dict()
+            if getattr(state, "memory_plan", None) is not None
+            else None
+        ),
+        "allow_swap": bool(getattr(state, "allow_swap", False)),
+        "memory_guard_events": list(
+            getattr(dashboard, "memory_guard_events", ()) or ()
+        )[-8:],
         "settings": _mtplx_current_settings(state),
         "scheduler": _mtplx_scheduler_state(state),
         "machine": _machine_info(),
@@ -12451,8 +17599,555 @@ def _memory_pressure_level() -> int:
 
 def _memory_pressure_guard_enabled() -> bool:
     return os.environ.get("MTPLX_MEMORY_PRESSURE_GUARD", "1").strip().lower() not in {
-        "0", "off", "false", "no",
+        "0",
+        "off",
+        "false",
+        "no",
     }
+
+
+# Allocation failures the daemon must survive as per-request errors. MLX's
+# Metal allocator raises plain RuntimeErrors ("[metal::malloc] ... maximum
+# allowed buffer size", "Insufficient Memory",
+# kIOGPUCommandBufferCallbackErrorOutOfMemory); before 2.9.4 these reached
+# clients as anonymous internal_error 500s with no cache shed, so the very
+# next request hit the same wall (#348).
+_ALLOCATION_FAILURE_MARKERS = (
+    "insufficient memory",
+    "out of memory",
+    "failed to allocate",
+    "kiogpucommandbuffercallbackerroroutofmemory",
+    "metal::malloc",
+    "maximum allowed buffer size",
+)
+
+
+def _is_allocation_failure(exc: BaseException) -> bool:
+    if isinstance(exc, MemoryError):
+        return True
+    if not isinstance(exc, (RuntimeError, OSError)):
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in _ALLOCATION_FAILURE_MARKERS)
+
+
+def _record_guard_event(state: "ServerState", payload: dict[str, Any]) -> None:
+    """Ring buffer of guard actions for the dashboard/app (never raises)."""
+    try:
+        dashboard = state.dashboard
+        events = getattr(dashboard, "memory_guard_events", None)
+        if events is None:
+            events = deque(maxlen=16)
+            dashboard.memory_guard_events = events
+        events.append({"ts": time.time(), **payload})
+    except Exception:
+        pass
+
+
+def _shed_after_allocation_failure(state: "ServerState") -> dict[str, Any]:
+    """Give memory back after an allocation failure; never raises.
+
+    Bank to half its current budget + allocator cache clear: the next
+    request should find room instead of hitting the identical wall.
+    """
+    receipt: dict[str, Any] = {"action": "allocation_failure_shed"}
+    try:
+        bank = getattr(getattr(state, "sessions", None), "bank", None)
+        if bank is not None:
+            receipt["bank_entries_evicted"] = bank.shrink_to_bytes(
+                int(bank.effective_max_bytes()) // 2,
+                reason="allocation_failure",
+            )
+            receipt["bank_bytes_after"] = int(bank.total_nbytes)
+    except Exception as exc:
+        receipt["bank_error"] = repr(exc)
+    try:
+        import mlx.core as _mx
+
+        _mx.clear_cache()
+        receipt["cache_cleared"] = True
+    except Exception:
+        receipt["cache_cleared"] = False
+    _record_guard_event(state, receipt)
+    try:
+        print("[mtplx] memory guard " + json.dumps(receipt), flush=True)
+    except Exception:
+        pass
+    return receipt
+
+
+def _allocation_failure_http_exception(
+    state: "ServerState", exc: BaseException
+) -> HTTPException:
+    """Shed caches, then turn the raw allocator error into an honest 507."""
+    _shed_after_allocation_failure(state)
+    plan = getattr(state, "memory_plan", None)
+    advice = "Reduce --context-window, close other apps, or try q8 KV quantization."
+    if plan is not None and getattr(plan, "context_overcommitted", False):
+        advice = (
+            f"--context-window {plan.context_window_resolved} exceeds this "
+            f"machine's fit of {plan.context_window_fit} tokens; serve at or "
+            "below the fit (or use q8 KV quantization)."
+        )
+        if bool(getattr(state, "allow_swap", False)):
+            advice = (
+                "--allow-swap admitted this prompt past the machine's fit of "
+                f"{plan.context_window_fit} tokens and the allocator still "
+                "refused; reduce the prompt, close other apps, or use q8 KV "
+                "quantization."
+            )
+    return HTTPException(
+        status_code=507,
+        detail=(
+            "insufficient memory: the request exceeded available GPU memory "
+            f"({exc}). The engine shed its caches and stays up; this request "
+            f"failed. {advice}"
+        ),
+    )
+
+
+def _prefill_admission_refusal(
+    state: "ServerState", receipt: Mapping[str, Any]
+) -> HTTPException:
+    """The structured 507 for a prompt the shed could not make fit (#450).
+
+    Raised before prefill, so the engine keeps every resident session and
+    the client gets a real answer instead of a swap spiral or a kernel panic.
+    """
+    gib = float(1024**3)
+    limit = int(receipt.get("limit_bytes") or 0)
+    projected = int(
+        receipt.get("projected_bytes_after") or receipt.get("projected_bytes") or 0
+    )
+    over = max(0, projected - limit)
+    prompt_tokens = int(receipt.get("prompt_tokens") or 0)
+    miss_tokens = int(receipt.get("miss_tokens") or 0)
+    return HTTPException(
+        status_code=507,
+        detail=(
+            "insufficient memory: this prompt projects "
+            f"{projected / gib:.1f} GiB against the engine's {limit / gib:.1f} GiB "
+            f"limit ({over / gib:.1f} GiB over) after the allocator cache and the "
+            f"session bank were reclaimed ({prompt_tokens} prompt tokens, "
+            f"{miss_tokens} not cached). The engine stays up and keeps its "
+            "sessions; this request was refused before prefill instead of "
+            "pushing the Mac into swap. Reduce the prompt, start a new "
+            "conversation, close other apps, or use q8 KV quantization; "
+            "--allow-swap admits it anyway."
+        ),
+    )
+
+
+def _vision_bank_session_id(bank: Any, prompt_ids: list[int], splice: Any) -> str | None:
+    """Recover anonymous lineage from a pixel-keyed snapshot, never raw KV.
+
+    Vision deliberately has no raw-token session frontier. Its bank entry
+    still owns a session id; reusing that id keeps consecutive image turns
+    in one cache budget instead of creating a protected terminal per turn.
+    Require an exact prefix containing pixels, not a shared text preamble.
+    """
+    from mtplx.vision.splice import vision_bank_key_ids
+
+    keys = vision_bank_key_ids(prompt_ids, splice)
+    entry = bank.longest_prefix(keys) if keys is not None else None
+    if entry is None or tuple(prompt_ids[:len(entry.token_ids)]) == entry.token_ids:
+        return None
+    return entry.session_id
+
+
+def _prefill_admission_shed_enabled() -> bool:
+    return os.environ.get(
+        "MTPLX_PREFILL_ADMISSION_SHED", "1"
+    ).strip().lower() not in {"0", "off", "false", "no"}
+
+
+def _prefill_admission_min_miss_tokens() -> int:
+    raw = os.environ.get("MTPLX_PREFILL_ADMISSION_MIN_MISS_TOKENS", "4096")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 4096
+
+
+def _prefill_admission_live_prefix_enabled() -> bool:
+    return os.environ.get(
+        "MTPLX_PREFILL_ADMISSION_LIVE_PREFIX", "1"
+    ).strip().lower() not in {"0", "off", "false", "no"}
+
+
+def _prefill_admission_chain_shed_enabled() -> bool:
+    return os.environ.get(
+        "MTPLX_PREFILL_ADMISSION_CHAIN_SHED", "1"
+    ).strip().lower() not in {"0", "off", "false", "no"}
+
+
+# Same line as _allocator_pressure_level's WARNING edge. This is an early
+# allocation-budget signal, not proof that the operating system is swapping.
+_PREFILL_ADMISSION_PRESSURE_FRACTION = 0.97
+
+
+def _block_restorable_prefix_tokens(matched_tokens: int) -> int:
+    """Tokens a block-prefix restore serves from a ``matched_tokens`` common
+    prefix: rewound to the block edge, zero under the restore floor. Mirrors
+    the block path of ``SessionBank.near_prefix_candidates`` (conservative
+    for kvcache-v2 entries, which restore at any token)."""
+    from mtplx.session_bank import (
+        DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS,
+        DEFAULT_PREFIX_BLOCK_SIZE,
+        block_aligned_prefix_len,
+    )
+
+    aligned = block_aligned_prefix_len(
+        max(0, int(matched_tokens)), block_size=DEFAULT_PREFIX_BLOCK_SIZE
+    )
+    if aligned < DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS:
+        return 0
+    return int(aligned)
+
+
+def _prefill_admission_shed(
+    state: "ServerState",
+    *,
+    prompt_ids: list[int],
+    session_bank: Any | None,
+    session_id: str | None,
+    vision_splice: Any | None = None,
+) -> dict[str, Any] | None:
+    """Release idle memory BEFORE a tight cache-miss prefill (#415).
+
+    The shipped failure: a Pi agent hit its compaction threshold at 248k,
+    the compaction rewrote the whole prefix, and the replacement prefill —
+    a guaranteed cache miss — started while the superseded 6.09 GiB
+    SessionBank snapshot of the pre-compaction transcript sat resident on
+    a memory plan that admits 262K with zero headroom. The footprint
+    crossed the Metal cap mid-prefill and the sustained-pressure guard
+    killed the request (structured 507) ~30 s later. Shedding first is
+    cheap and reversible; the abort is neither.
+
+    Projects the miss-prefill footprint against the live allocator state
+    and, only when the projection crosses the guard's WARNING line, frees
+    in escalation order: unused allocator cache, superseded same-session
+    bank entries (the prefix
+    was rewritten, so they can never be restored by this lineage again),
+    then LRU idle entries with every active session protected, then sibling
+    and terminal snapshots while protecting the incoming restore source.
+    Never raises; returns the receipt when it acted.
+    """
+
+    if not _prefill_admission_shed_enabled():
+        return None
+    try:
+        prompt_tokens = len(prompt_ids)
+        if prompt_tokens < _prefill_admission_min_miss_tokens():
+            return None
+        if vision_splice is not None:
+            # Admission must ask the same content-keyed question as restore.
+            # Raw image pads only match the text before the first image;
+            # that false miss can evict the very snapshot we need and refuse
+            # a warm request. Surrogates never reach the model input.
+            from mtplx.vision.splice import vision_bank_key_ids
+
+            keyed_ids = vision_bank_key_ids(prompt_ids, vision_splice)
+            if keyed_ids is None:
+                session_bank = None
+            else:
+                prompt_ids = keyed_ids
+        caps = getattr(state, "metal_memory_caps", None)
+        limit = 0
+        if isinstance(caps, dict):
+            value = caps.get("memory_limit_bytes")
+            if isinstance(value, int):
+                limit = value
+        if limit <= 0:
+            return None
+        stats = _mlx_memory_stats_live()
+        active = int(stats.get("active_memory_bytes") or 0)
+        cache = int(stats.get("cache_memory_bytes") or 0)
+        if active <= 0:
+            return None
+        plan = getattr(state, "memory_plan", None)
+        per_token = 0
+        transients = 0
+        if plan is not None:
+            per_token = (
+                int(getattr(plan, "kv_bytes_per_token_effective", 0) or 0)
+                + int(getattr(plan, "aux_bytes_per_token", 0) or 0)
+                + int(getattr(plan, "prefill_transient_bytes_per_token", 0) or 0)
+            )
+            try:
+                from mtplx.memory_plan import RUNTIME_TRANSIENTS_BYTES
+
+                transients = int(RUNTIME_TRANSIENTS_BYTES)
+            except Exception:
+                transients = 0
+        threshold = int(limit * _PREFILL_ADMISSION_PRESSURE_FRACTION)
+        # Cheap worst-case gate first (miss == full prompt): skip the bank
+        # probe entirely when even a fully cold prefill projects under the
+        # line — the common, memory-healthy case.
+        if active + cache + prompt_tokens * per_token + transients <= threshold:
+            return None
+        reused_tokens = 0
+        reused_mode = "none"
+        if session_bank is not None:
+            try:
+                entry = session_bank.longest_prefix(prompt_ids)
+            except Exception:
+                entry = None
+            if entry is not None:
+                reused_tokens = len(entry.token_ids)
+                reused_mode = "exact"
+            # The restore path also serves prompts no entry is an exact
+            # prefix of: a block-prefix restore rewinds to the last safe
+            # boundary under the common prefix (the turn after a forced
+            # tool round, whose banked entry ends in the transient
+            # sentinel; a retokenized tail). Ask the bank the question the
+            # restore asks, or the estimate reads 0 here and the session's
+            # own restorable entry is evicted below as "superseded" (2.11
+            # release gate, tool_result_forced: 41,901 tokens re-prefilled
+            # cold, 54 s, with a 41,391-token block restore available).
+            shared_fn = getattr(session_bank, "longest_shared_prefix_tokens", None)
+            if callable(shared_fn):
+                try:
+                    block_tokens = _block_restorable_prefix_tokens(
+                        shared_fn(prompt_ids)
+                    )
+                except Exception:
+                    block_tokens = 0
+                if block_tokens > reused_tokens:
+                    reused_tokens = block_tokens
+                    reused_mode = "block_prefix"
+        # The bank is not the only holder of reusable state: the engine's
+        # live sessions serve a committed prefix directly (that is what a
+        # warm turn's cached_tokens reads), and a live frontier can be
+        # unbanked — a refused snapshot (retokenized-history mismatch)
+        # banks nothing while the live KV still serves. Estimating from
+        # the bank alone read a warm 212k-token session as a full miss,
+        # cleared its snapshots as "superseded", and every client retry
+        # was then a 211,807-token cold miss that could never be admitted
+        # until a server restart (#447).
+        if vision_splice is None and _prefill_admission_live_prefix_enabled():
+            sessions = getattr(state, "sessions", None)
+            live_tokens = 0
+            if sessions is not None:
+                # Ask the same ladder session resolution asks (exact, then
+                # pending-postcommit near prefix, then best common prefix),
+                # with the non-exact answers rewound to the block floor the
+                # bank estimate above uses — the reuse a request achieves
+                # is never more optimistic than resolution's own match.
+                try:
+                    exact_fn = getattr(sessions, "longest_prefix_session", None)
+                    live = exact_fn(prompt_ids) if callable(exact_fn) else None
+                    if live is not None:
+                        live_tokens = len(
+                            getattr(live, "committed_token_ids", ()) or ()
+                        )
+                    if live_tokens <= 0:
+                        near_fn = getattr(
+                            sessions, "pending_near_prefix_session", None
+                        )
+                        if callable(near_fn):
+                            near, matched = near_fn(prompt_ids)
+                            if near is not None:
+                                live_tokens = _block_restorable_prefix_tokens(
+                                    int(matched)
+                                )
+                    if live_tokens <= 0:
+                        common_fn = getattr(
+                            sessions, "best_common_prefix_session", None
+                        )
+                        if callable(common_fn):
+                            shared, matched = common_fn(prompt_ids)
+                            if shared is not None:
+                                live_tokens = _block_restorable_prefix_tokens(
+                                    int(matched)
+                                )
+                except Exception:
+                    live_tokens = 0
+            if live_tokens > reused_tokens:
+                reused_tokens = int(live_tokens)
+                reused_mode = "live_session"
+        miss_tokens = max(0, prompt_tokens - reused_tokens)
+        if miss_tokens < _prefill_admission_min_miss_tokens():
+            return None
+        projected = active + cache + miss_tokens * per_token + transients
+        if projected <= threshold:
+            return None
+        receipt: dict[str, Any] = {
+            "action": "prefill_admission_shed",
+            "prompt_tokens": int(prompt_tokens),
+            "reusable_prefix_tokens": int(reused_tokens),
+            "reusable_prefix_mode": reused_mode,
+            "miss_tokens": int(miss_tokens),
+            "active_bytes": int(active),
+            "cache_bytes": int(cache),
+            "projected_bytes": int(projected),
+            "threshold_bytes": int(threshold),
+            "limit_bytes": int(limit),
+        }
+        # The allocator pool is free storage, whereas session snapshots
+        # avoid real re-prefill/SSD work. Reclaim the pool and remeasure
+        # before choosing any snapshot victims. Counting it as an admission
+        # deficit evicted useful conversations even when active KV fitted.
+        try:
+            import mlx.core as _mx
+
+            _mx.clear_cache()
+            receipt["cache_cleared"] = True
+        except Exception as exc:
+            receipt["cache_cleared"] = False
+            receipt["cache_clear_error"] = repr(exc)
+        after_cache = _mlx_memory_stats_live()
+        if int(after_cache.get("active_memory_bytes") or 0) > 0:
+            projected = (
+                int(after_cache["active_memory_bytes"])
+                + int(after_cache.get("cache_memory_bytes") or 0)
+                + miss_tokens * per_token + transients
+            )
+        receipt["projected_bytes_after_cache_clear"] = int(projected)
+        deficit = max(0, projected - threshold)
+        if session_bank is not None and deficit > 0:
+            try:
+                bank_bytes_before = int(session_bank.total_nbytes)
+                receipt["bank_bytes_before"] = bank_bytes_before
+                if session_id and reused_tokens == 0:
+                    # Nothing restorable, exact or by block prefix: the
+                    # client rewrote this session's prefix (agent
+                    # compaction), so its banked snapshots are superseded
+                    # and can never be restored by this lineage again.
+                    receipt["superseded_session_entries_evicted"] = int(
+                        session_bank.clear(session_id=session_id)
+                    )
+                elif session_id:
+                    # A restorable prefix exists — pin this session so the
+                    # LRU pass below cannot evict the entry the imminent
+                    # restore depends on.
+                    session_bank.touch_sessions([session_id])
+                bank_bytes_now = int(session_bank.total_nbytes)
+                remaining = deficit - max(0, bank_bytes_before - bank_bytes_now)
+                if remaining > 0 and bank_bytes_now > 0:
+                    receipt["lru_entries_evicted"] = int(
+                        session_bank.shrink_to_bytes(
+                            max(0, bank_bytes_now - remaining),
+                            reason="prefill_admission",
+                            protect_active=True,
+                        )
+                    )
+                # Escalation between the protected LRU pass and giving up
+                # (#447): a deep session's sibling snapshots — forked
+                # generations of the same conversation that no put()-time
+                # supersede collapses — are active-protected above, so a
+                # 12.6 GiB bank served a 7 GiB deficit with zero evictions
+                # and the request died on the sustained-pressure 507. Walk
+                # those chain prefixes (never a session's terminal entry,
+                # never the entry this prompt restores from; the SSD cold
+                # tier keeps every eviction restorable) before letting the
+                # prefill start into a projection that crosses the line.
+                if _prefill_admission_chain_shed_enabled():
+                    bank_bytes_now = int(session_bank.total_nbytes)
+                    remaining = deficit - max(
+                        0, bank_bytes_before - bank_bytes_now
+                    )
+                    chain_fn = getattr(
+                        session_bank, "shrink_for_admission", None
+                    )
+                    if (
+                        remaining > 0
+                        and bank_bytes_now > 0
+                        and callable(chain_fn)
+                    ):
+                        chain_evicted, terminal_evicted = chain_fn(
+                            max(0, bank_bytes_now - remaining),
+                            protect_tokens=prompt_ids,
+                            reason="prefill_admission_chain",
+                        )
+                        receipt["chain_entries_evicted"] = int(chain_evicted)
+                        receipt["terminal_entries_evicted"] = int(
+                            terminal_evicted
+                        )
+                receipt["bank_bytes_after"] = int(session_bank.total_nbytes)
+            except Exception as exc:
+                receipt["bank_error"] = repr(exc)
+        if deficit > 0:
+            # Evicted leaves may now sit in the allocator pool. Return that
+            # storage before the final physical-memory receipt as well.
+            try:
+                import mlx.core as _mx
+
+                _mx.clear_cache()
+                receipt["cache_cleared"] = True
+            except Exception as exc:
+                receipt["cache_clear_error"] = repr(exc)
+        after = _mlx_memory_stats_live()
+        receipt["active_bytes_after"] = int(after.get("active_memory_bytes") or 0)
+        receipt["cache_bytes_after"] = int(after.get("cache_memory_bytes") or 0)
+        # #450: admission past the hard limit is not "shed and hope". On a
+        # 128 GB Mac the shed admitted a 136k prompt at a projected 105.4 GB
+        # against a 103.1 GB limit once the allocator cache was cleared, and
+        # nothing downstream stops such a request safely: MLX's limit is
+        # soft, macOS compresses and swaps for minutes, and that machine
+        # kernel-panicked four times before any 507 could fire. When the
+        # projection still crosses the limit after every reclamation step,
+        # mark the receipt refused; the caller answers with the structured
+        # 507 before prefill. --allow-swap (#427) keeps the operator's
+        # explicit past-the-fit choice.
+        projected_after = (
+            int(after.get("active_memory_bytes") or 0)
+            + int(after.get("cache_memory_bytes") or 0)
+            + miss_tokens * per_token
+            + transients
+        )
+        receipt["projected_bytes_after"] = int(projected_after)
+        if projected_after > limit and not bool(getattr(state, "allow_swap", False)):
+            receipt["refused"] = True
+            receipt["refusal_reason"] = "projected_over_limit_after_reclamation"
+        _record_guard_event(state, receipt)
+        try:
+            print("[mtplx] memory guard " + json.dumps(receipt), flush=True)
+        except Exception:
+            pass
+        return receipt
+    except Exception as exc:  # noqa: BLE001 — an admission guard must never
+        # cost a request; generation proceeds and the runtime backstops
+        # (#393 pressure abort, allocation-failure shed) still apply.
+        try:
+            _record_guard_event(
+                state,
+                {"action": "prefill_admission_shed_error", "error": repr(exc)},
+            )
+        except Exception:
+            pass
+        return None
+
+
+def _allocator_pressure_level(state: "ServerState") -> tuple[int, float]:
+    """Engine-relative pressure: allocator footprint vs the Metal limit.
+
+    macOS's kern.memorystatus level fires only once the system is already
+    compressing/swapping — on a 48 GB Mac that is minutes into the death
+    spiral (#305: 61.8/48.0 GB before the first signal). The allocator
+    knows its allocation envelope earlier: active+cache at >=97% of the
+    configured Metal memory limit is treated as WARNING (2);
+    past the limit is CRITICAL-equivalent (4). Returns (level, fraction).
+    """
+    caps = getattr(state, "metal_memory_caps", None)
+    limit = 0
+    if isinstance(caps, dict):
+        value = caps.get("memory_limit_bytes")
+        if isinstance(value, int):
+            limit = value
+    if limit <= 0:
+        return 1, 0.0
+    stats = _mlx_memory_stats_live()
+    active = stats.get("active_memory_bytes") or 0
+    cache = stats.get("cache_memory_bytes") or 0
+    if not active:
+        return 1, 0.0
+    fraction = float(int(active) + int(cache)) / float(limit)
+    if fraction >= 1.02:
+        return 4, fraction
+    if fraction >= 0.97:
+        return 2, fraction
+    return 1, fraction
 
 
 def _engine_busy_signal(state: "ServerState") -> bool:
@@ -12469,6 +18164,60 @@ def _engine_busy_signal(state: "ServerState") -> bool:
     except Exception:
         pass
     return False
+
+
+# Sustained-critical prefill abort (#393): this many consecutive guard ticks
+# (~30 s at the 10 s interval) at CRITICAL with the engine busy. One tick is
+# routinely survivable — the trim frees bank/retrieval weight and the
+# allocator recovers — but a deep prefill re-grows the footprint faster than
+# anything can be shed, and macOS compresses/swaps for minutes before any
+# Metal allocation error (the only prior 507 trigger) would ever fire.
+# Sustained critical means the shedding already ran and lost.
+_PRESSURE_ABORT_TICKS = 3
+
+
+def _pressure_abort_requested(state: "ServerState") -> bool:
+    """True while the guard loop has armed the sustained-pressure abort."""
+    event = getattr(state, "pressure_abort_event", None)
+    return bool(event is not None and event.is_set())
+
+
+def _note_critical_pressure_tick(
+    state: "ServerState", level: int, busy: bool, streak: int
+) -> int:
+    """One guard-loop tick of the sustained-critical tracker; returns streak.
+
+    Arms ``state.pressure_abort_event`` after ``_PRESSURE_ABORT_TICKS``
+    consecutive CRITICAL ticks with the engine busy — an idle engine cannot
+    be the cause, and aborting nothing frees nothing. Any tick that is
+    sub-critical or idle disarms and resets: the abort must never linger
+    past recovery and kill a healthy later request.
+    """
+    if level >= 4 and busy:
+        streak += 1
+        if streak >= _PRESSURE_ABORT_TICKS and not _pressure_abort_requested(
+            state
+        ):
+            event = getattr(state, "pressure_abort_event", None)
+            if event is None:
+                event = threading.Event()
+                state.pressure_abort_event = event
+            event.set()
+            _record_guard_event(
+                state,
+                {
+                    "action": "pressure_abort_armed",
+                    "level": int(level),
+                    "streak": int(streak),
+                },
+            )
+        return streak
+    if _pressure_abort_requested(state):
+        state.pressure_abort_event.clear()
+        _record_guard_event(
+            state, {"action": "pressure_abort_cleared", "level": int(level)}
+        )
+    return 0
 
 
 class _MemoryPressureGuard:
@@ -12535,6 +18284,40 @@ class _MemoryPressureGuard:
             self.prev_level = level
 
 
+async def _retrieval_idle_loop(
+    state: "ServerState", *, interval_s: float = 30.0
+) -> None:
+    """Release idle retrieval weights, then archive the session bank.
+
+    Started only when a timeout is configured. Never raises into the server:
+    a watcher that can kill the daemon is worse than one that misses a cycle.
+    """
+    retrieval = getattr(state, "retrieval", None)
+    if retrieval is None or retrieval.idle_timeout_s <= 0:
+        return
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            released = await asyncio.to_thread(retrieval.unload_idle)
+            if released["unloaded"]:
+                LOGGER.info(
+                    "retrieval idle release: %d model(s), %.2f GB",
+                    len(released["unloaded"]),
+                    released["freed_bytes"] / (1024**3),
+                )
+                # Only once nothing is resident: archiving while a retrieval
+                # model is still serving would trade one cost for another.
+                if not retrieval.status()["resident"]:
+                    try:
+                        await asyncio.to_thread(state.sessions.archive_cold_tier)
+                    except Exception as exc:
+                        LOGGER.warning("session bank archive failed: %s", exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOGGER.warning("retrieval idle watcher: %s", exc)
+
+
 async def _memory_pressure_loop(
     state: "ServerState", *, interval_s: float = 10.0
 ) -> None:
@@ -12562,13 +18345,87 @@ async def _memory_pressure_loop(
     """
 
     guard = _MemoryPressureGuard()
+    abort_streak = 0
     while True:
         try:
             level = await asyncio.to_thread(_memory_pressure_level)
+            level_source = "macos"
+            allocator_level, allocator_fraction = _allocator_pressure_level(state)
+            if allocator_level >= 2 and allocator_level >= level:
+                # The allocator sees the wall minutes before macOS does
+                # (see _allocator_pressure_level); the guard acts on
+                # whichever signal is worse. Ties at WARNING+ blame the
+                # allocator: the "macos" copy asserts the engine footprint
+                # is steady, which is false while the allocator is also at
+                # its ceiling.
+                level = allocator_level
+                level_source = "allocator"
+            elif level >= 2 and allocator_fraction <= 0.0:
+                # macOS reports pressure but the allocator probe bailed
+                # (no Metal limit configured, or zero active memory), so
+                # engine steadiness cannot be attested either way.
+                level_source = "unknown"
             state.dashboard.last_memory_pressure_level = level
+            state.dashboard.last_memory_pressure_source = level_source
+            state.dashboard.last_allocator_fraction = float(allocator_fraction)
+            # Dynamic bank ceiling (memory plan): during a long-context
+            # prefill no put() runs for minutes while KV grows, so the
+            # put-time budget check alone reacts too late. Enforce here
+            # every tick. Deliberately NO mx.clear_cache() while busy —
+            # freed bank buffers return to the allocator pool and get
+            # reused by the growing KV, which is exactly the point.
+            bank = getattr(getattr(state, "sessions", None), "bank", None)
+            if bank is not None and getattr(bank, "dynamic_ceiling_fn", None):
+                try:
+                    # Re-stamp the activity pin for live requests first: the
+                    # pin is otherwise touched only at restore/put, so one
+                    # turn longer than its 600 s TTL would lose
+                    # protect_active mid-generation.
+                    in_flight = getattr(
+                        getattr(state, "dashboard", None), "in_flight", None
+                    )
+                    touch = getattr(bank, "touch_sessions", None)
+                    if in_flight is not None and callable(touch):
+                        touch(in_flight.session_ids())
+                    ceiling = int(bank.effective_max_bytes())
+                    if int(bank.total_nbytes) > ceiling + 256 * 1024**2:
+                        # protect_active: the ceiling reads the working set
+                        # instantaneously, so a deep prefill's transient
+                        # spike must squeeze idle sessions' cache, never the
+                        # in-flight session's own prefix chain (93k receipt
+                        # 2026-08-28: bank walked to 0 mid-request, 54-57 s
+                        # TTFTs after). Real macOS/allocator pressure below
+                        # keeps take-anything semantics.
+                        dyn_evicted = bank.shrink_to_bytes(
+                            ceiling,
+                            reason="dynamic_ceiling",
+                            protect_active=True,
+                        )
+                        if dyn_evicted:
+                            _record_guard_event(
+                                state,
+                                {
+                                    "action": "dynamic_ceiling",
+                                    "ceiling_bytes": ceiling,
+                                    "bank_entries_evicted": int(dyn_evicted),
+                                    "bank_bytes_after": int(bank.total_nbytes),
+                                },
+                            )
+                except Exception:
+                    pass
             busy = False
             if 2 <= level < 4:
                 busy = await asyncio.to_thread(_engine_busy_signal, state)
+            # The guard's own busy is deliberately not computed at CRITICAL
+            # (CRITICAL trims never defer); the abort tracker needs it there.
+            critical_busy = (
+                await asyncio.to_thread(_engine_busy_signal, state)
+                if level >= 4
+                else False
+            )
+            abort_streak = _note_critical_pressure_tick(
+                state, level, critical_busy, abort_streak
+            )
             deferred_s = guard.deferred_for_s(time.monotonic())
             if guard.decide(level, time.monotonic(), busy):
                 bank = getattr(getattr(state, "sessions", None), "bank", None)
@@ -12583,6 +18440,24 @@ async def _memory_pressure_loop(
                             else "memory_pressure_warning"
                         ),
                     )
+                if level >= 4:
+                    # Under CRITICAL, shedding the buffer pool is not enough:
+                    # retrieval weights are whole GB and reload in seconds, so
+                    # they are the cheapest large thing to give back. Idle-only
+                    # (threshold 0 means "not pinned"), so an in-flight request
+                    # never loses its model.
+                    retrieval = getattr(state, "retrieval", None)
+                    if retrieval is not None and retrieval.enabled:
+                        try:
+                            released = await asyncio.to_thread(retrieval.unload_idle, 0)
+                            if released["unloaded"]:
+                                LOGGER.info(
+                                    "memory pressure released %d retrieval model(s), %.2f GB",
+                                    len(released["unloaded"]),
+                                    released["freed_bytes"] / (1024**3),
+                                )
+                        except Exception as exc:
+                            LOGGER.warning("retrieval pressure release: %s", exc)
                 if evicted or level >= 4:
                     try:
                         import mlx.core as _mx
@@ -12590,18 +18465,20 @@ async def _memory_pressure_loop(
                         _mx.clear_cache()
                     except Exception:
                         pass
-                print(
-                    "[mtplx] memory pressure guard "
-                    + json.dumps(
-                        {
-                            "level": level,
-                            "bank_entries_evicted": evicted,
-                            "bank_bytes_after": int(
-                                getattr(bank, "total_nbytes", 0) or 0
-                            ),
-                            "deferred_s": deferred_s,
-                        }
+                action_receipt = {
+                    "action": "pressure_trim",
+                    "level": level,
+                    "level_source": level_source,
+                    "allocator_fraction": round(allocator_fraction, 3),
+                    "bank_entries_evicted": evicted,
+                    "bank_bytes_after": int(
+                        getattr(bank, "total_nbytes", 0) or 0
                     ),
+                    "deferred_s": deferred_s,
+                }
+                _record_guard_event(state, action_receipt)
+                print(
+                    "[mtplx] memory pressure guard " + json.dumps(action_receipt),
                     flush=True,
                 )
         except asyncio.CancelledError:
@@ -12612,6 +18489,212 @@ async def _memory_pressure_loop(
             await asyncio.sleep(interval_s)
         except asyncio.CancelledError:
             raise
+
+
+def _idle_pump_enabled() -> bool:
+    raw = str(os.environ.get("MTPLX_SSD_IDLE_PUMP", "1")).strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+# The pump arms only after this much request-level quiet. Well above any
+# foreground->tail-postcommit gap (milliseconds) and above the scheduler's
+# own idle+quiet graces (~0.55 s), so an armed pump can never race a
+# latency-critical tail; well below the ~90 s background-warmup re-fire,
+# so durability lands before the warm ladder re-occupies the idle band.
+_IDLE_PUMP_AFTER_S = 5.0
+_IDLE_PUMP_INTERVAL_S = 2.0
+
+
+def _server_request_idle_s(state: "ServerState") -> float:
+    """Seconds since the last HTTP request activity; 0.0 while any is live.
+
+    Fresh boot (no request ever) counts as infinitely idle: pending
+    durability work (e.g. a re-dispatched encode) may drain freely."""
+    try:
+        if state.has_foreground():
+            return 0.0
+    except BaseException:
+        return 0.0
+    last = max(
+        float(getattr(state, "last_request_started_at", 0.0) or 0.0),
+        float(getattr(state, "last_request_at", 0.0) or 0.0),
+    )
+    if last <= 0.0:
+        return float("inf")
+    return max(0.0, time.time() - last)
+
+
+async def _idle_persistence_pump_loop(
+    state: "ServerState", *, interval_s: float = _IDLE_PUMP_INTERVAL_S
+) -> None:
+    """Guarantee the durability lane forward progress on an idle server.
+
+    Issue #290: the scheduler's persistence band is reachable only while
+    the idle_postcommit deque is COMPLETELY empty, so any self-chaining
+    idle occupant (the 2.8.2 background warm ladder ran rungs back-to-back
+    for minutes after the last request; 2.8.3's 90 s grace narrowed but
+    did not close the window) starves SSD session-cache writes forever —
+    entries sat in the RAM bank with every cold-tier counter at zero and
+    were lost on restart. An idle server is the BEST time to write: once
+    the server has seen several seconds of request-level quiet, arm one
+    pump slot per tick so the persistence head can bridge the chain's
+    not-yet-ready gaps. All existing protections stand: foreground always
+    wins, a foreground submission disarms the pump before admission, a
+    ready idle item still runs first, and the per-tensor encode abort +
+    writer pause keep yielding to real traffic.
+    """
+    scheduler = getattr(state, "model_scheduler", None)
+    if (
+        scheduler is None
+        or not hasattr(scheduler, "pump_persistence")
+        or not hasattr(scheduler, "persistence_pending")
+    ):
+        return
+    while True:
+        try:
+            if (
+                scheduler.persistence_pending() > 0
+                and _server_request_idle_s(state) >= _IDLE_PUMP_AFTER_S
+                and not scheduler.foreground_pending_or_active()
+            ):
+                scheduler.pump_persistence(budget=1)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        try:
+            await asyncio.sleep(interval_s)
+        except asyncio.CancelledError:
+            raise
+
+
+def _shutdown_flush_timeout_s() -> float:
+    """Bounded best-effort window for the shutdown cold-write flush.
+
+    Matches EngineSessionManager.flush_cold_tier's historical 10 s bound.
+    MTPLX_SHUTDOWN_SSD_FLUSH_S overrides; 0 disables the flush entirely.
+    """
+    raw = str(os.environ.get("MTPLX_SHUTDOWN_SSD_FLUSH_S", "")).strip()
+    if not raw:
+        return 10.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 10.0
+    if value != value or value < 0.0:
+        return 10.0
+    return min(value, 60.0)
+
+
+def _shutdown_flush_cold_writes(state: "ServerState") -> dict[str, Any]:
+    """Best-effort, bounded flush of pending SSD session-cache writes.
+
+    Issue #290 (secondary): lifespan shutdown used to go straight to
+    ``scheduler.shutdown(cancel_futures=True)`` — queued persistence
+    encodes were CANCELLED and the writer queue was never drained, so a
+    plain SIGTERM/Ctrl-C silently lost every entry still in flight and the
+    next boot paid a full re-prefill. This runs BEFORE the scheduler
+    shutdown: pump the persistence lane (the owner thread is still alive
+    and no foreground exists during shutdown), then wait out the writer
+    queue's task accounting. Bounded and honest — one console line says
+    how many writes flushed and how many remained.
+    """
+    outcome = {"pending_before": 0, "flushed": 0, "remained": 0, "elapsed_s": 0.0}
+    budget_s = _shutdown_flush_timeout_s()
+    scheduler = getattr(state, "model_scheduler", None)
+    cold_tier = getattr(state, "session_bank_cold_tier", None)
+    sessions = getattr(state, "sessions", None)
+    if budget_s <= 0.0 or cold_tier is None:
+        return outcome
+
+    def _writer_outstanding() -> int:
+        """Staged writes not yet durable — INCLUDING the in-flight one.
+
+        ``writer_queue_depth`` alone misses the write the writer thread
+        has already popped and is moving to disk (measured live: a 619 MB
+        entry showed depth 0 / enqueued 1 / completed 0 while its file was
+        mid-write; an early exit on depth alone let the daemon writer die
+        mid-file). This mirrors the tier's ``flush()`` task accounting.
+        """
+        try:
+            stats = cold_tier.stats()
+            outstanding = (
+                int(stats.get("writes_enqueued") or 0)
+                - int(stats.get("writes_completed") or 0)
+                - int(stats.get("write_failures") or 0)
+                - int(stats.get("writes_cancelled") or 0)
+            )
+            return max(0, outstanding)
+        except BaseException:
+            return 0
+
+    def _persistence_pending() -> int:
+        if scheduler is None or not hasattr(scheduler, "persistence_pending"):
+            return 0
+        try:
+            return int(scheduler.persistence_pending())
+        except BaseException:
+            return 0
+
+    def _persistence_active() -> bool:
+        # A popped encode no longer counts as pending but is still moving
+        # bytes (spill_entry writes blobs directly on the owner thread);
+        # the flush must outwait it or report it as remained.
+        if scheduler is None or not hasattr(scheduler, "stats"):
+            return False
+        try:
+            return scheduler.stats().get("active_kind") == "idle_persistence"
+        except BaseException:
+            return False
+
+    started = time.monotonic()
+    deadline = started + budget_s
+    pending = _persistence_pending() + _writer_outstanding()
+    if pending <= 0 and not _persistence_active():
+        return outcome
+    if _persistence_active():
+        # The running encode is real outstanding work too.
+        pending += 1
+    outcome["pending_before"] = pending
+    print(
+        f"[mtplx] shutdown: flushing {pending} pending SSD session-cache "
+        f"write(s) (bounded {budget_s:.0f}s)...",
+        flush=True,
+    )
+    # Drain the un-run encodes first: each needs an owner-thread slot, and
+    # during shutdown the only possible idle-band occupants are background
+    # chains — exactly what the pump bridges.
+    while (
+        _persistence_pending() > 0 or _persistence_active()
+    ) and time.monotonic() < deadline:
+        try:
+            if scheduler is not None and hasattr(scheduler, "pump_persistence"):
+                scheduler.pump_persistence(budget=4)
+        except BaseException:
+            break
+        time.sleep(0.05)
+    # Then the staged writer queue (file IO on the writer thread).
+    remaining_s = max(0.1, deadline - time.monotonic())
+    flush = getattr(sessions, "flush_cold_tier", None) if sessions is not None else None
+    try:
+        if callable(flush):
+            flush(timeout_s=remaining_s)
+        elif hasattr(cold_tier, "flush"):
+            cold_tier.flush(timeout_s=remaining_s)
+    except BaseException:
+        pass
+    remained = _persistence_pending() + _writer_outstanding()
+    outcome["remained"] = remained
+    outcome["flushed"] = max(0, pending - remained)
+    outcome["elapsed_s"] = round(time.monotonic() - started, 2)
+    print(
+        "[mtplx] shutdown: SSD session cache flushed "
+        f"{outcome['flushed']}/{pending} pending write(s) in "
+        f"{outcome['elapsed_s']}s"
+        + (f"; {remained} remained (bound hit)" if remained else ""),
+        flush=True,
+    )
+    return outcome
 
 
 async def _thermal_poll_loop(state: "ServerState", *, interval_s: float = 1.0) -> None:
@@ -12704,6 +18787,70 @@ class _OwnerStallProbe:
         return None
 
 
+def _qwen4_install_reports(state: Any) -> dict[str, Any]:
+    """Load-time install receipts of the Flash-Next lanes, for /health.
+
+    The engagement proof of a stamped default must be readable without the
+    serve log: the stage-3 kernel report (with its two-kernel routing head
+    block), the fused rope glue's per-item verdicts, and the n-gram table
+    pre-read plan. Absent lanes read as null; nothing here touches the GPU.
+    """
+
+    runtime = getattr(state, "runtime", None)
+    if runtime is None:
+        return {}
+    out: dict[str, Any] = {}
+    stage3 = getattr(runtime, "qwen4_m4_stage3_report", None)
+    if isinstance(stage3, dict):
+        out["m4_stage3"] = stage3
+    glue = getattr(runtime, "_mtplx_qwen4_verify_glue", None)
+    if isinstance(glue, dict):
+        out["verify_glue"] = glue
+    try:
+        model = getattr(runtime, "model", None)
+        text = getattr(model, "language_model", model)
+        prewarm = None
+        for _name, module in getattr(text, "named_modules", lambda: [])():
+            sidecar = getattr(module, "_sidecar", None)
+            receipt = getattr(sidecar, "prewarm_at_load", None)
+            if isinstance(receipt, dict):
+                prewarm = receipt
+                break
+        if prewarm is not None:
+            out["ngram_prewarm"] = prewarm
+    except Exception:
+        pass
+    return out
+
+
+def _log_stream_commit_wait_deferred(
+    state: Any,
+    *,
+    response_id: str | None,
+    session_id: str | None,
+    waited_s: float,
+    streamed_tokens: int,
+) -> None:
+    """One structured line when a stream closes ahead of its postcommit (#425)."""
+
+    try:
+        print(
+            json.dumps(
+                {
+                    "event": "mtplx_stream_commit_wait_deferred",
+                    "response_id": response_id,
+                    "session_id": session_id,
+                    "waited_s": round(float(waited_s), 3),
+                    "completion_tokens": int(streamed_tokens),
+                    "deadline_s": STREAM_COMMIT_WAIT_MAX_S,
+                }
+            ),
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
 def _log_stream_stall_break(
     state: Any,
     *,
@@ -12750,6 +18897,26 @@ def _stream_heartbeat_payload(
         "elapsed_s": max(0.0, float(now_s) - float(stream_started_s)),
         "seconds_since_last_token": max(0.0, float(now_s) - float(last_activity_s)),
     }
+
+
+def _sse_keepalive_interval_s() -> float | None:
+    """Interval for pre-first-token SSE comment heartbeats (#358); None = off.
+
+    MTPLX_SSE_HEARTBEAT=0 disables the comments; MTPLX_SSE_HEARTBEAT_INTERVAL_S
+    overrides the cadence (clamped to >= 1s; unparseable values fall back to
+    the default). Read at stream start — cheap, and tunable without a daemon
+    restart.
+    """
+    if not _env_bool_setting("MTPLX_SSE_HEARTBEAT", default=True):
+        return None
+    raw = os.environ.get("MTPLX_SSE_HEARTBEAT_INTERVAL_S")
+    if raw is None:
+        return SSE_KEEPALIVE_DEFAULT_INTERVAL_S
+    try:
+        interval_s = float(raw)
+    except ValueError:
+        return SSE_KEEPALIVE_DEFAULT_INTERVAL_S
+    return max(SSE_KEEPALIVE_MIN_INTERVAL_S, interval_s)
 
 
 @contextmanager
@@ -12873,9 +19040,7 @@ def _commit_prompt_prefix_for_request(
     tier = getattr(state, "session_bank_cold_tier", None)
     if tier is None or not bool(getattr(tier, "enabled", False)):
         return False
-    min_prefix_tokens = int(
-        getattr(tier, "min_prefix_tokens", 512) or 512
-    )
+    min_prefix_tokens = int(getattr(tier, "min_prefix_tokens", 512) or 512)
     return len(prompt_ids) >= max(512, min_prefix_tokens)
 
 
@@ -12887,6 +19052,8 @@ def _anonymous_coding_agent_tool_request(
     }
     if not names:
         return False
+    # read_file/search_files/terminal/write_file are hermes-agent's wire
+    # names; without them that lane's membership hangs on "patch" alone.
     coding_agent_tools = {
         "bash",
         "edit",
@@ -12896,11 +19063,15 @@ def _anonymous_coding_agent_tool_request(
         "multi_edit",
         "patch",
         "read",
+        "read_file",
+        "search_files",
         "str_replace_editor",
         "task",
+        "terminal",
         "todowrite",
         "webfetch",
         "write",
+        "write_file",
     }
     return bool(names & coding_agent_tools)
 
@@ -12923,9 +19094,7 @@ def _tool_result_ids_from_messages(messages: list[ChatMessage]) -> set[str]:
         if str(message.role).lower() != "tool":
             continue
         tool_call_id = str(
-            message.tool_call_id
-            or _message_extra(message, "tool_call_id")
-            or ""
+            message.tool_call_id or _message_extra(message, "tool_call_id") or ""
         ).strip()
         if tool_call_id:
             ids.add(tool_call_id)
@@ -13003,6 +19172,7 @@ def _live_frontier_envelope_fields(
     session_restore_mode: Any,
     cache_miss_reason: str | None,
     session_keep_live_ref: bool,
+    cached_tokens: Any = None,
 ) -> dict[str, Any]:
     """Frontier hit/miss envelope fields for agent result turns.
 
@@ -13013,7 +19183,7 @@ def _live_frontier_envelope_fields(
     if not request_observability.get("live_frontier_result_turn"):
         return {}
     frontier_hit = bool(session_cache_hit)
-    return {
+    fields: dict[str, Any] = {
         "live_frontier_hit": frontier_hit,
         "live_frontier_restore_mode": session_restore_mode,
         "live_frontier_miss_reason": (
@@ -13021,19 +19191,14 @@ def _live_frontier_envelope_fields(
             if frontier_hit
             else _live_frontier_miss_reason_from_counts(
                 assistant_tool_call_count=int(
-                    request_observability.get(
-                        "live_frontier_assistant_tool_call_count"
-                    )
+                    request_observability.get("live_frontier_assistant_tool_call_count")
                     or 0
                 ),
                 tool_result_count=int(
-                    request_observability.get("live_frontier_tool_result_count")
-                    or 0
+                    request_observability.get("live_frontier_tool_result_count") or 0
                 ),
                 unknown_tool_result_count=int(
-                    request_observability.get(
-                        "live_frontier_unknown_tool_result_count"
-                    )
+                    request_observability.get("live_frontier_unknown_tool_result_count")
                     or 0
                 ),
                 cache_miss_reason=cache_miss_reason,
@@ -13044,6 +19209,19 @@ def _live_frontier_envelope_fields(
             )
         ),
     }
+    canonicalization = (
+        request_observability.get("committed_reasoning_canonicalization") or {}
+    )
+    committed_len = canonicalization.get("committed_len")
+    cached = request_observability.get("cached_tokens")
+    if committed_len is not None and cached is not None:
+        # live_frontier_hit is a legacy any-hit bool; this is the honest
+        # signal — did the reusable prefix actually reach the committed
+        # frontier (2026-08-21: a 3913-of-4661 partial hit reported a clean
+        # frontier and hid the seam walls).
+        fields["live_frontier_extended"] = int(cached) >= int(committed_len) - 1
+        fields["live_frontier_committed_len"] = int(committed_len)
+    return fields
 
 
 def _clear_mlx_cache_after_request(
@@ -13112,9 +19290,7 @@ def _auto_clear_mlx_cache_after_completed_request(
         return None
     request_observability = request_observability or {}
     client = str(
-        request_observability.get("request_client_hint")
-        or request_observability.get("request_client_label")
-        or ""
+        request_observability.get("request_client_evidence") or ""
     ).lower()
     if raw in {"1", "true", "yes", "always"}:
         reason = "after_request_forced"
@@ -13227,6 +19403,9 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "paged_kv_quant_dequant_calls",
     "paged_kv_quant_dequant_time_s",
     "paged_kv_quant_dequant_tokens",
+    "paged_kv_quant_dequant_memo_hits",
+    "paged_kv_quant_dequant_memo_rebuilds",
+    "paged_kv_quant_kernel_calls",
     "paged_gqa_sdpa_calls",
     "paged_gqa_sdpa_calls_by_route",
     "paged_gqa_sdpa_calls_by_phase",
@@ -13344,6 +19523,13 @@ PUBLIC_MTPLX_STATS_KEYS = (
     *MAINTENANCE_TIMING_STATS_KEYS,
     "session_cache_hit",
     "session_prompt_prefix_bank_commit",
+    "session_prefill_store",
+    "pre_first_token_setup_s",
+    "session_restore_served",
+    "prompt_state_total_time_s",
+    "prompt_state_unattributed_time_s",
+    "first_primary_sample_time_s",
+    "first_round",
     "cached_tokens",
     "new_prefill_tokens",
     "cache_source",
@@ -13418,6 +19604,8 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "sampler_policy_temperature",
     "sampler_policy_top_p",
     "sampler_policy_top_k",
+    "draft_sampler_resolved_temperature",
+    "draft_sampler_policy_source",
     "mlx_cache_cleanup",
     "request_cancelled",
     "cancellation_reason",
@@ -13437,6 +19625,13 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "queue_wait_s",
     "active_batch_size",
     "ar_batch_max_observed",
+    "mtp_batch_real_width",
+    "mtp_batch_fixed_width",
+    "mtp_batch_route_id",
+    "target_verify_cycles",
+    "verify_timing_scope",
+    "mlx_finalize_scope",
+    "mtp_batch_session_cache_bypass",
     "mtp_disabled_reason",
     "mtp_depth",
     "speculative_depth",
@@ -13450,6 +19645,9 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "reasoning_reentries",
     "reasoning_tokens",
     "answer_tokens",
+    # Stamped only when finish=length cut the turn inside reasoning and left
+    # content empty (#F3), so quiet envelopes stay byte-stable.
+    "content_empty_reason",
     "reasoning_completion_repair_attempted",
     "reasoning_completion_repair_succeeded",
     "reasoning_completion_repair_skipped",
@@ -13495,7 +19693,13 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "tool_parse_status",
     "tool_calls_emitted",
     "tool_calls_truncated_parallel_disabled",
+    # Stamped only when a length cap cut a tool-call turn (#196/#197), so
+    # quiet envelopes stay byte-stable.
+    "tool_calls_truncated_by_length",
     "raw_tool_markup_suppressed",
+    # Stamped only when a suppressed (unexecuted) tool call got its visible
+    # truth notice (#349), so quiet envelopes stay byte-stable.
+    "unexecuted_tool_call_notice",
     "legacy_bridge_used",
     "hidden_generation_repair_used",
     "early_tool_cancel_used",
@@ -13623,6 +19827,42 @@ PUBLIC_POSTCOMMIT_KEYS = (
 def _public_mtplx_stats(generated: dict[str, Any]) -> dict[str, Any]:
     stats = generated.get("stats") or {}
     public = {key: stats[key] for key in PUBLIC_MTPLX_STATS_KEYS if key in stats}
+    if stats.get("repetition_stop_triggered"):
+        # Exactness law: a repetition-guard stop must be distinguishable
+        # from a natural "stop" in every eval arm. Stamped only when it
+        # fired so quiet envelopes stay byte-stable for existing clients
+        # (and the golden matrix).
+        public["repetition_stop_triggered"] = True
+        reason = stats.get("repetition_stop_reason")
+        if reason is not None:
+            public["repetition_stop_reason"] = str(reason)
+    # #414 telemetry: same quiet-envelope rule. finish_stop_origin is None
+    # on every length/aborted finish, so it joins the envelope only when a
+    # stop actually named its commit path; without this the origin exists
+    # on GenerationStats but never reaches the SSE payload.
+    stop_origin = stats.get("finish_stop_origin")
+    if stop_origin is not None:
+        public["finish_stop_origin"] = str(stop_origin)
+    # Draft-sampler truth keys (same quiet-envelope idiom): stamped only
+    # when the resolution ran, so AR responses — which carry no draft
+    # telemetry at all — and legacy envelopes stay byte-stable.
+    draft_policy = stats.get("draft_sampler_policy")
+    if draft_policy is not None:
+        public["draft_sampler_policy"] = str(draft_policy)
+    if stats.get("draft_sampler_greedy_coupled"):
+        public["draft_sampler_greedy_coupled"] = True
+    draft_ownership = stats.get("draft_sampler_ownership")
+    if draft_ownership is not None:
+        public["draft_sampler_ownership"] = str(draft_ownership)
+    # Adaptive draft-temperature summary (MTPLX_ADAPTIVE_DTEMP): non-empty
+    # only when the gate is on, so disabled runs keep byte-stable envelopes.
+    # With the controller active, draft_sampler_resolved_temperature remains
+    # the request-resolved BASE set-point and this block explains any drift
+    # from it (current_temperature + EMA + transition log) — an adaptive
+    # trajectory is provable telemetry, not a desync.
+    adaptive_dtemp = stats.get("draft_sampler_adaptive_dtemp")
+    if adaptive_dtemp:
+        public["draft_sampler_adaptive_dtemp"] = adaptive_dtemp
     postcommit = stats.get("session_postcommit_snapshot")
     if isinstance(postcommit, dict):
         public["session_postcommit_snapshot"] = {
@@ -13672,6 +19912,8 @@ def _record_stream_cancellation_metric(
     reason: str,
     request_observability: dict[str, Any],
     client_disconnected: bool,
+    mlx_finalize_scope: str | None = None,
+    token_times: list[float] | None = None,
 ) -> None:
     elapsed_s = max(0.0, time.perf_counter() - stream_started_s)
     streamed_tokens = int(streamed_completion_tokens)
@@ -13701,22 +19943,139 @@ def _record_stream_cancellation_metric(
         "session_cache_hit": False,
         "cache_miss_reason": None,
     }
-    cleanup = _auto_clear_mlx_cache_after_completed_request(
-        state,
-        session_id=session_id,
-        request_observability=request_observability,
-    )
-    if cleanup is not None:
-        envelope["mlx_cache_cleanup"] = cleanup
-    envelope.update(_mlx_allocator_public_stats())
+    if token_times:
+        envelope.update(_producer_gap_census(token_times))
+        envelope["sliding_decode_tok_s_first_32"] = _token_window_rate_first(
+            token_times, 32
+        )
+        envelope["sliding_decode_tok_s_last_32"] = _token_window_rate(token_times, 32)
+        if len(token_times) >= 2:
+            span_s = token_times[-1] - token_times[0]
+            if span_s > 0.0 and streamed_tokens > 1:
+                envelope["decode_tok_s"] = (streamed_tokens - 1) / span_s
+                envelope["partial_decode_tok_s"] = envelope["decode_tok_s"]
+    if mlx_finalize_scope is not None:
+        envelope["mlx_finalize_scope"] = str(mlx_finalize_scope)
+    else:
+        cleanup = _auto_clear_mlx_cache_after_completed_request(
+            state,
+            session_id=session_id,
+            request_observability=request_observability,
+        )
+        if cleanup is not None:
+            envelope["mlx_cache_cleanup"] = cleanup
+        envelope.update(_mlx_allocator_public_stats())
     envelope.update(request_observability)
     _record_request_metrics(state, envelope)
-    state.last_request_at = time.time()
-    state.requests_cancelled = int(getattr(state, "requests_cancelled", 0) or 0) + 1
+    if not bool(envelope.get("warmup")):
+        state.last_request_at = time.time()
+        state.requests_cancelled = int(getattr(state, "requests_cancelled", 0) or 0) + 1
     try:
         state.dashboard.bus.publish(
             {
                 "kind": "cancelled",
+                "when_s": time.time(),
+                "envelope": dict(envelope),
+            }
+        )
+    except BaseException:
+        pass
+
+
+def _stream_error_kind(error: BaseException) -> tuple[str, int | None]:
+    """Classify a worker-side terminal error for the request receipt.
+
+    ``memory_refusal`` covers the engine-health 507s (#393 pressure abort,
+    allocation-failure shed): the engine refused the request to protect
+    itself. Everything else keeps its HTTP status when it has one.
+    """
+
+    status: int | None = None
+    raw_status = getattr(error, "status_code", None)
+    if isinstance(raw_status, int):
+        status = raw_status
+    if status == 507 or _is_allocation_failure(error):
+        return "memory_refusal", 507
+    if status is not None:
+        return "http_error", status
+    return "engine_error", None
+
+
+def _stream_error_detail(error: BaseException) -> str:
+    detail = getattr(error, "detail", None)
+    text = str(detail) if detail is not None else str(error)
+    return text[:400]
+
+
+def _record_stream_error_metric(
+    state: ServerState,
+    *,
+    response_id: str,
+    session_id: str | None,
+    prompt_tokens: int,
+    streamed_completion_tokens: int,
+    stream_started_s: float,
+    error: BaseException,
+    request_observability: dict[str, Any],
+    client_disconnected: bool = False,
+    token_times: list[float] | None = None,
+    mode: str = "stream",
+) -> None:
+    """Honest receipt for a request the ENGINE failed or refused (#415).
+
+    Before this, a worker-side error unwound through the stream teardown,
+    which sets the cancel event, so the receipt claimed
+    ``request_cancelled=true / cancellation_reason="stream_cancelled"``
+    while the client had actually received a structured 507. A refusal the
+    operator cannot find in the request log is a refusal they cannot act
+    on; this row names it.
+    """
+
+    error_kind, error_status = _stream_error_kind(error)
+    elapsed_s = max(0.0, time.perf_counter() - stream_started_s)
+    streamed_tokens = int(streamed_completion_tokens)
+    partial_tok_s = streamed_tokens / elapsed_s if elapsed_s > 0.0 else 0.0
+    envelope: dict[str, Any] = {
+        "mode": mode,
+        "request_id": response_id,
+        "session_id": session_id,
+        "prompt_tokens": int(prompt_tokens),
+        "completion_tokens": streamed_tokens,
+        "generated_tokens": streamed_tokens,
+        "request_elapsed_s": elapsed_s,
+        "elapsed_s": elapsed_s,
+        "server_elapsed_s": elapsed_s,
+        "decode_elapsed_s": elapsed_s,
+        "request_cancelled": False,
+        "stream_cancelled_by_client": bool(client_disconnected),
+        "stream_error": True,
+        "error_kind": error_kind,
+        "error_status": error_status,
+        "error_detail": _stream_error_detail(error),
+        "memory_refusal": error_kind == "memory_refusal",
+        "streamed_completion_tokens": streamed_tokens,
+        "decode_tok_s": partial_tok_s,
+        "request_tok_s": partial_tok_s,
+        "tok_s": partial_tok_s,
+        "server_tok_s": partial_tok_s,
+        "partial_decode_tok_s": partial_tok_s,
+        "partial_request_tok_s": partial_tok_s,
+        "session_cache_hit": False,
+        "cache_miss_reason": None,
+    }
+    if token_times:
+        envelope.update(_producer_gap_census(token_times))
+    # Allocator truth at failure time — for memory refusals this is the
+    # diagnosis, not decoration.
+    envelope.update(_mlx_allocator_public_stats())
+    envelope.update(request_observability)
+    _record_request_metrics(state, envelope)
+    if not bool(envelope.get("warmup")):
+        state.last_request_at = time.time()
+    try:
+        state.dashboard.bus.publish(
+            {
+                "kind": "request_error",
                 "when_s": time.time(),
                 "envelope": dict(envelope),
             }
@@ -13765,7 +20124,13 @@ def _request_observability(
             "x-mtplx-request-id",
         }
     }
+    client_links = {}
+    for name in ("turn", "entry"):
+        value = str(headers.get(f"x-mtplx-client-{name}-id") or "")
+        if _CLIENT_REQUEST_ID_RE.fullmatch(value):
+            client_links[f"request_client_{name}_id"] = value
     return {
+        **client_links,
         "request_message_count": len(request.messages),
         "request_message_roles": [message.role for message in request.messages],
         "request_message_chars": [
@@ -13790,6 +20155,11 @@ def _request_observability(
         "request_depth": int(request_depth),
         "request_last_user_preview": user_texts[-1][:180] if user_texts else None,
         "request_last_user_chars": len(user_texts[-1]) if user_texts else 0,
+        **(
+            {"anthropic_max_tokens_defaulted": True}
+            if getattr(request, "anthropic_max_tokens_defaulted", False)
+            else {}
+        ),
     }
 
 
@@ -13852,17 +20222,16 @@ def _opencode_default_sampler_override(
     default_top_p: float,
     default_top_k: int,
 ) -> SamplerConfig | None:
-    client_hint = str(request_observability.get("request_client_hint") or "").lower()
+    client_hint = str(
+        request_observability.get("request_client_evidence") or ""
+    ).lower()
     if "opencode" not in client_hint:
         return None
     simple_chitchat = _is_simple_chitchat_text(_last_user_text(messages))
     opencode_default_sampler = (
         (request_temperature is None or abs(float(request_temperature) - 0.55) < 1e-9)
         and (request_top_p is None or abs(float(request_top_p) - 1.0) < 1e-9)
-        and (
-            request_top_k is None
-            or int(request_top_k) == int(default_top_k)
-        )
+        and (request_top_k is None or int(request_top_k) == int(default_top_k))
     )
     if not tools_active and not simple_chitchat:
         return None
@@ -13889,24 +20258,55 @@ def _opencode_default_sampler_override(
     )
 
 
-def _opencode_default_draft_sampler_for_request(
+def _opencode_launch_default_draft_policy(
     state: ServerState,
     request_observability: dict[str, Any],
-) -> SamplerConfig | None:
-    launched = getattr(state, "draft_sampler", None)
-    if not isinstance(launched, SamplerConfig):
-        return None
-    request_observability["draft_sampler_policy"] = "launch_default"
+) -> None:
+    """Stamp the launch_default draft ownership tier for the OpenCode
+    sampler normalization.
+
+    Server-injected values are NOT a client request: the draft sampler
+    stays owned by the launch policy, so per-request resolution (family
+    curve + greedy coupling) still runs instead of freezing a
+    "request_explicit" copy of the launch sampler. Only the tier and the
+    launched values are recorded here; the resolver stamps the truthful
+    resolution.
+    """
+    request_observability["draft_sampler_ownership"] = "launch_default"
     request_observability["draft_sampler_policy_reason"] = (
-        "OpenCode default target sampler normalized; keep the launched "
-        "model-contract proposal sampler for speculative decoding"
+        "OpenCode default target sampler normalized; draft resolution "
+        "stays launch-owned (family curve + greedy coupling still run)"
     )
-    request_observability["draft_sampler_policy_temperature"] = float(
-        launched.temperature
-    )
-    request_observability["draft_sampler_policy_top_p"] = float(launched.top_p)
-    request_observability["draft_sampler_policy_top_k"] = int(launched.top_k)
-    return launched
+    launched = getattr(state, "draft_sampler", None)
+    if isinstance(launched, SamplerConfig):
+        request_observability["draft_sampler_policy_temperature"] = float(
+            launched.temperature
+        )
+        request_observability["draft_sampler_policy_top_p"] = float(
+            launched.top_p
+        )
+        request_observability["draft_sampler_policy_top_k"] = int(
+            launched.top_k
+        )
+
+
+def _bank_history_policy(state: "ServerState") -> str:
+    """The MTP-history policy every bank store, lookup and fingerprint uses.
+
+    MTP runtimes bank prefixes under ``committed`` (the committed MTP-history
+    cache shape). A target-only AR runtime (``--no-load-mtp``) has no MTP
+    head: generation degrades its prefill to the ``cycle`` path and the
+    postcommit store already banked under ``cycle`` — while the lookups, the
+    prefill store and the policy fingerprint kept saying ``committed``. The
+    bank compares the two strings, so every postcommit entry (the longest
+    prefix, the one the next turn matches) was refused with
+    ``policy_mismatch`` and an AR-only Hermes or Pi session re-prefilled its
+    whole prompt on every top-level turn (#465: 14.5k tokens, ~2 minutes per
+    turn on an M1 Max; the idle stall in #455 on an M3 Ultra). One answer per
+    runtime, derived here, used everywhere.
+    """
+    runtime = getattr(state, "runtime", None)
+    return "committed" if bool(getattr(runtime, "mtp_enabled", True)) else "cycle"
 
 
 def _policy_fingerprint(
@@ -13948,33 +20348,55 @@ def _policy_fingerprint(
         _reasoning_history_fingerprint_component(state),
         f"openai_bridge={_OPENAI_BRIDGE_POLICY_VERSION}",
         f"tool_prompt_mode={effective_tool_prompt_mode}",
+        # Per-request steering that rides a TRANSIENT TRAILING user turn --
+        # forced tool_choice, the post-tool answer contract, the read-only
+        # force-answer contract, the Pi convergence contract -- is excluded
+        # from the cache identity on purpose. Their bytes sit after the stable
+        # prefix the next turn resends (see _transient_trailing_user_sentinel_
+        # texts), so the KV of that prefix is identical with or without them;
+        # keying the bank on them made every transition round (Pi's
+        # convergence flip, a forced write, a force-answer turn) miss the whole
+        # session and re-prefill it cold, one harness at a time (agent-session
+        # gate, 2026-09-03: forced write round at 41k = 41 s + 44 s cold).
+        # A bank entry is exact for its token ids; the fingerprint only has to
+        # carry what changes the KV or the MTP history WITHOUT changing the
+        # tokens (model, draft head, depth policy, history policy).
         "tool_contract="
         + _tool_prompt_policy_version_for_request(
             tools_active=tools_active,
             tool_prompt_mode=effective_tool_prompt_mode,
             no_tools_contract_active=no_tools_contract_active,
-            read_only_force_answer_contract_active=read_only_force_answer_contract_active,
-            pi_convergence_contract_active=pi_convergence_contract_active,
-            post_tool_answer_contract_active=post_tool_answer_contract_active,
         ),
-        f"tool_choice={_tool_choice_policy_signature(tool_choice)}",
         f"no_tools_contract={int(bool(no_tools_contract_active))}",
-        f"post_tool_answer_contract={int(bool(post_tool_answer_contract_active))}",
-        "read_only_force_answer_contract="
-        f"{int(bool(read_only_force_answer_contract_active))}",
-        f"pi_convergence_contract={int(bool(pi_convergence_contract_active))}",
         f"simple_chat_contract={int(bool(simple_chat_contract_active))}",
         f"opencode_prompt_contract={opencode_prompt_contract_profile or 'none'}",
         f"generation_mode={effective_mode}",
         f"depth={effective_depth}",
-        f"hidden_variant={state.session_hidden_variant or 'none'}",
-        f"mtp_history_policy={state.session_mtp_history_policy}",
+        "hidden_variant=post_norm",
+        f"mtp_history_policy={_bank_history_policy(state)}",
         f"draft_head={state.draft_head_identity}",
         f"adaptive={json.dumps(adaptive, sort_keys=True, separators=(',', ':'))}",
         f"proposal_cache={json.dumps(proposal_cache, sort_keys=True, separators=(',', ':'))}",
         f"online_hidden={json.dumps(online_hidden, sort_keys=True, separators=(',', ':'))}",
     ]
     normalized_cache_scope = str(cache_scope or "").strip()
+    if _model_family_for_state(state) == "qwen4_exp":
+        from mtplx.models.qwen4_exp import vision_qsa_enabled
+
+        # Old vision entries used dense attention, including their text
+        # prefixes. They must not seed the corrected sparse model path.
+        parts.append(f"vision_attention=mrope_qsa_v1:{int(vision_qsa_enabled())}")
+    mtp_batch_lane = getattr(state, "mtp_batch_lane", None)
+    if mtp_batch_lane is not None:
+        parts.extend(
+            (
+                "mtp_batch_numerics="
+                f"{getattr(mtp_batch_lane, 'numerics_profile', 'unknown')}",
+                f"mtp_batch_route={getattr(mtp_batch_lane, 'route_id', 'unknown')}",
+                "mtp_batch_config="
+                f"{getattr(mtp_batch_lane, 'config_fingerprint', 'unknown')}",
+            )
+        )
     if normalized_cache_scope and normalized_cache_scope != "stable":
         parts.append(f"cache_scope={normalized_cache_scope}")
     return ";".join(parts)
@@ -13986,7 +20408,7 @@ def _session_cache_scope_for_request(
     headers: Mapping[str, str],
     metadata: Mapping[str, Any],
 ) -> str:
-    client_hint = str(_request_client_hint_from_headers(headers, metadata) or "")
+    client_hint = str(_request_client_hint_from_request(headers, metadata) or "")
     if "opencode" not in client_hint:
         return "stable"
     launch_id = str(getattr(state.args, "app_launch_id", "") or "").strip()
@@ -14000,7 +20422,7 @@ def _is_opencode_client(
     headers: Mapping[str, str],
     metadata: Mapping[str, Any],
 ) -> bool:
-    client_hint = str(_request_client_hint_from_headers(headers, metadata) or "")
+    client_hint = str(_request_client_hint_from_request(headers, metadata) or "")
     return "opencode" in client_hint
 
 
@@ -14009,7 +20431,7 @@ def _is_hermes_client(
     headers: Mapping[str, str],
     metadata: Mapping[str, Any],
 ) -> bool:
-    client_hint = str(_request_client_hint_from_headers(headers, metadata) or "")
+    client_hint = str(_request_client_hint_from_request(headers, metadata) or "")
     return "hermes" in client_hint
 
 
@@ -14038,7 +20460,7 @@ def _agent_tool_contract_client_hint(
     headers: Mapping[str, str],
     metadata: Mapping[str, Any],
 ) -> str | None:
-    client_hint = str(_request_client_hint_from_headers(headers, metadata) or "")
+    client_hint = str(_request_client_hint_from_request(headers, metadata) or "")
     for marker in _TOOL_CONTRACT_AGENT_CLIENT_HINTS:
         if marker in client_hint:
             return marker
@@ -14051,6 +20473,7 @@ def _tool_prompt_mode_for_request(
     headers: Mapping[str, str],
     metadata: Mapping[str, Any],
     tools_active: bool,
+    backend: BackendDescriptor | None = None,
 ) -> tuple[str, dict[str, Any]]:
     launch_mode = _tool_prompt_mode_from_args(args)
     requested_mode = _request_tool_prompt_mode_override(
@@ -14061,7 +20484,30 @@ def _tool_prompt_mode_for_request(
         headers=headers,
         metadata=metadata,
     )
-    if requested_mode is not None:
+    # Callers with a ServerState pass the resolved descriptor: runtime-sniffed
+    # variants (LFM2 on the mlx_lm_ar lane) carry a required mode the plain
+    # backend_id lookup cannot see.
+    if backend is None:
+        backend = descriptor_for_backend_id(getattr(args, "backend_id", None))
+    required_mode = backend.required_tool_prompt_mode
+    if required_mode is not None:
+        if requested_mode is not None and requested_mode != required_mode:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"backend {backend.backend_id} requires tool_prompt_mode="
+                    f"{required_mode}"
+                ),
+            )
+        mode = required_mode
+        source = f"backend:{backend.backend_id}"
+    elif _agent_rewrites_mode() == "off":
+        # Hard passthrough (#282): the chat template owns the tool
+        # declaration natively and no MTPLX contract message is injected.
+        # Only a backend-required mode (protocol, not policy) outranks it.
+        mode = _TOOL_PROMPT_MODE_NATIVE
+        source = "agent_rewrites_off"
+    elif requested_mode is not None:
         mode = requested_mode
         source = "request"
     elif tools_active and client_hint == "opencode":
@@ -14137,9 +20583,7 @@ def _opencode_tool_history_restore_policy(
         tool_result_history_present=tool_result_history_present,
     )
     live_frontier_restore = (
-        eligible
-        and not cache_bypass
-        and _opencode_tool_history_live_frontier_enabled()
+        eligible and not cache_bypass and _opencode_tool_history_live_frontier_enabled()
     )
     return {
         "eligible": bool(eligible),
@@ -14238,6 +20682,10 @@ def _adaptive_config(
                 "decrease_after": int(args.adaptive_decrease_after),
             }
         )
+    elif policy == "cost":
+        config["marginal_ms_prior"] = float(
+            getattr(args, "adaptive_cost_marginal_ms", 7.0) or 7.0
+        )
     elif policy == "expected_value":
         configured_base_depth = max(1, int(args.adaptive_ev_base_depth))
         effective_base_depth = max(
@@ -14293,6 +20741,15 @@ def _make_adaptive_policy(
             increase_after=int(args.adaptive_increase_after),
             decrease_after=int(args.adaptive_decrease_after),
         )
+    if policy == "cost":
+        from mtplx.adaptive import CostModelDepthPolicy
+
+        return CostModelDepthPolicy(
+            max_depth=effective_max_depth,
+            min_depth=effective_min_depth,
+            marginal_ms=float(getattr(args, "adaptive_cost_marginal_ms", 0.0) or 0.0)
+            or None,
+        )
     if policy == "expected_value":
         effective_base_depth = max(
             effective_min_depth,
@@ -14313,9 +20770,7 @@ def _make_adaptive_policy(
             min_extra_accept_probability=float(
                 args.adaptive_ev_min_extra_accept_probability
             ),
-            warmup_full_depth_cycles=int(
-                args.adaptive_ev_warmup_full_depth_cycles
-            ),
+            warmup_full_depth_cycles=int(args.adaptive_ev_warmup_full_depth_cycles),
             exploration_interval=int(args.adaptive_ev_exploration_interval),
         )
     raise ValueError(f"unknown adaptive policy: {policy}")
@@ -14329,6 +20784,7 @@ def _store_retokenized_history_snapshot(
     assistant_content: str,
     assistant_tool_calls: list[dict[str, Any]] | None = None,
     thinking_enabled: bool,
+    reasoning_effort: str | None = None,
     policy_fingerprint: str,
     acquire_model_lock_blocking: bool = True,
     tool_specs: list[dict[str, Any]] | None = None,
@@ -14340,6 +20796,7 @@ def _store_retokenized_history_snapshot(
     keep_live_ref: bool = True,
     tool_prompt_mode: str | None = None,
     strip_tool_call_preamble_text: bool = False,
+    committed_stream_ids: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     if session_id is None:
         return {"stored": False, "reason": "no_session_id"}
@@ -14368,9 +20825,11 @@ def _store_retokenized_history_snapshot(
         assistant_content=assistant_content,
         assistant_tool_calls=assistant_tool_calls,
         thinking_enabled=thinking_enabled,
+        reasoning_effort=reasoning_effort,
         tool_specs=tool_specs,
         tool_prompt_mode=tool_prompt_mode,
         strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+        committed_stream_ids=committed_stream_ids,
     )
     if not history_ids:
         return {"stored": False, "reason": "empty_boundary_prefix"}
@@ -14405,28 +20864,102 @@ def _store_retokenized_history_snapshot(
     }
     bank_budget = int(getattr(state.sessions.bank, "per_session_max_bytes", 0) or 0)
     estimated_nbytes = 0
-    if best_prefix_len > 0 and best_prefix_nbytes > 0:
+    if best_prefix_len > 0:
         # SessionBank snapshots scale roughly with prefix length. If the
         # previous committed boundary is already close to the per-session
         # cap, attempting to materialize a larger postcommit snapshot can
-        # burn tens of seconds only to be rejected as oversized. Skip that
-        # best-effort cache maintenance before touching MLX arrays; the
-        # foreground user request can still reuse the existing shorter
-        # prefix and prefill only the suffix.
-        estimated_nbytes = int(
-            (float(best_prefix_nbytes) * float(history_tokens) / float(best_prefix_len))
-            * 1.03
-        )
+        # burn tens of seconds only to be rejected as oversized. Project the
+        # size before touching MLX arrays. A zero-byte best prefix is a
+        # live-ref lease (the bank's own oversized fallback); its recorded
+        # rejected-snapshot size keeps the projection honest in the
+        # oversized regime, where entry.nbytes reads 0.
+        projection_base_nbytes = int(best_prefix_nbytes)
+        if projection_base_nbytes <= 0:
+            projection_base_nbytes = int(
+                getattr(best_prefix, "oversized_nbytes", 0) or 0
+            )
+        if projection_base_nbytes > 0:
+            estimated_nbytes = int(
+                (
+                    float(projection_base_nbytes)
+                    * float(history_tokens)
+                    / float(best_prefix_len)
+                )
+                * 1.03
+            )
+    oversized_nbytes_override: int | None = None
     if bank_budget > 0 and estimated_nbytes > bank_budget:
-        return {
-            "stored": False,
-            "mode": "retokenized_history",
-            "reason": "estimated_oversized_snapshot",
-            "estimated_nbytes": int(estimated_nbytes),
-            "budget": int(bank_budget),
-            "best_prefix_nbytes": int(best_prefix_nbytes),
-            **prefix_probe,
-        }
+        if session is None or not keep_live_ref:
+            # No live-ref lease is possible here (no EngineSession to track
+            # the frontier for, or live refs are disallowed for this
+            # request, e.g. a forked busy session), so the prefill + put
+            # below is provably doomed: put() would reject the snapshot as
+            # oversized and has no fallback to install. Skip the model work
+            # — but never silently: the frontier still advances on the
+            # session (the retokenized ids are pure tokenizer output, no
+            # GPU work), and the once-per-session ceiling warning fires.
+            # Without the frontier commit, committed_token_ids froze at the
+            # last under-budget boundary and every later turn re-prefilled
+            # a growing suffix forever (issue #255: cache_read plateaued at
+            # 38335, 111k prompts paid 277s TTFT).
+            try:
+                state.sessions.bank.warn_oversized_snapshot_skip(
+                    session_id, needed_nbytes=int(estimated_nbytes)
+                )
+            except BaseException:
+                pass
+            outcome = {
+                "stored": False,
+                "mode": "retokenized_history",
+                "reason": "estimated_oversized_snapshot",
+                "estimated_nbytes": int(estimated_nbytes),
+                "budget": int(bank_budget),
+                "best_prefix_nbytes": int(best_prefix_nbytes),
+                **prefix_probe,
+            }
+            if session is not None and history_vision_splice is not None:
+                # The engine-session frontier is raw-token-id keyed and has
+                # no image identity, so a committed vision frontier lets a
+                # later request with DIFFERENT pixels but identical pad ids
+                # extend/restore another image's KV (the pillar alias leg).
+                # Vision turns keep their warm reuse through the bank lane,
+                # whose keys are content surrogates. Before the F39 frontier
+                # fix these turns never committed by accident; now they skip
+                # deliberately.
+                outcome["session_commit"] = {
+                    "committed": False,
+                    "reason": "vision_session_frontier_skip",
+                    "prefix_len": int(getattr(session, "prefix_len", 0) or 0),
+                }
+                return outcome
+            if session is not None:
+                try:
+                    commit = session.commit_retokenized_prefix(
+                        token_ids=history_ids,
+                        expected_revision=expected_session_revision,
+                        nbytes=0,
+                    )
+                    outcome["session_commit"] = {
+                        "committed": bool(commit.committed),
+                        "reason": commit.reason,
+                        "prefix_len": int(commit.prefix_len),
+                    }
+                except BaseException as exc:
+                    outcome["session_commit"] = {
+                        "committed": False,
+                        "reason": f"session_commit_error:{type(exc).__name__}",
+                        "prefix_len": int(getattr(session, "prefix_len", 0) or 0),
+                    }
+            return outcome
+        # A lease is possible: do the postcommit anyway (restore the best
+        # banked/live prefix, forward only the true remainder) and route the
+        # store through put()'s existing oversized branch via
+        # nbytes_override, which skips snapshot materialization entirely and
+        # installs the live-ref lease (#150/#229 policy — the same fallback
+        # oversized generation-final commits already ride). The next turn
+        # restores the lease at the full canonical frontier instead of the
+        # frozen last-under-budget boundary.
+        oversized_nbytes_override = int(estimated_nbytes)
     if _abort_requested():
         return {
             "stored": False,
@@ -14461,6 +20994,17 @@ def _store_retokenized_history_snapshot(
     # (chat-template encoding is deterministic for the same messages and
     # tools), so `longest_prefix` matches and only the new user turn +
     # assistant turn need to be forward-AR'd.
+    # AR-only runtimes (laguna_ar target-only) have no MTP head. Banking under
+    # the "committed" MTP-history policy would drive
+    # restore_or_prefill_prompt_state into the committed-history prefill branch,
+    # which calls rt.make_mtp_cache() and raises "MTP is not enabled for this
+    # runtime" (the 2026-07-22 laguna serving-window failure). Route the
+    # postcommit re-prefill through the AR (cycle) path instead: the trunk cache
+    # is still banked for next-turn prefix reuse, and the stored policy metadata
+    # stays consistent with what the next AR turn looks up. MTP runtimes keep
+    # the committed policy unchanged. The lookups and the prefill store derive
+    # the same answer from _bank_history_policy (#465).
+    history_mtp_policy = _bank_history_policy(state)
     try:
         try:
             if _abort_requested():
@@ -14469,21 +21013,35 @@ def _store_retokenized_history_snapshot(
                 prompt_state = restore_or_prefill_prompt_state(
                     state.runtime,
                     history_ids,
-                    mtp_hidden_variant=state.session_hidden_variant,
-                    mtp_history_policy=state.session_mtp_history_policy,
+                    mtp_hidden_variant="post_norm",
+                    mtp_history_policy=history_mtp_policy,
                     session_bank=state.sessions.bank,
                     template_hash=state.template_hash,
                     draft_head_identity=state.draft_head_identity,
                     policy_fingerprint=policy_fingerprint,
                     abort_check=abort_check,
                     vision_splice=history_vision_splice,
-                    target_only=state.session_mtp_history_policy == "none",
+                    # In the oversized regime the store-on-prefill inside the
+                    # restore is provably doomed (computed nbytes would beat
+                    # the cap with keep_live_ref hardwired False there):
+                    # don't let it materialize a multi-GiB snapshot only to
+                    # throw it away. None follows the env gate as before.
+                    store_prefix_snapshot=(
+                        False if oversized_nbytes_override is not None else None
+                    ),
                 )
             if _abort_requested():
                 raise PostcommitAbort(_abort_reason())
+            # Oversized regime: put() takes its nbytes_override branch, which
+            # never reads mtp_history_snapshot (the lease carries live refs
+            # instead) — snapshotting the MTP cache here would be pure waste.
+            # Hand the live committed-MTP cache as a ref so the lease stays
+            # restorable under the committed history policy (the same pairing
+            # the bank's lease restore trims and returns together).
             mtp_snapshot = (
                 snapshot_cache(prompt_state.committed_mtp_cache)
                 if prompt_state.committed_mtp_cache is not None
+                and oversized_nbytes_override is None
                 else None
             )
             if _abort_requested():
@@ -14494,21 +21052,31 @@ def _store_retokenized_history_snapshot(
                 cache=prompt_state.trunk_cache,
                 logits=prompt_state.logits,
                 hidden=prompt_state.hidden,
-                hidden_variant=state.session_hidden_variant,
+                hidden_variant="post_norm",
                 keep_live_ref=bool(keep_live_ref),
                 session_id=session_id,
                 template_hash=state.template_hash,
-                mtp_history_policy=state.session_mtp_history_policy,
+                mtp_history_policy=history_mtp_policy,
                 draft_head_identity=state.draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
                 gdn_boundaries=list(
                     getattr(prompt_state, "gdn_boundaries", None) or []
                 ),
                 mtp_history_snapshot=mtp_snapshot,
+                mtp_history_cache_ref=(
+                    prompt_state.committed_mtp_cache
+                    if oversized_nbytes_override is not None
+                    else None
+                ),
                 snapshot_epoch=len(history_ids),
                 mtp_snapshot_epoch=len(history_ids)
                 if mtp_snapshot is not None
+                or (
+                    oversized_nbytes_override is not None
+                    and prompt_state.committed_mtp_cache is not None
+                )
                 else None,
+                nbytes_override=oversized_nbytes_override,
             )
         except PostcommitAbort:
             return {
@@ -14530,6 +21098,17 @@ def _store_retokenized_history_snapshot(
             **prefix_probe,
         }
     session_commit: dict[str, Any] | None = None
+    if session is not None and history_vision_splice is not None:
+        # Raw-id session frontiers carry no image identity; a committed
+        # vision frontier aliases DIFFERENT pixels behind identical pad ids
+        # (pillar alias leg). Vision reuse rides the surrogate-keyed bank
+        # entry stored above; the session frontier deliberately stays put.
+        session_commit = {
+            "committed": False,
+            "reason": "vision_session_frontier_skip",
+            "prefix_len": int(getattr(session, "prefix_len", 0) or 0),
+        }
+        session = None
     if session is not None:
         try:
             if _abort_requested():
@@ -14556,7 +21135,7 @@ def _store_retokenized_history_snapshot(
                 "reason": f"session_commit_error:{type(exc).__name__}",
                 "prefix_len": int(getattr(session, "prefix_len", 0) or 0),
             }
-    return {
+    outcome = {
         "stored": True,
         "mode": "retokenized_history",
         "prefix_len": entry.prefix_len,
@@ -14587,6 +21166,16 @@ def _store_retokenized_history_snapshot(
         "cache_miss_reason": getattr(prompt_state, "cache_miss_reason", None),
         "session_commit": session_commit,
     }
+    if oversized_nbytes_override is not None:
+        # Quiet-envelope stamp: only oversized-regime commits carry these, so
+        # under-budget envelopes stay byte-stable. The `[mtplx] idle async
+        # session postcommit ...` log line then shows the projected bytes,
+        # the budget, and that the store is a live-ref lease — a byte
+        # ceiling is never silent (#255).
+        outcome["estimated_nbytes"] = int(oversized_nbytes_override)
+        outcome["budget"] = int(bank_budget)
+        outcome["live_ref_lease"] = bool(getattr(entry, "live_ref_only", False))
+    return outcome
 
 
 def _history_ids_for_postcommit(
@@ -14596,9 +21185,12 @@ def _history_ids_for_postcommit(
     assistant_content: str,
     assistant_tool_calls: list[dict[str, Any]] | None,
     thinking_enabled: bool,
+    reasoning_effort: str | None = None,
     tool_specs: list[dict[str, Any]] | None = None,
     tool_prompt_mode: str | None = None,
     strip_tool_call_preamble_text: bool = False,
+    committed_stream_ids: Sequence[int] | None = None,
+    session_committed_ids: Sequence[int] | None = None,
 ) -> tuple[list[int], Any]:
     """Retokenized next-turn history ids, plus a VisionSplice when the
     history carries images.
@@ -14613,9 +21205,15 @@ def _history_ids_for_postcommit(
     worse, mis-matching) entries.
     """
 
+    # The retokenized history must render with the SAME effort the live
+    # request used: the xhigh/low effort instruction is part of the rendered
+    # prompt, so re-rendering at the state default poisons the boundary for
+    # every non-default-effort session (drop-day receipt: medium sessions
+    # ran the bank permanently cold while xhigh warm-hit).
     reasoning_effort = _reasoning_effort_for_state(
         state,
         thinking_enabled=thinking_enabled,
+        request_effort=reasoning_effort,
     )
     effective_tool_prompt_mode = _normalize_tool_prompt_mode(
         tool_prompt_mode,
@@ -14634,6 +21232,7 @@ def _history_ids_for_postcommit(
         )
     except ValueError:
         return [], None
+    postcommit_transcript_stats: Any | None = None
     if tool_specs:
         # The generation prompt may compact the current large read as an
         # active-read excerpt. Once the assistant response is appended, that
@@ -14645,7 +21244,7 @@ def _history_ids_for_postcommit(
                 *history_messages,
                 ChatMessage(role="user", content=_POSTCOMMIT_SENTINEL_CONTENT),
             ]
-        history_messages, _stats = _canonicalize_agent_transcript(
+        history_messages, postcommit_transcript_stats = _canonicalize_agent_transcript(
             canonicalization_messages,
             tools_active=True,
             strip_tool_call_preamble_text=strip_tool_call_preamble_text,
@@ -14658,6 +21257,88 @@ def _history_ids_for_postcommit(
             == _POSTCOMMIT_SENTINEL_CONTENT
         ):
             history_messages = history_messages[:-1]
+    # Committed-think substitution for the postcommit (audit F11 #3, the
+    # issue #269 bug): the banked next-turn prefix must be built from the
+    # SAME canonical encoding the next request will actually send. The next
+    # request's committed-reasoning gate substitutes each assistant turn's
+    # think interior from the session's committed stream — including the
+    # turn generated THIS request — so a postcommit rendered without those
+    # interiors never byte-extends the committed session
+    # ("retokenized_prefix_not_extending_session" on every commit) and the
+    # banked entry never matches the next prompt either. Substituting from
+    # the decoded committed stream (prompt + generated ids) through the same
+    # helper the gate uses keeps producer and consumer on one choke point.
+    # A client-planted committed-reasoning field is scrubbed inside the
+    # substitution walk; when the walk is skipped, the explicit scrub below
+    # keeps allow_committed_reasoning encodes clean.
+    substitution_walked = False
+    if (
+        committed_stream_ids
+        and thinking_enabled
+        and _committed_reasoning_canonicalization_enabled()
+        and not getattr(state.args, "strip_assistant_reasoning_history", False)
+        and not _reasoning_history_scoped_active(state)
+        and _transcript_dropped_assistant_turns(postcommit_transcript_stats) == 0
+    ):
+        try:
+            committed_text = state.runtime.tokenizer.decode(
+                [int(token) for token in committed_stream_ids]
+            )
+        except Exception:
+            committed_text = ""
+        if committed_text:
+            committed_turns = _committed_assistant_turns(committed_text)
+            # F11 #3 follow-up (founder-session receipt 2026-08-21): the
+            # request-local stream renders an EMPTY think interior for any
+            # history turn the committed-reasoning gate could not
+            # canonicalize (stale-frontier race, fail-open), and an empty
+            # interior here republishes that regression — the committed
+            # session oscillates real→empty→real and the gate loses its
+            # substrate. The session's committed stream is KV-true for every
+            # turn it holds: backfill empty ordinals from it.
+            if session_committed_ids:
+                try:
+                    session_text = state.runtime.tokenizer.decode(
+                        [int(token) for token in session_committed_ids]
+                    )
+                except Exception:
+                    session_text = ""
+                if session_text:
+                    session_turns = _committed_assistant_turns(session_text)
+                    committed_turns = [
+                        (
+                            session_turns[index]
+                            if not turn[0]
+                            and index < len(session_turns)
+                            and session_turns[index][0]
+                            else turn
+                        )
+                        for index, turn in enumerate(committed_turns)
+                    ]
+            if any(interior for interior, _gate, _markup in committed_turns):
+                history_messages, _substituted = (
+                    _substitute_committed_reasoning_messages(
+                        history_messages,
+                        committed_turns,
+                        strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                    )
+                )
+                if _reasoning_history_preserve_echo_active(state) and history_messages:
+                    # An older rewritten/interrupted turn can close the
+                    # history substitution walk. This response is owned by
+                    # this request: match its own visible/tool body before
+                    # carrying its reasoning, independently of older turns.
+                    # Full snapshot compatibility still compares every token.
+                    current, _ = _substitute_committed_reasoning_messages(
+                        history_messages[-1:], committed_turns[-1:],
+                        strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                    )
+                    history_messages[-1:] = current
+                substitution_walked = True
+    if not substitution_walked:
+        history_messages = [
+            _scrub_inbound_committed_reasoning(message) for message in history_messages
+        ]
     next_turn_prefix_ids = _postcommit_next_turn_prefix_ids(
         state.runtime.tokenizer,
         history_messages,
@@ -14665,6 +21346,7 @@ def _history_ids_for_postcommit(
         reasoning_effort=reasoning_effort,
         strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
         scoped_reasoning_history=_reasoning_history_scoped_active(state),
+        preserve_reasoning_history=_reasoning_history_preserve_echo_active(state),
         tools=tool_specs,
         assistant_tool_calls=assistant_tool_calls,
         tool_prompt_mode=effective_tool_prompt_mode,
@@ -14676,9 +21358,14 @@ def _history_ids_for_postcommit(
         reasoning_effort=reasoning_effort,
         strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
         scoped_reasoning_history=_reasoning_history_scoped_active(state),
+        preserve_reasoning_history=_reasoning_history_preserve_echo_active(state),
         add_generation_prompt=False,
         tools=tool_specs,
         tool_prompt_mode=effective_tool_prompt_mode,
+        # Substituted interiors ride _COMMITTED_REASONING_FIELD on
+        # server-built copies; without this flag the fallback encode
+        # silently drops them and the prefix stops extending the session.
+        allow_committed_reasoning=True,
     )
     if not postcommit_vision_images or not history_ids:
         return list(history_ids or []), None
@@ -14700,16 +21387,21 @@ def _generation_final_postcommit_compatibility(
     assistant_content: str,
     assistant_tool_calls: list[dict[str, Any]] | None = None,
     thinking_enabled: bool,
+    reasoning_effort: str | None = None,
     tool_specs: list[dict[str, Any]] | None = None,
     tool_prompt_mode: str | None = None,
     strip_tool_call_preamble_text: bool = False,
+    session: Any | None = None,
 ) -> dict[str, Any]:
-    if assistant_tool_calls:
-        return {
-            "safe": False,
-            "mode": "unsafe",
-            "reason": "tool_call_history_rewrite",
-        }
+    # Tool-call turns are no longer refused a priori (the retired
+    # "tool_call_history_rewrite" gate): the byte-compare below is the real
+    # safety — _history_ids_for_postcommit renders tool-call histories via
+    # the tool sentinel — and the early refusal forced every coding-agent
+    # tool round onto the starvable idle re-prefill postcommit (2026-08-21:
+    # committed froze at 15,389 while the stream passed 76k). A render
+    # mismatch still refuses empirically below, which is exactly the old
+    # behavior; a byte-identical render banks the live generation-final KV
+    # with zero GPU recompute and advances the frontier inline.
     if (
         _STATS_FOOTER_RE.search(assistant_content)
         or STATS_FOOTER_MARKER in assistant_content
@@ -14760,9 +21452,24 @@ def _generation_final_postcommit_compatibility(
         assistant_content=assistant_content,
         assistant_tool_calls=assistant_tool_calls,
         thinking_enabled=thinking_enabled,
+        reasoning_effort=reasoning_effort,
         tool_specs=tool_specs,
         tool_prompt_mode=tool_prompt_mode,
         strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+        # The generation boundary IS the committed stream this snapshot
+        # anchors: rendering the history with its think interiors is what
+        # lets a thinking turn be token-identical to prompt+generated at
+        # all (before F11 #3 the retokenized history rendered an empty
+        # think scaffold and thinking turns could never match).
+        committed_stream_ids=final_token_ids,
+        # The session's own committed stream backfills think interiors the
+        # request-local render lost (canon-miss turns) so the postcommit
+        # publishes the richest stream instead of regressing it.
+        session_committed_ids=(
+            list(getattr(session, "committed_token_ids", ()) or ())
+            if session is not None
+            else None
+        ),
     )
 
     def _bank_view(token_ids: list[int]) -> list[int] | None:
@@ -14797,6 +21504,14 @@ def _generation_final_postcommit_compatibility(
                 "history_suffix_tokens": len(history_ids) - len(final_token_ids),
             }
     reason = "retokenized_history_mismatch"
+    divergence = _first_divergence(final_token_ids, history_ids)
+    _dump_postcommit_mismatch(
+        state,
+        prompt_ids=prompt_ids,
+        final_token_ids=final_token_ids,
+        history_ids=history_ids,
+        divergence=divergence,
+    )
     if bool(state.args.strip_assistant_reasoning_history) and thinking_enabled:
         reason = "reasoning_history_stripping_mismatch"
     elif _reasoning_history_scoped_active(state) and thinking_enabled:
@@ -14813,7 +21528,75 @@ def _generation_final_postcommit_compatibility(
         "reason": reason,
         "history_tokens": len(history_ids),
         "generation_boundary_tokens": len(final_token_ids),
+        "divergence_token": divergence,
+        "divergence_offset_in_turn": (
+            divergence - len(prompt_ids) if divergence is not None else None
+        ),
     }
+
+
+def _first_divergence(left: Sequence[int], right: Sequence[int]) -> int | None:
+    """Index of the first differing token, or None when one is a prefix of the other."""
+    limit = min(len(left), len(right))
+    for index in range(limit):
+        if int(left[index]) != int(right[index]):
+            return index
+    return None
+
+
+def _dump_postcommit_mismatch(
+    state: ServerState,
+    *,
+    prompt_ids: Sequence[int],
+    final_token_ids: Sequence[int],
+    history_ids: Sequence[int],
+    divergence: int | None,
+) -> None:
+    """Write both token streams around the divergence when asked to.
+
+    MTPLX_DEBUG_POSTCOMMIT_MISMATCH_DIR=<dir> turns this on. A refused
+    generation-final snapshot is the single most expensive cache event an
+    agent turn can have (it routes to a GPU re-prefill of the whole assistant
+    turn), and without the two id lists side by side its cause -- a tool-call
+    re-serialisation, a stripped preamble, a BPE seam -- is a guess.
+    """
+
+    directory = (os.environ.get("MTPLX_DEBUG_POSTCOMMIT_MISMATCH_DIR") or "").strip()
+    if not directory:
+        return
+    try:
+        os.makedirs(directory, exist_ok=True)
+        tokenizer = state.runtime.tokenizer
+        at = int(divergence) if divergence is not None else min(len(final_token_ids), len(history_ids))
+        lo, hi = max(0, at - 24), at + 24
+
+        def _window(ids: Sequence[int]) -> dict[str, Any]:
+            ids = [int(t) for t in ids[lo:hi]]
+            try:
+                text = tokenizer.decode(ids)
+            except Exception:
+                text = ""
+            return {"ids": ids, "text": text}
+
+        record = {
+            "ts": time.time(),
+            "prompt_tokens": len(prompt_ids),
+            "generation_boundary_tokens": len(final_token_ids),
+            "history_tokens": len(history_ids),
+            "divergence_token": divergence,
+            "divergence_offset_in_turn": (
+                divergence - len(prompt_ids) if divergence is not None else None
+            ),
+            "window": [lo, hi],
+            "generated": _window(final_token_ids),
+            "history": _window(history_ids),
+        }
+        path = os.path.join(directory, f"postcommit-mismatch-{int(time.time() * 1000)}.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, ensure_ascii=False, indent=1)
+    except Exception:
+        # Diagnostics never fail a request.
+        pass
 
 
 def _store_generation_final_history_snapshot(
@@ -14826,14 +21609,26 @@ def _store_generation_final_history_snapshot(
     assistant_content: str,
     assistant_tool_calls: list[dict[str, Any]] | None = None,
     thinking_enabled: bool,
+    reasoning_effort: str | None = None,
     policy_fingerprint: str,
     tool_specs: list[dict[str, Any]] | None = None,
     keep_live_ref: bool = True,
     tool_prompt_mode: str | None = None,
     strip_tool_call_preamble_text: bool = False,
+    session: Any | None = None,
 ) -> dict[str, Any]:
     if session_id is None:
         return {"stored": False, "mode": "unsafe", "reason": "no_session_id"}
+    if session is None:
+        # Fast-final callers carry only session_id; resolve the live session
+        # so the compatibility render can backfill think interiors from the
+        # session's committed stream (oscillation kill, 2026-08-21).
+        peek = getattr(getattr(state, "sessions", None), "peek", None)
+        if peek is not None:
+            try:
+                session = peek(session_id)
+            except Exception:
+                session = None
     started = time.perf_counter()
     compatibility = _generation_final_postcommit_compatibility(
         state,
@@ -14843,17 +21638,31 @@ def _store_generation_final_history_snapshot(
         assistant_content=assistant_content,
         assistant_tool_calls=assistant_tool_calls,
         thinking_enabled=thinking_enabled,
+        reasoning_effort=reasoning_effort,
         tool_specs=tool_specs,
         tool_prompt_mode=tool_prompt_mode,
         strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+        session=session,
     )
     if not bool(compatibility.get("safe")):
-        return {
+        outcome = {
             "stored": False,
             "mode": compatibility.get("mode", "unsafe"),
             "reason": compatibility.get("reason", "unsafe_history"),
             "elapsed_s": time.perf_counter() - started,
         }
+        for key in ("history_tokens", "generation_boundary_tokens"):
+            if key in compatibility:
+                outcome[key] = compatibility[key]
+        # The refusal is the expensive outcome -- it routes the turn to the
+        # retokenizing postcommit, a GPU re-prefill of the whole assistant
+        # turn racing the client's next request -- so it must be readable
+        # per turn. Before 2026-09-03 only the retokenizing job wrote a
+        # flight event; 83 of 83 postcommits in a day's flight log read
+        # "retokenized_history" with no record of WHY the O(1) snapshot
+        # was refused every time.
+        _flight(state).pc(session_id, {"action": "generation_final", **outcome})
+        return outcome
     final_state = generated["_final_state"]
     token_ids = [int(token) for token in compatibility["token_ids"]]
     acquired = state.lock.acquire(blocking=False)
@@ -14867,8 +21676,7 @@ def _store_generation_final_history_snapshot(
     try:
         mtp_snapshot = (
             snapshot_cache(final_state.final_committed_mtp_cache)
-            if state.session_mtp_history_policy == "committed"
-            and final_state.final_committed_mtp_cache is not None
+            if final_state.final_committed_mtp_cache is not None
             else None
         )
         entry = state.sessions.bank.put(
@@ -14876,16 +21684,12 @@ def _store_generation_final_history_snapshot(
             token_ids=token_ids,
             cache=final_state.final_trunk_cache,
             logits=final_state.final_logits,
-            hidden=(
-                final_state.final_hidden
-                if state.session_mtp_history_policy == "committed"
-                else None
-            ),
-            hidden_variant=state.session_hidden_variant,
+            hidden=final_state.final_hidden,
+            hidden_variant="post_norm",
             keep_live_ref=bool(keep_live_ref),
             session_id=session_id,
             template_hash=state.template_hash,
-            mtp_history_policy=state.session_mtp_history_policy,
+            mtp_history_policy=_bank_history_policy(state),
             draft_head_identity=state.draft_head_identity,
             policy_fingerprint=policy_fingerprint,
             mtp_history_snapshot=mtp_snapshot,
@@ -14896,13 +21700,15 @@ def _store_generation_final_history_snapshot(
     finally:
         state.lock.release()
     if entry is None:
-        return {
+        outcome = {
             "stored": False,
             "mode": compatibility["mode"],
             "reason": "sessionbank_snapshot_skipped",
             "elapsed_s": time.perf_counter() - started,
         }
-    return {
+        _flight(state).pc(session_id, {"action": "generation_final", **outcome})
+        return outcome
+    outcome = {
         "stored": True,
         "mode": compatibility["mode"],
         "reason": compatibility["reason"],
@@ -14912,10 +21718,52 @@ def _store_generation_final_history_snapshot(
         "history_suffix_tokens": int(compatibility.get("history_suffix_tokens") or 0),
         "token_hash": entry.token_hash,
     }
+    _flight(state).pc(session_id, {"action": "generation_final", **outcome})
+    return outcome
 
 
 _IDLE_POSTCOMMIT_MAX_WAIT_S = 30.0
 _IDLE_POSTCOMMIT_POLL_INTERVAL_S = 0.25
+
+
+def _postcommit_cross_session_yield_enabled() -> bool:
+    """Abort OTHER sessions' pending idle postcommits at request admission.
+
+    The foreground grace below is a same-session bargain (wait <=grace for
+    a commit that saves THIS session a 2-4k salvage re-prefill). It was
+    silently taxing cross-session traffic too — a stranger's request paid
+    the commit's remaining runtime in TTFT plus its bandwidth residue in
+    decode (2026-08-05 showdown receipts). Default on; set
+    MTPLX_POSTCOMMIT_CROSS_SESSION_YIELD=0 to restore the old behavior.
+    """
+    raw = (
+        str(os.environ.get("MTPLX_POSTCOMMIT_CROSS_SESSION_YIELD", "1")).strip().lower()
+    )
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _idle_postcommit_foreground_grace_s() -> float:
+    """Bounded window during which a running postcommit finishes despite a
+    queued foreground request.
+
+    2026-08-01 live gauntlet receipts: in a real OpenCode tool loop the next
+    request arrives within ~0.5s of the previous response, so EVERY
+    tool_call_history_rewrite postcommit was preempted
+    (foreground_preempted_postcommit x6 in one 8-turn run) and every
+    tool-turn paid a 2-4k-token block-salvage re-prefill instead (3-7s of
+    TTFT). The commit itself starts from the live cache and typically
+    finishes well under this grace, so letting it win delays the queued
+    request by at most the grace while removing the far larger salvage.
+    0 restores strict immediate-yield (the 2026-07-02 starvation semantics,
+    still guarded as bounded by this cap in the yield test).
+    """
+    raw = os.environ.get("MTPLX_POSTCOMMIT_FOREGROUND_GRACE_S")
+    if raw is None or not str(raw).strip():
+        return 2.0
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 2.0
 
 
 def _schedule_idle_postcommit_snapshot(
@@ -14926,6 +21774,7 @@ def _schedule_idle_postcommit_snapshot(
     assistant_content: str,
     assistant_tool_calls: list[dict[str, Any]] | None = None,
     thinking_enabled: bool,
+    reasoning_effort: str | None = None,
     policy_fingerprint: str,
     unsafe_reason: str,
     tool_specs: list[dict[str, Any]] | None = None,
@@ -14934,6 +21783,8 @@ def _schedule_idle_postcommit_snapshot(
     keep_live_ref: bool = True,
     tool_prompt_mode: str | None = None,
     strip_tool_call_preamble_text: bool = False,
+    committed_stream_ids: Sequence[int] | None = None,
+    retry_count: int = 0,
 ) -> dict[str, Any]:
     """Schedule a background SessionBank commit for a response the
     generation-final compatibility check rejected as unsafe (most commonly
@@ -14948,16 +21799,39 @@ def _schedule_idle_postcommit_snapshot(
     rechecks that no newer foreground is queued and that the session did not
     advance before it builds a new cache.
     """
+    if assistant_tool_calls and str(
+        os.environ.get("MTPLX_IDLE_POSTCOMMIT_TOOL_REWRITE", "1")
+    ).strip().lower() in {"0", "false", "off", "no"}:
+        # 2026-08-01 gauntlet: on the OpenCode hybrid tool lane this commit's
+        # canonical retokenization matched NEITHER the generation stream NOR
+        # the next request's bytes (its own bank lookup found ~no prefix), so
+        # it re-forwarded the full 27-29k history in the gap, never stored
+        # (aborted on the next request, one after 26.8s of GPU), and the
+        # foreground grace then delayed the queued request for doomed work.
+        # This is the "postcommit ghost re-prefill" pathology. Kill switch until
+        # the hybrid-lane canonical rendering is byte-proven against real
+        # next-turn prompts; store-on-prefill + block salvage remain.
+        return {
+            "stored": False,
+            "mode": "disabled",
+            "reason": "tool_rewrite_postcommit_disabled",
+        }
     pending = {
         "stored": False,
         "mode": "async_pending",
         "reason": unsafe_reason,
     }
+    if retry_count > 0:
+        pending["retry_count"] = int(retry_count)
     abort_event = Event()
     pending_record_holder: dict[str, Any] = {}
 
     def _log(outcome: dict[str, Any]) -> None:
         record = pending_record_holder.get("record")
+        try:
+            _flight(state).pc(session_id, outcome)
+        except Exception:
+            pass
         if (
             session is not None
             and record is not None
@@ -15008,19 +21882,89 @@ def _schedule_idle_postcommit_snapshot(
             and int(observed) != int(expected_session_revision)
         )
 
+    # Foreground pressure only aborts the commit after the bounded grace
+    # (anchored when the job actually starts); explicit aborts and stale
+    # session revisions stay immediate.
+    grace_s = _idle_postcommit_foreground_grace_s()
+    job_started_holder: dict[str, float] = {}
+
+    def _foreground_pressure_past_grace() -> bool:
+        if not _foreground_model_work_pending(state):
+            return False
+        started_at = job_started_holder.get("t")
+        if started_at is None:
+            return True
+        return (time.monotonic() - started_at) > grace_s
+
     def _postcommit_abort_reason() -> str:
         if _stale_session_revision():
             return "stale_session_revision"
-        if abort_event.is_set() or _foreground_model_work_pending(state):
+        if _pressure_abort_requested(state):
+            return "memory_pressure_critical"
+        if abort_event.is_set() or _foreground_pressure_past_grace():
             return "foreground_preempted_postcommit"
         return "postcommit_abort_requested"
 
     def _postcommit_abort_check() -> bool:
+        # Every call is a chunk boundary the prefill just reached: stamp it
+        # so a same-session request waiting on this job can tell "still
+        # prefilling" from "wedged" and keep waiting for work it would
+        # otherwise redo from scratch (progress-gated wait, 2026-09-03).
+        record = pending_record_holder.get("record")
+        if record is not None and hasattr(record, "note_progress"):
+            try:
+                record.note_progress()
+            except BaseException:
+                pass
+        # The pressure arm (#393): a postcommit prefill replays the same
+        # deep forward that wedged the machine, so it must yield too. The
+        # aborted job re-arms on the idle band and retries once pressure
+        # clears.
         return bool(
             abort_event.is_set()
             or _stale_session_revision()
-            or _foreground_model_work_pending(state)
+            or _foreground_pressure_past_grace()
+            or _pressure_abort_requested(state)
         )
+
+    def _resubmit_after_yield() -> bool:
+        # Re-arm an abandoned commit (2026-08-21): yielding frees the single
+        # model worker for queued foreground (bounded-yield contract, kept),
+        # but drop-on-abandon let fast agent chains starve the commit forever
+        # — the committed stream froze at 15,389 while the true stream passed
+        # 76k, and preserve-mode history silently lost the model's own
+        # 57.8k-token derivation. The re-armed job queues on the idle band
+        # (runs only when foreground drains) with a fresh abort event; a
+        # superseding newer turn bumps the session revision, so a re-armed
+        # job that is no longer the frontier dies as abandoned_stale on its
+        # first check. Stored/stale/error outcomes never re-arm.
+        if session is None or _stale_session_revision():
+            return False
+        if retry_count >= 16:
+            return False
+        try:
+            _schedule_idle_postcommit_snapshot(
+                state,
+                session_id=session_id,
+                messages=messages,
+                assistant_content=assistant_content,
+                assistant_tool_calls=assistant_tool_calls,
+                thinking_enabled=thinking_enabled,
+                reasoning_effort=reasoning_effort,
+                policy_fingerprint=policy_fingerprint,
+                unsafe_reason=unsafe_reason,
+                tool_specs=tool_specs,
+                session=session,
+                expected_session_revision=expected_session_revision,
+                keep_live_ref=keep_live_ref,
+                tool_prompt_mode=tool_prompt_mode,
+                strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                committed_stream_ids=committed_stream_ids,
+                retry_count=retry_count + 1,
+            )
+            return True
+        except BaseException:
+            return False
 
     # The postcommit re-prefills the conversation at full GPU load after the
     # HTTP response has already finished. Hold a smart-fan lease from
@@ -15035,6 +21979,7 @@ def _schedule_idle_postcommit_snapshot(
 
     def async_postcommit() -> None:
         deadline = time.monotonic() + _IDLE_POSTCOMMIT_MAX_WAIT_S
+        job_started_holder["t"] = time.monotonic()
         record = pending_record_holder.get("record")
         if record is not None and hasattr(record, "mark_started"):
             try:
@@ -15055,18 +22000,22 @@ def _schedule_idle_postcommit_snapshot(
                         }
                     )
                     return
-                if abort_event.is_set() or _foreground_model_work_pending(state):
-                    # Yield to queued foreground: return to free the single
-                    # model worker (a sleep+retry here would starve the
-                    # foreground request behind us — regression caught by
+                if abort_event.is_set() or _foreground_pressure_past_grace():
+                    # Yield to queued foreground once the bounded grace is
+                    # spent: return to free the single model worker (an
+                    # unbounded sleep+retry here would starve the foreground
+                    # request behind us — regression caught by
                     # test_running_idle_postcommit_yields_to_queued_foreground,
-                    # 2026-07-02). Warming the next agent turn is handled by
-                    # store-on-prefill instead, which needs no idle gap.
+                    # 2026-07-02; the grace keeps the delay bounded while
+                    # letting agent-loop tool-turn commits actually land —
+                    # 2026-08-01 gauntlet receipts). Store-on-prefill remains
+                    # the fallback warmer when the commit loses.
                     _log(
                         {
                             "stored": False,
                             "mode": "abandoned_foreground_busy",
                             "reason": _postcommit_abort_reason(),
+                            "retry_scheduled": _resubmit_after_yield(),
                         }
                     )
                     return
@@ -15077,6 +22026,7 @@ def _schedule_idle_postcommit_snapshot(
                     assistant_content=assistant_content,
                     assistant_tool_calls=assistant_tool_calls,
                     thinking_enabled=thinking_enabled,
+                    reasoning_effort=reasoning_effort,
                     policy_fingerprint=policy_fingerprint,
                     acquire_model_lock_blocking=False,
                     tool_specs=tool_specs,
@@ -15088,6 +22038,7 @@ def _schedule_idle_postcommit_snapshot(
                     keep_live_ref=bool(keep_live_ref),
                     tool_prompt_mode=tool_prompt_mode,
                     strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                    committed_stream_ids=committed_stream_ids,
                 )
                 if postcommit.get("stored"):
                     _log(postcommit)
@@ -15104,6 +22055,7 @@ def _schedule_idle_postcommit_snapshot(
                             "stored": False,
                             "mode": "abandoned_foreground_busy",
                             "reason": "model_lock_busy_past_deadline",
+                            "retry_scheduled": _resubmit_after_yield(),
                         }
                     )
                     return
@@ -15136,10 +22088,23 @@ def _schedule_idle_postcommit_snapshot(
     # times out the next request just falls through to a cold prefill.
     if session is not None:
         try:
+            # Seed the size from the session's committed frontier (#432).
+            # The exact history length only lands via update_token_count
+            # once the job has rendered the conversation, which for a 200k
+            # session is many seconds in - long after the interleaved
+            # foreign request that decides whether this commit survives.
+            # The committed prefix is a sound lower bound available now, so
+            # size-keyed policy (marathon protection) stops reading 0 for
+            # exactly the commits it exists to protect.
+            try:
+                seed_tokens = len(getattr(session, "committed_token_ids", ()) or ())
+            except BaseException:
+                seed_tokens = 0
             record = session.set_pending_postcommit(
                 future,
                 abort_event=abort_event,
                 reason=unsafe_reason,
+                token_count=seed_tokens,
             )
             pending_record_holder["record"] = record
         except BaseException:
@@ -15192,23 +22157,71 @@ def _uncapped_response_lease_tokens_from_env() -> int | None:
         return None
 
 
-def _validate_prompt_has_decode_room(
-    state: ServerState,
-    *,
-    prompt_token_count: int,
-) -> None:
-    served_context_window = int(state.context_window)
-    if int(prompt_token_count) < served_context_window:
-        return
-    raise HTTPException(
-        status_code=400,
-        detail=(
-            f"Prompt contains {int(prompt_token_count)} tokens, but the served "
-            f"context window is {served_context_window} tokens. The prompt must "
-            "be shorter than the context window to leave room for at least one "
-            "generated token."
-        ),
-    )
+def _reject_prompt_over_context(state: ServerState, prompt_token_count: int) -> None:
+    """Refuse prompts the serve cannot hold (400) or honestly fit (507).
+
+    400: the prompt alone fills or overflows the context window. Without
+    this the request would enter generation with remaining_context floored
+    to 1 and produce a single token — a silent degradation a benchmark
+    ladder charts as engine speed. OpenAI parity: error code
+    context_length_exceeded with both numbers in the message.
+
+    507: the served window was explicitly overcommitted past the memory
+    plan's fit (--context-window overrides the plan by design — warn-loudly
+    policy) and THIS prompt's cold cost lands beyond the fit. Admitting it
+    would not fail fast: macOS compresses and swaps for minutes before any
+    Metal allocation error (the only prior 507 trigger) would fire — #393
+    wedged a 128 GB machine at a 119 GB footprint that way. Prompts under
+    the fit still serve, so an oversized window keeps its legitimate use.
+
+    Called early in the chat/completions handlers (a real error before any
+    stream starts) and again inside _generation_params as the backstop for
+    every lane.
+    """
+    context_window = int(state.context_window)
+    if int(prompt_token_count) >= context_window:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": (
+                    f"This model's maximum context length is {context_window} "
+                    f"tokens, but the prompt alone has "
+                    f"{int(prompt_token_count)} tokens, leaving no room to "
+                    "generate. Reduce the prompt or serve with a larger "
+                    "--context-window."
+                ),
+                "code": "context_length_exceeded",
+            },
+        )
+    if bool(getattr(state, "allow_swap", False)):
+        # #427: the operator asked for the pre-2.10 behavior past the fit.
+        return None
+    plan = getattr(state, "memory_plan", None)
+    if (
+        plan is not None
+        and bool(getattr(plan, "context_overcommitted", False))
+        and int(getattr(plan, "context_window_fit", 0) or 0) > 0
+        and int(prompt_token_count) >= int(plan.context_window_fit)
+    ):
+        fit = int(plan.context_window_fit)
+        resolved = int(
+            getattr(plan, "context_window_resolved", context_window)
+            or context_window
+        )
+        raise HTTPException(
+            status_code=507,
+            detail={
+                "message": (
+                    f"--context-window {resolved} exceeds this machine's "
+                    f"memory-plan fit of {fit} tokens, and this prompt "
+                    f"({int(prompt_token_count)} tokens) does not fit in "
+                    "memory. Prompts below the fit still serve; reduce the "
+                    f"prompt, serve at or below --context-window {fit}, or "
+                    "use q8 KV quantization."
+                ),
+                "code": "insufficient_memory",
+            },
+        )
 
 
 def _generation_params(
@@ -15222,8 +22235,35 @@ def _generation_params(
     presence_penalty: float | None = None,
     frequency_penalty: float | None = None,
 ) -> tuple[int, SamplerConfig, dict[str, Any]]:
+    _reject_prompt_over_context(state, prompt_token_count)
     remaining_context = max(1, int(state.context_window) - int(prompt_token_count))
     request_max_tokens = None if max_tokens is None else int(max_tokens)
+    if (
+        request_max_tokens is not None
+        and request_max_tokens <= TINY_MAX_TOKENS_WARN_AT
+        and remaining_context >= TINY_MAX_TOKENS_ROOM_TOKENS
+    ):
+        # #436: a client whose own context budget is exhausted sends
+        # max_tokens=1 (Pi: contextWindow minus a chars/4 estimate of the
+        # transcript, which runs 2x to 3x over the real count on tool-heavy
+        # prompts). The server honors it, the answer stops after one token
+        # (finish_reason "length", often inside a tool call), and the client
+        # reports a truncated response. Nothing on the server side is wrong,
+        # so say so in one line instead of leaving a silent 1-token turn.
+        LOGGER.warning(
+            "max_tokens leaves no room to answer",
+            extra={
+                "requested_max_tokens": request_max_tokens,
+                "remaining_context_tokens": int(remaining_context),
+                "prompt_tokens": int(prompt_token_count),
+                "context_window": int(state.context_window),
+                "hint": (
+                    "the client capped the answer, not the server; raise the "
+                    "client's context window setting for this model (Pi: "
+                    "models.json contextWindow) or its max output tokens"
+                ),
+            },
+        )
     semantic_requested_max = (
         remaining_context if request_max_tokens is None else request_max_tokens
     )
@@ -15235,6 +22275,20 @@ def _generation_params(
         )
     after_server_cap = semantic_requested_max
     semantic_effective_max = max(1, min(after_server_cap, remaining_context))
+    if semantic_effective_max < after_server_cap:
+        # Visible clamp (exactness law): context_cap_applied plus the
+        # effective value ride in the stats below; one server log line so
+        # the trail exists even for clients that drop mtplx_stats.
+        LOGGER.warning(
+            "max_tokens clamped to remaining context",
+            extra={
+                "requested_max_tokens": request_max_tokens,
+                "effective_max_tokens": int(semantic_effective_max),
+                "remaining_context_tokens": int(remaining_context),
+                "prompt_tokens": int(prompt_token_count),
+                "context_window": int(state.context_window),
+            },
+        )
     decode_lease_tokens = semantic_effective_max
     uncapped_response_requested = request_max_tokens is None
     uncapped_response_lease_tokens: int | None = None
@@ -15245,7 +22299,9 @@ def _generation_params(
             decode_lease_tokens = max(
                 1, min(semantic_effective_max, uncapped_response_lease_tokens)
             )
-            uncapped_response_lease_applied = decode_lease_tokens < semantic_effective_max
+            uncapped_response_lease_applied = (
+                decode_lease_tokens < semantic_effective_max
+            )
     sampler_temperature = (
         state.args.temperature if temperature is None else float(temperature)
     )
@@ -15289,9 +22345,7 @@ def _generation_params(
                 if uncapped_response_lease_tokens is None
                 else int(uncapped_response_lease_tokens)
             ),
-            "uncapped_response_lease_applied": bool(
-                uncapped_response_lease_applied
-            ),
+            "uncapped_response_lease_applied": bool(uncapped_response_lease_applied),
             "remaining_context_tokens": int(remaining_context),
             "server_cap_applied": bool(
                 server_max_response_tokens is not None
@@ -15305,13 +22359,30 @@ def _generation_params(
     )
 
 
-def _uncapped_repetition_stop_enabled(generation_limits: dict[str, Any]) -> bool:
-    if not bool(generation_limits.get("uncapped_response_requested")):
-        return False
-    if generation_limits.get("server_max_response_tokens") is not None:
-        return False
-    raw = os.environ.get("MTPLX_UNCAPPED_REPETITION_STOP", "1").strip().lower()
+def _repetition_stop_enabled(generation_limits: dict[str, Any]) -> bool:
+    """Arm the literal-token-repetition stop on every request (#311).
+
+    The detector fires only on exact repeated token blocks (objectively
+    broken output) — it is not a thinking or length cap, so a client-sent
+    max_tokens is no reason to disarm it: Pi's 8,192-cap request burned
+    5,803 "!" tokens to budget with the guard sitting disabled. The old
+    uncapped-only predicate lived here from the guard's introduction; both
+    env names are honored (new one wins) and the historical name stays as
+    an alias for imports.
+    """
+    raw = (
+        os.environ.get(
+            "MTPLX_REPETITION_STOP",
+            os.environ.get("MTPLX_UNCAPPED_REPETITION_STOP", "1"),
+        )
+        .strip()
+        .lower()
+    )
     return raw not in _UNCAPPED_RESPONSE_LEASE_DISABLED_VALUES
+
+
+# Historical name (pre-#311 the guard armed only for uncapped responses).
+_uncapped_repetition_stop_enabled = _repetition_stop_enabled
 
 
 def _loop_guard_enabled() -> bool:
@@ -15363,7 +22434,10 @@ def _dashboard_in_flight_count(state: ServerState) -> int:
 
 def _ar_batch_mtp_fallback_reason(state: ServerState) -> str | None:
     config = _scheduler_config_from_args(state.args)
-    if config.mode not in {SchedulerMode.AR_BATCH, SchedulerMode.MTP_COHORT_EXPERIMENTAL}:
+    if config.mode not in {
+        SchedulerMode.AR_BATCH,
+        SchedulerMode.MTP_COHORT_EXPERIMENTAL,
+    }:
         return None
     burst_reason = (
         "open_code_fair_burst"
@@ -15391,13 +22465,60 @@ def _ar_batch_mtp_fallback_reason(state: ServerState) -> str | None:
         time.sleep(0.001)
 
 
+def _ar_batch_unavailable_reason(runtime: Any) -> str | None:
+    """Why the batched AR lane cannot serve this model family, or None.
+
+    mlx-lm's BatchGenerator merges the per-request caches of every prompt
+    it batches (PromptProcessingBatch -> _merge_caches), which requires
+    each cache entry to expose merge(). The Flash-Next family's QSACache
+    does not, so two concurrent requests under --scheduler-mode ar_batch
+    died with an unhandled ValueError while sequential requests were fine
+    (#420, reproduced 2026-09-02 on the M5 Max: 3 sequential OK, 2
+    concurrent 500). The app passes ar_batch for every family, so the lane
+    has to refuse itself for a family it cannot batch and let the solo
+    lane serve the requests one at a time.
+    """
+
+    # Probe exactly what the batch generator builds for a fresh request:
+    # mlx-lm's make_prompt_cache on the runtime's model object. This is not
+    # runtime.make_cache(): that one asks the inner language model and, for
+    # the 27B family, returns the paged KV classes the solo lane uses, which
+    # have no merge() either while the batch lane happily batches the 27B
+    # (verified 2026-09-02: the outer model has no make_cache, so mlx-lm
+    # builds stock KVCache entries for it).
+    try:
+        from mlx_lm.models.cache import make_prompt_cache
+
+        cache = make_prompt_cache(runtime.model)
+    except Exception as exc:
+        return f"cache probe failed: {exc!r}"
+    if cache is None:
+        return None
+    unmergeable = sorted(
+        {type(entry).__name__ for entry in cache if not hasattr(entry, "merge")}
+    )
+    if not unmergeable:
+        return None
+    return (
+        "this model's cache family cannot batch: "
+        f"{', '.join(unmergeable)} has no merge()"
+    )
+
+
 def _use_live_ar_batch(
     state: ServerState,
     *,
     effective_mode: str,
 ) -> tuple[bool, str | None]:
     config = _scheduler_config_from_args(state.args)
-    if config.mode not in {SchedulerMode.AR_BATCH, SchedulerMode.MTP_COHORT_EXPERIMENTAL}:
+    if config.mode not in {
+        SchedulerMode.AR_BATCH,
+        SchedulerMode.MTP_COHORT_EXPERIMENTAL,
+    }:
+        return False, None
+    if getattr(state, "ar_batch_unavailable_reason", None):
+        # #420: the lane refused itself at startup for this cache family;
+        # every request rides the solo lane, serialized by the scheduler.
         return False, None
     if effective_mode == "ar":
         return True, "generation_mode_ar"
@@ -15405,6 +22526,11 @@ def _use_live_ar_batch(
     if fallback_reason is None:
         return False, None
     return True, fallback_reason
+
+
+def _use_live_mtp_batch(state: ServerState, *, effective_mode: str) -> bool:
+    config = _scheduler_config_from_args(state.args)
+    return config.mode == SchedulerMode.MTP_BATCH and effective_mode == "mtp"
 
 
 def _ar_batch_history_bypass_reason(
@@ -15463,11 +22589,16 @@ def _finalize_batched_ar_generation(
         completion_tokens=completion_tokens,
         elapsed_s=elapsed_s,
     )
+    request_elapsed_s = float(
+        generated.get("request_elapsed_s")
+        or stats.get("request_elapsed_s")
+        or elapsed_s
+    )
     envelope = _metrics_envelope(
         stats=stats,
         prompt_tokens=len(prompt_ids),
         completion_tokens=completion_tokens,
-        request_elapsed_s=elapsed_s,
+        request_elapsed_s=request_elapsed_s,
         token_times=token_times,
         request_started_s=float(stats.get("request_started_s") or time.perf_counter()),
         lock_wait_time_s=float(stats.get("queue_wait_s") or 0.0),
@@ -15516,6 +22647,11 @@ def _finalize_batched_ar_generation(
             envelope[key] = stats[key]
     if request_observability:
         envelope.update(request_observability)
+    # This whole lane is AR: request-policy stamps (e.g. the OpenCode
+    # launch_default tier) must not read as draft stats on an AR response
+    # (F8 — absent, not null-with-value). The serial lane scrubs the same way.
+    for key in [k for k in envelope if k.startswith("draft_sampler")]:
+        del envelope[key]
     cleanup = _auto_clear_mlx_cache_after_completed_request(
         state,
         session_id=session_id,
@@ -15546,20 +22682,30 @@ def _finalize_batched_ar_generation(
         envelope["cache_miss_reason"] = None
     stats.update(envelope)
     stats.update(_generation_truth_stats(state, "ar"))
-    stats["server_elapsed_s"] = elapsed_s
+    stats["server_elapsed_s"] = request_elapsed_s
     stats["server_tok_s"] = (
-        completion_tokens / elapsed_s if elapsed_s > 0 else 0.0
+        completion_tokens / request_elapsed_s if request_elapsed_s > 0 else 0.0
     )
-    state.last_metrics.append(dict(envelope))
-    state.last_metrics = state.last_metrics[-100:]
-    state.last_request_at = time.time()
-    state.requests_completed += 1
+    # Warmup rows stay out of the dashboard ring (see
+    # _record_request_metrics); real-request bookkeeping below still runs.
+    if not bool(envelope.get("warmup")):
+        state.last_metrics.append(dict(envelope))
+        state.last_metrics = state.last_metrics[-100:]
+        # Warming generations are not user requests (adapting community PR
+        # #300 by @Blakeolson21): stamping the traffic clock from a warm rung
+        # made the ladder defer against its own output and made /health
+        # report user traffic on an untouched daemon. Clock and counter move
+        # together so the two /health fields cannot disagree.
+        state.last_request_at = time.time()
+        state.requests_completed += 1
     _dashboard_record_completion(state, envelope=envelope, stats=stats)
     generated["stats"] = _json_safe(stats)
     generated["completion_tokens"] = completion_tokens
     generated["tok_s"] = stats.get("decode_tok_s") or generated.get("tok_s") or 0.0
     generated["end_to_end_tok_s"] = stats["server_tok_s"]
-    if not bool((request_observability or {}).get("warmup")) and not _server_console_enabled(state):
+    if not bool(
+        (request_observability or {}).get("warmup")
+    ) and not _server_console_enabled(state):
         _safe_stdout_print(
             json.dumps(
                 {
@@ -15567,7 +22713,10 @@ def _finalize_batched_ar_generation(
                     "scheduler_lane": "ar_batch",
                     "prompt_tokens": generated.get("prompt_tokens"),
                     "completion_tokens": completion_tokens,
-                    "elapsed_s": round(elapsed_s, 6),
+                    "max_tokens": stats.get("request_max_tokens"),
+                    "effective_max_tokens": stats.get("effective_max_tokens"),
+                    "finish_reason": generated.get("finish_reason"),
+                    "elapsed_s": round(request_elapsed_s, 6),
                     "tok_s": round(float(generated.get("tok_s") or 0.0), 6),
                     "end_to_end_tok_s": round(float(generated["end_to_end_tok_s"]), 6),
                     "seed": stats.get("server_seed"),
@@ -15577,7 +22726,663 @@ def _finalize_batched_ar_generation(
                 ensure_ascii=False,
             )
         )
+    if request_capture.capture_dir():
+        request_capture.capture_outcome(
+            (request_observability or {}).get("request_id"),
+            {
+                "scheduler_lane": "ar_batch",
+                **request_capture.completion_token_ids(generated.get("tokens")),
+                "completion_tokens": completion_tokens,
+                "finish_reason": generated.get("finish_reason"),
+                "resolved_seed": stats.get("server_seed"),
+                "tok_s": round(float(generated.get("tok_s") or 0.0), 3),
+                **request_capture.clip_text_head_tail(generated.get("text") or ""),
+            },
+        )
     return generated
+
+
+def _finalize_mtp_batch_generation(
+    state: ServerState,
+    prompt_ids: list[int],
+    generated: dict[str, Any],
+    *,
+    session_id: str | None,
+    request_observability: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Publish one request from a completed multi-request MTP cohort."""
+
+    defer_mlx_finalize = bool(generated.pop("_mtp_batch_defer_mlx_finalize", False))
+    raw_stats = dict(generated.get("stats") or {})
+    generation_elapsed_s = float(generated.get("elapsed_s") or 0.0)
+    carried_request_elapsed_s = float(
+        generated.get("request_elapsed_s")
+        or raw_stats.get("request_elapsed_s")
+        or generation_elapsed_s
+    )
+    request_started_value = raw_stats.get("request_started_s")
+    request_started_s = (
+        float(request_started_value)
+        if request_started_value is not None
+        else time.perf_counter() - carried_request_elapsed_s
+    )
+    if bool(generated.pop("_mtp_batch_decode_on_request", False)):
+        stop_token_ids = {
+            int(value) for value in generated.pop("_mtp_batch_stop_token_ids", [])
+        }
+        decode = getattr(state.runtime.tokenizer, "decode", None)
+        generated["text"] = (
+            str(
+                decode(
+                    [
+                        int(token)
+                        for token in generated.get("tokens") or []
+                        if int(token) not in stop_token_ids
+                    ]
+                )
+            )
+            if callable(decode)
+            else ""
+        )
+    prefill_callback = generated.pop("_mtp_batch_prefill_callback", None)
+    prefill_completion = generated.pop("_mtp_batch_prefill_completion", None)
+    if callable(prefill_callback) and isinstance(prefill_completion, dict):
+        try:
+            prefill_callback(dict(prefill_completion))
+        except Exception:
+            pass
+    token_times = [float(value) for value in generated.pop("_token_times", [])]
+    generation_limits = dict(generated.pop("_generation_limits", {}) or {})
+    completion_tokens = _effective_completion_tokens(
+        generated_tokens=list(generated.get("tokens") or []),
+        streamed_token_times=token_times,
+    )
+    request_elapsed_s = max(
+        carried_request_elapsed_s,
+        time.perf_counter() - request_started_s,
+    )
+    generated["request_elapsed_s"] = request_elapsed_s
+    raw_stats["request_elapsed_s"] = request_elapsed_s
+    raw_stats.setdefault("elapsed_s", generation_elapsed_s)
+    stats = _repair_streamed_generation_stats(
+        raw_stats,
+        completion_tokens=completion_tokens,
+        elapsed_s=generation_elapsed_s,
+    )
+    restore_info = (request_observability or {}).get("mtp_batch_session_restore")
+    restore_hit = bool(isinstance(restore_info, dict) and restore_info.get("hit"))
+    restored_tokens = int(restore_info.get("restore_point") or 0) if restore_hit else 0
+    envelope = _metrics_envelope(
+        stats=stats,
+        prompt_tokens=len(prompt_ids),
+        completion_tokens=completion_tokens,
+        request_elapsed_s=request_elapsed_s,
+        token_times=token_times,
+        request_started_s=request_started_s,
+        lock_wait_time_s=float(stats.get("queue_wait_s") or 0.0),
+        session_id=session_id,
+        session_cache_hit=restore_hit,
+        cache_miss_reason=None if restore_hit else "mtp_batch_cold_prefill",
+        session_restore_mode=(
+            "mtp_batch_boundary_restore" if restore_hit else "mtp_batch_cold"
+        ),
+        mtp_depth=1,
+        generation_limits=generation_limits,
+    )
+    if restore_hit:
+        envelope["cached_tokens"] = restored_tokens
+        envelope["new_prefill_tokens"] = max(0, len(prompt_ids) - restored_tokens)
+    envelope.update(
+        {
+            key: stats[key]
+            for key in (
+                "scheduler_lane",
+                "scheduler_mode",
+                "scheduler_policy",
+                "request_id",
+                "queue_wait_s",
+                "active_batch_size",
+                "mtp_batch_real_width",
+                "mtp_batch_fixed_width",
+                "mtp_batch_route_id",
+                "target_verify_cycles",
+                "mtp_disabled_reason",
+                "server_seed",
+            )
+            if key in stats
+        }
+    )
+    envelope["generation_mode"] = "mtp"
+    envelope["requested_mtp_depth"] = 1
+    envelope["requested_speculative_depth"] = 1
+    envelope["speculative_depth"] = 1
+    envelope["long_context_mtp_depth_policy"] = {}
+    # The enabled lane carries no per-cycle timers: adding them would perturb
+    # the measured hot path. Verify engagement is the physical cycle count;
+    # timing is collected by the external Metal/profile gate.
+    for key in (
+        "verify_time_s",
+        "verify_forward_time_s",
+        "verify_eval_time_s",
+        "verify_logits_eval_time_s",
+        "verify_hidden_eval_time_s",
+        "verify_joint_eval_time_s",
+        "verify_target_distribution_time_s",
+    ):
+        envelope.pop(key, None)
+    envelope["verify_timing_scope"] = "external_profile_only"
+    if request_observability:
+        envelope.update(request_observability)
+    if defer_mlx_finalize:
+        envelope["mlx_finalize_scope"] = "cohort_owner_after_decode"
+    else:
+        cleanup = _auto_clear_mlx_cache_after_completed_request(
+            state,
+            session_id=session_id,
+            request_observability=request_observability,
+        )
+        if cleanup is not None:
+            envelope["mlx_cache_cleanup"] = cleanup
+        envelope.update(_mlx_allocator_public_stats())
+    stats.update(envelope)
+    stats.update(_generation_truth_stats(state, "mtp"))
+    stats["server_elapsed_s"] = request_elapsed_s
+    stats["server_tok_s"] = (
+        completion_tokens / request_elapsed_s if request_elapsed_s > 0 else 0.0
+    )
+    # Warmup rows stay out of the dashboard ring (see
+    # _record_request_metrics); real-request bookkeeping below still runs.
+    if not bool(envelope.get("warmup")):
+        state.last_metrics.append(dict(envelope))
+        state.last_metrics = state.last_metrics[-100:]
+        # Warming generations are not user requests (adapting community PR
+        # #300 by @Blakeolson21): stamping the traffic clock from a warm rung
+        # made the ladder defer against its own output and made /health
+        # report user traffic on an untouched daemon. Clock and counter move
+        # together so the two /health fields cannot disagree.
+        state.last_request_at = time.time()
+        state.requests_completed += 1
+    _dashboard_record_completion(state, envelope=envelope, stats=stats)
+    generated["stats"] = _json_safe(stats)
+    generated["completion_tokens"] = completion_tokens
+    generated["tok_s"] = stats.get("decode_tok_s") or generated.get("tok_s") or 0.0
+    generated["end_to_end_tok_s"] = stats["server_tok_s"]
+    if not bool(
+        (request_observability or {}).get("warmup")
+    ) and not _server_console_enabled(state):
+        _safe_stdout_print(
+            json.dumps(
+                {
+                    "event": "mtplx_openai_generation",
+                    "scheduler_lane": "mtp_batch",
+                    "prompt_tokens": len(prompt_ids),
+                    "completion_tokens": completion_tokens,
+                    "max_tokens": stats.get("request_max_tokens"),
+                    "effective_max_tokens": stats.get("effective_max_tokens"),
+                    "finish_reason": generated.get("finish_reason"),
+                    "elapsed_s": round(request_elapsed_s, 6),
+                    "tok_s": round(float(generated.get("tok_s") or 0.0), 6),
+                    "end_to_end_tok_s": round(float(generated["end_to_end_tok_s"]), 6),
+                    "seed": stats.get("server_seed"),
+                    "mtp_batch_real_width": stats.get("mtp_batch_real_width"),
+                    "text_preview": str(generated.get("text") or "")[:120],
+                },
+                ensure_ascii=False,
+            )
+        )
+    if request_capture.capture_dir():
+        request_capture.capture_outcome(
+            (request_observability or {}).get("request_id"),
+            {
+                "scheduler_lane": "mtp_batch",
+                **request_capture.completion_token_ids(generated.get("tokens")),
+                "completion_tokens": completion_tokens,
+                "finish_reason": generated.get("finish_reason"),
+                "resolved_seed": stats.get("server_seed"),
+                "tok_s": round(float(generated.get("tok_s") or 0.0), 3),
+                **request_capture.clip_text_head_tail(generated.get("text") or ""),
+            },
+        )
+    return generated
+
+
+def _claim_mtp_batch_cancellation_finalize(
+    *,
+    route_selected: bool,
+    ownership: MTPBatchFinalizeOwnership,
+) -> str | None:
+    if not route_selected:
+        return None
+    return ownership.claim_cancellation_finalize()
+
+
+def _finalize_mtp_batch_cohort_owner(
+    state: ServerState,
+    jobs: list[MTPBatchJob],
+) -> dict[str, Any]:
+    """Run MLX completion work after the fixed cohort leaves model execution."""
+
+    receipt: dict[str, Any] = {
+        "mlx_finalize_scope": "cohort_owner_after_decode",
+    }
+    for job in jobs:
+        cleanup = _auto_clear_mlx_cache_after_completed_request(
+            state,
+            session_id=job.session_id,
+            request_observability=job.request_observability,
+        )
+        if cleanup is not None:
+            receipt["mlx_cache_cleanup"] = cleanup
+            break
+    receipt.update(_mlx_allocator_public_stats())
+    return receipt
+
+
+def _validate_mtp_batch_request_contract(
+    state: ServerState,
+    prompt_ids: list[int],
+    *,
+    response_max: int,
+    constraint_spec: Any | None,
+    vision_splice: Any | None,
+    background_request: bool,
+    depth: int | None,
+    resolved_mtp_depth: int | None,
+) -> None:
+    if constraint_spec is not None:
+        raise MTPBatchRequestError("mtp_batch does not support response_format")
+    if vision_splice is not None:
+        raise MTPBatchRequestError("mtp_batch does not support vision_splice")
+    if background_request:
+        raise MTPBatchRequestError("mtp_batch does not support background_request")
+    for field, value in (
+        ("depth", depth),
+        ("resolved_mtp_depth", resolved_mtp_depth),
+    ):
+        if value is not None and int(value) != 1:
+            raise MTPBatchRequestError(f"mtp_batch requires {field}=1")
+    service = getattr(state, "mtp_batch_service", None)
+    lane = getattr(state, "mtp_batch_lane", None)
+    if service is None or lane is None:
+        raise MTPBatchRequestError(
+            "mtp_batch service was not installed at construction"
+        )
+    if len(prompt_ids) + int(response_max) > int(lane.geometry.max_context_tokens):
+        raise A3BMTPBatchCapacityError(
+            "mtp_batch requires prompt_tokens + max_tokens <= "
+            f"{lane.geometry.max_context_tokens}"
+        )
+
+
+def _build_mtp_batch_session_hooks(
+    state: ServerState,
+    *,
+    prompt_ids: list[int],
+    session_bank: Any,
+    session_id: str | None,
+    template_hash: str | None,
+    policy_fingerprint: str | None,
+    lane: Any,
+    request_observability: dict[str, Any],
+) -> tuple[Callable[[], Any] | None, Callable[..., Any] | None]:
+    """Session-bank hooks for one mtp_batch cohort row (owner-thread only).
+
+    The cohort lane prefills every row as a scalar B=1 pass before the B8
+    merge, so the SERIAL bank machinery applies per row with no batched
+    capture: the restore hook runs the boundary-true executor and hands the
+    lane a cache sitting exactly at the boundary; the commit hook banks the
+    prompt-only scalar state WITH interior GDN boundaries and the committed
+    MTP-history snapshot — the two things ar_batch admission entries lack,
+    which is why batched rows never restored (LOG 2026-08-09 root cause).
+    Identity mirrors the serial put site (post_norm / committed /
+    state.draft_head_identity / the request's policy fingerprint), so
+    entries cross-restore between the solo runner, serial serving, and
+    cohorts. Both hooks are fail-safe: any error degrades to cold.
+    """
+    from types import SimpleNamespace as _NS
+
+    from mtplx.cache_state import snapshot_cache
+    from mtplx.generation import _inherited_gdn_boundaries
+    from mtplx.session_bank import _boundary_true_restore_enabled
+
+    prefill_keywords = dict(getattr(lane.prefill_request, "keywords", {}) or {})
+    cache_factory = prefill_keywords.get("target_cache_factory")
+    if session_bank is None or not callable(cache_factory):
+        return None, None
+    candidates_fn = getattr(session_bank, "near_prefix_candidates", None)
+    restore_fn = getattr(session_bank, "restore_entry_prefix_cache", None)
+    if not callable(candidates_fn) or not callable(restore_fn):
+        return None, None
+    rt = state.runtime
+    tokens = [int(token) for token in prompt_ids]
+    min_restore_tokens = 512  # matches the batched-lane cold-tier floor
+
+    def session_restore() -> Any | None:
+        outcome: dict[str, Any] = {"hit": False}
+        started = time.perf_counter()
+        try:
+            if len(tokens) <= min_restore_tokens or not _boundary_true_restore_enabled():
+                return None
+            candidates = candidates_fn(
+                tokens,
+                model_path=str(rt.model_path),
+                mtp_enabled=True,
+                hidden_variant="post_norm",
+                template_hash=template_hash,
+                mtp_history_policy=_bank_history_policy(state),
+                draft_head_identity=state.draft_head_identity,
+                policy_fingerprint=policy_fingerprint,
+                min_restore_tokens=min_restore_tokens,
+            )
+            for entry, matched in sorted(
+                candidates, key=lambda item: -int(item[1])
+            ):
+                restored = restore_fn(
+                    rt,
+                    entry,
+                    int(matched),
+                    mode="clone",
+                    cache_factory=cache_factory,
+                )
+                if restored is None:
+                    continue
+                if len(restored) == 5:
+                    cache, history, storage_mode, restore_point, hidden = restored
+                elif len(restored) == 4:
+                    cache, history, storage_mode, restore_point = restored
+                    hidden = None
+                else:
+                    cache, history, storage_mode = restored
+                    restore_point, hidden = int(matched), None
+                restore_point = int(restore_point)
+                # Cohort fail-closed gates: a GDN-hybrid row must resume at a
+                # boundary whose hidden is stored (re-running token b-1 would
+                # advance the recurrent state twice), and committed MTP
+                # history must restore with it (entries lacking the snapshot
+                # — e.g. ar_batch commits — stay cold here).
+                if (
+                    hidden is None
+                    or history is None
+                    or not min_restore_tokens <= restore_point < len(tokens)
+                ):
+                    continue
+                entry.hits += 1
+                entry.last_access_s = time.time()
+                outcome.update(
+                    {
+                        "hit": True,
+                        "restore_point": restore_point,
+                        "matched": int(matched),
+                        "entry_prefix_len": int(getattr(entry, "prefix_len", 0) or 0),
+                        "storage_restore_mode": str(storage_mode),
+                        "restore_s": round(time.perf_counter() - started, 6),
+                    }
+                )
+                return _NS(
+                    cache=cache,
+                    mtp_cache=history,
+                    restore_point=restore_point,
+                    boundary_hidden=hidden,
+                    inherited_boundaries=_inherited_gdn_boundaries(
+                        entry, restore_point
+                    ),
+                )
+            return None
+        except Exception as exc:
+            outcome["error"] = f"{type(exc).__name__}: {exc}"
+            return None
+        finally:
+            outcome.setdefault(
+                "restore_s", round(time.perf_counter() - started, 6)
+            )
+            request_observability["mtp_batch_session_restore"] = outcome
+
+    def session_commit(
+        *,
+        cache: Any,
+        mtp_cache: Any,
+        hidden: Any,
+        gdn_boundaries: list[Any],
+        restored: Any,
+    ) -> None:
+        started = time.perf_counter()
+        try:
+            if len(tokens) < 512:
+                return
+            if any(token >= (1 << 40) for token in tokens):
+                return  # vision surrogate ids never enter the batched bank path
+            if (
+                restored is not None
+                and len(tokens) - int(restored.restore_point) < 1024
+            ):
+                # The entry this restore served already covers the prompt to
+                # within a small suffix; same-key re-puts would only re-clone.
+                return
+            mtp_snapshot = snapshot_cache(mtp_cache) if mtp_cache is not None else None
+            entry = session_bank.put(
+                runtime=rt,
+                token_ids=tokens,
+                cache=cache,
+                logits=None,
+                hidden=hidden,
+                hidden_variant="post_norm",
+                session_id=session_id,
+                template_hash=template_hash,
+                mtp_history_policy=_bank_history_policy(state),
+                draft_head_identity=state.draft_head_identity,
+                policy_fingerprint=policy_fingerprint,
+                mtp_history_snapshot=mtp_snapshot,
+                snapshot_epoch=len(tokens),
+                mtp_snapshot_epoch=len(tokens) if mtp_snapshot is not None else None,
+                gdn_boundaries=list(gdn_boundaries or []),
+            )
+            request_observability["mtp_batch_prompt_boundary_bank_stored"] = (
+                entry is not None
+            )
+            request_observability["mtp_batch_bank_boundaries"] = len(
+                gdn_boundaries or []
+            )
+        except Exception as exc:
+            request_observability["mtp_batch_prompt_boundary_bank_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+        finally:
+            request_observability["mtp_batch_prompt_boundary_bank_put_s"] = round(
+                time.perf_counter() - started, 6
+            )
+
+    return session_restore, session_commit
+
+
+def _sampler_cohort_triple(sampler: Any) -> tuple[float, float, int]:
+    return (
+        float(getattr(sampler, "temperature", 0.0)),
+        float(getattr(sampler, "top_p", 0.0)),
+        int(getattr(sampler, "top_k", 0)),
+    )
+
+
+def _mtp_batch_compatibility_key(
+    lane: Any,
+    omit_bonus: bool,
+    sampler: Any,
+    draft_sampler: Any,
+) -> tuple[Any, ...]:
+    """Cohort admission key for the fixed-width mtp_batch lane.
+
+    One cohort binds one TARGET sampler triple and one DRAFT sampler
+    triple: requests resolved to different draft samplers must not share a
+    cohort, and — because the resolved draft can coincide while the target
+    sampling differs (e.g. greedy-coupled temp-0 next to an explicit
+    temp-1 draft) — the target triple is part of the key in its own right,
+    in both admission directions.
+    """
+    return (
+        str(getattr(lane, "route_id", "")),
+        bool(omit_bonus),
+        "cold_full_prompt",
+        _sampler_cohort_triple(sampler),
+        _sampler_cohort_triple(draft_sampler),
+    )
+
+
+def _run_mtp_batch_generation_dispatched(
+    state: ServerState,
+    prompt_ids: list[int],
+    *,
+    response_id: str | None,
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    service = getattr(state, "mtp_batch_service", None)
+    lane = getattr(state, "mtp_batch_lane", None)
+    if service is None or lane is None:
+        raise MTPBatchRequestError(
+            "mtp_batch service was not installed at construction"
+        )
+    response_max, sampler, generation_limits = _generation_params(
+        state,
+        prompt_token_count=len(prompt_ids),
+        max_tokens=kwargs.get("max_tokens"),
+        temperature=kwargs.get("temperature"),
+        top_p=kwargs.get("top_p"),
+        top_k=kwargs.get("top_k"),
+        presence_penalty=kwargs.get("presence_penalty"),
+        frequency_penalty=kwargs.get("frequency_penalty"),
+    )
+    # #311 batch close: cohort rows never pass through _run_generation's arm
+    # site, so the literal-repetition stop must be armed here or width>=2
+    # requests decode unguarded. Solo/b1-exact rows re-arm downstream with
+    # the same value (harmless).
+    generation_limits["uncapped_repetition_stop_enabled"] = bool(
+        _repetition_stop_enabled(generation_limits)
+    )
+    _validate_mtp_batch_request_contract(
+        state,
+        prompt_ids,
+        response_max=response_max,
+        constraint_spec=kwargs.get("constraint_spec"),
+        vision_splice=kwargs.get("vision_splice"),
+        background_request=bool(kwargs.get("background_request")),
+        depth=kwargs.get("depth"),
+        resolved_mtp_depth=kwargs.get("resolved_mtp_depth"),
+    )
+    generation_seed, _seed_is_explicit = _resolve_seed(state, kwargs.get("seed"))
+    request_observability = dict(kwargs.get("request_observability") or {})
+    solo_kwargs = dict(kwargs)
+    finalize_ownership = solo_kwargs.pop(
+        "mtp_batch_finalize_ownership", MTPBatchFinalizeOwnership()
+    )
+    solo_kwargs["seed"] = generation_seed
+    solo_kwargs["request_observability"] = dict(request_observability)
+    b1_exact_serial = getattr(lane, "numerics_profile", None) == "b1-exact"
+    session_restore_hook: Callable[[], Any] | None = None
+    session_commit_hook: Callable[..., Any] | None = None
+    if kwargs.get("session_bank") is not None and not b1_exact_serial:
+        session_restore_hook, session_commit_hook = _build_mtp_batch_session_hooks(
+            state,
+            prompt_ids=prompt_ids,
+            session_bank=kwargs.get("session_bank"),
+            session_id=kwargs.get("session_id"),
+            template_hash=kwargs.get("session_template_hash"),
+            policy_fingerprint=kwargs.get("session_policy_fingerprint"),
+            lane=lane,
+            request_observability=request_observability,
+        )
+    request_observability.update(
+        {
+            "scheduler_lane": (
+                "mtp_batch_b1_exact" if b1_exact_serial else "mtp_batch"
+            ),
+            "scheduler_mode": "mtp_batch",
+            "scheduler_policy": (
+                "serial_b1_exact" if b1_exact_serial else "fixed_mtp_batch_width_8"
+            ),
+            "mtp_disabled_reason": None,
+            "mtp_batch_session_cache_bypass": (
+                kwargs.get("session_bank") is not None
+                and session_restore_hook is None
+            ),
+        }
+    )
+    draft_sampler = _resolve_draft_sampler_for_request(
+        state,
+        request_draft_sampler=kwargs.get("draft_sampler"),
+        # Effective temperature, not the raw kwarg (None when omitted) —
+        # same coupling contract as the serial lane.
+        target_temperature=float(sampler.temperature),
+        target_sampler=sampler,
+        request_observability=request_observability,
+    )
+    cancel_event = kwargs.get("cancel_event") or Event()
+    omit_bonus = bool(getattr(state, "mtp_batch_omit_speculative_bonus", False))
+    job = MTPBatchJob(
+        request_id=response_id or f"mtpbatch-{uuid.uuid4().hex}",
+        prompt_ids=prompt_ids,
+        max_tokens=response_max,
+        sampler=sampler,
+        draft_sampler=draft_sampler,
+        seed=generation_seed,
+        stop_token_ids=_default_stop_tokens(state.runtime.tokenizer),
+        token_callback=kwargs.get("token_callback"),
+        prefill_callback=kwargs.get("prefill_callback"),
+        compatibility_key=_mtp_batch_compatibility_key(
+            lane, omit_bonus, sampler, draft_sampler
+        ),
+        generation_limits=generation_limits,
+        solo_runner=lambda _job: _run_generation(state, prompt_ids, **solo_kwargs),
+        cancel_error=lambda item: _StreamCancelled(
+            f"request {item.request_id} cancelled"
+        ),
+        cancel_event=cancel_event,
+        finalize_ownership=finalize_ownership,
+        request_observability=request_observability,
+        omit_speculative_bonus=omit_bonus,
+        session_id=kwargs.get("session_id"),
+        session_restore=session_restore_hook,
+        session_commit=session_commit_hook,
+    )
+    smart_fan_lease = _begin_smart_fan_request(
+        state,
+        request_id=_smart_fan_request_id(job.request_id, "mtpbatch"),
+        request_observability=request_observability,
+    )
+    state.begin_foreground()
+    try:
+        future = service.submit(job)
+        scheduler = getattr(state, "model_scheduler", None)
+        if (
+            scheduler is not None
+            and hasattr(scheduler, "is_owner_thread")
+            and scheduler.is_owner_thread()
+            and hasattr(service, "pump_once")
+        ):
+            service.pump_once()
+        generated = future.result()
+    finally:
+        state.end_foreground()
+        _end_smart_fan_request(state, smart_fan_lease)
+    if bool(generated.pop("_mtp_batch_solo", False)):
+        return generated
+    # Sealed-width truth: the cohort service stamped the executed width into
+    # the result stats after sealing; the request-thread observability dict
+    # still carries the submit-time defaults and is re-applied over stats by
+    # the envelope stages, so copy the truth back before finalization. At
+    # width 8 the values equal the defaults (byte-identical payloads).
+    sealed_stats = generated.get("stats") or {}
+    for width_truth_key in (
+        "scheduler_policy",
+        "mtp_batch_fixed_width",
+        "mtp_batch_route_id",
+    ):
+        if width_truth_key in sealed_stats:
+            request_observability[width_truth_key] = sealed_stats[width_truth_key]
+    return _finalize_mtp_batch_generation(
+        state,
+        prompt_ids,
+        generated,
+        session_id=kwargs.get("session_id"),
+        request_observability=request_observability,
+    )
 
 
 def _smart_fan_request_id(response_id: str | None, fallback_prefix: str) -> str:
@@ -15679,9 +23484,317 @@ class _SmartFanArrivalMiddleware:
             _end_smart_fan_request(self.state, lease)
 
 
-def _runtime_kv_admission(runtime: Any, tokens: int):
-    admit = getattr(runtime, "admit_kv_tokens", None)
-    return admit(tokens) if callable(admit) else nullcontext()
+class _AuthRateLimitMiddleware:
+    """API-key + rate-limit gate as pure ASGI (2026-08-18).
+
+    Behavior-identical replacement for the former ``@app.middleware
+    ("http")`` function ``api_key_and_rate_limit``. The decorator form
+    wraps responses in BaseHTTPMiddleware's rendezvous relay, taxing
+    every SSE frame; this class touches only the request head. Auth and
+    rate-limit helpers take a Starlette ``Request``, which constructs
+    fine from a bare http scope (headers/query only — the body is never
+    read here, so downstream receives an untouched stream).
+    """
+
+    def __init__(self, app: Any, state: Any) -> None:
+        self.app = app
+        self.state = state
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope)
+        path = str(scope.get("path") or "")
+        method = str(scope.get("method") or "GET").upper()
+        if _request_is_dashboard_bundle(method, path):
+            await self.app(scope, receive, send)
+            return
+        api_key = self.state.args.api_key
+        # The browser sign-in route checks its own credential (query key,
+        # ticket, or posted key) and answers 401 itself; it still pays the
+        # rate limit below, so key guessing stays throttled.
+        if path != _BROWSER_AUTH_PATH and not _request_is_authorized(request, api_key):
+            response = JSONResponse(
+                status_code=401,
+                content={
+                    "error": {
+                        "message": "missing or invalid API key",
+                        "type": "authentication_error",
+                    }
+                },
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await response(scope, receive, send)
+            return
+        allowed, retry_after = self.state.rate_limiter.check(_rate_limit_key(request))
+        if not allowed:
+            response = JSONResponse(
+                status_code=429,
+                content={
+                    "error": {
+                        "message": "rate limit exceeded",
+                        "type": "rate_limit_error",
+                    }
+                },
+                headers={"Retry-After": str(retry_after)},
+            )
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+class _OriginPolicyMiddleware:
+    """Same-origin-by-default browser gate, with CORS answered in one place.
+
+    Replaces the former ``CORSMiddleware(allow_origins=["*"],
+    allow_credentials=True)``, which let any web page the user visited drive
+    the local model (and, on a keyless localhost bind, read the answers and
+    clear sessions). Policy, per request carrying an ``Origin`` header:
+
+    - ``Origin`` equal to the origin the client used to reach us (scheme +
+      Host) is same-origin: allowed, credentials included.
+    - An origin listed in ``--cors-origin`` / ``MTPLX_CORS_ORIGINS`` is
+      allowed for the API, but never for the same-origin-only routes
+      (``/admin/*`` and the browser sign-in endpoints).
+    - Any other ``Origin`` (including ``null``) gets a 403 and no
+      ``Access-Control-Allow-*`` headers. Browsers attach ``Origin`` to
+      every cross-origin request, including "simple" POSTs whose response
+      they would not let the page read, so this also stops the
+      keep-the-GPU-busy variant.
+
+    Requests without ``Origin`` (the native app, OpenCode, Pi, Claude Code,
+    curl) pass through untouched: no wrapper, no per-chunk cost. Preflights
+    from allowed origins are answered here, including the private-network
+    grant Chromium asks for before a public page may call a loopback host.
+    Pure ASGI like the auth gate above, for the same streaming reason.
+    """
+
+    def __init__(self, app: Any, state: Any) -> None:
+        self.app = app
+        self.state = state
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope)
+        origin = request.headers.get("origin")
+        if origin is None:
+            await self.app(scope, receive, send)
+            return
+        path = str(scope.get("path") or "")
+        method = str(scope.get("method") or "GET").upper()
+        same_origin = _request_origin_is_own(
+            origin, scheme=request.url.scheme, host_header=request.headers.get("host")
+        )
+        allowlisted = not same_origin and _origin_is_allowlisted(
+            origin, getattr(self.state.args, "cors_origins", None) or ()
+        )
+        allowed = same_origin or (allowlisted and not _path_is_same_origin_only(path))
+        if not allowed:
+            response = JSONResponse(
+                status_code=403,
+                content={
+                    "error": {
+                        "message": "cross-origin request refused",
+                        "type": "origin_error",
+                    }
+                },
+            )
+            await response(scope, receive, send)
+            return
+        preflight = method == "OPTIONS" and "access-control-request-method" in request.headers
+        if preflight:
+            headers = {
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Credentials": "true",
+                "Access-Control-Allow-Methods": request.headers.get(
+                    "access-control-request-method", "GET"
+                ),
+                "Access-Control-Max-Age": "600",
+                "Vary": "Origin",
+            }
+            requested_headers = request.headers.get("access-control-request-headers")
+            if requested_headers:
+                headers["Access-Control-Allow-Headers"] = requested_headers
+            if request.headers.get("access-control-request-private-network", "").lower() == "true":
+                headers["Access-Control-Allow-Private-Network"] = "true"
+            response = Response(status_code=200, headers=headers)
+            await response(scope, receive, send)
+            return
+        if same_origin:
+            # Browsers do not apply CORS to same-origin requests; nothing to add.
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_cors_headers(message: Any) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers.append("Access-Control-Allow-Origin", origin)
+                headers.append("Access-Control-Allow-Credentials", "true")
+                headers.add_vary_header("Origin")
+            await send(message)
+
+        await self.app(scope, receive, send_with_cors_headers)
+
+
+async def _prompt_scoring_response(
+    state: "ServerState",
+    *,
+    prompt_ids: list[int],
+    top_k: int,
+    model: str,
+    response_id: str,
+    created: int,
+    request_observability: dict[str, Any] | None = None,
+) -> JSONResponse:
+    """/v1/completions echo+logprobs+max_tokens=0: teacher-forced prompt scoring.
+
+    The KL-divergence lane contract (OpenAI echo+logprobs alignment): all
+    four arrays have length n with index i describing prompt token i.
+    ``token_logprobs[0]`` and ``top_logprobs[0]`` are null (the first token
+    has no conditional); ``top_logprobs[i]`` is the token->logprob dict of
+    the distribution that predicted tokens[i] and always contains tokens[i]
+    itself ("up to k+1 entries"). ``token_ids`` rides along because string
+    keys collapse for multi-byte pieces; ``text``/``text_offset`` come from
+    the same per-token decomposition so offset slicing is exact. Correct
+    under both harness zip conventions (zip(tokens, token_logprobs) and the
+    skip-nulls variant). One prefill-shaped pass, chunk-bounded logits,
+    zero decode-hot-path involvement.
+    """
+
+    max_top_k = _env_int("MTPLX_PROMPT_LOGPROBS_MAX", 128) or 128
+    if top_k > max_top_k:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"logprobs={top_k} exceeds the prompt-scoring limit of "
+                f"{max_top_k} (MTPLX_PROMPT_LOGPROBS_MAX)"
+            ),
+        )
+    max_positions = _env_int("MTPLX_PROMPT_SCORE_MAX_TOKENS", 8192) or 8192
+    if len(prompt_ids) > max_positions:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"prompt has {len(prompt_ids)} tokens; prompt scoring is "
+                f"limited to {max_positions} (MTPLX_PROMPT_SCORE_MAX_TOKENS)"
+            ),
+        )
+
+    tokenizer = state.runtime.tokenizer
+
+    def _score_under_lock() -> dict[str, Any]:
+        state.begin_foreground()
+        state.lock.acquire()
+        try:
+            return score_prompt_logprobs(
+                state.runtime,
+                list(prompt_ids),
+                top_k=int(top_k),
+            )
+        finally:
+            state.lock.release()
+            state.end_foreground()
+
+    scored = await asyncio.to_thread(_score_under_lock)
+
+    # Single-token decode memo: the arrays below need per-token strings
+    # (batch decode may join pieces differently, breaking exact offsets),
+    # but positions x top_k naive decode calls reach ~65k at long context.
+    # Each UNIQUE id decodes exactly once; the decomposition is unchanged.
+    _token_text_by_id: dict[int, str] = {}
+
+    def _token_text(token_id: int) -> str:
+        cached = _token_text_by_id.get(token_id)
+        if cached is None:
+            cached = tokenizer.decode([token_id])
+            _token_text_by_id[token_id] = cached
+        return cached
+
+    token_strings = [_token_text(int(token)) for token in prompt_ids]
+    # text and text_offset share one per-token decomposition so
+    # text[text_offset[i] : text_offset[i] + len(tokens[i])] == tokens[i]
+    # exactly, ASCII or not (batch decode may join pieces differently).
+    echoed_text = "".join(token_strings)
+    text_offsets: list[int] = []
+    offset = 0
+    for token_text in token_strings:
+        text_offsets.append(offset)
+        offset += len(token_text)
+    # Engine position i predicts prompt token i+1; shift right by one with
+    # null at index 0 so array index i describes token i (OpenAI echo
+    # semantics — correct under both harness zip conventions).
+    token_logprobs: list[float | None] = [None]
+    token_logprobs.extend(float(value) for value in scored["token_logprobs"])
+    # Index 0 of top_logprobs is an EMPTY DICT, not null: nothing predicts
+    # position 0 (token_logprobs[0] stays null per OpenAI echo semantics),
+    # but harness KL parsers iterate top_logprobs entries with .items() and
+    # a null first element crashes them. {} carries the same meaning safely.
+    top_logprob_dicts: list[dict[str, float]] = [{}]
+    for position, entries in enumerate(scored["positions"]):
+        row: dict[str, float] = {}
+        if top_k > 0:
+            for token_id, logprob in entries:
+                token_text = _token_text(int(token_id))
+                # Distinct ids can decode to the same display string; keep
+                # the highest logprob (entries arrive sorted descending).
+                if token_text not in row:
+                    row[token_text] = float(logprob)
+        # The scored token always appears in its own map (OpenAI: "up to
+        # k+1 entries") and its entry always carries the TRUE scored value:
+        # when a higher-ranked entry decodes to the same display string
+        # (byte-fallback pieces collapsing to U+FFFD), a keep-first policy
+        # would leave the other token's logprob under this key and
+        # string-keyed KL readers would zip a wrong number against
+        # token_logprobs[i].
+        actual_text = token_strings[position + 1]
+        row[actual_text] = float(scored["token_logprobs"][position])
+        top_logprob_dicts.append(row)
+
+    if request_observability is not None:
+        request_observability["prompt_scoring"] = True
+        request_observability["prompt_scoring_positions"] = len(scored["positions"])
+        request_observability["prompt_scoring_top_k"] = int(top_k)
+
+    payload = {
+        "id": response_id,
+        "object": "text_completion",
+        "created": created,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "text": echoed_text,
+                "finish_reason": "length",
+                "logprobs": {
+                    "tokens": token_strings,
+                    "token_logprobs": token_logprobs,
+                    "top_logprobs": top_logprob_dicts,
+                    "text_offset": text_offsets,
+                    # Stable identity: string keys collapse when byte-level
+                    # pieces decode to U+FFFD; ids never do.
+                    "token_ids": [int(token) for token in prompt_ids],
+                },
+            }
+        ],
+        "usage": {
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": 0,
+            "total_tokens": len(prompt_ids),
+        },
+        "mtplx_stats": {
+            "mode": "prompt_scoring",
+            "prompt_tokens": len(prompt_ids),
+            "scored_positions": len(scored["positions"]),
+            "top_k": int(top_k),
+            "prompt_eval_time_s": float(scored["elapsed_s"]),
+        },
+    }
+    state.last_request_at = time.time()
+    state.requests_completed += 1
+    return JSONResponse(payload)
 
 
 def _run_generation_dispatched(
@@ -15700,6 +23813,51 @@ def _run_generation_dispatched(
     if response_id:
         request_observability_for_lane.setdefault("request_id", response_id)
     kwargs["request_observability"] = request_observability_for_lane
+    if request_capture.capture_dir() and not bool(
+        request_observability_for_lane.get("warmup")
+    ):
+        # Dispatch-time capture (#196/#197 third layer): persisted BEFORE any
+        # token is generated so a hung or early-stopped agent turn still
+        # leaves its bit-exact reproduction envelope on disk.
+        request_capture.capture_request(
+            request_observability_for_lane.get("request_id") or response_id,
+            {
+                "model_id": str(
+                    getattr(state.args, "model_id", None)
+                    or getattr(state, "model_id", None)
+                    or ""
+                ),
+                "prompt_len": len(prompt_ids),
+                "prompt_token_ids": [int(t) for t in prompt_ids],
+                "max_tokens": kwargs.get("max_tokens"),
+                "temperature": kwargs.get("temperature"),
+                "top_p": kwargs.get("top_p"),
+                "top_k": kwargs.get("top_k"),
+                "presence_penalty": kwargs.get("presence_penalty"),
+                "frequency_penalty": kwargs.get("frequency_penalty"),
+                "requested_seed": kwargs.get("seed"),
+                "generation_mode": str(effective_mode),
+                "depth": kwargs.get("depth"),
+                "session_id": kwargs.get("session_id"),
+                "session_restore_mode": kwargs.get("session_restore_mode"),
+                "has_constraint": kwargs.get("constraint_spec") is not None,
+                "tokenizer_template_hash": str(
+                    getattr(state, "main_system_prompt_hash", None) or ""
+                ),
+                "observability": {
+                    k: v
+                    for k, v in request_observability_for_lane.items()
+                    if isinstance(v, (str, int, float, bool))
+                },
+            },
+        )
+    if _use_live_mtp_batch(state, effective_mode=effective_mode):
+        return _run_mtp_batch_generation_dispatched(
+            state,
+            prompt_ids,
+            response_id=response_id,
+            kwargs=kwargs,
+        )
     history_bypass_reason = _ar_batch_history_bypass_reason(
         request_observability_for_lane
     )
@@ -15723,9 +23881,7 @@ def _run_generation_dispatched(
             if history_bypass_reason == "generic_openai_solo_mtp"
             else "solo_mtp_history"
         )
-        request_observability_for_lane["ar_batch_bypass_reason"] = (
-            history_bypass_reason
-        )
+        request_observability_for_lane["ar_batch_bypass_reason"] = history_bypass_reason
     else:
         use_ar_batch, mtp_disabled_reason = _use_live_ar_batch(
             state,
@@ -15793,19 +23949,10 @@ def _run_generation_dispatched(
             request_observability=request_observability,
         )
         state.begin_foreground()
-        kv_admission = None
         try:
-            kv_admission = _runtime_kv_admission(
-                state.runtime,
-                len(prompt_ids) + response_max
-            )
             future = state.ar_batch_service.submit(job)
             generated = future.result()
         finally:
-            if kv_admission is not None:
-                release_kv = getattr(kv_admission, "release", None)
-                if callable(release_kv):
-                    release_kv()
             state.end_foreground()
             _end_smart_fan_request(state, smart_fan_lease)
         ar_stats = dict(generated.get("stats") or {})
@@ -15831,16 +23978,230 @@ def _run_generation_dispatched(
         )
 
     def run() -> dict[str, Any]:
+        # Routing-only token: consumed by the mtp_batch branch (which receives
+        # the whole kwargs dict). The solo/_run_generation path must not see it
+        # — chat completions on non-mtp_batch schedulers crash otherwise.
+        kwargs.pop("mtp_batch_finalize_ownership", None)
         return _run_generation(state, prompt_ids, **kwargs)
 
+    # scheduler_mode=hyper (H0 singleton chassis): the SAME `run` closure and
+    # the SAME FIFO submission as serial — the gate only wraps admission
+    # accounting and the H1/H2 width seam around it (mtplx/server/hyper.py).
+    # Hyper must never route width-1 traffic through a batched driver; serial
+    # mode pays exactly one None check here.
+    hyper_gate = getattr(state, "hyper_gate", None)
+    hyper_ticket = None
+    submitted_run = run
+    if hyper_gate is not None:
+        hyper_ticket = hyper_gate.admit(
+            request_id=(
+                response_id or request_observability_for_lane.get("request_id")
+            ),
+            prompt_tokens=len(prompt_ids),
+        )
+        # The admission lane; orthogonal markers (ar_batch_bypass_reason,
+        # constrained flags) stay in the envelope untouched.
+        request_observability_for_lane["scheduler_lane"] = "hyper_singleton"
+        submitted_run = hyper_gate.bind(
+            hyper_ticket, run, generation_mode=effective_mode
+        )
     scheduler = getattr(state, "model_scheduler", None)
-    if scheduler is not None and hasattr(scheduler, "is_owner_thread") and scheduler.is_owner_thread():
-        return run()
-    return _submit_foreground_model_work(
-        state,
-        run,
-        batch_key=batch_key,
-    ).result()
+    try:
+        if (
+            scheduler is not None
+            and hasattr(scheduler, "is_owner_thread")
+            and scheduler.is_owner_thread()
+        ):
+            return submitted_run()
+        return _submit_foreground_model_work(
+            state,
+            submitted_run,
+            batch_key=batch_key,
+        ).result()
+    finally:
+        # Settles hyper tickets whose work item never started (cancelled
+        # futures / submit failures); a no-op for started tickets and for
+        # every non-hyper mode.
+        if hyper_gate is not None and hyper_ticket is not None:
+            hyper_gate.release(hyper_ticket)
+
+
+def _couple_draft_sampler_to_greedy_target(
+    draft_sampler: Any,
+    *,
+    explicit_draft_sampler: bool,
+    target_temperature: float | None,
+    request_observability: dict[str, Any] | None = None,
+) -> Any:
+    """Force greedy drafts when the target samples greedily.
+
+    Greedy target + sampled draft collapses acceptance to "did the sampled
+    draft hit argmax" (measured [79/65/42]% by depth on the 27B vs
+    [91/83/67]% at temp 0.6 — 2026-08-05 showdown receipts). A greedy
+    target's OUTPUT is draft-independent, so coupling the draft to greedy
+    only raises acceptance; it cannot change generated text. An explicitly
+    provided draft sampler is always respected. Env off-switch:
+    MTPLX_GREEDY_DRAFT_COUPLING=off.
+    """
+    if (
+        explicit_draft_sampler
+        or draft_sampler is None
+        or target_temperature is None
+        or float(target_temperature) > 0.0
+        or float(getattr(draft_sampler, "temperature", 0.0)) <= 0.0
+    ):
+        return draft_sampler
+    if str(os.environ.get("MTPLX_GREEDY_DRAFT_COUPLING", "on")).strip().lower() in (
+        "off",
+        "0",
+        "false",
+        "no",
+    ):
+        return draft_sampler
+    if request_observability is not None:
+        request_observability["draft_sampler_greedy_coupled"] = True
+    return replace(draft_sampler, temperature=0.0)
+
+
+def _launch_draft_sampler_pinned(args: Any, draft_sampler: Any) -> bool:
+    """Launch provenance for the draft sampler pin.
+
+    ``--draft-sampler-source explicit`` pins (user-typed launcher flag).
+    When the launcher did not stamp a source at all, a directly passed
+    ``--draft-temperature`` is an operator-typed flag and pins like any
+    other explicit flag — mtplx serve/start always stamp the source, so
+    only direct daemon launches take this branch.
+    """
+    source = getattr(args, "draft_sampler_source", None)
+    return str(source or "") == "explicit" or (
+        source is None and draft_sampler is not None
+    )
+
+
+def _env_draft_temperature_scale() -> float | None:
+    """Validated MTPLX_DRAFT_TEMPERATURE_SCALE, or None when inert.
+
+    Same guards the engine-side helper historically applied: unset/blank,
+    unparsable, and non-positive values are ignored.
+    """
+    raw = os.environ.get("MTPLX_DRAFT_TEMPERATURE_SCALE")
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        scale = float(raw)
+    except ValueError:
+        return None
+    if scale <= 0:
+        return None
+    return scale
+
+
+def _resolve_draft_sampler_for_request(
+    state: "ServerState",
+    *,
+    request_draft_sampler: Any | None,
+    target_temperature: float | None,
+    target_sampler: Any,
+    request_observability: dict[str, Any] | None = None,
+) -> Any:
+    """The single per-request draft-sampler resolution, serial and batch.
+
+    Policy order (correctness-free choice: probability-ratio acceptance
+    derives p and q independently, so any draft temperature preserves the
+    output marginal — this only moves speed):
+
+    1. request_explicit — a request-supplied draft sampler is honored as-is
+       (no curve, no greedy coupling).
+    2. pinned — a user-typed launch flag or explicit live-settings draft
+       value freezes the launch sampler and disables the family curve.
+    3. family_curve — the measured per-family curve maps the effective
+       target temperature to a draft temperature (identity when no curve
+       has been stamped).
+    4. target_mirror — no launch draft sampler: the draft mirrors the
+       effective target sampler. This is what the engine does with a None
+       draft sampler; resolving the mirror HERE and passing it explicitly
+       keeps the stamped policy equal to engine reality instead of
+       reporting "none" over a target-temperature draft.
+    5. greedy coupling — target temp 0 forces greedy drafts (the curve's
+       temp-0 row; keeps its own env off-switch).
+
+    MTPLX_DRAFT_TEMPERATURE_SCALE (diagnostic sweep knob) is applied HERE,
+    after coupling and before the telemetry stamp, so the stamped number
+    IS the effective draft temperature. The engine never rescales a
+    server-resolved sampler (see generation._effective_draft_sampler).
+
+    Telemetry: draft_sampler_policy, draft_sampler_policy_source,
+    draft_sampler_resolved_temperature (and draft_sampler_temperature_scale
+    when the knob rescaled) in request observability, so a desync is
+    visible per request instead of silent.
+    """
+
+    if request_draft_sampler is not None:
+        resolved = request_draft_sampler
+        source = "request_explicit"
+        policy = "request_explicit"
+    else:
+        base = getattr(state, "draft_sampler", None)
+        if base is None:
+            resolved = target_sampler
+            source = "target_mirror"
+            policy = "target_mirror"
+        else:
+            pinned = bool(getattr(state, "draft_sampler_pinned", False))
+            curve = getattr(state, "draft_temperature_curve", None)
+            if pinned or not curve:
+                resolved = base
+                source = "launch_pinned" if pinned else "family_default"
+                policy = "static"
+            else:
+                from mtplx.draft_sampling import resolve_draft_temperature
+
+                draft_temperature = resolve_draft_temperature(
+                    curve,
+                    target_temperature,
+                    default=float(getattr(base, "temperature", 0.0)),
+                )
+                if float(draft_temperature) == float(
+                    getattr(base, "temperature", 0.0)
+                ):
+                    resolved = base
+                else:
+                    resolved = replace(base, temperature=float(draft_temperature))
+                source = "family_curve"
+                policy = "curve"
+    coupled = _couple_draft_sampler_to_greedy_target(
+        resolved,
+        explicit_draft_sampler=request_draft_sampler is not None,
+        target_temperature=target_temperature,
+        request_observability=request_observability,
+    )
+    effective = coupled
+    scale = _env_draft_temperature_scale()
+    if (
+        scale is not None
+        and effective is not None
+        and float(getattr(effective, "temperature", 0.0)) > 0.0
+    ):
+        effective = replace(
+            effective, temperature=float(effective.temperature) * scale
+        )
+        if request_observability is not None:
+            request_observability["draft_sampler_temperature_scale"] = float(
+                scale
+            )
+    if request_observability is not None:
+        request_observability["draft_sampler_policy"] = policy
+        request_observability["draft_sampler_policy_source"] = (
+            source + "+greedy_coupled"
+            if coupled is not resolved
+            else source
+        )
+        request_observability["draft_sampler_resolved_temperature"] = (
+            float(getattr(effective, "temperature", 0.0))
+            if effective is not None
+            else None
+        )
+    return effective
 
 
 def _run_generation(
@@ -15877,6 +24238,7 @@ def _run_generation(
     streaming_response: bool | None = None,
     vision_splice: Any | None = None,
     constraint_spec: Any | None = None,
+    prefill_chunk_tokens: int | None = None,
 ) -> dict[str, Any]:
     response_max, sampler, generation_limits = _generation_params(
         state,
@@ -15888,7 +24250,10 @@ def _run_generation(
         presence_penalty=presence_penalty,
         frequency_penalty=frequency_penalty,
     )
-    uncapped_repetition_stop = _uncapped_repetition_stop_enabled(generation_limits)
+    # Key name is historical (pre-#311 the guard armed only for uncapped
+    # responses); it now reflects the universal literal-repetition stop and
+    # stays for receipt compatibility.
+    uncapped_repetition_stop = _repetition_stop_enabled(generation_limits)
     generation_limits["uncapped_repetition_stop_enabled"] = bool(
         uncapped_repetition_stop
     )
@@ -15897,10 +24262,26 @@ def _run_generation(
         prompt_ids=prompt_ids,
         request_observability=request_observability,
     )
-    effective_draft_sampler = draft_sampler if draft_sampler is not None else state.draft_sampler
     effective_mode = _normalize_generation_mode(
         generation_mode,
         default=getattr(state.args, "generation_mode", "mtp"),
+    )
+    # AR responses carry NO draft-sampler telemetry (absent, not
+    # null-with-value): there is no draft, so resolution never runs (F8).
+    effective_draft_sampler = (
+        None
+        if effective_mode == "ar"
+        else _resolve_draft_sampler_for_request(
+            state,
+            request_draft_sampler=draft_sampler,
+            # Effective temperature, not the raw request field: the field is
+            # None when the client omits it while the launch default still
+            # decodes greedily, and a None here skips greedy coupling — a
+            # silent sampled-draft collapse ([79/65/42]% vs [96/87/76]%).
+            target_temperature=float(sampler.temperature),
+            target_sampler=sampler,
+            request_observability=request_observability,
+        )
     )
     requested_depth = (
         0
@@ -15914,7 +24295,10 @@ def _run_generation(
         and requested_depth > 0
     ):
         effective_depth = max(1, min(int(resolved_mtp_depth), int(requested_depth)))
-    started = time.perf_counter()
+    # Include admission and pending-history waits in user-facing TTFT/wall
+    # time. Decode still starts at the first produced token; throughput is
+    # unaffected. Previously a 39s postcommit wait vanished from the receipt.
+    started = float((request_observability or {}).get("request_received_monotonic_s") or time.perf_counter())
     token_times: list[float] = []
     lock_wait_time_s = 0.0
 
@@ -15969,7 +24353,9 @@ def _run_generation(
                     headers={"Retry-After": "1"},
                 )
         else:
-            smart_request_id = str((request_observability or {}).get("request_id") or "")
+            smart_request_id = str(
+                (request_observability or {}).get("request_id") or ""
+            )
             smart_fan_lease = _begin_smart_fan_request(
                 state,
                 request_id=_smart_fan_request_id(
@@ -15981,23 +24367,79 @@ def _run_generation(
             state.begin_foreground()
             state.lock.acquire()
         lock_wait_time_s += time.perf_counter() - lock_started
-        kv_admission = None
         try:
             if cancel_event is not None and cancel_event.is_set():
                 raise _StreamCancelled("request cancelled before generation")
-            kv_admission = _runtime_kv_admission(
-                state.runtime,
-                len(prompt_ids) + response_max
+            if request_observability is not None:
+                # Was the GPU working set resident when this prefill started?
+                # A cold `warm=false` is the ~9 ms/GiB residency rebuild
+                # inside prompt_eval_time_s; read it before blaming prefill.
+                _keepalive_scheduler = getattr(state, "model_scheduler", None)
+                if _keepalive_scheduler is not None and hasattr(
+                    _keepalive_scheduler, "keepalive_state"
+                ):
+                    _keepalive = _keepalive_scheduler.keepalive_state()
+                    request_observability["gpu_keepalive"] = {
+                        key: _keepalive.get(key)
+                        for key in ("armed", "attentive", "warm", "beats", "last_beat_age_s")
+                    }
+            admission_shed = _prefill_admission_shed(
+                state,
+                prompt_ids=prompt_ids,
+                session_bank=session_bank,
+                session_id=session_id,
+                vision_splice=vision_splice,
             )
+            if admission_shed is not None and request_observability is not None:
+                request_observability["prefill_admission_shed"] = admission_shed
+            if admission_shed is not None and admission_shed.get("refused"):
+                raise _prefill_admission_refusal(state, admission_shed)
             dynamic_kv_reservation = _dynamic_paged_kv_reservation(
                 prompt_tokens=len(prompt_ids),
                 max_new_tokens=response_max,
                 mtp_depth=effective_depth,
             )
-            prefill_chunk_tokens = getattr(state.args, "prefill_chunk_tokens", None)
-            with _temporary_env(
-                dynamic_kv_reservation["env"]
-            ), prefill_chunk_size_override(prefill_chunk_tokens):
+            # Callers may tighten the prefill chunk for this generation
+            # (warming runs use a small chunk so their foreground-yield
+            # abort — checked once per chunk — fires fast); the serve-wide
+            # setting stays the default for real requests.
+            if prefill_chunk_tokens is None:
+                prefill_chunk_tokens = getattr(state.args, "prefill_chunk_tokens", None)
+            # Install the per-request live decode sink (flight recorder) so
+            # _DecodeTrace publishes by-depth acceptance at 1 Hz mid-request.
+            # Owner-thread module slot; cleared in the lock-release finally.
+            from mtplx.generation import set_live_decode_sink
+            from mtplx.route_tape import set_route_tape_sink
+
+            set_live_decode_sink(
+                _flight(state).live_depth_sink(
+                    str((request_observability or {}).get("request_id") or "")
+                )
+            )
+            # Route Tape: recorder-level sink; the server stamps the request id
+            # onto every record so generation stays rid-agnostic.
+            _rt_rid = str((request_observability or {}).get("request_id") or "")
+
+            def _emit_route_tape(rec: dict[str, Any]) -> None:
+                # Generation trace labels may contain a prompt preview. The
+                # canonical server request id is the sole telemetry identity.
+                rec["rid"] = _rt_rid
+                if rec.get("name") == "header":
+                    attrs = rec.setdefault("attrs", {})
+                    attrs["model_id"] = str(
+                        getattr(state.args, "model_id", None)
+                        or getattr(state.args, "model", None)
+                        or "unknown"
+                    )
+                    attrs["profile"] = getattr(state.args, "profile", None)
+                    attrs["generation_mode"] = effective_mode
+                _flight(state).emit_route(rec)
+
+            set_route_tape_sink(_emit_route_tape)
+            with (
+                _temporary_env(dynamic_kv_reservation["env"]),
+                prefill_chunk_size_override(prefill_chunk_tokens),
+            ):
                 constraint = (
                     constraint_spec.build(
                         state.runtime.tokenizer, prompt_ids=prompt_ids
@@ -16027,6 +24469,28 @@ def _run_generation(
                         loop_guard=_loop_guard_enabled(),
                         thinking_guard=thinking_guard_config,
                         constraint=constraint,
+                        # Warm-prefix parity with the MTP branch (#246): the
+                        # AR lane used to full-prefill unconditionally and
+                        # hardcode cached_tokens 0 / cache_hit false.
+                        session_bank=session_bank,
+                        session_id=session_id,
+                        session_restore_mode=_session_bank_restore_mode(
+                            session_restore_mode
+                        ),
+                        session_template_hash=session_template_hash,
+                        session_draft_head_identity=session_draft_head_identity,
+                        session_policy_fingerprint=session_policy_fingerprint,
+                        capture_final_state=session_bank is not None,
+                        abort_check=(
+                            (
+                                lambda: bool(
+                                    cancel_event.is_set()
+                                    or _pressure_abort_requested(state)
+                                )
+                            )
+                            if cancel_event is not None
+                            else (lambda: _pressure_abort_requested(state))
+                        ),
                     )
                 else:
                     adaptive_policy = _make_adaptive_policy(
@@ -16042,9 +24506,14 @@ def _run_generation(
                         constraint=constraint,
                         vision_splice=vision_splice,
                         abort_check=(
-                            (lambda: bool(cancel_event.is_set()))
+                            (
+                                lambda: bool(
+                                    cancel_event.is_set()
+                                    or _pressure_abort_requested(state)
+                                )
+                            )
                             if cancel_event is not None
-                            else None
+                            else (lambda: _pressure_abort_requested(state))
                         ),
                         max_tokens=response_max,
                         sampler=sampler,
@@ -16053,7 +24522,7 @@ def _run_generation(
                         seed=generation_seed,
                         mtp_hidden_variant="post_norm",
                         mtp_cache_policy="persistent",
-                        mtp_history_policy="committed",
+                        mtp_history_policy=_bank_history_policy(state),
                         verify_strategy=state.args.verify_strategy,
                         verify_core=state.args.verify_core,
                         draft_core=str(
@@ -16117,15 +24586,29 @@ def _run_generation(
                         ),
                     )
         except PostcommitAbort:
-            # abort_check tripped inside the prefill: the client disconnected
-            # mid-prompt-processing. Reuse the exact cancellation path client
-            # disconnects already take during decode.
+            # abort_check tripped inside the prefill. Two arms share it: a
+            # client disconnect reuses the exact cancellation path decode
+            # disconnects take, while the guard loop's sustained-critical
+            # pressure abort (#393) is an engine-health refusal the client
+            # must SEE — that one maps to the honest 507 (which also sheds
+            # caches) instead of a silent cancel.
+            if _pressure_abort_requested(state) and not (
+                cancel_event is not None and cancel_event.is_set()
+            ):
+                raise _allocation_failure_http_exception(
+                    state,
+                    RuntimeError(
+                        "sustained critical memory pressure during prefill; "
+                        "aborted before the allocator wall"
+                    ),
+                )
             raise _StreamCancelled("client disconnected during prefill")
         finally:
-            if kv_admission is not None:
-                release_kv = getattr(kv_admission, "release", None)
-                if callable(release_kv):
-                    release_kv()
+            from mtplx.generation import set_live_decode_sink
+            from mtplx.route_tape import set_route_tape_sink
+
+            set_live_decode_sink(None)
+            set_route_tape_sink(None)
             state.lock.release()
             if not background_request:
                 state.end_foreground()
@@ -16173,8 +24656,7 @@ def _run_generation(
             final_token_ids = list(final_commit_prompt_ids) + list(out.tokens)
             mtp_snapshot = (
                 snapshot_cache(final_state.final_committed_mtp_cache)
-                if state.session_mtp_history_policy == "committed"
-                and final_state.final_committed_mtp_cache is not None
+                if final_state.final_committed_mtp_cache is not None
                 else None
             )
             session_bank.put(
@@ -16182,16 +24664,12 @@ def _run_generation(
                 token_ids=final_token_ids,
                 cache=final_state.final_trunk_cache,
                 logits=final_state.final_logits,
-                hidden=(
-                    final_state.final_hidden
-                    if state.session_mtp_history_policy == "committed"
-                    else None
-                ),
-                hidden_variant=state.session_hidden_variant,
+                hidden=final_state.final_hidden,
+                hidden_variant="post_norm",
                 keep_live_ref=bool(session_keep_live_ref),
                 session_id=session_id,
                 template_hash=session_template_hash,
-                mtp_history_policy=state.session_mtp_history_policy,
+                mtp_history_policy=_bank_history_policy(state),
                 draft_head_identity=session_draft_head_identity,
                 policy_fingerprint=session_policy_fingerprint,
                 mtp_history_snapshot=mtp_snapshot,
@@ -16250,6 +24728,9 @@ def _run_generation(
             "paged_kv_quant_dequant_calls",
             "paged_kv_quant_dequant_time_s",
             "paged_kv_quant_dequant_tokens",
+            "paged_kv_quant_dequant_memo_hits",
+            "paged_kv_quant_dequant_memo_rebuilds",
+            "paged_kv_quant_kernel_calls",
             "paged_gqa_sdpa_calls",
             "paged_gqa_sdpa_calls_by_route",
             "paged_gqa_sdpa_calls_by_phase",
@@ -16315,8 +24796,18 @@ def _run_generation(
                     session_restore_mode=session_restore_mode,
                     cache_miss_reason=cache_miss_reason,
                     session_keep_live_ref=session_keep_live_ref,
+                    # cached_tokens lives in the metrics envelope, never in
+                    # request_observability — the old gate read the latter
+                    # and silently never fired (E5 inert, 2026-08-21).
+                    cached_tokens=envelope.get("cached_tokens"),
                 )
             )
+        if effective_mode == "ar":
+            # No draft ran: request-policy stamps (e.g. the OpenCode
+            # launch_default tier) must not read as draft stats on an AR
+            # response (F8 — absent, not null-with-value).
+            for key in [k for k in envelope if k.startswith("draft_sampler")]:
+                del envelope[key]
         cleanup = _auto_clear_mlx_cache_after_completed_request(
             state,
             session_id=session_id,
@@ -16326,6 +24817,23 @@ def _run_generation(
             envelope["mlx_cache_cleanup"] = cleanup
         envelope.update(_mlx_allocator_public_stats())
         stats["generation_mode"] = effective_mode
+        # Desync receipts (dynamic draft temperature): the resolved draft
+        # sampler is visible per response, so a drifted draft is provable
+        # from mtplx_stats alone. AR responses carry no draft keys at all.
+        # With MTPLX_ADAPTIVE_DTEMP on, this stamp stays the request-resolved
+        # BASE; the engine's per-round moves ride the accompanying
+        # draft_sampler_adaptive_dtemp block (current temp + EMA + transition
+        # log), which is what distinguishes an adaptive trajectory from a
+        # genuine desync.
+        if effective_mode != "ar" and effective_draft_sampler is not None:
+            stats["draft_sampler_resolved_temperature"] = float(
+                getattr(effective_draft_sampler, "temperature", 0.0)
+            )
+            policy_source = (request_observability or {}).get(
+                "draft_sampler_policy_source"
+            )
+            if policy_source is not None:
+                stats["draft_sampler_policy_source"] = policy_source
         stats.update(envelope)
         stats.update(_generation_truth_stats(state, effective_mode))
         if effective_mode == "ar":
@@ -16351,6 +24859,8 @@ def _run_generation(
             stats["drafted_by_depth"] = []
             stats["mean_accept_probability_by_depth"] = []
             stats["draft_time_s"] = 0.0
+            for key in [k for k in stats if k.startswith("draft_sampler")]:
+                del stats[key]
         stats["server_elapsed_s"] = elapsed_s
         stats["server_tok_s"] = server_tok_s
         stats["server_seed"] = generation_seed
@@ -16359,9 +24869,24 @@ def _run_generation(
         stats["server_blank_retry_suppressed"] = bool(
             response_is_streaming and blank_retry_budget
         )
+        # The public stats contract declares finish_reason (additive-only):
+        # stamp it at generation time so every stop path — stream and
+        # non-stream, chat and messages — actually carries it instead of
+        # only the envelope builders that re-nest it.
+        stats["finish_reason"] = (
+            out.final_state.finish_reason
+            if out.final_state is not None
+            # The serial AR lane has no final_state; its GenerationOutput
+            # still reports length-vs-stop correctly — don't flatten a
+            # max_tokens truncation into "stop".
+            else (getattr(out, "finish_reason", None) or "stop")
+        )
         _record_request_metrics(state, dict(envelope))
-        state.last_request_at = time.time()
-        state.requests_completed += 1
+        if not bool(envelope.get("warmup")):
+            # Same contract as the batch lanes: warm rungs never stamp the
+            # traffic clock (adapting community PR #300 by @Blakeolson21).
+            state.last_request_at = time.time()
+            state.requests_completed += 1
         _dashboard_record_completion(state, envelope=envelope, stats=stats)
         last = {
             "text": out.text,
@@ -16373,14 +24898,7 @@ def _run_generation(
             "tok_s": stats.get("decode_tok_s") or server_tok_s,
             "end_to_end_tok_s": server_tok_s,
             "_final_state": final_state,
-            "finish_reason": (
-                out.final_state.finish_reason
-                if out.final_state is not None
-                # The serial AR lane has no final_state; its GenerationOutput
-                # still reports length-vs-stop correctly — don't flatten a
-                # max_tokens truncation into "stop".
-                else (getattr(out, "finish_reason", None) or "stop")
-            ),
+            "finish_reason": stats["finish_reason"],
         }
         if seed_is_explicit or out.text.strip():
             break
@@ -16394,6 +24912,9 @@ def _run_generation(
                     "event": "mtplx_openai_generation",
                     "prompt_tokens": last["prompt_tokens"],
                     "completion_tokens": last["completion_tokens"],
+                    "max_tokens": last["stats"].get("request_max_tokens"),
+                    "effective_max_tokens": last["stats"].get("effective_max_tokens"),
+                    "finish_reason": last.get("finish_reason"),
                     "elapsed_s": round(float(last["elapsed_s"]), 6),
                     "tok_s": round(float(last["tok_s"]), 6),
                     "end_to_end_tok_s": round(float(last["end_to_end_tok_s"]), 6),
@@ -16404,6 +24925,30 @@ def _run_generation(
                 },
                 ensure_ascii=False,
             )
+        )
+    if request_capture.capture_dir():
+        request_capture.capture_outcome(
+            (request_observability or {}).get("request_id"),
+            {
+                # The solo path serves serial AND hyper-singleton traffic;
+                # mirror the hyper lane stamp instead of mislabeling hyper
+                # capture envelopes as serial. Every other lane keeps the
+                # historical "serial" label byte-for-byte.
+                "scheduler_lane": (
+                    "hyper_singleton"
+                    if (request_observability or {}).get("scheduler_lane")
+                    == "hyper_singleton"
+                    else "serial"
+                ),
+                **request_capture.completion_token_ids(last.get("tokens")),
+                "completion_tokens": last["completion_tokens"],
+                "finish_reason": last.get("finish_reason"),
+                "resolved_seed": last["stats"].get("server_seed"),
+                "attempts": last["stats"].get("server_attempts"),
+                "blank_retries": last["stats"].get("server_blank_retries"),
+                "tok_s": round(float(last["tok_s"]), 3),
+                **request_capture.clip_text_head_tail(last.get("text") or ""),
+            },
         )
     return last
 
@@ -16563,6 +25108,62 @@ class _BackgroundWarmup:
         except BaseException:
             pass
 
+    # A user who just got a response is reading it and about to send the
+    # next turn; warm rungs re-queued the moment a stream ends burned max
+    # GPU between every chat turn (2026-08-17 field regression: rungs
+    # preempted by the first chat re-fired right after each response).
+    # Warm steps now wait for this much foreground quiet before touching
+    # the model; the deferral is a timer, never model work, and does not
+    # consume the resubmit budget.
+    IDLE_GRACE_S = 90.0
+
+    @classmethod
+    def _idle_grace_s(cls) -> float:
+        raw = str(os.environ.get("MTPLX_WARMUP_IDLE_GRACE_S", "")).strip()
+        if raw:
+            try:
+                return max(0.0, float(raw))
+            except ValueError:
+                return cls.IDLE_GRACE_S
+        return cls.IDLE_GRACE_S
+
+    def _foreground_busy(self) -> bool:
+        """True while a real request is generating or queued for the model.
+
+        Only sound at step admission. The warming generation itself calls
+        ``begin_foreground`` for the whole rung, so ``has_foreground()``
+        reads zero here but non-zero once the rung is running: a caller
+        that re-checked from inside a rung would see warmup's own work as
+        live traffic and defer the ladder forever. That is why the sibling
+        ``_ForegroundYield`` reads the scheduler queues instead -- it runs
+        during the rung, this runs before it.
+        """
+        state = self.state
+        try:
+            if state.has_foreground():
+                return True
+        except BaseException:
+            pass
+        try:
+            return bool(_foreground_model_work_pending(state))
+        except BaseException:
+            return False
+
+    def _foreground_quiet_for_s(self) -> float:
+        # last_request_at is stamped when a request COMPLETES, so a request
+        # that has arrived and is still generating leaves it untouched --
+        # 0.0 on a daemon that has not finished one yet, which read as
+        # "infinitely quiet" and admitted a warm rung against live traffic.
+        # That is the post-restart window an operator actually types into,
+        # so the very first request of a serve was the one most likely to
+        # be warmed over. In-flight and queued work is _foreground_busy's
+        # answer; this measures the completion stamp alone.
+        last = float(getattr(self.state, "last_request_at", 0.0) or 0.0)
+        if last <= 0.0:
+            # Nothing has ever completed: no traffic to stay clear of.
+            return float("inf")
+        return max(0.0, time.time() - last)
+
     def submit(self, index: int = 0) -> None:
         try:
             _submit_idle_postcommit_model_work(
@@ -16574,6 +25175,11 @@ class _BackgroundWarmup:
         except BaseException:
             self.state_label = "failed"
             self._publish()
+
+    def _defer_step(self, index: int, wait_s: float) -> None:
+        timer = threading.Timer(max(1.0, wait_s), self.submit, args=(index,))
+        timer.daemon = True
+        timer.start()
 
     def _run_step(self, index: int) -> None:
         try:
@@ -16589,6 +25195,22 @@ class _BackgroundWarmup:
         if index >= len(self.steps):
             self._finish()
             return
+        grace = self._idle_grace_s()
+        busy = self._foreground_busy()
+        quiet = 0.0 if busy else self._foreground_quiet_for_s()
+        if busy or quiet < grace:
+            # Live or recently-served traffic: hold the plan without burning
+            # GPU or the resubmit budget, and re-check when the grace can be
+            # met. Busy is its own branch, not a zero folded into the grace
+            # comparison: MTPLX_WARMUP_IDLE_GRACE_S=0 is how an operator says
+            # "do not wait between turns", and it must not also hand a warm
+            # rung a request that is still generating.
+            step = self.steps[index]
+            if step.get("state") in ("pending", "yielded", "waiting_idle"):
+                step["state"] = "waiting_idle"
+            self._publish()
+            self._defer_step(index, grace - quiet)
+            return
         if self.started_at_s is None:
             self.started_at_s = time.time()
         self.state_label = "running"
@@ -16599,9 +25221,7 @@ class _BackgroundWarmup:
         yielded = False
         try:
             if step["kind"] == "gqa_packed_pipelines":
-                step["state"] = (
-                    "ok" if _prewarm_gqa_packed_pipelines() else "skipped"
-                )
+                step["state"] = "ok" if _prewarm_gqa_packed_pipelines() else "skipped"
             else:
                 generated = self._ladder_generation(int(step["context"]))
                 tok_s = generated.get("tok_s")
@@ -16635,6 +25255,27 @@ class _BackgroundWarmup:
         else:
             self._finish()
 
+    # Warming prefills must yield to real traffic quickly: the
+    # foreground-yield abort only fires once per prefill chunk, and the
+    # serve-wide 2048-token chunk holds the model lock ~3s per chunk on
+    # the 27B — a request arriving mid-warmup stalled exactly that long
+    # (measured 3.1-3.3s mid-turn freezes on the first turns of a fresh
+    # serve, 2026-07-31). A 256-token warming chunk bounds the wait to
+    # ~0.4s and lets preempted steps resume instead of burning the
+    # resubmit budget and abandoning. Passed as a _run_generation kwarg:
+    # the generation applies its own prefill_chunk_size_override
+    # internally, so an outer ContextVar wrapper would be clobbered.
+    # MTPLX_WARMUP_PREFILL_CHUNK overrides for profile tuning (audit F11
+    # #9); the 256 default is the measured 2026-07-31 fence and must not
+    # move without re-measuring the mid-warmup stall.
+    WARMUP_PREFILL_CHUNK_TOKENS = 256
+
+    def _warmup_prefill_chunk_tokens(self) -> int:
+        return max(
+            1,
+            _env_int("MTPLX_WARMUP_PREFILL_CHUNK", self.WARMUP_PREFILL_CHUNK_TOKENS),
+        )
+
     def _ladder_generation(self, context_tokens: int) -> dict[str, Any]:
         repeats = context_tokens // max(1, len(self.prompt_ids)) + 1
         prompt_ids = (list(self.prompt_ids) * repeats)[:context_tokens]
@@ -16648,12 +25289,18 @@ class _BackgroundWarmup:
             seed=0,
             request_observability={"warmup": True, "warmup_background": True},
             cancel_event=_ForegroundYield(self.state),
+            prefill_chunk_tokens=self._warmup_prefill_chunk_tokens(),
         )
 
     def _finish(self, abandoned: bool = False) -> None:
         if abandoned:
             for step in self.steps:
-                if step.get("state") in ("pending", "yielded", "running"):
+                if step.get("state") in (
+                    "pending",
+                    "yielded",
+                    "running",
+                    "waiting_idle",
+                ):
                     step["state"] = "abandoned"
         self.finished_at_s = time.time()
         self.state_label = "abandoned_busy" if abandoned else "done"
@@ -16670,7 +25317,13 @@ class _BackgroundWarmup:
                         "steps": [
                             {
                                 key: step.get(key)
-                                for key in ("kind", "context", "state", "elapsed_s", "tok_s")
+                                for key in (
+                                    "kind",
+                                    "context",
+                                    "state",
+                                    "elapsed_s",
+                                    "tok_s",
+                                )
                                 if key in step
                             }
                             for step in snapshot["steps"]
@@ -16756,6 +25409,9 @@ def _run_startup_warmup(state: ServerState) -> dict[str, Any]:
         _startup_line(
             f"[6/6] Warmup failed after {status['elapsed_s']:.1f}s: {status['error']}"
         )
+        # A failed warmup leaves every later request on the same broken
+        # path; the one-line message has no raise site, so surface it.
+        _startup_line(traceback.format_exc())
         if getattr(state.args, "strict_warmup", False):
             raise
         return status
@@ -16837,6 +25493,12 @@ def _run_startup_warmup(state: ServerState) -> dict[str, Any]:
 
 def _decode_timing(stats: dict[str, Any]) -> tuple[float, float]:
     generated_tokens = int(stats.get("generated_tokens") or 0)
+    # Native generators already separate restore, prompt-state construction
+    # and verifier setup. Recomputing from prefill compute alone charged that
+    # setup to decode a second time (11 s in the Hermes incident replay).
+    measured_decode_s = stats.get("decode_elapsed_s")
+    if measured_decode_s is not None and float(measured_decode_s) > 0.0:
+        return generated_tokens / float(measured_decode_s), float(measured_decode_s)
     elapsed_s = float(stats.get("elapsed_s") or 0.0)
     if "prompt_eval_time_s" in stats:
         prompt_eval_time_s = float(stats.get("prompt_eval_time_s") or 0.0)
@@ -16855,6 +25517,46 @@ def _decode_timing(stats: dict[str, Any]) -> tuple[float, float]:
     if decode_elapsed_s <= 0.0:
         return 0.0, 0.0
     return generated_tokens / decode_elapsed_s, decode_elapsed_s
+
+
+_MTPLX_FOOTER_UI_HINTS = {
+    # Product UI surfaces where a human reads the chat directly. Managed
+    # AGENT clients (opencode, pi, hermes, openwebui) are deliberately NOT
+    # here: they parse assistant content programmatically, which is exactly
+    # the consumer class the footer scoping protects.
+    "chat",
+    "mtplx",
+    "mtplx_app",
+    "mtplxapp",
+}
+
+
+def _stats_footer_allowed(
+    state: ServerState,
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+) -> bool:
+    """Visible TPS footer only on MTPLX product UI surfaces.
+
+    The footer is server-injected prose inside `content`. In the app and
+    browser chat it is a product feature a human reads. Everywhere else —
+    the OpenAI/Anthropic compat API and every agent client, managed or not —
+    it corrupts model output: agents parse it as answer text, temp-0
+    byte-equality breaks (the footer's own tok/s digits differ per run),
+    usage excludes its tokens (wire>usage mismatch), and its flush gap
+    deflates externally measured tok/s.
+
+    MTPLX_STATS_FOOTER_SCOPE=all restores the old always-on behavior.
+    """
+    if not getattr(state.args, "stats_footer", False):
+        return False
+    scope = str(os.environ.get("MTPLX_STATS_FOOTER_SCOPE", "owned")).strip().lower()
+    if scope == "all":
+        return True
+    hint = _app_managed_client_hint(headers, metadata)
+    if hint is None:
+        return False
+    return hint in _MTPLX_FOOTER_UI_HINTS or hint.startswith("mtplx_")
 
 
 def _stats_footer_text(state: ServerState, generated: dict[str, Any]) -> str:
@@ -16893,7 +25595,56 @@ def _usage_payload(generated: dict[str, Any]) -> dict[str, Any]:
         usage["prompt_tokens_details"] = {
             "cached_tokens": max(0, min(int(cached), prompt_tokens))
         }
+    reasoning = stats.get("reasoning_tokens")
+    if reasoning is not None:
+        # OpenAI-standard split so external clients/benchmarks can separate
+        # thinking from visible output instead of guessing from the stream
+        # (external tools were dividing visible tokens by thinking+visible
+        # wall time and under-reading the decoder).
+        usage["completion_tokens_details"] = {
+            "reasoning_tokens": max(0, min(int(reasoning), completion_tokens))
+        }
     return usage
+
+
+def _build_timings(generated: dict[str, Any]) -> dict[str, Any]:
+    stats = generated.get("stats") or {}
+    prompt_n = int(generated.get("prompt_tokens") or 0)
+    predicted_n = int(generated.get("completion_tokens") or 0)
+
+    # Prompt (prefill) timing – derive from target_forward_time_s if needed
+    if "prompt_eval_time_s" in stats:
+        prompt_s = float(stats.get("prompt_eval_time_s") or 0.0)
+    else:
+        target_forward_time_s = float(stats.get("target_forward_time_s") or 0.0)
+        verify_time_s = float(stats.get("verify_time_s") or 0.0)
+        repair_time_s = float(stats.get("repair_time_s") or 0.0)
+        prompt_s = max(0.0, target_forward_time_s - verify_time_s - repair_time_s)
+
+    # Decode (predict) timing – total elapsed minus prefill minus cache restore
+    elapsed_s = float(stats.get("elapsed_s") or 0.0)
+    cache_restore_time_s = max(
+        float(stats.get("cache_restore_time_s") or 0.0),
+        float(stats.get("ssd_restore_s") or 0.0),
+    )
+    decode_s = max(0.0, elapsed_s - prompt_s - cache_restore_time_s)
+
+    prompt_per_second = prompt_n / prompt_s if prompt_s > 0 else 0.0
+    predicted_per_second = predicted_n / decode_s if decode_s > 0 else 0.0
+
+    draft_n = int(stats.get("drafted_tokens") or 0)
+    draft_n_accepted = int(stats.get("accepted_drafts") or 0)
+
+    return {
+        "prompt_n": prompt_n,
+        "predicted_n": predicted_n,
+        "prompt_ms": round(prompt_s * 1000, 3),
+        "predicted_ms": round(decode_s * 1000, 3),
+        "prompt_per_second": round(prompt_per_second, 3),
+        "predicted_per_second": round(predicted_per_second, 3),
+        "draft_n": draft_n,
+        "draft_n_accepted": draft_n_accepted,
+    }
 
 
 def _strip_generated_chat_template_sentinels(text: str) -> str:
@@ -16936,7 +25687,9 @@ def _split_thinking_segments(text: str, *, thinking_enabled: bool) -> tuple[str,
                 segment = _clean_generated_assistant_text(text[position:])
                 append_reasoning(segment)
                 break
-            segment = _clean_generated_assistant_text(text[position : close_match.start()])
+            segment = _clean_generated_assistant_text(
+                text[position : close_match.start()]
+            )
             append_reasoning(segment)
             position = close_match.end()
             inside_thinking = False
@@ -16996,7 +25749,7 @@ def _split_backend_reasoning_for_state(
     thinking_enabled: bool,
 ) -> tuple[str, str]:
     parser = _reasoning_parser_for_state(state)
-    if parser in {"qwen3", "step3p5"}:
+    if parser in {"qwen3", "step3p5", "poolside_v1"}:
         text = normalize_qwen_thinking_tags(
             text,
             thinking_enabled=thinking_enabled,
@@ -17027,11 +25780,26 @@ def _tool_extraction_text_parts(
 class _IncrementalTokenDecoder:
     """Small TextStreamer-style decoder for committed-token SSE streaming.
 
-    The previous bridge decoded the entire generated token buffer after every
-    callback. That is prefix-stable, but it becomes O(n^2) tokenizer work during
-    long reasoning streams. This keeps only the current partial word and flushes
-    finalized text as soon as whitespace or CJK boundaries make it safe.
+    Release policy (streamwar 2026-08-19): emit the newly decoded suffix at
+    EVERY token boundary. The only hold is an incomplete UTF-8 sequence at
+    the tail — byte-level BPE can split one codepoint across tokens, and it
+    decodes as U+FFFD until the remaining bytes arrive.
+
+    This replaced a whitespace-boundary policy (hold until space/newline,
+    64-char force-flush escape releasing all but a 32-char tail). That
+    policy manufactured the "freeze then vomit" stutter on whitespace-poor
+    content — code, markdown tables, minified JSON froze 150-880 ms per
+    line while the producer census read clean (receipts:
+    outputs/streamscope-20260819/baseline/, STREAM_SMOOTHNESS_WAR doc).
+    Chunk-split reasoning close tags and tool-control markers are NOT this
+    class's job: _ThinkingContentStreamSplitter reassembles them from its
+    own partial-prefix holds (verified live path, see
+    _reasoning_control_marker_has_partial_prefix), so the decoder must not
+    duplicate that gating with cadence-destroying holds of its own.
     """
+
+    _CACHE_TRUNCATE_THRESHOLD = 96
+    _CACHE_KEEP_TOKENS = 8
 
     def __init__(self, tokenizer: Any) -> None:
         self._tokenizer = tokenizer
@@ -17044,36 +25812,69 @@ class _IncrementalTokenDecoder:
         except TypeError:
             return self._tokenizer.decode(tokens)
 
+    def _truncate_decoded_prefix(self, text: str) -> None:
+        """Drop flushed tokens from the cache when provably safe.
+
+        The cache previously reset only on newline flushes, so one long line
+        (JSON tool arguments, minified code) re-decoded an ever-growing token
+        list on every callback — O(n^2) tokenizer work on exactly the agentic
+        hot path. Byte-level BPE decodes segment-stably except around
+        incomplete UTF-8 sequences, so keep a short tail and verify it: the
+        endswith check proves the tail decodes independently to the same
+        bytes, keeping the visible stream byte-identical. On any mismatch the
+        cache is left alone (correctness first, speed second).
+        """
+        if len(self._token_cache) <= self._CACHE_TRUNCATE_THRESHOLD:
+            return
+        unflushed_chars = len(text) - self._print_len
+        if unflushed_chars < 0:
+            return
+        # The kept tail must decode to at least the unflushed suffix or
+        # truncation is impossible. Under token-boundary release the
+        # unflushed region is at most a trailing incomplete codepoint,
+        # but the ladder is kept: it is the general proof step (grow the
+        # tail until it covers the unflushed region and verifies), and
+        # it is what caught the 2026-08-18 O(n^2) regrowth bug.
+        keep = self._CACHE_KEEP_TOKENS
+        while True:
+            tail = self._token_cache[-keep:]
+            tail_text = self._decode(tail)
+            if (
+                tail_text
+                and len(tail_text) >= unflushed_chars
+                and text.endswith(tail_text)
+            ):
+                self._token_cache = list(tail)
+                self._print_len = len(tail_text) - unflushed_chars
+                return
+            if keep >= min(len(self._token_cache), self._CACHE_TRUNCATE_THRESHOLD):
+                return
+            keep = min(keep * 2, self._CACHE_TRUNCATE_THRESHOLD)
+
     def feed(self, tokens: list[int]) -> str:
         if not tokens:
             return ""
         self._token_cache.extend(int(token) for token in tokens)
         text = self._decode(self._token_cache)
         if text.endswith("\n"):
+            # Newline is an exact flush point: drop the cache so the next
+            # line starts a fresh, small decode.
             printable = text[self._print_len :]
             self._token_cache = []
             self._print_len = 0
             return printable
-        if text and self._is_cjk_char(ord(text[-1])):
-            printable = text[self._print_len :]
-            self._print_len += len(printable)
-            return printable
-        close_match = QWEN_STYLE_REASONING_CLOSE_RE.search(text, self._print_len)
-        if close_match is not None:
-            boundary = close_match.end()
-            printable = text[self._print_len : boundary]
-            self._print_len = boundary
-            return printable
-
-        boundary = -1
-        for index in range(len(text) - 1, -1, -1):
-            if text[index].isspace():
-                boundary = index + 1
-                break
-        if boundary <= self._print_len:
+        # Hold only a trailing U+FFFD run (an incomplete multi-byte
+        # codepoint still waiting for its continuation bytes). A real
+        # replacement char anywhere else flows through; a held one is
+        # released the moment later tokens resolve or extend past it.
+        end = len(text)
+        while end > self._print_len and text[end - 1] == "\ufffd":
+            end -= 1
+        if end <= self._print_len:
             return ""
-        printable = text[self._print_len : boundary]
-        self._print_len = boundary
+        printable = text[self._print_len : end]
+        self._print_len = end
+        self._truncate_decoded_prefix(text)
         return printable
 
     def finish(self) -> str:
@@ -17084,21 +25885,6 @@ class _IncrementalTokenDecoder:
         self._token_cache = []
         self._print_len = 0
         return printable
-
-    @staticmethod
-    def _is_cjk_char(cp: int) -> bool:
-        if (
-            (0x4E00 <= cp <= 0x9FFF)
-            or (0x3400 <= cp <= 0x4DBF)
-            or (0x20000 <= cp <= 0x2A6DF)
-            or (0x2A700 <= cp <= 0x2B73F)
-            or (0x2B740 <= cp <= 0x2B81F)
-            or (0x2B820 <= cp <= 0x2CEAF)
-            or (0xF900 <= cp <= 0xFAFF)
-            or (0x2F800 <= cp <= 0x2FA1F)
-        ):
-            return True
-        return False
 
 
 class _NonDuplicatingTokenDecoder(_IncrementalTokenDecoder):
@@ -17119,6 +25905,12 @@ class _NonDuplicatingTokenDecoder(_IncrementalTokenDecoder):
 class _ThinkingContentStreamSplitter:
     _TOOL_CALL_MARKER = "<tool_call"
     _TOOL_CALL_CLOSE_MARKER = "</tool_call>"
+    # Angle-bracketed protocol forms only. The former bare "function=" /
+    # "parameter=" entries flipped the think/content split on ordinary
+    # reasoning prose that merely *mentions* those substrings (any code
+    # discussion), leaking the rest of the think block into content
+    # (#196/#197 leak variant). Chunk-split "<function=" openers are already
+    # covered by the partial-prefix hold, so the bare forms bought nothing.
     _TOOL_CONTROL_MARKERS = (
         "<tool_call",
         "<function=",
@@ -17126,8 +25918,6 @@ class _ThinkingContentStreamSplitter:
         "</parameter>",
         "</function>",
         "</tool_call>",
-        "parameter=",
-        "function=",
     )
 
     def __init__(
@@ -17137,7 +25927,17 @@ class _ThinkingContentStreamSplitter:
         recover_unclosed_reasoning_as_content: bool = True,
         start_inside_thinking: bool = True,
         suppress_orphan_tool_markup: bool = False,
+        trim_visible_content_edges: bool = False,
     ) -> None:
+        # Live-SSE lanes only (stream/non-stream text parity): the
+        # non-stream cleaner ends with a global strip(), so streamed
+        # content deltas must concatenate to the same edge-stripped text
+        # (the model separates "</think>" from prose with "\n\n", which
+        # otherwise leaks as a leading content delta). The canonicalization
+        # normalizer must NOT set this — transcript identity is byte-exact.
+        self._trim_visible_content_edges = bool(trim_visible_content_edges)
+        self._stream_lead_ws_pending = True
+        self._stream_trailing_ws_hold = ""
         self._thinking_enabled = thinking_enabled
         self._recover_unclosed_reasoning_as_content = (
             recover_unclosed_reasoning_as_content
@@ -17149,18 +25949,53 @@ class _ThinkingContentStreamSplitter:
         self.suppressed_tool_markup_chars = 0
         self._orphan_in_span = False
         self._orphan_hold = ""
+        # Span interior is buffered, not discarded: finish() re-derives the
+        # non-stream stripper's result from it so an unclosed opener cannot
+        # eat the rest of the turn (2.7.1 known issue).
+        self._orphan_span_buffer = ""
+        self._orphan_span_search_from = 0
+        # Code-fence exemption state: content inside ``` fences streams
+        # through unfiltered, mirroring _strip_orphan_tool_markup.
+        self._orphan_fence_open = False
         self._inside_thinking = thinking_enabled and start_inside_thinking
         self._inside_tool_call = False
         self._tool_call_tail = ""
         self._pending = ""
         self._disabled_inside_reasoning = False
         self._disabled_visible_started = False
+        # Interior of a disabled-thinking reasoning span is buffered, not
+        # discarded (#F3): if the closer never arrives, finish() emits it as
+        # content, matching strip_qwen_style_reasoning_from_content's
+        # keep-prose behavior on the non-stream path.
+        self._disabled_reasoning_interior = ""
         self._reentry_count = 0
         self._reasoning_accumulated: list[str] = []
         self._content_emitted = False
         self._content_history_tail = ""
         self._post_orphan_close_duplicate_tail = ""
         self._saw_chat_template_sentinel = False
+        # F40 tool-preamble parity state. With reasoning=auto the template
+        # pre-opens <think>, so pre-tool-call preamble text is routed to
+        # reasoning_content before the splitter can know a tool call follows;
+        # non-stream classifies the same marker-less text as content. These
+        # flags let finish() distinguish that auto-routed preamble (recovered
+        # as content, F3-precedent) from an explicit think block (which
+        # legitimately stays reasoning on both paths) using splitter state,
+        # not text heuristics.
+        # Content that reached the content channel as user-visible prose —
+        # tool-call passthrough markup sets _content_emitted but not this.
+        self._visible_content_emitted = False
+        # The thinking state was exited by a tool-control marker (no
+        # explicit </think> close): everything accumulated as reasoning up
+        # to that point was auto-routed pre-tool-call text.
+        self._tool_call_interrupted_thinking = False
+        # An explicit think open/close marker was consumed while splitting:
+        # the accumulated reasoning is (at least partly) a real think block.
+        self._saw_explicit_reasoning_marker = False
+        # Set by finish(): auto-routed pre-tool-call preamble that should
+        # surface as a content delta once the stream lane confirms the turn
+        # actually parsed tool calls. None when no recovery applies.
+        self.tool_preamble_recovered_content: str | None = None
 
     @property
     def reentry_count(self) -> int:
@@ -17174,9 +26009,52 @@ class _ThinkingContentStreamSplitter:
             return []
         if not self._thinking_enabled:
             self._pending += text
-            return self._drain_disabled(final=False)
+            return self._trim_visible_edges(self._drain_disabled(final=False))
         self._pending += text
-        return self._drain(final=False)
+        return self._trim_visible_edges(self._drain(final=False))
+
+    def _trim_visible_edges(
+        self, chunks: list[tuple[str, str]], *, final: bool = False
+    ) -> list[tuple[str, str]]:
+        """Make streamed content concatenate to the non-stream strip().
+
+        Leading whitespace-only content is swallowed until the first visible
+        character; a trailing whitespace run is held and dropped at finish or
+        ahead of tool-call markup (interior whitespace passes untouched, so
+        markdown structure is preserved). Tool-protocol markup chunks are
+        never padded or trimmed — the tool translator consumes them verbatim.
+        """
+        if not self._trim_visible_content_edges:
+            return chunks
+        out: list[tuple[str, str]] = []
+        for channel, text in chunks:
+            if channel != "content" or not text:
+                out.append((channel, text))
+                continue
+            if text.lstrip().startswith(self._TOOL_CONTROL_MARKERS):
+                # The pre-tool separator ("...\n\n<tool_call>") rides at the
+                # head of the markup chunk; non-stream strips it, so drop it
+                # here too along with any held run. The markup itself passes
+                # verbatim for the tool translator.
+                self._stream_trailing_ws_hold = ""
+                out.append((channel, text.lstrip()))
+                continue
+            if self._stream_lead_ws_pending:
+                text = text.lstrip()
+                if not text:
+                    continue
+                self._stream_lead_ws_pending = False
+            if self._stream_trailing_ws_hold:
+                text = self._stream_trailing_ws_hold + text
+                self._stream_trailing_ws_hold = ""
+            body = text.rstrip()
+            if len(body) != len(text):
+                self._stream_trailing_ws_hold = text[len(body):]
+            if body:
+                out.append((channel, body))
+        if final:
+            self._stream_trailing_ws_hold = ""
+        return out
 
     def finish(
         self,
@@ -17200,6 +26078,7 @@ class _ThinkingContentStreamSplitter:
             if recover_unclosed_reasoning_as_content is None
             else recover_unclosed_reasoning_as_content
         )
+        recovered_as_content = False
         if (
             self._thinking_enabled
             and recover_unclosed_reasoning
@@ -17210,76 +26089,148 @@ class _ThinkingContentStreamSplitter:
             recovered = "".join(self._reasoning_accumulated).strip()
             if recovered:
                 self._content_emitted = True
+                recovered_as_content = True
                 chunks.append(("content", recovered))
+        if (
+            self._thinking_enabled
+            and not recovered_as_content
+            and self._tool_call_interrupted_thinking
+            and not self._visible_content_emitted
+            and not self._saw_explicit_reasoning_marker
+            and self._reasoning_accumulated
+            and not self._saw_chat_template_sentinel
+        ):
+            # F40: the auto-routed pre-tool-call preamble. The content
+            # channel carried nothing user-visible (tool markup only), the
+            # thinking state was exited by a tool-control marker, and no
+            # explicit think markers were involved — the same marker-less
+            # text non-stream clients receive as `content`. Stash instead of
+            # emitting: the stream lane surfaces it as a content delta before
+            # the finish frame only once the turn's tool calls actually
+            # parsed (F3-precedent recovery shape, 835a9fd0).
+            recovered = "".join(self._reasoning_accumulated).strip()
+            if recovered:
+                self.tool_preamble_recovered_content = recovered
         self._inside_thinking = False
-        return chunks
+        return self._trim_visible_edges(chunks, final=True)
 
     _ORPHAN_OPENERS = ("<tool_call", "<function=")
     _ORPHAN_CLOSERS = ("</tool_call>", "</function>")
+    _ORPHAN_FENCE = "```"
+
+    @classmethod
+    def _marker_tail_hold(cls, s: str, markers: tuple[str, ...]) -> int:
+        """Length of a trailing fragment that could still become a marker."""
+        max_hold = max(len(marker) for marker in markers) - 1
+        lower = s.lower()
+        for k in range(min(max_hold, len(s)), 0, -1):
+            fragment = lower[-k:]
+            if any(marker.startswith(fragment) for marker in markers):
+                return k
+        return 0
+
+    def _orphan_consume_span(self, s: str) -> str:
+        """Buffer span text until a closer arrives; return the remainder.
+
+        The interior is retained (not dropped): if the closer never comes,
+        flush_orphan_hold() re-derives the non-stream stripper's result at
+        finish so prose after a stray opener survives the turn.
+        """
+        self._orphan_span_buffer += s
+        lower = self._orphan_span_buffer.lower()
+        close_at = -1
+        close_len = 0
+        for closer in self._ORPHAN_CLOSERS:
+            at = lower.find(closer, self._orphan_span_search_from)
+            if at >= 0 and (close_at < 0 or at < close_at):
+                close_at, close_len = at, len(closer)
+        if close_at < 0:
+            max_closer = max(len(closer) for closer in self._ORPHAN_CLOSERS)
+            self._orphan_span_search_from = max(
+                0, len(self._orphan_span_buffer) - (max_closer - 1)
+            )
+            return ""
+        consumed = close_at + close_len
+        self.suppressed_tool_markup_chars += consumed
+        remainder = self._orphan_span_buffer[consumed:]
+        self._orphan_span_buffer = ""
+        self._orphan_span_search_from = 0
+        self._orphan_in_span = False
+        return remainder
 
     def _filter_orphan_tool_markup(self, text: str) -> str:
         """Drop tool-call protocol spans from no-tools content (#160).
 
-        Stateful across chunks: a held-back tail covers markers split over
-        stream deltas, and an in-span flag drops everything between an opener
-        and its closer (or end of stream — small models often never close).
+        Stateful across chunks, converging on _strip_orphan_tool_markup's
+        non-stream contract: code-fenced examples pass through untouched, a
+        held-back tail covers markers split over stream deltas, and span
+        interiors are buffered for a sanitized finish-flush instead of being
+        destroyed.
         """
         s = self._orphan_hold + text
         self._orphan_hold = ""
         out: list[str] = []
-        lower = s.lower()
-        i = 0
-        while i < len(s):
+        while s:
             if self._orphan_in_span:
-                close_at = -1
-                close_len = 0
-                for closer in self._ORPHAN_CLOSERS:
-                    at = lower.find(closer, i)
-                    if at >= 0 and (close_at < 0 or at < close_at):
-                        close_at, close_len = at, len(closer)
-                if close_at < 0:
-                    # Whole remainder is span interior; keep a tail that
-                    # could be a split closer, drop the rest.
-                    keep = min(len(s) - i, max(len(c) for c in self._ORPHAN_CLOSERS) - 1)
-                    self.suppressed_tool_markup_chars += len(s) - i - keep
-                    self._orphan_hold = s[len(s) - keep :] if keep else ""
-                    return "".join(out)
-                self.suppressed_tool_markup_chars += close_at + close_len - i
-                i = close_at + close_len
-                self._orphan_in_span = False
+                s = self._orphan_consume_span(s)
                 continue
+            if self._orphan_fence_open:
+                at = s.find(self._ORPHAN_FENCE)
+                if at < 0:
+                    hold = self._marker_tail_hold(s, (self._ORPHAN_FENCE,))
+                    if hold:
+                        self._orphan_hold = s[-hold:]
+                        s = s[:-hold]
+                    out.append(s)
+                    break
+                out.append(s[: at + len(self._ORPHAN_FENCE)])
+                self._orphan_fence_open = False
+                s = s[at + len(self._ORPHAN_FENCE) :]
+                continue
+            fence_at = s.find(self._ORPHAN_FENCE)
+            lower = s.lower()
             open_at = -1
             for opener in self._ORPHAN_OPENERS:
-                at = lower.find(opener, i)
+                at = lower.find(opener)
                 if at >= 0 and (open_at < 0 or at < open_at):
                     open_at = at
-            if open_at < 0:
-                # No opener; hold a tail that could be a split opener.
-                tail = s[i:]
-                hold = 0
-                max_hold = max(len(o) for o in self._ORPHAN_OPENERS) - 1
-                for k in range(min(max_hold, len(tail)), 0, -1):
-                    fragment = tail[-k:].lower()
-                    if any(o.startswith(fragment) for o in self._ORPHAN_OPENERS):
-                        hold = k
-                        break
-                if hold:
-                    self._orphan_hold = tail[-hold:]
-                    out.append(tail[:-hold])
-                else:
-                    out.append(tail)
-                return "".join(out)
-            out.append(s[i:open_at])
-            self._orphan_in_span = True
-            i = open_at
+            if fence_at >= 0 and (open_at < 0 or fence_at < open_at):
+                out.append(s[: fence_at + len(self._ORPHAN_FENCE)])
+                self._orphan_fence_open = True
+                s = s[fence_at + len(self._ORPHAN_FENCE) :]
+                continue
+            if open_at >= 0:
+                out.append(s[:open_at])
+                self._orphan_in_span = True
+                self._orphan_span_buffer = ""
+                self._orphan_span_search_from = 0
+                s = s[open_at:]
+                continue
+            hold = self._marker_tail_hold(
+                s, self._ORPHAN_OPENERS + (self._ORPHAN_FENCE,)
+            )
+            if hold:
+                self._orphan_hold = s[-hold:]
+                s = s[:-hold]
+            out.append(s)
+            break
         return "".join(out)
 
     def flush_orphan_hold(self) -> str:
-        """End-of-stream: release a held tail that never became a marker."""
+        """End-of-stream: release held text that never became dead markup.
+
+        An unclosed span emits its sanitized interior instead of being
+        discarded: the structural payload stays hidden, but prose the model
+        wrote after a stray opener survives the turn.
+        """
         if self._orphan_in_span:
-            self.suppressed_tool_markup_chars += len(self._orphan_hold)
-            self._orphan_hold = ""
-            return ""
+            buffered = self._orphan_span_buffer
+            self._orphan_span_buffer = ""
+            self._orphan_span_search_from = 0
+            self._orphan_in_span = False
+            salvaged = _sanitize_orphan_span_interior(buffered)
+            self.suppressed_tool_markup_chars += len(buffered) - len(salvaged)
+            return salvaged
         held, self._orphan_hold = self._orphan_hold, ""
         return held
 
@@ -17288,6 +26239,8 @@ class _ThinkingContentStreamSplitter:
         chunks: list[tuple[str, str]],
         field: str,
         text: str,
+        *,
+        visible: bool = True,
     ) -> None:
         if field == "content" and self._suppress_orphan_tool_markup:
             text = self._filter_orphan_tool_markup(text)
@@ -17299,9 +26252,15 @@ class _ThinkingContentStreamSplitter:
                 self._reasoning_accumulated.append(cleaned)
             elif field == "content":
                 self._content_emitted = True
-                self._content_history_tail = (
-                    self._content_history_tail + cleaned
-                )[-2048:]
+                if visible:
+                    # Tool-call passthrough emissions pass visible=False:
+                    # their bytes are protocol markup the downstream
+                    # translator turns into tool_call deltas, not prose the
+                    # client sees as message content (F40).
+                    self._visible_content_emitted = True
+                self._content_history_tail = (self._content_history_tail + cleaned)[
+                    -2048:
+                ]
             chunks.append((field, cleaned))
 
     @classmethod
@@ -17317,7 +26276,9 @@ class _ThinkingContentStreamSplitter:
     @classmethod
     def _tool_control_marker_has_partial_prefix(cls, text: str) -> bool:
         text_lower = text.lower()
-        return any(marker.startswith(text_lower) for marker in cls._TOOL_CONTROL_MARKERS)
+        return any(
+            marker.startswith(text_lower) for marker in cls._TOOL_CONTROL_MARKERS
+        )
 
     @staticmethod
     def _reasoning_control_marker_has_partial_prefix(text: str) -> bool:
@@ -17348,6 +26309,11 @@ class _ThinkingContentStreamSplitter:
         markers: list[str] = list(CHAT_TEMPLATE_SENTINEL_MARKERS)
         for name in QWEN_STYLE_REASONING_TAG_NAMES:
             markers.extend((f"<{name}", f"<{name}>", f"</{name}", f"</{name}>"))
+        # Tool-control markers too: without them a token-split "<tool_call"
+        # emitted as "<to..." — too short for the edge-trim's marker branch
+        # to recognize, so the held pre-tool whitespace leaked onto the wire
+        # (found 2026-08-19 when the decoder moved to token-boundary release).
+        markers.extend(cls._TOOL_CONTROL_MARKERS)
         return cls._partial_marker_tail_len(text, markers)
 
     @classmethod
@@ -17391,10 +26357,7 @@ class _ThinkingContentStreamSplitter:
                 return True
             common = 0
             max_common = min(len(self._pending), len(target))
-            while (
-                common < max_common
-                and self._pending[common] == target[common]
-            ):
+            while common < max_common and self._pending[common] == target[common]:
                 common += 1
             if common:
                 self._pending = self._pending[common:]
@@ -17436,12 +26399,18 @@ class _ThinkingContentStreamSplitter:
                 close_match = QWEN_STYLE_REASONING_CLOSE_RE.search(self._pending)
                 if close_match is None:
                     if final:
+                        self._disabled_reasoning_interior += self._pending
                         self._pending = ""
                     else:
                         hold = self._disabled_reasoning_close_tail_len(self._pending)
-                        self._pending = self._pending[-hold:] if hold else ""
+                        keep_from = len(self._pending) - hold
+                        self._disabled_reasoning_interior += self._pending[
+                            :keep_from
+                        ]
+                        self._pending = self._pending[keep_from:]
                     break
                 self._pending = self._pending[close_match.end() :].lstrip()
+                self._disabled_reasoning_interior = ""
                 self._disabled_inside_reasoning = False
                 self._disabled_visible_started = True
                 continue
@@ -17481,8 +26450,7 @@ class _ThinkingContentStreamSplitter:
                     not (stripped := self._pending.lstrip())
                     or (
                         stripped.startswith("<")
-                        and self._disabled_reasoning_tail_len(stripped)
-                        >= len(stripped)
+                        and self._disabled_reasoning_tail_len(stripped) >= len(stripped)
                     )
                 )
             ):
@@ -17498,6 +26466,21 @@ class _ThinkingContentStreamSplitter:
             self._disabled_visible_started = True
             self._pending = self._pending[emit_len:]
             break
+        if (
+            final
+            and self._disabled_inside_reasoning
+            and self._disabled_reasoning_interior
+        ):
+            # Keep-prose parity with the non-stream cleaner (#F3):
+            # strip_qwen_style_reasoning_from_content keeps the interior of
+            # an unclosed reasoning block when thinking is disabled. Dropping
+            # it here made the streamed answer silently lose text the
+            # non-stream path returns.
+            recovered = self._disabled_reasoning_interior.strip()
+            self._disabled_reasoning_interior = ""
+            if recovered:
+                self._append_chunk(chunks, "content", recovered)
+                self._disabled_visible_started = True
         return chunks
 
     def _drain(self, *, final: bool) -> list[tuple[str, str]]:
@@ -17506,10 +26489,16 @@ class _ThinkingContentStreamSplitter:
             len(marker) + len("assistant") + 2
             for marker in CHAT_TEMPLATE_SENTINEL_MARKERS
         )
-        tag_keep = max(len(name) for name in QWEN_STYLE_REASONING_TAG_NAMES) + len("</>")
+        tag_keep = max(len(name) for name in QWEN_STYLE_REASONING_TAG_NAMES) + len(
+            "</>"
+        )
         keep = max(
             tag_keep,
             sentinel_keep,
+            # Covers suffixed spellings ("</reasoning:opensource>") that
+            # outgrow the bare-tag keep; reasoning_codecs sizes this for
+            # exactly that (>= 32).
+            STREAM_TAG_HOLDBACK,
         )
         while self._pending:
             pending_lower = self._pending.lower()
@@ -17541,6 +26530,10 @@ class _ThinkingContentStreamSplitter:
                     self._inside_thinking = False
                     self._inside_tool_call = True
                     self._tool_call_tail = ""
+                    # Exited thinking on a tool-control marker, not an
+                    # explicit close: the reasoning accumulated so far was
+                    # auto-routed pre-tool-call preamble (F40).
+                    self._tool_call_interrupted_thinking = True
                     continue
                 if (
                     not final
@@ -17552,10 +26545,10 @@ class _ThinkingContentStreamSplitter:
                 if open_match_at_start is not None:
                     self._pending = self._pending[open_match_at_start.end() :]
                     self._reentry_count += 1
+                    self._saw_explicit_reasoning_marker = True
                     continue
-                if (
-                    not final
-                    and self._reasoning_control_marker_has_partial_prefix(self._pending)
+                if not final and self._reasoning_control_marker_has_partial_prefix(
+                    self._pending
                 ):
                     break
                 if close_match is None:
@@ -17576,15 +26569,42 @@ class _ThinkingContentStreamSplitter:
                 )
                 self._pending = self._pending[close_match.end() :].lstrip()
                 self._inside_thinking = False
+                # An explicit close ended this block: the accumulated
+                # reasoning is a real think block, never recovered as
+                # content at finish (F40).
+                self._saw_explicit_reasoning_marker = True
                 continue
 
             open_match = QWEN_STYLE_REASONING_OPEN_RE.search(self._pending)
+            close_match = QWEN_STYLE_REASONING_CLOSE_RE.search(self._pending)
+            pending_tool_index = self._tool_control_marker_index(self._pending)
+            if (
+                close_match is not None
+                and (open_match is None or close_match.start() < open_match.start())
+                and not self._inside_tool_call
+                and (
+                    pending_tool_index < 0
+                    or close_match.start() < pending_tool_index
+                )
+            ):
+                # Orphan reasoning close on the content channel (e.g. a turn
+                # whose <think> opened in a previous message closes after a
+                # tool span). The non-stream cleaner strips it; the stream
+                # used to rely on the whole tag landing inside one chunk for
+                # _clean_generated_assistant_text to catch — a chunk-shape
+                # dependency the token-boundary decoder exposed (2026-08-19).
+                # Drop it split-safely here; the keep tail below holds a
+                # partial tag until it is decidable.
+                before = self._pending[: close_match.start()]
+                if before:
+                    self._append_chunk(chunks, "content", before)
+                self._pending = self._pending[close_match.end() :]
+                continue
             if open_match is None:
                 pending_lower = self._pending.lower()
                 tool_close_index = pending_lower.find(self._TOOL_CALL_CLOSE_MARKER)
                 tool_passthrough = (
-                    self._inside_tool_call
-                    or self._TOOL_CALL_MARKER in pending_lower
+                    self._inside_tool_call or self._TOOL_CALL_MARKER in pending_lower
                 )
                 emit_len = (
                     len(self._pending)
@@ -17599,22 +26619,25 @@ class _ThinkingContentStreamSplitter:
                     break
                 emitted = self._pending[:emit_len]
                 if tool_passthrough:
-                    self._tool_call_tail = (
-                        self._tool_call_tail + emitted.lower()
-                    )[-len(self._TOOL_CALL_CLOSE_MARKER) :]
+                    self._tool_call_tail = (self._tool_call_tail + emitted.lower())[
+                        -len(self._TOOL_CALL_CLOSE_MARKER) :
+                    ]
                 if self._TOOL_CALL_CLOSE_MARKER in emitted.lower() or (
                     tool_passthrough
                     and self._tool_call_tail.endswith(self._TOOL_CALL_CLOSE_MARKER)
                 ):
                     self._inside_tool_call = False
                     self._tool_call_tail = ""
-                self._append_chunk(chunks, "content", emitted)
+                self._append_chunk(
+                    chunks, "content", emitted, visible=not tool_passthrough
+                )
                 self._pending = self._pending[emit_len:]
                 break
             self._append_chunk(chunks, "content", self._pending[: open_match.start()])
             self._pending = self._pending[open_match.end() :]
             self._inside_thinking = True
             self._reentry_count += 1
+            self._saw_explicit_reasoning_marker = True
         return chunks
 
 
@@ -17647,10 +26670,13 @@ def _stream_splitter_for_state(
         recover_unclosed_reasoning_as_content=recover_unclosed_reasoning_as_content,
         start_inside_thinking=start_inside_thinking,
         suppress_orphan_tool_markup=suppress_orphan_tool_markup,
+        trim_visible_content_edges=True,
     )
 
 
-def _finish_stream_splitter(splitter: Any, *, recover_unclosed_reasoning: bool) -> list[tuple[str, str]]:
+def _finish_stream_splitter(
+    splitter: Any, *, recover_unclosed_reasoning: bool
+) -> list[tuple[str, str]]:
     try:
         return splitter.finish(
             recover_unclosed_reasoning_as_content=recover_unclosed_reasoning
@@ -17704,6 +26730,7 @@ def _display_text(
     generated: dict[str, Any],
     *,
     thinking_enabled: bool = False,
+    footer_allowed: bool | None = None,
 ) -> str:
     raw_text = str(generated["text"])
     text = (
@@ -17715,7 +26742,9 @@ def _display_text(
         if state.args.normalize_thinking_tags
         else raw_text
     )
-    if not state.args.stats_footer:
+    if footer_allowed is None:
+        footer_allowed = bool(state.args.stats_footer)
+    if not footer_allowed:
         return text
     footer = _stats_footer_text(state, generated)
     if not footer:
@@ -17724,12 +26753,33 @@ def _display_text(
     return f"{text}{separator}{footer}"
 
 
+def _prompt_opens_thinking(state: ServerState, prompt_ids: Any) -> bool:
+    """True when the rendered prompt ended inside an open <think> block.
+
+    Template truth, not family guesswork: Qwen 3.8 (and pre-open templates
+    generally) end the generation prompt with `<think>\n`, so a completion
+    that hits max_tokens before emitting `</think>` contains no marker at
+    all — the whole text is reasoning. Templates that never prefill an open
+    tag (lfm2) can never trip this.
+    """
+    try:
+        markers = think_marker_ids(getattr(state.runtime, "tokenizer", None))
+        if markers is None or not prompt_ids:
+            return False
+        return int(markers[0]) in {int(t) for t in list(prompt_ids)[-8:]}
+    except Exception:
+        return False
+
+
 def _nonstream_chat_message_parts(
     state: ServerState,
     generated: dict[str, Any],
     *,
     thinking_enabled: bool,
+    starts_in_think: bool = False,
     suppress_visible_reasoning: bool = False,
+    footer_allowed: bool | None = None,
+    recover_unclosed_reasoning: bool = False,
 ) -> tuple[str, str]:
     raw_text = _strip_generated_chat_template_sentinels(
         str(generated.get("text") or "")
@@ -17764,8 +26814,13 @@ def _nonstream_chat_message_parts(
         stats["visible_reasoning_stripped"] = bool(
             reasoning_text and display_text != raw_text
         )
-    elif parser_enabled and parser in {"qwen3", "step3p5"}:
-        if thinking_enabled and has_qwen_style_reasoning_marker:
+    elif parser_enabled and parser in {"qwen3", "step3p5", "poolside_v1", "lfm2"}:
+        # starts_in_think covers the marker-less truncation case: the prompt
+        # pre-opened <think>, generation hit max_tokens before </think>, so
+        # the completion carries no tag yet is entirely reasoning (routine at
+        # Qwen 3.8 xhigh; the streaming path already handles it via splitter
+        # initial state).
+        if thinking_enabled and (has_qwen_style_reasoning_marker or starts_in_think):
             reasoning_text, display_text = _split_backend_reasoning_for_state(
                 state,
                 raw_text,
@@ -17786,7 +26841,11 @@ def _nonstream_chat_message_parts(
             )
             stats["nonstream_reasoning_content_routed"] = bool(reasoning_text)
             stats["visible_reasoning_stripped"] = bool(display_text != raw_text)
-    elif thinking_enabled and parser_enabled and (THINK_OPEN in raw_text or THINK_CLOSE in raw_text):
+    elif (
+        thinking_enabled
+        and parser_enabled
+        and (THINK_OPEN in raw_text or THINK_CLOSE in raw_text)
+    ):
         reasoning_text, display_text = _split_thinking_segments(
             raw_text,
             thinking_enabled=True,
@@ -17812,9 +26871,39 @@ def _nonstream_chat_message_parts(
         )
 
     display_text = _strip_mtplx_internal_continuation_markers(display_text)
+    finish_reason_for_parts = str(generated.get("finish_reason") or "")
+    if (
+        recover_unclosed_reasoning
+        and thinking_enabled
+        and finish_reason_for_parts == "stop"
+        and not display_text.strip()
+        and reasoning_text.strip()
+        and not CHAT_TEMPLATE_TURN_SENTINEL_RE.search(
+            str(generated.get("text") or "")
+        )
+    ):
+        # Parity with the streaming splitter's finish() recovery (#F3): a
+        # turn that ended at "stop" with every visible character still inside
+        # an unclosed reasoning block surfaces that text as content instead
+        # of returning an empty message. reasoning_content is kept, matching
+        # the stream where the reasoning deltas were already sent.
+        display_text = reasoning_text.strip()
+    elif (
+        finish_reason_for_parts == "length"
+        and not display_text.strip()
+        and reasoning_text.strip()
+    ):
+        # Quiet-envelope truth stat (#F3): the row is empty because
+        # max_tokens ran out inside the reasoning block — stamped only when
+        # it applies so unaffected envelopes stay byte-stable.
+        generated.setdefault("stats", {})["content_empty_reason"] = (
+            "truncated_inside_reasoning"
+        )
     if suppress_visible_reasoning:
         reasoning_text = ""
-    if not getattr(state.args, "stats_footer", False):
+    if footer_allowed is None:
+        footer_allowed = bool(getattr(state.args, "stats_footer", False))
+    if not footer_allowed:
         return display_text, reasoning_text
     footer = _stats_footer_text(state, generated)
     if not footer:
@@ -18484,8 +27573,12 @@ def _chat_ui_html(
             ctlEls.max_tokens.value = String(Math.min(parseInt(ctlEls.max_tokens.value, 10) || DEFAULTS.max_tokens, cap));
           }
           if (maxTokensHelpEl) {
+            // ctx is /health's context_window: what THIS launch is serving,
+            // which memory sizing may cap well below the model's native
+            // context. Labeling it "the model's" misled low-RAM users into
+            // reading the machine cap as a model property.
             maxTokensHelpEl.textContent =
-              "Cap is the model's " + formatTokens(ctx) + " context (slider tops out at " +
+              "Cap is this server's " + formatTokens(ctx) + " context window (slider tops out at " +
               formatTokens(cap) + ").";
           }
           refreshLabels();
@@ -19260,6 +28353,19 @@ def _chat_ui_html(
     )
 
 
+def _request_chat_template_kwargs(request: Any) -> dict[str, Any]:
+    """Qwen-style ``chat_template_kwargs`` from the request body, if any.
+
+    The official Qwen3.8 quickstart sends thinking controls as
+    ``extra_body={"chat_template_kwargs": {"enable_thinking": ...}}`` (the
+    vLLM/SGLang convention). The request models allow extra fields, so the
+    dict rides along; honoring the known keys keeps card-copied client code
+    working against MTPLX unchanged.
+    """
+    raw = getattr(request, "chat_template_kwargs", None)
+    return raw if isinstance(raw, dict) else {}
+
+
 def _thinking_enabled_for_request(
     state: ServerState,
     request: ChatCompletionRequest,
@@ -19268,18 +28374,18 @@ def _thinking_enabled_for_request(
 ) -> bool:
     if _reasoning_parser_for_state(state) == "none":
         return False
+    requested = request.enable_thinking
+    if requested is None:
+        template_kwargs_value = _request_chat_template_kwargs(request).get(
+            "enable_thinking"
+        )
+        if isinstance(template_kwargs_value, bool):
+            requested = template_kwargs_value
     return (
         state.args.enable_thinking
-        if request.enable_thinking is None or not allow_client_controls
-        else bool(request.enable_thinking)
+        if requested is None or not allow_client_controls
+        else bool(requested)
     )
-
-
-def _normalize_reasoning_effort(value: Any, *, default: str = "auto") -> str:
-    effort = str(value or default).strip().lower()
-    if effort not in {"auto", "low", "medium", "high"}:
-        raise ValueError("reasoning_effort must be one of: auto, low, medium, high")
-    return effort
 
 
 def _reasoning_effort_for_state(
@@ -19291,25 +28397,59 @@ def _reasoning_effort_for_state(
 ) -> str | None:
     if not thinking_enabled:
         return None
-    backend = _backend_descriptor(state)
-    levels = set(backend.reasoning_codec.effort_levels)
+    codec = _reasoning_codec_for_state(state)
+    levels = set(codec.effort_levels)
     if not levels:
         return None
+    client_supplied = request_effort is not None and allow_client_controls
     raw = (
         request_effort
-        if request_effort is not None and allow_client_controls
+        if client_supplied
         else getattr(state.args, "reasoning_effort", None)
     )
-    effort = _normalize_reasoning_effort(
-        raw,
-        default=backend.reasoning_codec.default_effort or "auto",
-    )
+    try:
+        effort = _normalize_reasoning_effort(
+            raw,
+            default=codec.default_effort or "auto",
+        )
+    except ValueError as exc:
+        if client_supplied:
+            # A junk client value ("banana") used to escape as an unhandled
+            # ValueError and turn into a 500; it is a request error (audit
+            # F11 #8).
+            raise HTTPException(status_code=400, detail=str(exc))
+        raise
     if effort == "auto":
-        effort = backend.reasoning_codec.default_effort or "low"
-    return effort if effort in levels else backend.reasoning_codec.default_effort
+        effort = codec.default_effort or "low"
+    if effort in levels:
+        return effort
+    # The requested tier is real vocabulary the loaded family does not
+    # declare (OpenAI clients send "high"; Qwen 3.8 declares
+    # low/medium/xhigh). Silently bouncing to the family default mapped the
+    # request DOWN and lied about honoring it (audit F11 #8). Map to the
+    # nearest declared tier UP the global ladder; when nothing above is
+    # declared, the nearest declared tier below.
+    try:
+        requested_rank = REASONING_EFFORT_LEVELS.index(effort)
+    except ValueError:
+        return codec.default_effort
+    for candidate in REASONING_EFFORT_LEVELS[requested_rank + 1 :]:
+        if candidate in levels:
+            return candidate
+    for candidate in reversed(REASONING_EFFORT_LEVELS[:requested_rank]):
+        if candidate in levels:
+            return candidate
+    return codec.default_effort
 
 
-_AGENT_THINKING_BUDGET_BY_EFFORT = {"low": 1536, "medium": 3072, "high": 6144}
+_AGENT_THINKING_BUDGET_BY_EFFORT = {
+    "low": 1536,
+    "medium": 3072,
+    "high": 6144,
+    # xhigh must sit above high — without this key the opt-in guard silently
+    # clamped xhigh sessions to the medium fallback budget.
+    "xhigh": 12288,
+}
 
 
 def _thinking_guard_config_for_request(
@@ -19455,6 +28595,18 @@ def _reasoning_history_mode(state: "ServerState") -> str:
         return _REASONING_HISTORY_STRIP
     if policy == "on":
         return _REASONING_HISTORY_PRESERVE
+    if policy == "auto" and _model_family_for_state(state) in {"qwen3_8", "qwen4_exp"}:
+        # Qwen3.8's trained contract inverts the 3.6-era rolling checkpoint:
+        # preserve_thinking is on by default for all workloads (model card),
+        # keeping historical <think> blocks in the rendered conversation.
+        # Append-only histories are also what the session bank wants. An
+        # explicit "scoped" policy above still wins for operators who ask.
+        # Flash-Next (qwen4_exp) ships the byte-identical Qwen3.8 template
+        # and the same trained contract; leaving it on the scoped fallback
+        # made every agent round's postcommit abort with
+        # reasoning_history_scoping_mismatch and re-prefill the whole
+        # assistant turn (receipted 2026-08-28, OpenCode wall-clock rig).
+        return _REASONING_HISTORY_PRESERVE
     if getattr(state, "reasoning_history_scoped_capable", False):
         return _REASONING_HISTORY_SCOPED
     return _REASONING_HISTORY_PRESERVE
@@ -19464,17 +28616,46 @@ def _reasoning_history_scoped_active(state: "ServerState") -> bool:
     return _reasoning_history_mode(state) == _REASONING_HISTORY_SCOPED
 
 
+def _reasoning_history_preserve_echo_active(state: "ServerState") -> bool:
+    """Preserve-mode echo-carry: render client-echoed reasoning history.
+
+    The committed-reasoning canonicalizer substitutes KV-true interiors for
+    every turn the committed stream covers, but commits lag live agent chains
+    (postcommit starvation, receipts 2026-08-21: committed froze at 15,389
+    tokens while the stream passed 76k — the model lost its own 57.8k-token
+    derivation and re-derived it from scratch). Carrying the client's echoed
+    reasoning as the BASE render means uncovered turns show the model its own
+    prior thinking instead of an empty scaffold; committed substitution still
+    overwrites covered turns, so cache exactness is untouched where it
+    exists. Explicit policy ``on`` keeps the legacy drop as the
+    byte-identical rollback lane.
+    """
+    if _reasoning_history_mode(state) != _REASONING_HISTORY_PRESERVE:
+        return False
+    return (
+        _normalize_preserve_thinking_policy(
+            getattr(state.args, "preserve_thinking", "auto")
+        )
+        != "on"
+    )
+
+
 def _reasoning_history_fingerprint_component(state: "ServerState") -> str:
     """Session-cache identity component for the reasoning-history policy.
 
-    Explicit preserve/strip emit the exact legacy ``strip_reasoning={0|1}``
-    strings so existing users' warm session banks survive this release.
-    Only scoped mints a new component - honest, because its rendered prompt
-    bytes genuinely differ from both legacy modes.
+    Explicit ``on``/strip emit the exact legacy ``strip_reasoning={0|1}``
+    strings so those users' warm session banks survive upgrades. Scoped and
+    preserve-echo mint their own components - honest, because their rendered
+    prompt bytes genuinely differ from the legacy modes.
     """
     mode = _reasoning_history_mode(state)
     if mode == _REASONING_HISTORY_SCOPED:
         return "reasoning_history=scoped"
+    if _reasoning_history_preserve_echo_active(state):
+        # Echo-carry renders bytes legacy preserve never did (structured
+        # reasoning echoes), so it mints its own component. Policy `on`
+        # stays on the legacy string below (byte-identical rollback lane).
+        return "reasoning_history=preserve_echo"
     return f"strip_reasoning={int(mode == _REASONING_HISTORY_STRIP)}"
 
 
@@ -19608,37 +28789,43 @@ def _start_server_console(state: ServerState) -> None:
     thread.start()
 
 
-async def _shutdown_model_workers(state: ServerState) -> None:
-    """Stop admission and quiesce every model owner before runtime teardown."""
+def _encoded_embedding(vector: list[float], encoding_format: str) -> Any:
+    """Return a vector in the representation the client asked for.
 
-    scheduler = getattr(state, "model_scheduler", None)
-    if scheduler is not None:
-        await asyncio.to_thread(
-            scheduler.shutdown,
-            wait=True,
-            cancel_futures=True,
-        )
-        return
+    OpenAI's ``base64`` format is the raw float32 buffer, little-endian, which
+    is what clients decode with ``numpy.frombuffer(..., dtype="float32")``.
+    """
+    if encoding_format != "base64":
+        return vector
+    return base64.b64encode(struct.pack(f"<{len(vector)}f", *vector)).decode("ascii")
 
-    executors: list[Any] = []
-    seen: set[int] = set()
-    for name in ("postcommit_executor", "generation_executor"):
-        executor = getattr(state, name, None)
-        if executor is None or id(executor) in seen:
-            continue
-        seen.add(id(executor))
-        executors.append(executor)
-    if executors:
-        await asyncio.gather(
-            *(
-                asyncio.to_thread(
-                    executor.shutdown,
-                    wait=True,
-                    cancel_futures=True,
-                )
-                for executor in executors
-            )
-        )
+
+def _truncated_normalized(vector: list[float], dimensions: int) -> list[float]:
+    """Cut a vector to its leading ``dimensions`` and re-normalise.
+
+    The Matryoshka recipe: MRL-trained models (jina-embeddings-v5 trains
+    32→1024) pack meaning into leading dimensions, so the truncated prefix is
+    a valid embedding once its norm is restored to 1 — without the re-scale,
+    cosine against stored full-width vectors is silently wrong.
+    """
+    trimmed = vector[:dimensions]
+    norm = math.sqrt(sum(value * value for value in trimmed))
+    if norm <= 0.0:
+        # A zero prefix cannot be normalised; returning it unscaled beats
+        # manufacturing NaNs that poison every downstream similarity.
+        return trimmed
+    return [value / norm for value in trimmed]
+
+
+def _as_text_list(value: Any, *, field: str) -> list[str]:
+    """Coerce an OpenAI-style text field into a list of strings."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return list(value)
+    raise HTTPException(
+        status_code=400, detail=f"{field} must be a string or a list of strings"
+    )
 
 
 def create_app(state: ServerState) -> FastAPI:
@@ -19651,10 +28838,23 @@ def create_app(state: ServerState) -> FastAPI:
         if dashboard is not None:
             dashboard.bus.attach_loop(asyncio.get_running_loop())
         bg_tasks: list[asyncio.Task[Any]] = []
-        if dashboard is not None and bool(getattr(state.args, "enable_thermal_poll", False)):
+        if dashboard is not None and bool(
+            getattr(state.args, "enable_thermal_poll", False)
+        ):
             bg_tasks.append(asyncio.create_task(_thermal_poll_loop(state)))
         if _memory_pressure_guard_enabled():
             bg_tasks.append(asyncio.create_task(_memory_pressure_loop(state)))
+        if (
+            _idle_pump_enabled()
+            and getattr(state, "session_bank_cold_tier", None) is not None
+        ):
+            # Issue #290: guarantee SSD session-cache writes forward
+            # progress once the server goes request-idle (the persistence
+            # band otherwise starves behind any chaining idle occupant).
+            bg_tasks.append(asyncio.create_task(_idle_persistence_pump_loop(state)))
+        retrieval = getattr(state, "retrieval", None)
+        if retrieval is not None and retrieval.idle_timeout_s > 0:
+            bg_tasks.append(asyncio.create_task(_retrieval_idle_loop(state)))
         try:
             yield
         finally:
@@ -19668,11 +28868,31 @@ def create_app(state: ServerState) -> FastAPI:
                 pass
             for task in bg_tasks:
                 task.cancel()
-            await _shutdown_model_workers(state)
-            runtime = getattr(state, "runtime", None)
-            close_runtime = getattr(runtime, "close", None)
-            if callable(close_runtime):
-                await asyncio.to_thread(close_runtime, timeout=5.0)
+            # Issue #290: BEFORE the scheduler shutdown cancels queued
+            # futures, give pending SSD session-cache writes a bounded
+            # best-effort flush — a plain SIGTERM/Ctrl-C used to silently
+            # lose every entry still in flight, and the next boot paid a
+            # full re-prefill. Off-loop so a second Ctrl-C stays live.
+            try:
+                await asyncio.to_thread(_shutdown_flush_cold_writes, state)
+            except Exception:
+                pass
+            mtp_batch_service = getattr(state, "mtp_batch_service", None)
+            if mtp_batch_service is not None:
+                mtp_batch_service.shutdown()
+                # park=True: the process is exiting; a clean owner-thread
+                # exit during interpreter finalization runs mlx's TLS
+                # destructor into _Py_Dealloc (#303).
+            scheduler = getattr(state, "model_scheduler", None)
+            if scheduler is not None:
+                scheduler.shutdown(wait=False, cancel_futures=True, park=True)
+            else:
+                postcommit_executor = getattr(state, "postcommit_executor", None)
+                generation_executor = getattr(state, "generation_executor", None)
+                if postcommit_executor is not None:
+                    postcommit_executor.shutdown(wait=False, cancel_futures=True)
+                if generation_executor is not None:
+                    generation_executor.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(title="MTPLX OpenAI-compatible server", lifespan=lifespan)
     app.state.mtplx = state
@@ -19680,74 +28900,103 @@ def create_app(state: ServerState) -> FastAPI:
     # (the most recently added Starlette middleware runs first): fans only
     # ramp for requests that passed the API-key and rate-limit gates.
     app.add_middleware(_SmartFanArrivalMiddleware, state=state)
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
 
-    @app.middleware("http")
-    async def api_key_and_rate_limit(
-        request: Request, call_next: Callable[[Request], Any]
-    ) -> Any:
-        if not _request_is_authorized(
-            request, state.args.api_key
-        ) and not _request_is_browser_auth_bootstrap(request, state.args.api_key):
-            return JSONResponse(
-                status_code=401,
-                content={
-                    "error": {
-                        "message": "missing or invalid API key",
-                        "type": "authentication_error",
-                    }
-                },
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        allowed, retry_after = state.rate_limiter.check(_rate_limit_key(request))
-        if not allowed:
-            return JSONResponse(
-                status_code=429,
-                content={
-                    "error": {
-                        "message": "rate limit exceeded",
-                        "type": "rate_limit_error",
-                    }
-                },
-                headers={"Retry-After": str(retry_after)},
-            )
-        return await call_next(request)
+    # Pure ASGI on purpose (2026-08-18): the @app.middleware("http")
+    # decorator form is Starlette BaseHTTPMiddleware, which relays every
+    # response chunk through a zero-buffer anyio memory channel across a
+    # task-group boundary — several extra event-loop turns per SSE frame at
+    # 60-120 frames/s, clumping stream delivery whenever the loop is busy.
+    # Both gates below only inspect the request head and otherwise pass the
+    # raw ASGI stream through untouched — zero per-chunk cost.
+    app.add_middleware(_AuthRateLimitMiddleware, state=state)
+    # Registered LAST so it is OUTERMOST: a foreign browser origin is refused
+    # before it can spend a key check or a rate-limit slot, and CORS
+    # preflights (which never carry credentials) are answered before the
+    # key gate would 401 them.
+    app.add_middleware(_OriginPolicyMiddleware, state=state)
+
+    browser_auth_tickets = _BrowserAuthTickets()
+
+    def _browser_auth_rejection() -> JSONResponse:
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": {
+                    "message": "missing or invalid API key",
+                    "type": "authentication_error",
+                }
+            },
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     @app.get(_BROWSER_AUTH_PATH)
     def browser_auth(request: Request) -> Response:
+        # Two bootstrap forms: `?mtplx_api_key=<key>` (the URL the CLI prints
+        # at startup for terminal users) and `?ticket=<t>` (a single-use,
+        # 60 s ticket minted by POST /mtplx/browser-auth/ticket, so an app
+        # that already holds the key never puts it in a URL).
         configured_api_key = getattr(state.args, "api_key", None)
-        if configured_api_key and not _request_is_browser_auth_bootstrap(
-            request, configured_api_key
-        ):
-            return JSONResponse(
-                status_code=401,
-                content={
-                    "error": {
-                        "message": "missing or invalid API key",
-                        "type": "authentication_error",
-                    }
-                },
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+        if configured_api_key:
+            ticket = request.query_params.get(_BROWSER_AUTH_TICKET_QUERY_PARAM)
+            if ticket is not None:
+                if not browser_auth_tickets.consume(ticket):
+                    return _browser_auth_rejection()
+            elif not _request_is_browser_auth_bootstrap(request, configured_api_key):
+                return _browser_auth_rejection()
         next_path = _safe_browser_auth_next_path(request.query_params.get("next"))
         response = RedirectResponse(url=next_path, status_code=303)
         if configured_api_key:
-            response.set_cookie(
-                _BROWSER_AUTH_COOKIE,
-                configured_api_key,
-                max_age=_BROWSER_AUTH_COOKIE_MAX_AGE_SECONDS,
-                httponly=True,
-                samesite="lax",
-                secure=False,
-                path="/",
-            )
+            _set_browser_auth_cookie(response, request, configured_api_key)
         return response
+
+    @app.post(_BROWSER_AUTH_PATH)
+    def browser_auth_sign_in(request: Request, payload: dict[str, Any] = Body(default={})) -> Response:
+        # The page's own sign-in form: the key travels once, in a same-origin
+        # POST body, and comes back as the HttpOnly cookie.
+        configured_api_key = getattr(state.args, "api_key", None)
+        next_path = _safe_browser_auth_next_path(
+            payload.get("next") if isinstance(payload, dict) else None
+        )
+        if configured_api_key:
+            candidate = payload.get("api_key") if isinstance(payload, dict) else None
+            if not (
+                isinstance(candidate, str)
+                and candidate
+                and secrets.compare_digest(candidate, configured_api_key)
+            ):
+                return JSONResponse(
+                    status_code=401,
+                    content={"error": {"message": "missing or invalid API key", "type": "auth"}},
+                )
+        response = JSONResponse(status_code=200, content={"ok": True, "next": next_path})
+        if configured_api_key:
+            _set_browser_auth_cookie(response, request, configured_api_key)
+        return response
+
+    @app.post(_BROWSER_AUTH_TICKET_PATH)
+    def browser_auth_ticket(request: Request, payload: dict[str, Any] = Body(default={})) -> Response:
+        # Reached only with a valid key (the auth gate above); mints the
+        # single-use ticket URL a client opens in the browser.
+        configured_api_key = getattr(state.args, "api_key", None)
+        next_path = _safe_browser_auth_next_path(
+            payload.get("next") if isinstance(payload, dict) else None
+        )
+        server_url = str(request.base_url).rstrip("/")
+        if not configured_api_key:
+            return JSONResponse(
+                status_code=200, content={"url": server_url + next_path, "expires_in": None}
+            )
+        ticket = browser_auth_tickets.mint()
+        query = urllib.parse.urlencode(
+            {_BROWSER_AUTH_TICKET_QUERY_PARAM: ticket, "next": next_path}
+        )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "url": f"{server_url}{_BROWSER_AUTH_PATH}?{query}",
+                "expires_in": _BROWSER_AUTH_TICKET_TTL_SECONDS,
+            },
+        )
 
     @app.get("/", response_class=HTMLResponse)
     def root(request: Request) -> HTMLResponse:
@@ -19765,7 +29014,9 @@ def create_app(state: ServerState) -> FastAPI:
                         getattr(state.args, "default_presence_penalty", 0.0) or 0.0
                     ),
                     "depth": int(state.args.depth),
-                    "depth_max": int(_backend_descriptor(state).draft_semantics.maximum),
+                    "depth_max": int(
+                        _backend_descriptor(state).draft_semantics.maximum
+                    ),
                     "mtp_enabled": str(getattr(state.args, "generation_mode", "mtp"))
                     == "mtp",
                     "max_tokens": int(state.args.max_response_tokens or 16384),
@@ -19855,8 +29106,7 @@ def create_app(state: ServerState) -> FastAPI:
             "ok": True,
             "model": state.model_id,
             "model_path": str(
-                getattr(runtime, "model_path", None)
-                or getattr(state.args, "model", "")
+                getattr(runtime, "model_path", None) or getattr(state.args, "model", "")
             ),
             "vision": {
                 "enabled": _server_vision_spec(state) is not None,
@@ -19918,6 +29168,7 @@ def create_app(state: ServerState) -> FastAPI:
                 getattr(state.args, "api_key_source", "none") or "none"
             ),
             "paged_kv_quantization": _effective_paged_kv_quantization(),
+            "paged_kv_quantization_detail": _paged_kv_quantization_detail(),
             "kernel_selfcheck": _kernel_selfcheck_health_payload(),
             "expert_streaming": (
                 runtime.expert_streaming_snapshot()
@@ -19971,6 +29222,7 @@ def create_app(state: ServerState) -> FastAPI:
                 if getattr(state, "last_request_at", 0.0) > 0
                 else None
             ),
+            "gpu_keepalive": _gpu_keepalive_health(state),
             "reasoning_parser": state.args.reasoning_parser,
             "load_time_s": getattr(state, "load_time_s", None),
             "draft_lm_head": state.draft_lm_head,
@@ -19982,6 +29234,7 @@ def create_app(state: ServerState) -> FastAPI:
             "draft_head_identity": state.draft_head_identity,
             "tokenizer_template_hash": state.template_hash,
             "fast_path_env": state.fast_path_env_status,
+            "qwen4_install_reports": _qwen4_install_reports(state),
             "profile_env": state.profile_env_status,
             "diagnostic_env_ablation": bool(state.args.diagnostic_env_ablation),
             "mtp_history_materialize_every": (
@@ -20129,13 +29382,28 @@ def create_app(state: ServerState) -> FastAPI:
             "live_output_detach": os.environ.get("MTPLX_DETACH_LIVE_OUTPUTS"),
             "live_output_detach_mode": os.environ.get("MTPLX_DETACH_LIVE_OUTPUTS_MODE"),
             "aime_process_isolation": os.environ.get("MTPLX_AIME_PROCESS_ISOLATION"),
+            # Additive degradation truth block (#F23-surface): the benchmark
+            # harness gate reads /health; everything slow or clamped must be
+            # visible here. Defensive reads only — see
+            # _health_degradation_payload.
+            "degradation": _health_degradation_payload(state),
             "metal_memory_caps": getattr(
                 state,
                 "metal_memory_caps",
                 {"applied": False, "reason": "unavailable"},
             ),
+            "memory_plan": (
+                state.memory_plan.to_dict()
+                if getattr(state, "memory_plan", None) is not None
+                else None
+            ),
             "mlx_cache_limit": state.mlx_cache_limit_status,
             "mlx_runtime": state.mlx_runtime_status,
+            # Page-cache residency of the streamed n-gram table decides 56 vs
+            # 68.8 tok/s on decode, so it belongs in the same truth block as
+            # the other clamps: a warm-looking box that skipped the pre-read
+            # is a slow box with no other symptom.
+            "ngram_prewarm": _ngram_prewarm_health_payload(),
             # Hardware fields surfaced for the dashboard's HardwareBanner
             # and MemoryStackedBar. Cached after the first lookup.
             **_machine_info(),
@@ -20168,6 +29436,13 @@ def create_app(state: ServerState) -> FastAPI:
             "capacity": state.dashboard.prefill_history.capacity(),
             "history": state.dashboard.prefill_history.snapshot(),
         }
+
+    @app.get("/v1/mtplx/flight")
+    def mtplx_flight() -> dict[str, Any]:
+        # Live in-flight status: phase, tokens, instantaneous TPS, live MTP
+        # acceptance, stall age, and a tail preview of the generated text —
+        # the one-curl answer to "is it hung or thinking?".
+        return _flight(state).snapshot()
 
     @app.post("/v1/mtplx/cancel/{request_id}")
     def mtplx_cancel(request_id: str) -> dict[str, Any]:
@@ -20351,9 +29626,11 @@ def create_app(state: ServerState) -> FastAPI:
     def _aime_release_parent_runtime_enabled(body: "_AIMEStartBody | None") -> bool:
         if _aime_process_isolation_mode(body) != "per_question":
             return False
-        raw = str(
-            os.environ.get("MTPLX_AIME_RELEASE_PARENT_RUNTIME") or "auto"
-        ).strip().lower()
+        raw = (
+            str(os.environ.get("MTPLX_AIME_RELEASE_PARENT_RUNTIME") or "auto")
+            .strip()
+            .lower()
+        )
         return raw not in {"0", "false", "no", "off", "never"}
 
     def _release_parent_runtime_for_aime() -> dict[str, Any]:
@@ -20372,7 +29649,9 @@ def create_app(state: ServerState) -> FastAPI:
                 "allocator_after": _mlx_allocator_public_stats(),
             }
         started = time.perf_counter()
-        model_path = str(getattr(runtime, "model_path", getattr(state.args, "model", "")))
+        model_path = str(
+            getattr(runtime, "model_path", getattr(state.args, "model", ""))
+        )
         mtp_enabled = bool(getattr(runtime, "mtp_enabled", False))
         lock = getattr(state, "lock", None)
         acquired = False
@@ -20393,9 +29672,6 @@ def create_app(state: ServerState) -> FastAPI:
             state.draft_head_identity = None
             state.template_hash = None
             state.aime_parent_runtime_released = True
-            close_runtime = getattr(runtime, "close", None)
-            if callable(close_runtime):
-                close_runtime(timeout=5.0)
             gc.collect()
             cleanup = _clear_mlx_cache_after_request(
                 state,
@@ -20478,7 +29754,9 @@ def create_app(state: ServerState) -> FastAPI:
                         f"AIME worker exited before health check: returncode={returncode}"
                     )
                 try:
-                    response = await client.get(base_url.rstrip("/") + "/health", headers=headers)
+                    response = await client.get(
+                        base_url.rstrip("/") + "/health", headers=headers
+                    )
                     if response.status_code == 200:
                         payload = response.json()
                         if isinstance(payload, dict) and payload.get("ok"):
@@ -20529,11 +29807,12 @@ def create_app(state: ServerState) -> FastAPI:
         from mtplx.benchmarks.runners.aime import AIMEQuestionRuntime
 
         port = _free_loopback_port()
-        idx = int(getattr(runner, "current_idx", None) or getattr(problem, "index", 0) or 0)
+        idx = int(
+            getattr(runner, "current_idx", None) or getattr(problem, "index", 0) or 0
+        )
         attempt = int(getattr(runner, "current_attempt", None) or 1)
         parent_launch_id = (
-            str(getattr(state.args, "app_launch_id", None) or "").strip()
-            or "mtplx"
+            str(getattr(state.args, "app_launch_id", None) or "").strip() or "mtplx"
         )
         app_launch_id = (
             f"{parent_launch_id}-aime-q{idx}-a{attempt}-{uuid.uuid4().hex[:6]}"
@@ -20691,9 +29970,7 @@ def create_app(state: ServerState) -> FastAPI:
             "question_isolation_factory": _aime_question_isolation_cleanup,
         }
         if _aime_process_isolation_mode(body) == "per_question":
-            kwargs["question_runtime_factory"] = (
-                _aime_question_process_runtime_factory
-            )
+            kwargs["question_runtime_factory"] = _aime_question_process_runtime_factory
         if body is not None:
             if body.temperature is not None:
                 kwargs["temperature"] = body.temperature
@@ -20820,7 +30097,9 @@ def create_app(state: ServerState) -> FastAPI:
                         if isinstance(obj, dict) and "summary" in obj:
                             last_summary = obj["summary"]
                 if last_summary is not None:
-                    runs.append({"run_id": path.stem, "path": str(path), **last_summary})
+                    runs.append(
+                        {"run_id": path.stem, "path": str(path), **last_summary}
+                    )
             except OSError:
                 continue
         return {"runs": runs}
@@ -20934,16 +30213,16 @@ def create_app(state: ServerState) -> FastAPI:
         async def event_stream():
             try:
                 snapshot = _mtplx_dashboard_snapshot(state)
-                yield (
-                    "event: snapshot\n"
-                    f"data: {json.dumps(_json_safe(snapshot))}\n\n"
-                )
+                yield (f"event: snapshot\ndata: {json.dumps(_json_safe(snapshot))}\n\n")
                 last_snapshot_s = time.perf_counter()
                 while True:
+                    effective_interval_s = _dashboard_snapshot_interval_for_activity_s(
+                        snapshot_interval_s,
+                        active_requests=_dashboard_in_flight_count(state),
+                    )
                     timeout_s = max(
                         0.01,
-                        snapshot_interval_s
-                        - (time.perf_counter() - last_snapshot_s),
+                        effective_interval_s - (time.perf_counter() - last_snapshot_s),
                     )
                     try:
                         event = await asyncio.wait_for(queue.get(), timeout=timeout_s)
@@ -20953,9 +30232,11 @@ def create_app(state: ServerState) -> FastAPI:
                         )
                     except asyncio.TimeoutError:
                         pass
-                    if (
-                        time.perf_counter() - last_snapshot_s
-                    ) >= snapshot_interval_s:
+                    effective_interval_s = _dashboard_snapshot_interval_for_activity_s(
+                        snapshot_interval_s,
+                        active_requests=_dashboard_in_flight_count(state),
+                    )
+                    if (time.perf_counter() - last_snapshot_s) >= effective_interval_s:
                         snapshot = _mtplx_dashboard_snapshot(state)
                         yield (
                             "event: snapshot\n"
@@ -21047,33 +30328,229 @@ def create_app(state: ServerState) -> FastAPI:
         return archived
 
     @app.get("/v1/models")
-    def list_models() -> dict[str, Any]:
+    def list_models(capability: str | None = None) -> dict[str, Any]:
+        # The default listing is chat-only. Every OpenAI-compatible client
+        # (OpenCode, Cline, Continue, ...) enumerates /v1/models to offer a
+        # chat model picker; mixing embedders and rerankers into that list
+        # gets them selected as chat targets, which can only end in a 400 or
+        # — worse — a silent answer from the wrong model. Retrieval models
+        # are listed on request via ?capability=embedding|rerank, and every
+        # entry carries its `capability` so callers never have to guess.
+        wanted = str(capability).strip().lower() if capability is not None else None
+        if wanted is not None and wanted not in {"chat", "embedding", "rerank"}:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"unknown capability {capability!r}; "
+                    "expected 'chat', 'embedding', or 'rerank'"
+                ),
+            )
         now = int(time.time())
-        return {
-            "object": "list",
-            "data": [
+        entries: list[dict[str, Any]] = []
+        if wanted in (None, "chat"):
+            entries.append(
                 {
                     "id": state.model_id,
                     "object": "model",
                     "created": now,
                     "owned_by": "mtplx",
+                    "capability": "chat",
+                    "supports_vision": _server_vision_spec(state) is not None,
+                    "modalities": {
+                        "input": ["text", "image"] if _server_vision_spec(state) is not None else ["text"],
+                        "output": ["text"],
+                    },
                     "context_length": state.context_window,
                     "max_context_length": state.context_window,
                     "max_model_len": state.context_window,
                 }
+            )
+        retrieval = getattr(state, "retrieval", None)
+        if retrieval is not None and wanted in ("embedding", "rerank"):
+            for descriptor in retrieval.descriptors():
+                if descriptor["role"] != wanted:
+                    continue
+                entries.append(
+                    {
+                        "id": descriptor["id"],
+                        "object": "model",
+                        "created": now,
+                        "owned_by": "mtplx",
+                        "capability": descriptor["role"],
+                        "root": descriptor["model_ref"],
+                        "max_model_len": descriptor["max_tokens"],
+                    }
+                )
+        return {"object": "list", "data": entries}
+
+    @app.post("/v1/embeddings")
+    async def embeddings(request: EmbeddingsRequest) -> Response:
+        retrieval = getattr(state, "retrieval", None)
+        if retrieval is None or not retrieval.enabled:
+            raise HTTPException(
+                status_code=404,
+                detail="no embedding model is configured; start MTPLX with --embedding-model",
+            )
+        texts = _as_text_list(request.input, field="input")
+        encoding_format = str(request.encoding_format or "float").lower()
+        if encoding_format not in {"float", "base64"}:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"unsupported encoding_format {request.encoding_format!r}; "
+                    "expected 'float' or 'base64'"
+                ),
+            )
+        dimensions = request.dimensions
+        if dimensions is not None and int(dimensions) < 1:
+            raise HTTPException(
+                status_code=400,
+                detail=f"dimensions must be a positive integer, got {dimensions}",
+            )
+        try:
+            vectors, spec, prompt_tokens = await asyncio.to_thread(
+                retrieval.embed,
+                texts,
+                model=request.model,
+                instruction=request.instruction,
+            )
+        except RetrievalTrustError as exc:
+            # 403, not 404: the model is configured and present — serving it
+            # is refused until --retrieval-trust-remote-code grants it.
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except RetrievalError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if dimensions is not None and vectors:
+            # The native width is a property of the loaded model, so the
+            # bound can only be enforced once the vectors exist. Anything
+            # beyond it would have to be zero-padded — an embedding the model
+            # never produced — so it is a 400, not a silent stretch.
+            dimensions = int(dimensions)
+            native_width = len(vectors[0])
+            if dimensions > native_width:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"dimensions must be between 1 and {native_width} "
+                        f"for {spec.served_id} (native width {native_width}), "
+                        f"got {dimensions}"
+                    ),
+                )
+            if dimensions < native_width:
+                vectors = [
+                    _truncated_normalized(vector, dimensions) for vector in vectors
+                ]
+        payload = {
+            "object": "list",
+            "data": [
+                {
+                    "object": "embedding",
+                    "index": index,
+                    "embedding": _encoded_embedding(vector, encoding_format),
+                }
+                for index, vector in enumerate(vectors)
             ],
+            "model": spec.served_id,
+            # Real counts: clients use these for accounting and rate limits, so
+            # a fixed zero silently corrupts every retrieval total.
+            "usage": {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens},
+        }
+        # Serialise here rather than returning the dict. FastAPI would run
+        # jsonable_encoder over every float individually in Python, which costs
+        # roughly 30x the actual inference for a 4096-dim vector — measured at
+        # ~870 ms of encoding for ~31 ms of forward pass.
+        return Response(
+            content=json.dumps(payload, separators=(",", ":")),
+            media_type="application/json",
+        )
+
+    @app.post("/v1/rerank")
+    async def rerank(request: RerankRequest) -> dict[str, Any]:
+        retrieval = getattr(state, "retrieval", None)
+        if retrieval is None or not retrieval.enabled:
+            raise HTTPException(
+                status_code=404,
+                detail="no reranking model is configured; start MTPLX with --reranker-model",
+            )
+        if not request.query or not str(request.query).strip():
+            raise HTTPException(status_code=400, detail="query must be a non-empty string")
+        documents = _as_text_list(request.documents, field="documents")
+        try:
+            scores, spec, prompt_tokens = await asyncio.to_thread(
+                retrieval.rerank,
+                str(request.query),
+                documents,
+                model=request.model,
+                instruction=request.instruction,
+            )
+        except RetrievalTrustError as exc:
+            # 403, not 404: the model is configured and present — serving it
+            # is refused until --retrieval-trust-remote-code grants it.
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except RetrievalError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        ranked = sorted(enumerate(scores), key=lambda item: item[1], reverse=True)
+        if request.top_n is not None and int(request.top_n) > 0:
+            ranked = ranked[: int(request.top_n)]
+        results: list[dict[str, Any]] = []
+        for index, score in ranked:
+            entry: dict[str, Any] = {"index": index, "relevance_score": score}
+            if request.return_documents:
+                entry["document"] = {"text": documents[index]}
+            results.append(entry)
+        return {
+            "id": f"rerank-{int(time.time() * 1000)}",
+            "model": spec.served_id,
+            "results": results,
+            "usage": {"total_tokens": prompt_tokens},
         }
 
     @app.post("/v1/chat/completions")
     async def chat_completions(
         raw_request: Request, request: ChatCompletionRequest
     ) -> Any:
+        request_received_monotonic_s = time.perf_counter()
         if not request.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
+        if bool(request.logprobs) or int(request.top_logprobs or 0) > 0:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "logprobs/top_logprobs are not supported on "
+                    "/v1/chat/completions; omit them (support is planned)"
+                ),
+            )
         headers = dict(raw_request.headers)
         metadata = _request_metadata(request)
-        request_max_tokens = _request_max_tokens(request)
+        request_max_tokens, hermes_default_cap_stripped = (
+            _strip_client_injected_output_cap(
+                _request_max_tokens(request), headers=headers, metadata=metadata
+            )
+        )
         requested_model = request.model
+        # A request that names a configured embedder or reranker is a
+        # capability mismatch, not a stale id: silently answering it with the
+        # loaded chat model returns prose where the caller expected retrieval
+        # behaviour. Reject it clearly. Ids that are merely stale chat ids
+        # keep falling through to the served model exactly as before —
+        # request_model observability records the mismatch for those.
+        retrieval_registry = getattr(state, "retrieval", None)
+        if (
+            requested_model
+            and requested_model != state.model_id
+            and retrieval_registry is not None
+            and getattr(retrieval_registry, "enabled", False)
+        ):
+            retrieval_role = retrieval_registry.role_for_model_id(requested_model)
+            if retrieval_role is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"model {requested_model!r} is served for {retrieval_role}, "
+                        "not chat. Use it via /v1/embeddings or /v1/rerank; "
+                        "chat models are listed at /v1/models."
+                    ),
+                )
         model = state.model_id
         response_id = _response_id_from_client_hint(
             prefix="chatcmpl",
@@ -21099,157 +30576,15 @@ def create_app(state: ServerState) -> FastAPI:
             "stateless",
             "off",
         }
-        opencode_client = _is_opencode_client(headers=headers, metadata=metadata)
-        requested_tool_specs = _normalize_tool_specs(request.tools)
-        tool_specs = _filter_tool_specs_for_request(
-            requested_tool_specs,
-            request.messages,
-            tool_choice=request.tool_choice,
-            client_manages_tools=opencode_client,
-        )
-        tools_active = _tools_active_for_request(tool_specs, request.tool_choice)
-        raw_tool_result_history_present = any(
-            str(message.role).lower() == "tool" for message in request.messages
-        )
-        agent_transcript_tools_active = bool(
-            tools_active
-            or (
-                requested_tool_specs
-                and raw_tool_result_history_present
-                and _is_read_only_inspection_request(_last_user_text(request.messages))
-            )
-        )
-        read_only_force_answer_contract_active = (
-            _request_should_force_answer_for_read_only_inspection(request.messages)
-        )
-        if read_only_force_answer_contract_active:
-            if (
-                _tool_result_message_count(request.messages) > 0
-                and _request_explicit_single_tool_then_answer(request.messages)
-            ):
-                # Explicit "use one tool then answer": the forced final turn
-                # generates tool-free, and turn-level tool state/observability
-                # must agree (zero remaining tools, read_only_force_answer:v1
-                # policy version).
-                tool_specs = []
-                tools_active = False
-            else:
-                # Read-budget force answer: keep the REQUESTED toolset
-                # byte-identical to every prior round of this loop. Filtering
-                # to a read-only subset rewrote the rendered tool contract in
-                # the system prompt, so the largest prompt of the session (the
-                # forced final answer) diverged from every banked prefix at
-                # token ~3 and re-prefilled fully cold (measured 2026-07-04:
-                # 13.2k tokens, TTFT 21s). The appended force-answer user
-                # message carries the "answer now, no more tools" conditioning;
-                # prefix stability owns the toolset bytes.
-                pass
-        no_tools_contract_applies = bool(
-            not read_only_force_answer_contract_active
-            and _should_add_no_tool_contract(
-                requested_tools=requested_tool_specs,
-                tools_active=tools_active,
-                messages=request.messages,
-            )
-        )
-        # A tool loop's FINAL round (tool results already in this turn,
-        # tools now disabled) must synthesize a full answer — it gets
-        # the post-tool contract instead of the terse direct-reply one,
-        # whose no-lists/no-analysis clauses clip searched answers.
-        post_tool_answer_contract_active = bool(
-            no_tools_contract_applies
-            and _turn_tail_contains_tool_results(request.messages)
-        )
-        no_tools_contract_active = bool(
-            no_tools_contract_applies and not post_tool_answer_contract_active
-        )
-        client_controls_allowed = _client_controls_allowed(headers, metadata)
-        pi_convergence_contract_active = bool(
-            not read_only_force_answer_contract_active
-            and not no_tools_contract_active
-            and not post_tool_answer_contract_active
-            and _request_should_add_pi_convergence_contract(
-                request.messages,
+        try:
+            policy = resolve_request_policy(
+                state,
+                request,
                 headers=headers,
                 metadata=metadata,
-                tools_active=agent_transcript_tools_active,
+                endpoint="chat",
             )
-        )
-        opencode_prompt_contract_profile = _opencode_prompt_contract_profile(
-            request.messages,
-            headers=headers,
-            metadata=metadata,
-            tool_choice=request.tool_choice,
-        )
-        opencode_prompt_contract_system_prompt = (
-            _opencode_prompt_contract_system_prompt(opencode_prompt_contract_profile)
-        )
-        opencode_simple_chat_contract_active = False
-        messages_for_generation, transcript_stats = _canonicalize_agent_transcript(
-            request.messages,
-            tools_active=agent_transcript_tools_active,
-            replace_simple_chitchat_system_prompt=False,
-            initial_client_system_prompt=opencode_prompt_contract_system_prompt,
-            strip_tool_call_preamble_text=opencode_client,
-        )
-        messages_for_generation, backend_chat_policy_active = _with_backend_chat_policy(
-            state,
-            messages_for_generation,
-        )
-        if read_only_force_answer_contract_active:
-            messages_for_generation = _with_mtplx_read_only_force_answer_contract(
-                messages_for_generation
-            )
-        elif post_tool_answer_contract_active:
-            messages_for_generation = _with_mtplx_post_tool_answer_contract(
-                messages_for_generation
-            )
-        elif no_tools_contract_active:
-            messages_for_generation = _with_mtplx_no_tool_contract(
-                messages_for_generation
-            )
-        elif pi_convergence_contract_active:
-            messages_for_generation = _with_mtplx_pi_convergence_contract(
-                messages_for_generation
-            )
-        read_only_inspection_request = _is_read_only_inspection_request(
-            _last_user_text(messages_for_generation)
-        )
-        tool_result_history_present = any(
-            str(message.role).lower() == "tool" for message in messages_for_generation
-        )
-        raw_messages_for_postcommit = (
-            list(request.messages)
-            if read_only_force_answer_contract_active
-            else (
-                list(messages_for_generation)
-                if (
-                    no_tools_contract_active
-                    or post_tool_answer_contract_active
-                    or pi_convergence_contract_active
-                    or opencode_prompt_contract_profile is not None
-                    or backend_chat_policy_active
-                )
-                else list(request.messages)
-            )
-        )
-        postcommit_tool_specs = (
-            tool_specs
-            if tools_active
-            else (requested_tool_specs if agent_transcript_tools_active else None)
-        )
-        background = is_background_request(
-            messages=messages_for_generation,
-            max_tokens=request_max_tokens,
-            headers=headers,
-            metadata=metadata,
-            main_system_hash=state.main_system_prompt_hash,
-        )
-        if background and (
-            state.has_foreground()
-            or state.lock.locked()
-            or _foreground_model_work_pending(state)
-        ):
+        except BackgroundBusyBypass:
             return JSONResponse(
                 status_code=503,
                 headers={"Retry-After": "1"},
@@ -21265,60 +30600,55 @@ def create_app(state: ServerState) -> FastAPI:
                     },
                 },
             )
-        thinking_enabled = _thinking_enabled_for_request(
-            state,
-            request,
-            allow_client_controls=client_controls_allowed,
+        # Locals alias the policy so the generation/streaming body below and
+        # its closures read exactly as before the extraction.
+        opencode_client = policy.opencode_client
+        tool_specs = policy.tool_specs
+        tools_active = policy.tools_active
+        agent_transcript_tools_active = policy.agent_transcript_tools_active
+        read_only_force_answer_contract_active = (
+            policy.read_only_force_answer_contract_active
         )
-        reasoning_effort = _reasoning_effort_for_state(
-            state,
-            thinking_enabled=thinking_enabled,
-            request_effort=request.reasoning_effort,
-            allow_client_controls=client_controls_allowed,
+        suppress_stream_tool_preamble = bool(
+            request.stream and tools_active and not read_only_force_answer_contract_active
+            and _is_hermes_client(headers=headers, metadata=metadata)
         )
-        if (
-            read_only_force_answer_contract_active
-            and _reasoning_parser_for_state(state) == "gemma4"
-        ):
-            thinking_enabled = False
-        aime_visible_working = (
-            _aime_visible_working_for_request(metadata)
-            and thinking_enabled
-            and _reasoning_parser_for_state(state) in {"qwen3", "step3p5"}
+        # The cache producer and next-turn reader must normalize exactly what
+        # the wire translator removes. Hermes suppresses these preambles too;
+        # comparing its empty echo to the raw preamble rejected the whole
+        # committed reasoning turn and re-prefilled tens of thousands of tokens.
+        strip_tool_call_preamble_text = opencode_client or suppress_stream_tool_preamble
+        no_tools_contract_active = policy.no_tools_contract_active
+        post_tool_answer_contract_active = policy.post_tool_answer_contract_active
+        pi_convergence_contract_active = policy.pi_convergence_contract_active
+        opencode_simple_chat_contract_active = (
+            policy.opencode_simple_chat_contract_active
         )
-        tool_prompt_mode, tool_prompt_mode_resolution = _tool_prompt_mode_for_request(
-            state.args,
-            headers=headers,
-            metadata=metadata,
-            tools_active=tools_active,
+        opencode_prompt_contract_profile = policy.opencode_prompt_contract_profile
+        transient_suffix_contract_active = policy.transient_suffix_contract_active
+        messages_for_generation = policy.messages_for_generation
+        raw_messages_for_postcommit = policy.raw_messages_for_postcommit
+        postcommit_tool_specs = policy.postcommit_tool_specs
+        read_only_inspection_request = policy.read_only_inspection_request
+        tool_result_history_present = policy.tool_result_history_present
+        background = policy.background
+        thinking_enabled = policy.thinking_enabled
+        reasoning_effort = policy.reasoning_effort
+        aime_visible_working = policy.aime_visible_working
+        tool_prompt_mode = policy.tool_prompt_mode
+        template_tool_prompt_mode = policy.template_tool_prompt_mode
+        postcommit_tool_prompt_mode = policy.postcommit_tool_prompt_mode
+        request_generation_mode = policy.request_generation_mode
+        sampler_temperature = policy.sampler_temperature
+        sampler_top_p = policy.sampler_top_p
+        sampler_top_k = policy.sampler_top_k
+        sampler_presence_penalty = policy.sampler_presence_penalty
+        sampler_frequency_penalty = policy.sampler_frequency_penalty
+        request_draft_sampler = policy.request_draft_sampler
+        defer_mtp_batch_mlx_finalize = _use_live_mtp_batch(
+            state, effective_mode=request_generation_mode
         )
-        template_tool_prompt_mode = tool_prompt_mode
-        if read_only_force_answer_contract_active and tools_active:
-            # Read-budget force-answer turns keep the SAME template mode as
-            # every prior round. The earlier hybrid switch re-rendered the
-            # system prompt with full "# Tools" schemas, so the forced final
-            # turn's prompt diverged from all banked prefixes at token ~3 and
-            # re-prefilled fully cold — the fingerprint compatibility shim
-            # could not help because the BYTES differed (2026-07-04 fix).
-            # The appended contract user message is a pure suffix and owns
-            # the force-answer conditioning.
-            tool_prompt_mode_resolution = {
-                **tool_prompt_mode_resolution,
-                "tool_prompt_mode_source": "read_only_force_answer_prefix_stable",
-            }
-        postcommit_tool_prompt_mode = tool_prompt_mode
-        if postcommit_tool_specs and not tools_active:
-            postcommit_tool_prompt_mode, _ = _tool_prompt_mode_for_request(
-                state.args,
-                headers=headers,
-                metadata=metadata,
-                tools_active=True,
-            )
-        request_generation_mode = _request_generation_mode_for_generation(
-            state,
-            request,
-            allow_client_controls=client_controls_allowed,
-        )
+        mtp_batch_finalize_ownership = MTPBatchFinalizeOwnership()
         try:
             constraint_spec = constraint_spec_from_response_format(
                 request.response_format,
@@ -21354,12 +30684,6 @@ def create_app(state: ServerState) -> FastAPI:
                 )
             # Constrained requests ride the serial lanes (MTP included since
             # #186 phase 3); only the batched AR pump is bypassed.
-        request_depth = _request_depth_for_generation(
-            state,
-            request,
-            generation_mode=request_generation_mode,
-            allow_client_controls=client_controls_allowed,
-        )
         try:
             messages_for_generation, vision_images = _vision_extract_and_flatten(
                 messages_for_generation
@@ -21389,11 +30713,114 @@ def create_app(state: ServerState) -> FastAPI:
             reasoning_effort=reasoning_effort,
             strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
             scoped_reasoning_history=_reasoning_history_scoped_active(state),
+            preserve_reasoning_history=_reasoning_history_preserve_echo_active(state),
             tools=tool_specs if tools_active else None,
             tool_choice=request.tool_choice,
             tool_prompt_mode=template_tool_prompt_mode,
             template_observability=template_observability,
         )
+        resolved_session_id: str | None = None
+        resolved_session_source: str | None = None
+        resolved_session_diagnostic: dict[str, Any] = {}
+        early_postcommit_handled = False
+        early_postcommit_wait: dict[str, Any] | None = None
+        early_cross_session_yield: dict[str, Any] | None = None
+        if (
+            not background
+            and not cache_bypass
+            and not vision_images
+            and not aime_visible_working
+        ):
+            # Resolve the session exactly once (audit F11 P2): the
+            # committed-reasoning gate and the session-adoption step below
+            # used to resolve independently, doubling the anonymous
+            # prefix-scan cost and overwriting last_prefix_diagnostic
+            # twice per request. Header/metadata-identified clients (every
+            # real agent bridge) resolve identically from either call
+            # site; anonymous prompt-inference uses the raw encode here,
+            # which is the same stream the canonical encode extends.
+            try:
+                resolved_session_id, resolved_session_source = (
+                    state.sessions.resolve_session_id(
+                        headers=headers,
+                        metadata=metadata,
+                        user=_request_extra(request, "user"),
+                        chat_id=_request_extra(request, "chat_id"),
+                        conversation_id=_request_extra(request, "conversation_id"),
+                        prompt_ids=prompt_ids,
+                        diagnostic_out=resolved_session_diagnostic,
+                    )
+                )
+            except Exception:
+                resolved_session_id = None
+                resolved_session_source = None
+            # Canon-after-wait (2026-08-21): the committed-reasoning gate
+            # below peeks the session's committed stream, but the pending
+            # postcommit sweep + wait used to run ~690 lines later — every
+            # turn canonicalized against a frontier one commit stale even
+            # when the wait then reported completed. Run them FIRST so the
+            # gate reads the post-commit frontier. Bonus: no foreground work
+            # from THIS request is queued yet, so the job's bounded
+            # foreground-pressure grace can no longer be tripped by the very
+            # request waiting on it. Observability lands at the original
+            # site below (request_observability binds later in the prologue).
+            if resolved_session_id is not None:
+                early_postcommit_handled = True
+                _early_sweep = getattr(
+                    getattr(state, "sessions", None),
+                    "abort_cross_session_postcommits",
+                    None,
+                )
+                if (
+                    _early_sweep is not None
+                    and _postcommit_cross_session_yield_enabled()
+                ):
+                    early_cross_session_yield = await asyncio.to_thread(
+                        _early_sweep,
+                        except_session_id=resolved_session_id,
+                    )
+                _early_peek = getattr(
+                    getattr(state, "sessions", None), "peek", None
+                )
+                _pending_session = None
+                if _early_peek is not None:
+                    try:
+                        _pending_session = _early_peek(resolved_session_id)
+                    except Exception:
+                        _pending_session = None
+                if _pending_session is not None:
+                    early_postcommit_wait = await asyncio.to_thread(
+                        _pending_session.resolve_pending_postcommit_for_request
+                    )
+            # Defect B (2.8 headline): if this conversation's session holds a
+            # committed stream the raw encode diverges from inside a think
+            # block, substitute the committed think bytes and re-encode so
+            # restores track the live frontier. Served only when the
+            # canonicalized encode provably matches the committed stream
+            # further than the raw one; every derivation below runs on the
+            # final ids exactly once.
+            _canonicalized = _maybe_canonicalize_committed_reasoning(
+                state,
+                messages=messages_for_generation,
+                prompt_ids=prompt_ids,
+                headers=headers,
+                metadata=metadata,
+                request=request,
+                thinking_enabled=thinking_enabled,
+                reasoning_effort=reasoning_effort,
+                tools=tool_specs if tools_active else None,
+                tool_choice=request.tool_choice,
+                tool_prompt_mode=template_tool_prompt_mode,
+                template_observability=template_observability,
+                # request_observability is bound later in the prologue on
+                # some branches; the outcome rides template_observability,
+                # which merges into the request stream downstream.
+                transcript_stats=policy.transcript_stats,
+                strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                session_id=resolved_session_id,
+            )
+            if _canonicalized is not None:
+                messages_for_generation, prompt_ids = _canonicalized
         if vision_images:
             try:
                 prompt_ids, vision_splice = _materialize_vision_splice(
@@ -21401,6 +30828,19 @@ def create_app(state: ServerState) -> FastAPI:
                 )
             except ValueError as vision_error:
                 raise HTTPException(status_code=400, detail=str(vision_error))
+            # Alias-boundary receipt for QA gates: positions before the first
+            # image pad carry no pixel influence (causal attention), so this
+            # is the exact bar a restore must stay under for a different
+            # image. Deliberately a direct id scan, not the restore guard's
+            # span bookkeeping — a gate comparing restores against this value
+            # must not be self-certified by the code path it is auditing.
+            _pad_id = int(vision_splice.image_pad_token_id)
+            _first_pad = next(
+                (pos for pos, tok in enumerate(prompt_ids) if tok == _pad_id),
+                None,
+            )
+            if _first_pad is not None:
+                template_observability["first_image_pad_position"] = int(_first_pad)
         if aime_visible_working:
             prompt_ids = [
                 *prompt_ids,
@@ -21411,26 +30851,35 @@ def create_app(state: ServerState) -> FastAPI:
             ]
             template_observability["aime_visible_working"] = True
             template_observability["aime_visible_working_prompt_close"] = True
-        _validate_prompt_has_decode_room(
+        policy = policy.with_prompt_tokens(
             state,
-            prompt_token_count=len(prompt_ids),
-        )
-        request_depth, short_depth_policy = _opencode_short_context_depth_policy(
             request,
             headers=headers,
             metadata=metadata,
-            generation_mode=request_generation_mode,
-            request_depth=request_depth,
             prompt_tokens=len(prompt_ids),
         )
-        effective_request_depth, long_context_depth_policy = (
-            _long_context_mtp_depth_policy_for_request(
+        request_depth = policy.request_depth
+        effective_request_depth = policy.effective_request_depth
+        if defer_mtp_batch_mlx_finalize:
+            response_max, _sampler, _generation_limits = _generation_params(
                 state,
-                generation_mode=request_generation_mode,
-                request_depth=request_depth,
-                prompt_tokens=len(prompt_ids),
+                prompt_token_count=len(prompt_ids),
+                max_tokens=request_max_tokens,
+                temperature=None,
+                top_p=None,
+                top_k=None,
             )
-        )
+            _validate_mtp_batch_request_contract(
+                state,
+                prompt_ids,
+                response_max=response_max,
+                constraint_spec=constraint_spec,
+                vision_splice=vision_splice,
+                background_request=background,
+                depth=request_depth,
+                resolved_mtp_depth=effective_request_depth,
+            )
+        _reject_prompt_over_context(state, len(prompt_ids))
         current_system_hash = system_prompt_hash(messages_for_generation)
         if current_system_hash is not None and not background:
             state.main_system_prompt_hash = current_system_hash
@@ -21471,9 +30920,6 @@ def create_app(state: ServerState) -> FastAPI:
         # fingerprint, or the flag flip alone would hard-miss the bank at the
         # exact turn that most needs the warm prefix (measured on OpenCode
         # 2026-07-04; Pi shares the mechanism via its >=14-tools contract).
-        transient_suffix_contract_active = bool(
-            read_only_force_answer_contract_active or pi_convergence_contract_active
-        )
         postcommit_policy_fingerprint = policy_fingerprint
         if transient_suffix_contract_active:
             postcommit_policy_fingerprint = _policy_fingerprint(
@@ -21512,22 +30958,38 @@ def create_app(state: ServerState) -> FastAPI:
             request_generation_mode=request_generation_mode,
             request_depth=request_depth,
         )
+        request_observability["request_received_monotonic_s"] = request_received_monotonic_s
         if constraint_spec is not None:
-            request_observability["constrained_decoding"] = (
-                constraint_spec.source_type
-            )
+            request_observability["constrained_decoding"] = constraint_spec.source_type
         if vision_splice is not None:
             request_observability["request_vision_images"] = len(vision_images)
             request_observability["request_vision_rows"] = vision_splice.total_rows
+        # Receipt identity + resolved effort: request_id joins the receipt to
+        # flight-recorder events (the cancellation lane already stamps it; this
+        # covers the normal lane via envelope.update), and the resolved effort
+        # was previously logged nowhere (2026-08-21 lane-audit telemetry gap).
+        request_observability["request_id"] = response_id
+        if reasoning_effort is not None:
+            request_observability["resolved_reasoning_effort"] = reasoning_effort
+        if hermes_default_cap_stripped:
+            request_observability["hermes_default_cap_stripped"] = True
         if transient_suffix_contract_active:
+            if read_only_force_answer_contract_active:
+                _restore_policy_label = "stable_without_transient_force_answer"
+            elif pi_convergence_contract_active:
+                _restore_policy_label = "stable_without_transient_pi_convergence"
+            elif post_tool_answer_contract_active:
+                _restore_policy_label = "stable_without_transient_post_tool_answer"
+            else:
+                _restore_policy_label = "stable_without_transient_no_tools"
             request_observability["request_session_restore_policy"] = (
-                "stable_without_transient_force_answer"
-                if read_only_force_answer_contract_active
-                else "stable_without_transient_pi_convergence"
+                _restore_policy_label
             )
             request_observability[
                 "request_session_restore_policy_matches_postcommit"
-            ] = bool(session_restore_policy_fingerprint == postcommit_policy_fingerprint)
+            ] = bool(
+                session_restore_policy_fingerprint == postcommit_policy_fingerprint
+            )
         opencode_tool_history_policy = (
             _opencode_tool_history_restore_policy(
                 headers=headers,
@@ -21587,125 +31049,50 @@ def create_app(state: ServerState) -> FastAPI:
             if opencode_tool_history_cache_bypass:
                 cache_miss_reason = "opencode_tool_history_cache_bypass"
                 session_restore_mode = "opencode_tool_history_bypass"
-            session_id, session_source = state.sessions.resolve_session_id(
-                headers=headers,
-                metadata=metadata,
-                user=_request_extra(request, "user"),
-                chat_id=_request_extra(request, "chat_id"),
-                conversation_id=_request_extra(request, "conversation_id"),
-                prompt_ids=prompt_ids,
-            )
+            if resolved_session_id is not None:
+                # Reuse the prologue's single resolution (F11 P2); the
+                # vision-keyed and aime arms never resolved early, so they
+                # keep the original call here.
+                session_id, session_source = (
+                    resolved_session_id,
+                    resolved_session_source,
+                )
+            else:
+                session_id, session_source = state.sessions.resolve_session_id(
+                    headers=headers,
+                    metadata=metadata,
+                    user=_request_extra(request, "user"),
+                    chat_id=_request_extra(request, "chat_id"),
+                    conversation_id=_request_extra(request, "conversation_id"),
+                    prompt_ids=prompt_ids,
+                    diagnostic_out=resolved_session_diagnostic,
+                )
+            if vision_cache_keying and session_source in {
+                "new", "longest_prefix", "pending_postcommit_near_prefix", "common_prefix_reuse"
+            }:
+                bank_session_id = _vision_bank_session_id(
+                    state.sessions.bank, prompt_ids, vision_splice
+                )
+                if bank_session_id:
+                    session_id, session_source = bank_session_id, "vision_bank_prefix"
+                    resolved_session_diagnostic.clear()
             session = state.sessions.get_or_create(session_id)
             session.last_cache_miss_reason = cache_miss_reason
             session.last_restore_mode = session_restore_mode
+            # request_observability was built ~100 lines up, before this
+            # resolution ran, from the line-one None placeholder — so a
+            # header-identified session logged request_session_source: null
+            # while session_id was populated, which #384 read (reasonably)
+            # as the live-ref gate never opening. Stamp the truth.
+            request_observability["request_session_source"] = session_source
         if requested_model:
             request_observability["request_model"] = requested_model
             request_observability["served_model_id"] = state.model_id
             request_observability["request_model_matches_served_model"] = (
                 requested_model == state.model_id
             )
-        server_reasoning_mode = getattr(state.args, "reasoning", None)
-        if server_reasoning_mode not in {"auto", "on", "off"}:
-            server_reasoning_mode = (
-                "on" if bool(getattr(state.args, "enable_thinking", True)) else "off"
-            )
-        request_observability["request_effective_mtp_depth"] = int(
-            effective_request_depth
-        )
-        if not client_controls_allowed:
-            request_reasoning_mode = (
-                "off" if not thinking_enabled else server_reasoning_mode
-            )
-        elif request.enable_thinking is False:
-            request_reasoning_mode = "off"
-        elif request.enable_thinking is True and server_reasoning_mode == "auto":
-            request_reasoning_mode = "on"
-        else:
-            request_reasoning_mode = server_reasoning_mode
-        request_observability["request_reasoning_mode"] = request_reasoning_mode
-        request_observability["request_enable_thinking"] = bool(thinking_enabled)
-        request_observability["request_reasoning_effort"] = reasoning_effort
-        request_observability["request_enable_thinking_override"] = (
-            request.enable_thinking is not None and client_controls_allowed
-        )
-        request_observability["mtplx_control_owner"] = (
-            "client" if client_controls_allowed else "server"
-        )
-        request_observability["client_controls_allowed"] = bool(
-            client_controls_allowed
-        )
-        if not client_controls_allowed:
-            ignored_fields = _ignored_client_control_fields(request)
-            if ignored_fields:
-                request_observability["client_control_fields_ignored"] = (
-                    ignored_fields
-                )
-        request_observability["request_reasoning_parser"] = (
-            _reasoning_parser_for_state(state)
-        )
-        request_observability["request_read_only_inspection_force_answer"] = bool(
-            read_only_force_answer_contract_active
-        )
-        request_observability["request_read_only_inspection_tool_result_count"] = (
-            _tool_result_message_count(request.messages)
-        )
-        request_observability[
-            "request_read_only_inspection_force_answer_after_tools"
-        ] = _read_only_inspection_force_answer_after_tools()
-        request_observability["request_pi_convergence_contract"] = bool(
-            pi_convergence_contract_active
-        )
-        request_observability["request_pi_convergence_tool_result_count"] = (
-            _tool_result_message_count(request.messages)
-        )
-        request_observability["request_pi_convergence_after_tools"] = (
-            _pi_convergence_after_tools()
-        )
-        request_observability["opencode_simple_chat_contract_active"] = bool(
-            opencode_simple_chat_contract_active
-        )
-        request_observability["opencode_prompt_contract_profile"] = (
-            opencode_prompt_contract_profile or "none"
-        )
-        request_observability["backend_chat_policy_active"] = bool(
-            backend_chat_policy_active
-        )
-        request_observability["request_effective_message_count"] = len(
-            messages_for_generation
-        )
-        request_observability["request_effective_message_roles"] = [
-            message.role for message in messages_for_generation
-        ]
-        request_observability["request_effective_message_chars"] = [
-            len(_content_to_text(message.content))
-            for message in messages_for_generation
-        ]
-        request_observability["preserve_thinking"] = getattr(
-            state.args, "preserve_thinking", "auto"
-        )
-        request_observability["preserve_thinking_effective"] = (
-            _preserve_thinking_effective(state.args)
-        )
-        request_observability["reasoning_history_mode"] = _reasoning_history_mode(
-            state
-        )
-        request_observability["strip_assistant_reasoning_history"] = bool(
-            state.args.strip_assistant_reasoning_history
-        )
-        request_observability["long_context_mtp_depth_policy"] = (
-            long_context_depth_policy
-        )
-        request_observability.update(
-            _bridge_policy_observability(
-                tools_active=tools_active,
-                tool_prompt_mode=template_tool_prompt_mode,
-                no_tools_contract_active=no_tools_contract_active,
-                read_only_force_answer_contract_active=read_only_force_answer_contract_active,
-                pi_convergence_contract_active=pi_convergence_contract_active,
-                post_tool_answer_contract_active=post_tool_answer_contract_active,
-            )
-        )
-        request_observability.update(tool_prompt_mode_resolution)
+        request_observability.update(policy.as_observability())
+        request_observability["agent_rewrites"] = _agent_rewrites_mode()
         request_observability["session_cache_scope"] = session_cache_scope
         request_observability["opencode_tool_history_cache_bypass"] = bool(
             opencode_tool_history_cache_bypass
@@ -21716,44 +31103,14 @@ def create_app(state: ServerState) -> FastAPI:
         request_observability["opencode_tool_history_live_frontier_restore"] = bool(
             opencode_tool_history_live_frontier_restore
         )
-        requested_tool_names = list(request_observability.get("request_tool_names") or [])
-        filtered_tool_names = _tool_names(tool_specs) if tools_active else []
-        hidden_tool_names = [
-            name for name in requested_tool_names if name not in filtered_tool_names
-        ]
-        request_observability.update(
-            {
-                "request_filtered_tool_count": len(filtered_tool_names),
-                "request_filtered_tool_names": filtered_tool_names,
-                "request_hidden_tool_names": hidden_tool_names,
-                "request_tools_hidden_by_bridge": bool(hidden_tool_names),
-            }
-        )
-        chat_template_report = getattr(state, "chat_template_report", {}) or {}
-        request_observability.update(
-            {
-                "chat_template_profile": str(
-                    chat_template_report.get("profile")
-                    or getattr(state, "chat_template_profile", _CHAT_TEMPLATE_PROFILE_LOCAL)
-                ),
-                "chat_template_source": chat_template_report.get("source"),
-                "chat_template_path": chat_template_report.get("path"),
-                "chat_template_hash": state.template_hash,
-            }
-        )
-        request_observability["opencode_short_context_depth_policy"] = (
-            short_depth_policy
-        )
-        request_observability.update(transcript_stats.to_metrics())
         request_observability.update(template_observability)
         if template_observability.get("tool_template_fallback"):
             _record_tool_parse_event(state, event="tool_template_fallback")
         if request_observability.get("request_client_hint") == "android_studio":
             _record_tool_parse_event(state, event="android_studio_request_detected")
-        prefix_diagnostic = getattr(state.sessions, "last_prefix_diagnostic", None)
-        if isinstance(prefix_diagnostic, dict):
+        if resolved_session_diagnostic:
             request_observability["request_session_prefix_diagnostic"] = (
-                prefix_diagnostic
+                resolved_session_diagnostic
             )
         session_keep_live_ref = _session_keep_live_refs_for_request(
             session_source=session_source,
@@ -21763,9 +31120,7 @@ def create_app(state: ServerState) -> FastAPI:
         live_frontier_policy = "none"
         if agent_transcript_tools_active:
             live_frontier_policy = (
-                "live_reference_lease"
-                if session_keep_live_ref
-                else "snapshot_only"
+                "live_reference_lease" if session_keep_live_ref else "snapshot_only"
             )
         if (
             _is_opencode_client(headers=headers, metadata=metadata)
@@ -21837,92 +31192,6 @@ def create_app(state: ServerState) -> FastAPI:
         request_observability["request_commit_prompt_prefix"] = bool(
             commit_prompt_prefix
         )
-        sampler_temperature = request.temperature if client_controls_allowed else None
-        sampler_top_p = request.top_p if client_controls_allowed else None
-        sampler_top_k = request.top_k if client_controls_allowed else None
-        # Penalties follow the same control-ownership policy as the other
-        # sampler fields; None falls through to the server default inside
-        # _generation_params (request value > server default > 0.0).
-        sampler_presence_penalty = (
-            request.presence_penalty if client_controls_allowed else None
-        )
-        sampler_frequency_penalty = (
-            request.frequency_penalty if client_controls_allowed else None
-        )
-        request_observability["request_temperature"] = request.temperature
-        request_observability["request_top_p"] = request.top_p
-        request_observability["request_top_k"] = request.top_k
-        if request.presence_penalty is not None:
-            request_observability["request_presence_penalty"] = (
-                request.presence_penalty
-            )
-        if request.frequency_penalty is not None:
-            request_observability["request_frequency_penalty"] = (
-                request.frequency_penalty
-            )
-        ignored_sampler_fields = [
-            name
-            for name, value in (
-                ("temperature", request.temperature),
-                ("top_p", request.top_p),
-                ("top_k", request.top_k),
-                ("presence_penalty", request.presence_penalty),
-                ("frequency_penalty", request.frequency_penalty),
-            )
-            if value is not None and not client_controls_allowed
-        ]
-        if ignored_sampler_fields:
-            request_observability["client_sampler_fields_ignored"] = (
-                ignored_sampler_fields
-            )
-        request_draft_sampler = _opencode_default_sampler_override(
-            messages=messages_for_generation,
-            tools_active=tools_active,
-            request_temperature=request.temperature,
-            request_top_p=request.top_p,
-            request_top_k=request.top_k,
-            request_observability=request_observability,
-            default_temperature=getattr(state.args, "temperature", 0.6),
-            default_top_p=getattr(state.args, "top_p", 0.95),
-            default_top_k=getattr(state.args, "top_k", 20),
-        )
-        if request_draft_sampler is not None:
-            target_sampler_override = request_draft_sampler
-            sampler_temperature = target_sampler_override.temperature
-            sampler_top_p = target_sampler_override.top_p
-            sampler_top_k = target_sampler_override.top_k
-            launch_draft_sampler = _opencode_default_draft_sampler_for_request(
-                state,
-                request_observability,
-            )
-            request_draft_sampler = launch_draft_sampler or target_sampler_override
-            request_observability["draft_sampler_override"] = asdict(
-                request_draft_sampler
-            )
-        if sampler_temperature is None:
-            default_temperature = getattr(state.args, "temperature", None)
-            sampler_temperature = (
-                0.6 if default_temperature is None else default_temperature
-            )
-        if sampler_top_p is None:
-            default_top_p = getattr(state.args, "top_p", None)
-            sampler_top_p = 0.95 if default_top_p is None else default_top_p
-        if sampler_top_k is None:
-            default_top_k = getattr(state.args, "top_k", None)
-            sampler_top_k = 20 if default_top_k is None else default_top_k
-        request_observability["effective_temperature"] = float(sampler_temperature)
-        request_observability["effective_top_p"] = float(sampler_top_p)
-        request_observability["effective_top_k"] = int(sampler_top_k)
-        request_observability["effective_presence_penalty"] = float(
-            sampler_presence_penalty
-            if sampler_presence_penalty is not None
-            else getattr(state.args, "default_presence_penalty", 0.0) or 0.0
-        )
-        request_observability["effective_frequency_penalty"] = float(
-            sampler_frequency_penalty
-            if sampler_frequency_penalty is not None
-            else getattr(state.args, "default_frequency_penalty", 0.0) or 0.0
-        )
         suppress_visible_reasoning = False
         stop_sequences = _normalize_stop_sequences(request.stop)
 
@@ -21949,9 +31218,7 @@ def create_app(state: ServerState) -> FastAPI:
         nonstream_stop_reasoning_chunks: list[str] = []
         if stop_sequences and not request.stream:
             nonstream_stop_monitor = _StopSequenceStreamMonitor(stop_sequences)
-            nonstream_stop_decoder = _IncrementalTokenDecoder(
-                state.runtime.tokenizer
-            )
+            nonstream_stop_decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
             nonstream_stop_splitter = _stream_splitter_for_state(
                 state,
                 thinking_enabled=thinking_enabled,
@@ -21978,9 +31245,7 @@ def create_app(state: ServerState) -> FastAPI:
                 if nonstream_client_disconnected
                 else "request cancelled"
             )
-            _raise_if_stream_cancelled(
-                nonstream_cancel_event, cancel_message
-            )
+            _raise_if_stream_cancelled(nonstream_cancel_event, cancel_message)
             if nonstream_stop_monitor is not None:
                 delta = nonstream_stop_decoder.feed(
                     [int(token) for token in new_tokens]
@@ -22049,6 +31314,7 @@ def create_app(state: ServerState) -> FastAPI:
                         token_callback=_nonstream_on_tokens,
                         prefill_callback=_nonstream_on_prefill,
                         cancel_event=nonstream_cancel_event,
+                        mtp_batch_finalize_ownership=mtp_batch_finalize_ownership,
                         streaming_response=False,
                     )
                 )
@@ -22087,14 +31353,21 @@ def create_app(state: ServerState) -> FastAPI:
                     token_callback=_nonstream_on_tokens,
                     prefill_callback=_nonstream_on_prefill,
                     cancel_event=nonstream_cancel_event,
+                    mtp_batch_finalize_ownership=mtp_batch_finalize_ownership,
                     streaming_response=False,
                 )
                 generated_result = attach_response_observability(generated_result)
-                session.commit(
-                    prompt_ids=prompt_ids,
-                    generated_ids=generated_result["tokens"],
-                    finish_reason=generated_result.get("finish_reason", "stop"),
-                )
+                if vision_splice is None:
+                    # Raw-id session frontiers carry no image identity: a
+                    # committed vision frontier lets a same-text request
+                    # with DIFFERENT pixels adopt and restore this KV whole
+                    # (pillar alias leg). Vision reuse rides the
+                    # surrogate-keyed bank lane only.
+                    session.commit(
+                        prompt_ids=prompt_ids,
+                        generated_ids=generated_result["tokens"],
+                        finish_reason=generated_result.get("finish_reason", "stop"),
+                    )
                 return generated_result
 
         async def store_postcommit_snapshot(
@@ -22123,9 +31396,11 @@ def create_app(state: ServerState) -> FastAPI:
                 assistant_content=assistant_content,
                 assistant_tool_calls=assistant_tool_calls,
                 thinking_enabled=thinking_enabled,
+                reasoning_effort=reasoning_effort,
                 tool_specs=postcommit_tool_specs,
                 tool_prompt_mode=postcommit_tool_prompt_mode,
-                strip_tool_call_preamble_text=opencode_client,
+                strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                session=session,
             )
             if compatibility.get("safe"):
                 generated["stats"]["session_postcommit_snapshot"] = {
@@ -22154,6 +31429,13 @@ def create_app(state: ServerState) -> FastAPI:
                     _attach_skipped_postcommit_cleanup(state, skipped)
                 )
                 return
+            # The committed stream this turn will anchor: canonical prompt +
+            # generated ids. The retokenized history substitutes its think
+            # interiors from these bytes so the commit actually extends the
+            # session (F11 #3 / issue #269).
+            postcommit_committed_stream = [int(token) for token in prompt_ids] + [
+                int(token) for token in (generated.get("tokens") or [])
+            ]
             if state.args.session_postcommit_mode == "async" and generated_mode != "ar":
                 generated["stats"]["session_postcommit_snapshot"] = (
                     _schedule_idle_postcommit_snapshot(
@@ -22163,6 +31445,7 @@ def create_app(state: ServerState) -> FastAPI:
                         assistant_content=assistant_content,
                         assistant_tool_calls=assistant_tool_calls,
                         thinking_enabled=thinking_enabled,
+                        reasoning_effort=reasoning_effort,
                         policy_fingerprint=postcommit_policy_fingerprint,
                         unsafe_reason=unsafe_reason,
                         tool_specs=postcommit_tool_specs,
@@ -22170,7 +31453,8 @@ def create_app(state: ServerState) -> FastAPI:
                         expected_session_revision=getattr(session, "revision", None),
                         keep_live_ref=session_keep_live_ref,
                         tool_prompt_mode=postcommit_tool_prompt_mode,
-                        strip_tool_call_preamble_text=opencode_client,
+                        strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                        committed_stream_ids=postcommit_committed_stream,
                     )
                 )
                 return
@@ -22184,11 +31468,13 @@ def create_app(state: ServerState) -> FastAPI:
                         assistant_content=assistant_content,
                         assistant_tool_calls=assistant_tool_calls,
                         thinking_enabled=thinking_enabled,
+                        reasoning_effort=reasoning_effort,
                         policy_fingerprint=postcommit_policy_fingerprint,
                         tool_specs=postcommit_tool_specs,
                         keep_live_ref=session_keep_live_ref,
                         tool_prompt_mode=postcommit_tool_prompt_mode,
-                        strip_tool_call_preamble_text=opencode_client,
+                        strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                        committed_stream_ids=postcommit_committed_stream,
                     ),
                     batch_key=f"postcommit.inline:{session_id or 'stateless'}",
                 ),
@@ -22205,7 +31491,72 @@ def create_app(state: ServerState) -> FastAPI:
         # the session lock is acquired. Set MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S
         # explicitly to restore the blocking wait.
         postcommit_wait_outcome: dict[str, Any] | None = None
-        if session is not None:
+        if early_postcommit_handled:
+            # Sweep + wait already ran BEFORE the committed-reasoning gate
+            # (canon-after-wait, 2026-08-21); publish those results here,
+            # where request_observability exists.
+            if early_cross_session_yield is not None:
+                request_observability["postcommit_cross_session_yield"] = (
+                    early_cross_session_yield
+                )
+                if not _server_console_enabled(state):
+                    try:
+                        _safe_stdout_print(
+                            "[mtplx] postcommit cross-session yield "
+                            + json.dumps(
+                                {
+                                    "admitting_session_id": session_id,
+                                    **early_cross_session_yield,
+                                },
+                                sort_keys=True,
+                                default=str,
+                            )
+                        )
+                    except BaseException:
+                        pass
+            postcommit_wait_outcome = early_postcommit_wait
+            if postcommit_wait_outcome is not None:
+                request_observability["postcommit_wait"] = postcommit_wait_outcome
+        else:
+            _cross_session_sweep = getattr(
+                getattr(state, "sessions", None),
+                "abort_cross_session_postcommits",
+                None,
+            )
+            if (
+                _cross_session_sweep is not None
+                and _postcommit_cross_session_yield_enabled()
+            ):
+                # A foreign session's idle commit cannot help THIS request —
+                # only the same-session grace below has a payoff. Abort all
+                # cross-session pending commits so this request never pays a
+                # stranger's 0.5-3.5GB retokenized_history job (2026-08-05
+                # showdown: tight-cadence multi-session traffic lost 30-50%
+                # decode + the job's runtime in TTFT to exactly this).
+                cross_yield = await asyncio.to_thread(
+                    _cross_session_sweep,
+                    except_session_id=session_id,
+                )
+                if cross_yield is not None:
+                    request_observability["postcommit_cross_session_yield"] = (
+                        cross_yield
+                    )
+                    if not _server_console_enabled(state):
+                        try:
+                            _safe_stdout_print(
+                                "[mtplx] postcommit cross-session yield "
+                                + json.dumps(
+                                    {
+                                        "admitting_session_id": session_id,
+                                        **cross_yield,
+                                    },
+                                    sort_keys=True,
+                                    default=str,
+                                )
+                            )
+                        except BaseException:
+                            pass
+        if not early_postcommit_handled and session is not None:
             postcommit_wait_outcome = await asyncio.to_thread(
                 session.resolve_pending_postcommit_for_request
             )
@@ -22236,14 +31587,27 @@ def create_app(state: ServerState) -> FastAPI:
                 stream_started_s = time.perf_counter()
                 last_sse_sent_s = stream_started_s
                 last_token_s: float | None = None
+                # Enqueue stamp of the token item currently being drained
+                # (generation-thread perf_counter). The census subtracts it
+                # to expose queue residency — the direct starvation receipt.
+                latest_token_enqueue_s: float | None = None
                 next_silence_warn_s = stream_started_s + STREAM_SILENCE_WARN_S
-                owner_stall_probe = _OwnerStallProbe(
-                    deadline_s=STREAM_STALL_DEADLINE_S
-                )
+                owner_stall_probe = _OwnerStallProbe(deadline_s=STREAM_STALL_DEADLINE_S)
+                sse_keepalive_interval_s = _sse_keepalive_interval_s()
 
                 def mark_sse_sent(chunk: str) -> str:
                     nonlocal last_sse_sent_s
                     last_sse_sent_s = time.perf_counter()
+                    if _STREAM_CENSUS_DIR is not None:
+                        _stream_census_record(
+                            response_id,
+                            chunk,
+                            queue_age_ms=(
+                                (last_sse_sent_s - latest_token_enqueue_s) * 1000
+                                if latest_token_enqueue_s is not None
+                                else None
+                            ),
+                        )
                     return chunk
 
                 first = {
@@ -22261,8 +31625,8 @@ def create_app(state: ServerState) -> FastAPI:
                 }
                 yield mark_sse_sent(f"data: {json.dumps(first)}\n\n")
 
-                queue: Queue[tuple[str, Any]] = Queue()
-                cancel_event = Event()
+                queue = _LoopFedStreamQueue(asyncio.get_running_loop())
+                cancel_event = _AttributedCancelEvent()
                 # Register this request in the dashboard's in-flight registry
                 # so external cancel (`POST /v1/mtplx/cancel/{id}`) can flip
                 # the same per-request cancel_event the worker already checks.
@@ -22279,6 +31643,13 @@ def create_app(state: ServerState) -> FastAPI:
                     prompt_tokens=len(prompt_ids),
                 )
                 state.dashboard.in_flight.register(in_flight_handle)
+                _flight(state).begin(
+                    response_id,
+                    session_id=session_id,
+                    model=model,
+                    prompt_tokens=len(prompt_ids),
+                    stream=True,
+                )
                 decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
                 splitter = _stream_splitter_for_state(
                     state,
@@ -22296,8 +31667,7 @@ def create_app(state: ServerState) -> FastAPI:
                 # completion surface).
                 stop_monitor: _StopSequenceStreamMonitor | None = (
                     _StopSequenceStreamMonitor(stop_sequences)
-                    if stop_sequences
-                    and not read_only_force_answer_contract_active
+                    if stop_sequences and not read_only_force_answer_contract_active
                     else None
                 )
                 stop_sequence_cancel_fired = False
@@ -22307,9 +31677,15 @@ def create_app(state: ServerState) -> FastAPI:
                     if stop_sequence_cancel_fired:
                         return
                     stop_sequence_cancel_fired = True
-                    _cancel_stream_generation(cancel_event, generation_future)
+                    _cancel_stream_generation(
+                        cancel_event, generation_future, origin="stop_sequence"
+                    )
 
                 stream_interval = max(1, int(state.args.stream_interval))
+                pacer_enabled = _stream_pacer_enabled()
+                pacer_min_tokens = _stream_pacer_min_tokens()
+                pacer_gap_ema_s = 0.0
+                pacer_last_batch_s = 0.0
                 content_tool_translator = (
                     _ToolAwareContentStreamTranslator(
                         tools=tool_specs,
@@ -22318,10 +31694,7 @@ def create_app(state: ServerState) -> FastAPI:
                         repair_unclosed_complete=(
                             str(raw_request.url.path or "") != "/v1/messages"
                         ),
-                        suppress_tool_call_preamble=_is_hermes_client(
-                            headers=headers,
-                            metadata=metadata,
-                        ),
+                        suppress_tool_call_preamble=suppress_stream_tool_preamble,
                     )
                     # Forced final-answer turns stream sanitized visible text
                     # through the buffered marker path; the tool-call
@@ -22331,7 +31704,7 @@ def create_app(state: ServerState) -> FastAPI:
                     else None
                 )
                 stream_client_hint = str(
-                    request_observability.get("request_client_hint") or ""
+                    request_observability.get("request_client_evidence") or ""
                 ).lower()
                 single_tool_call_stream = _single_tool_call_stream_policy(
                     parallel_tool_calls=_request_parallel_tool_calls(request),
@@ -22346,6 +31719,9 @@ def create_app(state: ServerState) -> FastAPI:
                 orphan_reasoning_stream_guard = _InitialOrphanToolControlStreamGuard()
                 orphan_content_stream_guard = _InitialOrphanToolControlStreamGuard()
                 stream_orphan_tool_markup_suppressed = False
+                # (field, stripped remainder) from orphan-mode guards, held
+                # until tool extraction decides their fate (#249).
+                deferred_orphan_stream_remainders: list[tuple[str, str]] = []
                 pending_stream_tokens: list[int] = []
                 commit_event = Event()
                 commit_state = {
@@ -22521,9 +31897,18 @@ def create_app(state: ServerState) -> FastAPI:
                         scoped_reasoning_history=_reasoning_history_scoped_active(
                             state
                         ),
+                        preserve_reasoning_history=(
+                            _reasoning_history_preserve_echo_active(state)
+                        ),
                         tools=tool_specs,
                         tool_prompt_mode=tool_prompt_mode,
                         template_observability=repair_observability,
+                        # Repair re-encodes run on the gate's canonical
+                        # messages: without this flag the substituted think
+                        # interiors are dropped and the repair prompt
+                        # re-poisons what canonicalization just fixed
+                        # (audit F11 #5).
+                        allow_committed_reasoning=True,
                     )
                     retry_observability = dict(request_observability)
                     retry_observability.update(
@@ -22613,12 +31998,39 @@ def create_app(state: ServerState) -> FastAPI:
                 def maybe_repair_tool_fed_reasoning_only_completion(
                     generated: dict[str, Any],
                 ) -> dict[str, Any]:
+                    # The repair is a second-chance enhancement: its own
+                    # failure must never take down a request that already has
+                    # a servable first pass. Cancellation still propagates.
+                    try:
+                        return _repair_reasoning_only_completion_unguarded(
+                            generated
+                        )
+                    except _StreamCancelled:
+                        raise
+                    except Exception as exc:
+                        generated.setdefault("stats", {})[
+                            "reasoning_completion_repair_error"
+                        ] = f"{type(exc).__name__}: {exc}"[:200]
+                        return generated
+
+                def _repair_reasoning_only_completion_unguarded(
+                    generated: dict[str, Any],
+                ) -> dict[str, Any]:
+                    # Tools-declared turns are excluded from the F3
+                    # reasoning-as-content recovery (planning prose is not an
+                    # answer), so a reasoning-only stop here would otherwise
+                    # return an EMPTY assistant message. That includes the
+                    # FIRST turn of a tools-declared conversation (app chat
+                    # with web search on, agent clients' opening message) —
+                    # not just tool-fed turns — so the continuation repair
+                    # covers both (user reports: "model responds but produces
+                    # no answer", 27B + Flash-Next, chat and API).
                     if (
                         not tools_active
-                        or not tool_result_history_present
                         or not thinking_enabled
                         or request.seed is not None
-                        or _reasoning_parser_for_state(state) not in {"qwen3", "step3p5"}
+                        or _reasoning_parser_for_state(state)
+                        not in {"qwen3", "step3p5", "poolside_v1"}
                         # Forced final-answer turns intentionally rehearse
                         # before the visible marker; the buffered marker
                         # stream owns visibility, so a reasoning-shaped first
@@ -22632,6 +32044,19 @@ def create_app(state: ServerState) -> FastAPI:
                         )
                     )
                     if not first_text.strip():
+                        return generated
+                    # Tool-control markup — even unclosed — belongs to the
+                    # established tool-parse fallback machinery
+                    # (orphan/unclosed_tool_call), not this repair. The
+                    # thinking splitter classifies markup after a pre-opened
+                    # <think> as reasoning, which would otherwise read here
+                    # as a reasoning-only turn.
+                    if any(
+                        marker in first_text
+                        for marker in (
+                            _ThinkingContentStreamSplitter._TOOL_CONTROL_MARKERS
+                        )
+                    ):
                         return generated
                     raw_reasoning_text, raw_content_text = _tool_extraction_text_parts(
                         state,
@@ -22670,6 +32095,8 @@ def create_app(state: ServerState) -> FastAPI:
                             "reasoning_completion_repair_attempted": True,
                             "reasoning_completion_repair_reason": (
                                 "tool_fed_reasoning_only_completion"
+                                if tool_result_history_present
+                                else "tools_declared_reasoning_only_completion"
                             ),
                             "reasoning_completion_repair_first_completion_tokens": int(
                                 generated.get("completion_tokens") or 0
@@ -22682,6 +32109,10 @@ def create_app(state: ServerState) -> FastAPI:
                             ),
                         }
                     )
+                    # The repair re-streams through the same guard objects; an
+                    # orphan-mode guard still holding the first pass would
+                    # accumulate both passes and emit the remainder twice.
+                    queue.put(("reset_orphan_stream_guards", None))
                     queue.put(("close_unclosed_reasoning_for_repair", None))
                     retry_generated = _run_generation_dispatched(
                         state,
@@ -22738,9 +32169,9 @@ def create_app(state: ServerState) -> FastAPI:
                     ).strip()
                     retry_stats = retry_generated.setdefault("stats", {})
                     retry_stats.update(retry_observability)
-                    retry_succeeded = bool(
-                        retry_extraction.tool_calls
-                    ) or bool(retry_visible_text)
+                    retry_succeeded = bool(retry_extraction.tool_calls) or bool(
+                        retry_visible_text
+                    )
                     retry_stats["reasoning_completion_repair_succeeded"] = (
                         retry_succeeded
                     )
@@ -22805,11 +32236,14 @@ def create_app(state: ServerState) -> FastAPI:
                     )
                     if extraction.tool_calls:
                         return generated
-                    visible_candidate = "\n\n".join(
-                        part.strip()
-                        for part in (raw_reasoning_text, raw_content_text)
-                        if part and part.strip()
-                    ) or raw_text
+                    visible_candidate = (
+                        "\n\n".join(
+                            part.strip()
+                            for part in (raw_reasoning_text, raw_content_text)
+                            if part and part.strip()
+                        )
+                        or raw_text
+                    )
                     if not _looks_like_stalled_agent_tool_promise(visible_candidate):
                         return generated
 
@@ -22823,7 +32257,7 @@ def create_app(state: ServerState) -> FastAPI:
                                 "check more work, but it did not include a tool call. "
                                 "If more work is needed, emit exactly one declared "
                                 "tool call now. If no more tool is needed, answer "
-                                "with concrete final results. Do not say \"let me\" "
+                                'with concrete final results. Do not say "let me" '
                                 "and do not quote MTPLX internal notes."
                             ),
                         )
@@ -22838,9 +32272,18 @@ def create_app(state: ServerState) -> FastAPI:
                         scoped_reasoning_history=_reasoning_history_scoped_active(
                             state
                         ),
+                        preserve_reasoning_history=(
+                            _reasoning_history_preserve_echo_active(state)
+                        ),
                         tools=tool_specs,
                         tool_prompt_mode=tool_prompt_mode,
                         template_observability=repair_observability,
+                        # Repair re-encodes run on the gate's canonical
+                        # messages: without this flag the substituted think
+                        # interiors are dropped and the repair prompt
+                        # re-poisons what canonicalization just fixed
+                        # (audit F11 #5).
+                        allow_committed_reasoning=True,
                     )
                     first_stats = dict(generated.get("stats") or {})
                     retry_observability = dict(request_observability)
@@ -22854,9 +32297,7 @@ def create_app(state: ServerState) -> FastAPI:
                             "stalled_agent_retry_first_decode_tok_s": first_stats.get(
                                 "decode_tok_s"
                             ),
-                            "stalled_agent_retry_prompt_tokens": len(
-                                repair_prompt_ids
-                            ),
+                            "stalled_agent_retry_prompt_tokens": len(repair_prompt_ids),
                         }
                     )
                     retry_generated = _run_generation_dispatched(
@@ -22962,11 +32403,14 @@ def create_app(state: ServerState) -> FastAPI:
                         raw_text,
                         thinking_enabled=thinking_enabled,
                     )
-                    visible_candidate = "\n\n".join(
-                        part.strip()
-                        for part in (raw_reasoning_text, raw_content_text)
-                        if part and part.strip()
-                    ) or raw_text
+                    visible_candidate = (
+                        "\n\n".join(
+                            part.strip()
+                            for part in (raw_reasoning_text, raw_content_text)
+                            if part and part.strip()
+                        )
+                        or raw_text
+                    )
                     if not _looks_like_read_only_force_answer_failure(
                         visible_candidate
                     ):
@@ -22997,9 +32441,15 @@ def create_app(state: ServerState) -> FastAPI:
                         scoped_reasoning_history=_reasoning_history_scoped_active(
                             state
                         ),
+                        preserve_reasoning_history=(
+                            _reasoning_history_preserve_echo_active(state)
+                        ),
                         tools=None,
                         tool_prompt_mode=tool_prompt_mode,
                         template_observability=repair_observability,
+                        # Same committed-reasoning preservation as the other
+                        # repair encodes (audit F11 #5).
+                        allow_committed_reasoning=True,
                     )
                     first_stats = dict(generated.get("stats") or {})
                     retry_observability = dict(request_observability)
@@ -23132,12 +32582,17 @@ def create_app(state: ServerState) -> FastAPI:
                                 request_observability=request_observability,
                                 prefill_callback=on_prefill,
                                 cancel_event=cancel_event,
+                                mtp_batch_finalize_ownership=(
+                                    mtp_batch_finalize_ownership
+                                ),
                             )
                             generated = maybe_retry_degenerate_read_only_inspection(
                                 generated
                             )
-                            generated = maybe_retry_degenerate_tool_fed_empty_completion(
-                                generated
+                            generated = (
+                                maybe_retry_degenerate_tool_fed_empty_completion(
+                                    generated
+                                )
                             )
                             generated = maybe_repair_tool_fed_reasoning_only_completion(
                                 generated
@@ -23183,15 +32638,22 @@ def create_app(state: ServerState) -> FastAPI:
                                     request_observability=request_observability,
                                     prefill_callback=on_prefill,
                                     cancel_event=cancel_event,
+                                    mtp_batch_finalize_ownership=(
+                                        mtp_batch_finalize_ownership
+                                    ),
                                 )
                                 generated = maybe_retry_degenerate_read_only_inspection(
                                     generated
                                 )
-                                generated = maybe_retry_degenerate_tool_fed_empty_completion(
-                                    generated
+                                generated = (
+                                    maybe_retry_degenerate_tool_fed_empty_completion(
+                                        generated
+                                    )
                                 )
-                                generated = maybe_repair_tool_fed_reasoning_only_completion(
-                                    generated
+                                generated = (
+                                    maybe_repair_tool_fed_reasoning_only_completion(
+                                        generated
+                                    )
                                 )
                                 generated = maybe_retry_read_only_force_answer(
                                     generated
@@ -23205,7 +32667,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     assistant_history_content = str(
                                         commit_state.get("assistant_history_content")
                                         or ""
-                                    ) or (
+                                    ) if "assistant_history_content" in commit_state else (
                                         _normalize_reasoning_tags_for_state(
                                             state,
                                             str(generated["text"]),
@@ -23217,6 +32679,12 @@ def create_app(state: ServerState) -> FastAPI:
                                     assistant_tool_calls = commit_state.get(
                                         "assistant_tool_calls"
                                     )
+                                    stream_committed_stream = [
+                                        int(token) for token in prompt_ids
+                                    ] + [
+                                        int(token)
+                                        for token in (generated.get("tokens") or [])
+                                    ]
                                     if bool(commit_state.get("retokenize_inline")):
                                         postcommit = _submit_foreground_model_work(
                                             state,
@@ -23231,38 +32699,83 @@ def create_app(state: ServerState) -> FastAPI:
                                                     assistant_tool_calls
                                                 ),
                                                 thinking_enabled=thinking_enabled,
+                                                reasoning_effort=reasoning_effort,
                                                 policy_fingerprint=postcommit_policy_fingerprint,
                                                 tool_specs=postcommit_tool_specs,
                                                 keep_live_ref=session_keep_live_ref,
                                                 tool_prompt_mode=postcommit_tool_prompt_mode,
-                                                strip_tool_call_preamble_text=opencode_client,
+                                                strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                                                committed_stream_ids=(
+                                                    stream_committed_stream
+                                                ),
                                             ),
                                             batch_key=(
                                                 f"postcommit.stream.inline:"
                                                 f"{session_id or 'stateless'}"
                                             ),
                                         ).result()
+                                    elif generated.get("_final_state") is None:
+                                        # Batched AR has no generation-final cache
+                                        # state to install. Do not queue this known
+                                        # miss behind newer foreground requests.
+                                        # The helper still classifies tool/history
+                                        # incompatibilities before the unsafe result
+                                        # routes to bounded idle retokenization.
+                                        postcommit = _store_generation_final_history_snapshot(
+                                            state,
+                                            session_id=session_id,
+                                            prompt_ids=prompt_ids,
+                                            generated=generated,
+                                            messages=raw_messages_for_postcommit,
+                                            assistant_content=(
+                                                assistant_history_content
+                                            ),
+                                            assistant_tool_calls=(assistant_tool_calls),
+                                            thinking_enabled=thinking_enabled,
+                                            reasoning_effort=reasoning_effort,
+                                            policy_fingerprint=postcommit_policy_fingerprint,
+                                            tool_specs=postcommit_tool_specs,
+                                            keep_live_ref=session_keep_live_ref,
+                                            tool_prompt_mode=postcommit_tool_prompt_mode,
+                                            strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                                        )
+                                        generated["stats"][
+                                            "session_postcommit_snapshot"
+                                        ] = postcommit
+                                        queue.put(
+                                            (
+                                                "released",
+                                                {
+                                                    "generated": generated,
+                                                    "postcommit": postcommit,
+                                                },
+                                            )
+                                        )
+                                        return
                                     else:
                                         postcommit = _submit_foreground_model_work(
                                             state,
-                                            lambda: _store_generation_final_history_snapshot(
-                                                state,
-                                                session_id=session_id,
-                                                prompt_ids=prompt_ids,
-                                                generated=generated,
-                                                messages=raw_messages_for_postcommit,
-                                                assistant_content=(
-                                                    assistant_history_content
-                                                ),
-                                                assistant_tool_calls=(
-                                                    assistant_tool_calls
-                                                ),
-                                                thinking_enabled=thinking_enabled,
-                                                policy_fingerprint=postcommit_policy_fingerprint,
-                                                tool_specs=postcommit_tool_specs,
-                                                keep_live_ref=session_keep_live_ref,
-                                                tool_prompt_mode=postcommit_tool_prompt_mode,
-                                                strip_tool_call_preamble_text=opencode_client,
+                                            lambda: (
+                                                _store_generation_final_history_snapshot(
+                                                    state,
+                                                    session_id=session_id,
+                                                    prompt_ids=prompt_ids,
+                                                    generated=generated,
+                                                    messages=raw_messages_for_postcommit,
+                                                    assistant_content=(
+                                                        assistant_history_content
+                                                    ),
+                                                    assistant_tool_calls=(
+                                                        assistant_tool_calls
+                                                    ),
+                                                    thinking_enabled=thinking_enabled,
+                                                    reasoning_effort=reasoning_effort,
+                                                    policy_fingerprint=postcommit_policy_fingerprint,
+                                                    tool_specs=postcommit_tool_specs,
+                                                    keep_live_ref=session_keep_live_ref,
+                                                    tool_prompt_mode=postcommit_tool_prompt_mode,
+                                                    strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                                                )
                                             ),
                                             batch_key=(
                                                 f"postcommit.stream.final:"
@@ -23286,14 +32799,18 @@ def create_app(state: ServerState) -> FastAPI:
                                     generated["stats"][
                                         "session_postcommit_snapshot"
                                     ] = postcommit
-                                    session.commit(
-                                        prompt_ids=prompt_ids,
-                                        generated_ids=generated["tokens"],
-                                        finish_reason=generated.get(
-                                            "finish_reason", "stop"
-                                        ),
-                                        nbytes=int(postcommit.get("nbytes") or 0),
-                                    )
+                                    if vision_splice is None:
+                                        # Vision frontiers alias different
+                                        # pixels behind identical pad ids;
+                                        # bank lane (surrogate keys) only.
+                                        session.commit(
+                                            prompt_ids=prompt_ids,
+                                            generated_ids=generated["tokens"],
+                                            finish_reason=generated.get(
+                                                "finish_reason", "stop"
+                                            ),
+                                            nbytes=int(postcommit.get("nbytes") or 0),
+                                        )
                                     queue.put(("committed", generated))
                                 else:
                                     queue.put(("released", None))
@@ -23336,21 +32853,28 @@ def create_app(state: ServerState) -> FastAPI:
                     daemon=True,
                 ).start()
 
+                # The envelope around each delta is constant for the whole
+                # stream; serialize it once instead of rebuilding and
+                # re-serializing the full payload dict per token chunk.
+                # Byte-identical to json.dumps of the equivalent dict
+                # (default separators and key order).
+                _delta_envelope_prefix = (
+                    'data: {"id": '
+                    + json.dumps(response_id)
+                    + ', "object": "chat.completion.chunk", "created": '
+                    + json.dumps(created)
+                    + ', "model": '
+                    + json.dumps(model)
+                    + ', "choices": [{"index": 0, "delta": '
+                )
+                _delta_envelope_suffix = ', "finish_reason": null}]}\n\n'
+
                 def delta_payload_chunk(delta: dict[str, Any]) -> str:
-                    payload = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": delta,
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    return f"data: {json.dumps(payload)}\n\n"
+                    return (
+                        _delta_envelope_prefix
+                        + json.dumps(delta)
+                        + _delta_envelope_suffix
+                    )
 
                 def delta_chunk(field: str, text: str) -> str:
                     return delta_payload_chunk({field: text})
@@ -23373,12 +32897,22 @@ def create_app(state: ServerState) -> FastAPI:
                     return f"data: {json.dumps(payload)}\n\n"
 
                 def error_chunk(exc: BaseException) -> str:
+                    if _is_allocation_failure(exc):
+                        # Shed caches + honest 507 instead of an anonymous
+                        # RuntimeError 500; the daemon stays up (#348).
+                        exc = _allocation_failure_http_exception(state, exc)
                     if isinstance(exc, HTTPException):
                         message = str(exc.detail)
                         status_code = exc.status_code
+                        error_code = (
+                            "insufficient_memory"
+                            if status_code == 507
+                            else type(exc).__name__
+                        )
                     else:
                         message = str(exc)
                         status_code = 500
+                        error_code = type(exc).__name__
                     payload = {
                         "id": response_id,
                         "object": "chat.completion.chunk",
@@ -23390,7 +32924,7 @@ def create_app(state: ServerState) -> FastAPI:
                         **_openai_error_content(
                             message,
                             status_code=status_code,
-                            code=type(exc).__name__,
+                            code=error_code,
                         ),
                     }
                     return f"data: {json.dumps(payload)}\n\n"
@@ -23460,6 +32994,13 @@ def create_app(state: ServerState) -> FastAPI:
                 history_reasoning_chunks: list[str] = []
                 history_content_chunks: list[str] = []
                 streamed_token_ids: list[int] = []
+                # One timestamp per streamed token (batch-mates share one),
+                # mirroring the completed-path census shape — so a CANCELLED
+                # request still records the producer-gap census. The founder's
+                # 2026-08-18 stutter run was cancelled mid-stream and its
+                # record had no gap fields at all: the one request that
+                # mattered was the one we were blind on.
+                streamed_token_times: list[float] = []
                 streamed_progress_tokens = 0
                 streamed_decode_started_s: float | None = None
                 streamed_assistant_tool_calls: list[dict[str, Any]] | None = None
@@ -23489,9 +33030,8 @@ def create_app(state: ServerState) -> FastAPI:
                     orphan_reasoning_stream_guard = (
                         _InitialOrphanToolControlStreamGuard()
                     )
-                    orphan_content_stream_guard = (
-                        _InitialOrphanToolControlStreamGuard()
-                    )
+                    orphan_content_stream_guard = _InitialOrphanToolControlStreamGuard()
+                    deferred_orphan_stream_remainders.clear()
 
                 def apply_orphan_stream_guard(field: str, text: str) -> str:
                     nonlocal stream_orphan_tool_markup_suppressed
@@ -23522,6 +33062,9 @@ def create_app(state: ServerState) -> FastAPI:
                     nonlocal pending_tool_cancel_started_s
                     if not text:
                         return []
+                    # Flight recorder sees generated truth (pre-guard, pre-
+                    # suppression) so char counts reflect what the model wrote.
+                    _flight(state).on_delta(response_id, field, text)
                     if use_orphan_guard:
                         text = apply_orphan_stream_guard(field, text)
                         if not text:
@@ -23529,11 +33072,7 @@ def create_app(state: ServerState) -> FastAPI:
                     if field == "reasoning_content" and suppress_visible_reasoning:
                         remember_stream_delta({field: text})
                         return []
-                    if (
-                        field == "content"
-                        and monitor_stop
-                        and stop_monitor is not None
-                    ):
+                    if field == "content" and monitor_stop and stop_monitor is not None:
                         if stop_monitor.stopped:
                             return []
                         text = stop_monitor.feed(text)
@@ -23592,33 +33131,49 @@ def create_app(state: ServerState) -> FastAPI:
                         ):
                             early_tool_cancel_used = True
                             pending_tool_cancel_started_s = None
-                            _cancel_stream_generation(cancel_event, generation_future)
+                            _cancel_stream_generation(
+                                cancel_event,
+                                generation_future,
+                                origin="early_tool_finish",
+                            )
                             return chunks
                         if content_tool_translator.invalid_trailing_after_tool_call:
                             streamed_assistant_tool_calls = (
                                 content_tool_translator.tool_calls
                                 or streamed_assistant_tool_calls
                             )
-                            if single_tool_call_stream and streamed_assistant_tool_calls:
+                            if (
+                                single_tool_call_stream
+                                and streamed_assistant_tool_calls
+                            ):
                                 streamed_assistant_tool_calls = (
                                     streamed_assistant_tool_calls[:1]
                                 )
                             early_tool_cancel_used = True
                             pending_tool_cancel_started_s = None
-                            _cancel_stream_generation(cancel_event, generation_future)
+                            _cancel_stream_generation(
+                                cancel_event,
+                                generation_future,
+                                origin="early_tool_finish",
+                            )
                         elif content_tool_translator.ready_to_finish_tool_turn:
                             streamed_assistant_tool_calls = (
                                 content_tool_translator.tool_calls
                                 or streamed_assistant_tool_calls
                             )
-                            if single_tool_call_stream and streamed_assistant_tool_calls:
+                            if (
+                                single_tool_call_stream
+                                and streamed_assistant_tool_calls
+                            ):
                                 streamed_assistant_tool_calls = (
                                     streamed_assistant_tool_calls[:1]
                                 )
                                 early_tool_cancel_used = True
                                 pending_tool_cancel_started_s = None
                                 _cancel_stream_generation(
-                                    cancel_event, generation_future
+                                    cancel_event,
+                                    generation_future,
+                                    origin="early_tool_finish",
                                 )
                             elif pending_tool_cancel_started_s is None:
                                 pending_tool_cancel_started_s = time.perf_counter()
@@ -23641,6 +33196,11 @@ def create_app(state: ServerState) -> FastAPI:
                         flushed = guard.finish()
                         if guard.suppressed:
                             stream_orphan_tool_markup_suppressed = True
+                        remainder = guard.take_orphan_remainder()
+                        if remainder:
+                            deferred_orphan_stream_remainders.append(
+                                (field, remainder)
+                            )
                         if not flushed:
                             continue
                         chunks.extend(
@@ -23765,6 +33325,7 @@ def create_app(state: ServerState) -> FastAPI:
                     tokens: list[int],
                     *,
                     force: bool = False,
+                    coalesce: bool = True,
                 ) -> list[tuple[str, str]]:
                     pending_stream_tokens.extend(tokens)
                     chunks: list[tuple[str, str]] = []
@@ -23782,7 +33343,11 @@ def create_app(state: ServerState) -> FastAPI:
                             for field, text in splitter.feed(delta)
                             if text
                         )
-                    return chunks
+                    # One committed verify step (or one force-drain) emits
+                    # one write per channel run, not one per token — see
+                    # _coalesce_stream_fields. The release pacer asks for the
+                    # per-token pieces and paces them itself.
+                    return _coalesce_stream_fields(chunks) if coalesce else chunks
 
                 def streamed_history_content() -> str:
                     # Always capture the natural-language portion of the
@@ -23814,6 +33379,7 @@ def create_app(state: ServerState) -> FastAPI:
 
                 stream_cancelled_by_client = False
                 cancelled_metric_recorded = False
+                stream_error_item: BaseException | None = None
                 for field, text in splitter.start():
                     if text:
                         for chunk in stream_content_delta_chunks(field, text):
@@ -23822,7 +33388,7 @@ def create_app(state: ServerState) -> FastAPI:
                 try:
                     while True:
                         try:
-                            kind, item = await asyncio.to_thread(queue.get, True, 0.25)
+                            kind, item = await queue.get(0.25)
                         except Empty:
                             if stop_monitor is not None and stop_monitor.stopped:
                                 # Stop-sequence cancel in flight: keep
@@ -23833,11 +33399,39 @@ def create_app(state: ServerState) -> FastAPI:
                                     stream_cancelled_by_client = True
                                     return
                                 continue
+                            client_disconnected_now = (
+                                await raw_request.is_disconnected()
+                            )
                             if (
                                 cancel_event.is_set()
-                                or await raw_request.is_disconnected()
-                            ):
-                                stream_cancelled_by_client = True
+                                and not early_tool_cancel_used
+                            ) or client_disconnected_now:
+                                # `and not early_tool_cancel_used` because the
+                                # early tool-call cancel below sets the very
+                                # same event and then `continue`s straight back
+                                # into this branch. The worker only observes
+                                # the event once per committed token batch
+                                # (`on_tokens`), so whenever that batch gap
+                                # outlives the 0.25s poll above, the loop read
+                                # its own cancel as a foreign one and killed a
+                                # healthy tool-calling turn. Excluding it keeps
+                                # draining until the worker acknowledges, which
+                                # lands on the `kind == "cancelled"` handler
+                                # and its `early_tool_cancel_used and
+                                # streamed_assistant_tool_calls` terminal
+                                # frame. The completions loop already guards
+                                # its own `stop_hit` cancel this way.
+                                #
+                                # Truthful cancel accounting (#F36): only a
+                                # genuinely dead transport is a client
+                                # disconnect; an explicit server-side cancel
+                                # (POST /v1/mtplx/cancel/{id}) leaves the
+                                # client connected and MUST still receive a
+                                # terminal frame + [DONE] instead of a silent
+                                # close.
+                                stream_cancelled_by_client = (
+                                    client_disconnected_now
+                                )
                                 _cancel_stream_generation(
                                     cancel_event, generation_future
                                 )
@@ -23846,7 +33440,22 @@ def create_app(state: ServerState) -> FastAPI:
                                 ):
                                     session.abort_pending_postcommit(
                                         "stream_client_disconnected"
+                                        if client_disconnected_now
+                                        else "stream_cancelled"
                                     )
+                                if not client_disconnected_now:
+                                    yield mark_sse_sent(
+                                        error_chunk(
+                                            RuntimeError(
+                                                "request cancelled via "
+                                                f"{_cancel_via_label(cancel_event)} "
+                                                "after "
+                                                f"{streamed_progress_tokens} "
+                                                "streamed tokens"
+                                            )
+                                        )
+                                    )
+                                    yield mark_sse_sent("data: [DONE]\n\n")
                                 return
                             now_s = time.perf_counter()
                             if (
@@ -23858,7 +33467,9 @@ def create_app(state: ServerState) -> FastAPI:
                                 early_tool_cancel_used = True
                                 pending_tool_cancel_started_s = None
                                 _cancel_stream_generation(
-                                    cancel_event, generation_future
+                                    cancel_event,
+                                    generation_future,
+                                    origin="early_tool_finish",
                                 )
                                 continue
                             frozen_for_s = owner_stall_probe.observe(now_s)
@@ -23879,7 +33490,9 @@ def create_app(state: ServerState) -> FastAPI:
                                     streamed_tokens=streamed_progress_tokens,
                                 )
                                 _cancel_stream_generation(
-                                    cancel_event, generation_future
+                                    cancel_event,
+                                    generation_future,
+                                    origin="stream_stall",
                                 )
                                 if session is not None and hasattr(
                                     session, "abort_pending_postcommit"
@@ -23900,6 +33513,23 @@ def create_app(state: ServerState) -> FastAPI:
                                 )
                                 yield mark_sse_sent("data: [DONE]\n\n")
                                 return
+                            if (
+                                sse_keepalive_interval_s is not None
+                                and streamed_decode_started_s is None
+                                and not generation_future.done()
+                                and now_s - last_sse_sent_s
+                                >= sse_keepalive_interval_s
+                            ):
+                                # Pre-first-token liveness (#358): during long
+                                # prefills the only bytes so far are the role
+                                # delta, so strict client/proxy read-timeouts
+                                # see a dead wire. SSE comments are invisible
+                                # to parsers and cannot disturb chunk layout;
+                                # once decode starts, token cadence takes
+                                # over. At the default cadence (5s < 10s)
+                                # this also keeps the progress-chunk check
+                                # below idle until decode starts.
+                                yield mark_sse_sent(SSE_KEEPALIVE_COMMENT)
                             if (
                                 not generation_future.done()
                                 and now_s - last_sse_sent_s
@@ -23926,15 +33556,30 @@ def create_app(state: ServerState) -> FastAPI:
                             else:
                                 stream_tokens = list(item or [])
                                 token_timestamp_s = time.perf_counter()
+                            latest_token_enqueue_s = token_timestamp_s
                             if stream_tokens:
                                 streamed_token_ids.extend(int(t) for t in stream_tokens)
+                                streamed_token_times.extend(
+                                    token_timestamp_s for _ in stream_tokens
+                                )
                                 last_token_s = token_timestamp_s
                                 next_silence_warn_s = (
                                     token_timestamp_s + STREAM_SILENCE_WARN_S
                                 )
                                 if streamed_decode_started_s is None:
                                     streamed_decode_started_s = token_timestamp_s
+                                    _flight(state).note_decode_started(
+                                        response_id,
+                                        getattr(
+                                            in_flight_handle, "prefill_state", None
+                                        ),
+                                    )
                                 streamed_progress_tokens += len(stream_tokens)
+                                _flight(state).on_tokens(
+                                    response_id,
+                                    len(stream_tokens),
+                                    token_timestamp_s,
+                                )
                                 progress_payload = _stream_progress_payload(
                                     completion_tokens=streamed_progress_tokens,
                                     decode_started_s=streamed_decode_started_s,
@@ -23955,7 +33600,38 @@ def create_app(state: ServerState) -> FastAPI:
                                         progress_chunk(published_progress)
                                     )
                             if not buffer_read_only_force_answer_stream:
-                                for field, text in drain_stream_tokens(stream_tokens):
+                                if pacer_enabled and stream_tokens:
+                                    if pacer_last_batch_s > 0:
+                                        gap = min(
+                                            1.0,
+                                            max(0.001, token_timestamp_s - pacer_last_batch_s),
+                                        )
+                                        pacer_gap_ema_s = (
+                                            gap
+                                            if pacer_gap_ema_s <= 0
+                                            else pacer_gap_ema_s * 0.7 + gap * 0.3
+                                        )
+                                    pacer_last_batch_s = token_timestamp_s
+                                pieces = drain_stream_tokens(
+                                    stream_tokens, coalesce=not pacer_enabled
+                                )
+                                pace_dt = 0.0
+                                if pacer_enabled:
+                                    if len(pieces) >= pacer_min_tokens:
+                                        pace_dt = _stream_pacer_interval(
+                                            len(pieces), pacer_gap_ema_s
+                                        )
+                                    else:
+                                        pieces = _coalesce_stream_fields(pieces)
+                                for index, (field, text) in enumerate(pieces):
+                                    if pace_dt > 0 and index:
+                                        if cancel_event.is_set() or (
+                                            stop_monitor is not None
+                                            and stop_monitor.stopped
+                                        ):
+                                            pace_dt = 0.0
+                                        else:
+                                            await asyncio.sleep(pace_dt)
                                     for chunk in stream_content_delta_chunks(
                                         field, text
                                     ):
@@ -23992,7 +33668,9 @@ def create_app(state: ServerState) -> FastAPI:
                                     if streamed_assistant_tool_calls:
                                         early_tool_cancel_used = True
                                         _cancel_stream_generation(
-                                            cancel_event, generation_future
+                                            cancel_event,
+                                            generation_future,
+                                            origin="early_tool_finish",
                                         )
                                     else:
                                         reason = (
@@ -24008,7 +33686,9 @@ def create_app(state: ServerState) -> FastAPI:
                                             stream=True,
                                         )
                                         _cancel_stream_generation(
-                                            cancel_event, generation_future
+                                            cancel_event,
+                                            generation_future,
+                                            origin="hidden_tool_guard",
                                         )
                                         yield mark_sse_sent(
                                             error_chunk(
@@ -24039,6 +33719,9 @@ def create_app(state: ServerState) -> FastAPI:
                                 generated["text"] = streamed_history_content()
                                 generated["finish_reason"] = "stop"
                                 stats = generated.setdefault("stats", {})
+                                # mtplx_stats.finish_reason mirrors the
+                                # response-level rewrite (truth contract).
+                                stats["finish_reason"] = "stop"
                                 stats["stop_sequence_hit"] = True
                                 stats["stop_sequence_matched"] = (
                                     stop_monitor.matched_stop
@@ -24062,7 +33745,9 @@ def create_app(state: ServerState) -> FastAPI:
                                 if tail:
                                     for _field, text in splitter.feed(tail):
                                         if text:
-                                            for chunk in stream_read_only_force_answer_text(
+                                            for (
+                                                chunk
+                                            ) in stream_read_only_force_answer_text(
                                                 text
                                             ):
                                                 yield mark_sse_sent(chunk)
@@ -24106,10 +33791,14 @@ def create_app(state: ServerState) -> FastAPI:
                                                 len(streamed_visible_text) :
                                             ]
                                         if missing_visible_text:
-                                            for part in read_only_force_answer_text_slices(
+                                            for (
+                                                part
+                                            ) in read_only_force_answer_text_slices(
                                                 missing_visible_text
                                             ):
-                                                for chunk in stream_content_delta_chunks(
+                                                for (
+                                                    chunk
+                                                ) in stream_content_delta_chunks(
                                                     "content",
                                                     part,
                                                     use_orphan_guard=False,
@@ -24117,7 +33806,9 @@ def create_app(state: ServerState) -> FastAPI:
                                                 ):
                                                     yield mark_sse_sent(chunk)
                                     else:
-                                        for chunk in emit_read_only_force_answer_visible_text(
+                                        for (
+                                            chunk
+                                        ) in emit_read_only_force_answer_visible_text(
                                             visible_text
                                         ):
                                             yield mark_sse_sent(chunk)
@@ -24177,9 +33868,11 @@ def create_app(state: ServerState) -> FastAPI:
                                     defer_content_resolution=True,
                                 ):
                                     yield mark_sse_sent(chunk)
-                            raw_generated_text = _strip_mtplx_internal_continuation_markers(
-                                _strip_generated_chat_template_sentinels(
-                                    str(generated.get("text") or "")
+                            raw_generated_text = (
+                                _strip_mtplx_internal_continuation_markers(
+                                    _strip_generated_chat_template_sentinels(
+                                        str(generated.get("text") or "")
+                                    )
                                 )
                             )
                             raw_reasoning_text, raw_content_text = (
@@ -24201,17 +33894,41 @@ def create_app(state: ServerState) -> FastAPI:
                                 # marker path; running tool extraction over the
                                 # raw rehearsal text would re-emit it as a
                                 # malformed-as-content fallback.
-                                if tools_active and not read_only_force_answer_contract_active
+                                if tools_active
+                                and not read_only_force_answer_contract_active
                                 else None
                             )
                             assistant_tool_calls = streamed_assistant_tool_calls or (
-                                extraction.tool_calls if extraction is not None else None
+                                extraction.tool_calls
+                                if extraction is not None
+                                else None
                             )
+                            if deferred_orphan_stream_remainders:
+                                deferred_remainders = list(
+                                    deferred_orphan_stream_remainders
+                                )
+                                deferred_orphan_stream_remainders.clear()
+                                # A parser-claimed span means the stripped
+                                # remainder is the tool call's argument values
+                                # — emitting it duplicated them into
+                                # delta.content (#249). Only a turn with no
+                                # tool call gets its remainder forwarded, as
+                                # genuinely visible prose wrapped in stray
+                                # markup.
+                                if not assistant_tool_calls:
+                                    for field, remainder in deferred_remainders:
+                                        for chunk in stream_content_delta_chunks(
+                                            field,
+                                            remainder,
+                                            use_orphan_guard=False,
+                                            use_tool_translator=False,
+                                        ):
+                                            yield mark_sse_sent(chunk)
                             if content_tool_translator is not None:
-                                for delta in (
-                                    content_tool_translator.resolve_deferred_content(
-                                        has_tool_calls=bool(assistant_tool_calls),
-                                    )
+                                for (
+                                    delta
+                                ) in content_tool_translator.resolve_deferred_content(
+                                    has_tool_calls=bool(assistant_tool_calls),
                                 ):
                                     remember_stream_delta(delta)
                                     yield mark_sse_sent(delta_payload_chunk(delta))
@@ -24249,7 +33966,8 @@ def create_app(state: ServerState) -> FastAPI:
                                     extraction.status == "malformed_as_content"
                                     and extraction.cleaned_text
                                     and (
-                                        fallback_visible_text := _visible_malformed_tool_content(
+                                        fallback_visible_text
+                                        := _visible_malformed_tool_content(
                                             extraction.cleaned_text,
                                             state.runtime.tokenizer,
                                         )
@@ -24260,7 +33978,119 @@ def create_app(state: ServerState) -> FastAPI:
                                     delta = {"content": fallback_visible_text}
                                     remember_stream_delta(delta)
                                     yield mark_sse_sent(delta_payload_chunk(delta))
+                                if (
+                                    extraction.status == "malformed_as_content"
+                                    and not assistant_tool_calls
+                                    and _tool_parse_counter_key(
+                                        extraction.malformed_reason
+                                        or "malformed_tool_call"
+                                    )
+                                    == "unknown_tool_name"
+                                ):
+                                    # #349 (stream twin of the non-stream
+                                    # fallback): a call to an undeclared tool
+                                    # was suppressed without executing — and a
+                                    # turn that was ONLY that call streamed no
+                                    # content at all. State the truth so the
+                                    # model self-corrects instead of believing
+                                    # the tool ran and returned nothing.
+                                    unknown_tool_notice = (
+                                        _unknown_tool_unexecuted_call_notice(
+                                            _unknown_tool_name_from_reason(
+                                                extraction.malformed_reason or ""
+                                            ),
+                                            _tool_names(tool_specs),
+                                        )
+                                    )
+                                    if unknown_tool_notice not in "".join(
+                                        history_content_chunks
+                                    ):
+                                        delta = {"content": unknown_tool_notice}
+                                        remember_stream_delta(delta)
+                                        yield mark_sse_sent(
+                                            delta_payload_chunk(delta)
+                                        )
+                                        stats["unexecuted_tool_call_notice"] = True
+                            elif (
+                                not tools_active
+                                and not read_only_force_answer_contract_active
+                                and not assistant_tool_calls
+                                and splitter.suppressed_tool_markup_chars > 0
+                            ):
+                                # #349 (stream twin of the non-stream #160
+                                # strip): the splitter suppressed no-tools
+                                # tool-call markup mid-stream, so the model's
+                                # call vanished with no output and no error.
+                                # Emit the truthful notice as the turn's last
+                                # content delta; remember_stream_delta puts it
+                                # in the committed history too, keeping the
+                                # session bank byte-identical with what the
+                                # client replays next turn.
+                                no_tools_notice = _no_tools_unexecuted_call_notice(
+                                    _tool_markup_call_names(raw_generated_text)
+                                )
+                                if no_tools_notice not in "".join(
+                                    history_content_chunks
+                                ):
+                                    delta = {"content": no_tools_notice}
+                                    remember_stream_delta(delta)
+                                    yield mark_sse_sent(delta_payload_chunk(delta))
+                                    stats["unexecuted_tool_call_notice"] = True
+                                    # Parity with the non-stream #160 strip,
+                                    # which stamps this on every no-tools
+                                    # suppression.
+                                    stats["raw_tool_markup_suppressed"] = True
                             if assistant_tool_calls:
+                                recovered_tool_preamble = getattr(
+                                    splitter,
+                                    "tool_preamble_recovered_content",
+                                    None,
+                                )
+                                if (
+                                    recovered_tool_preamble
+                                    and (
+                                        recovered_tool_preamble
+                                        not in "".join(history_content_chunks)
+                                    )
+                                    # Hermes-mode clients suppress tool-turn
+                                    # preambles by contract (the translator
+                                    # drops even LIVE preamble content when
+                                    # the turn parses tool calls); the
+                                    # recovered auto-routed preamble honors
+                                    # the same suppression.
+                                    and not (
+                                        content_tool_translator is not None
+                                        and getattr(
+                                            content_tool_translator,
+                                            "_suppress_tool_call_preamble",
+                                            False,
+                                        )
+                                    )
+                                ):
+                                    # F40 stream/non-stream parity: the
+                                    # reasoning=auto pre-tool-call preamble
+                                    # non-stream clients receive as `content`
+                                    # surfaces as a content delta before the
+                                    # finish frame (F3-precedent recovery,
+                                    # 835a9fd0). Bypasses the tool translator
+                                    # (its done-mode would swallow trailing
+                                    # content) — the recovered text cannot
+                                    # contain tool markup: a marker inside it
+                                    # would have flipped the splitter to tool
+                                    # mode at that point. reasoning deltas
+                                    # already sent stay sent, matching the
+                                    # plain-lane recovery contract.
+                                    for chunk in stream_content_delta_chunks(
+                                        "content",
+                                        recovered_tool_preamble,
+                                        use_orphan_guard=False,
+                                        use_tool_translator=False,
+                                        monitor_stop=False,
+                                    ):
+                                        yield mark_sse_sent(chunk)
+                                    stats[
+                                        "stream_tool_preamble_recovered_as_content"
+                                    ] = True
                                 if not streamed_tool_deltas_emitted:
                                     for delta in _stream_tool_call_deltas(
                                         assistant_tool_calls,
@@ -24275,18 +34105,31 @@ def create_app(state: ServerState) -> FastAPI:
                                 )
                                 stats["tool_parse_success"] = True
                                 stats["tool_call_count"] = len(assistant_tool_calls)
-                                generated["finish_reason"] = "tool_calls"
+                                # Honest finish on budget cuts (#196/#197): a
+                                # length-truncated turn that still yielded
+                                # complete tool calls must NOT report
+                                # "tool_calls" — the client would treat the
+                                # batch as complete while a trailing call was
+                                # cut and swallowed. "length" tells agent
+                                # clients (OpenCode et al.) to continue.
+                                if (
+                                    str(generated.get("finish_reason") or "")
+                                    == "length"
+                                ):
+                                    stats["tool_calls_truncated_by_length"] = True
+                                else:
+                                    generated["finish_reason"] = "tool_calls"
+                                    # mtplx_stats.finish_reason mirrors the
+                                    # response-level rewrite (truth contract).
+                                    stats["finish_reason"] = "tool_calls"
                             elif (
                                 extraction is not None
                                 and extraction.status == "malformed_as_content"
                             ):
                                 fallback_reason = (
-                                    extraction.malformed_reason
-                                    or "malformed_tool_call"
+                                    extraction.malformed_reason or "malformed_tool_call"
                                 )
-                                fallback_kind = _tool_parse_counter_key(
-                                    fallback_reason
-                                )
+                                fallback_kind = _tool_parse_counter_key(fallback_reason)
                                 _record_tool_parse_event(
                                     state,
                                     event=fallback_kind,
@@ -24297,9 +34140,7 @@ def create_app(state: ServerState) -> FastAPI:
                                 stats["tool_parse_fallback"] = True
                                 stats["tool_parse_fallback_reason"] = fallback_reason
                                 stats["tool_parse_fallback_kind"] = fallback_kind
-                            _merge_final_bridge_stats_into_latest_metrics(
-                                state, stats
-                            )
+                            _merge_final_bridge_stats_into_latest_metrics(state, stats)
                             if session is not None:
                                 assistant_history_content = streamed_history_content()
                                 commit_state["assistant_history_content"] = (
@@ -24313,9 +34154,121 @@ def create_app(state: ServerState) -> FastAPI:
                                 )
                                 commit_state["commit"] = True
                                 commit_event.set()
-                                commit_kind, commit_item = await asyncio.to_thread(
-                                    queue.get
+                                # Bounded commit wait (#F34): the session
+                                # postcommit runs on the model owner. Behind a
+                                # competing foreground job this wait is long
+                                # but alive (the owner heartbeat keeps
+                                # ticking), while the old unbounded
+                                # ``queue.get()`` held the stream open with
+                                # heartbeats dead and hung forever on a wedged
+                                # owner. Poll at the stream cadence so client
+                                # heartbeats keep flowing, and reuse the
+                                # stall-probe idiom for a visible error finish
+                                # instead of a silent hang.
+                                commit_wait_probe = _OwnerStallProbe(
+                                    deadline_s=STREAM_STALL_DEADLINE_S
                                 )
+                                commit_wait_started_s = time.perf_counter()
+                                while True:
+                                    try:
+                                        commit_kind, commit_item = await queue.get(
+                                            0.25
+                                        )
+                                    except Empty:
+                                        now_s = time.perf_counter()
+                                        if (
+                                            STREAM_COMMIT_WAIT_MAX_S > 0
+                                            and now_s - commit_wait_started_s
+                                            >= STREAM_COMMIT_WAIT_MAX_S
+                                        ):
+                                            # #425: the owner is alive but busy
+                                            # with someone else's prefill and
+                                            # our postcommit is queued behind
+                                            # it. Close the stream now; the
+                                            # snapshot lands when the owner
+                                            # reaches it.
+                                            waited_s = now_s - commit_wait_started_s
+                                            _log_stream_commit_wait_deferred(
+                                                state,
+                                                response_id=response_id,
+                                                session_id=session_id,
+                                                waited_s=waited_s,
+                                                streamed_tokens=(
+                                                    streamed_progress_tokens
+                                                ),
+                                            )
+                                            commit_kind = "released"
+                                            commit_item = {
+                                                "generated": generated,
+                                                "postcommit": {
+                                                    "stored": False,
+                                                    "deferred": (
+                                                        "stream_commit_wait_deadline"
+                                                    ),
+                                                    "waited_s": round(waited_s, 3),
+                                                },
+                                            }
+                                            break
+                                        frozen_for_s = commit_wait_probe.observe(
+                                            now_s
+                                        )
+                                        if frozen_for_s is not None:
+                                            _log_stream_stall_break(
+                                                state,
+                                                response_id=response_id,
+                                                session_id=session_id,
+                                                frozen_for_s=frozen_for_s,
+                                                streamed_tokens=(
+                                                    streamed_progress_tokens
+                                                ),
+                                            )
+                                            if hasattr(
+                                                session,
+                                                "abort_pending_postcommit",
+                                            ):
+                                                session.abort_pending_postcommit(
+                                                    "stream_stall_watchdog"
+                                                )
+                                            yield mark_sse_sent(
+                                                error_chunk(
+                                                    TimeoutError(
+                                                        "model owner made no "
+                                                        "progress for "
+                                                        f"{frozen_for_s:.0f}s "
+                                                        "while committing the "
+                                                        "session after "
+                                                        "generation; request "
+                                                        "aborted by the stream "
+                                                        "stall watchdog "
+                                                        "(MTPLX_STREAM_STALL_DEADLINE_S)"
+                                                    )
+                                                )
+                                            )
+                                            yield mark_sse_sent(
+                                                "data: [DONE]\n\n"
+                                            )
+                                            return
+                                        if (
+                                            now_s - last_sse_sent_s
+                                            >= STREAM_HEARTBEAT_INTERVAL_S
+                                        ):
+                                            maybe_log_stream_silence(now_s)
+                                            yield mark_sse_sent(
+                                                progress_chunk(
+                                                    _stream_heartbeat_payload(
+                                                        completion_tokens=(
+                                                            streamed_progress_tokens
+                                                        ),
+                                                        stream_started_s=(
+                                                            stream_started_s
+                                                        ),
+                                                        last_token_s=last_token_s,
+                                                        now_s=now_s,
+                                                    )
+                                                )
+                                            )
+                                        continue
+                                    break
                                 if commit_kind == "committed":
                                     generated = commit_item
                                 elif commit_kind == "error":
@@ -24338,10 +34291,14 @@ def create_app(state: ServerState) -> FastAPI:
                                         if assistant_tool_calls
                                         else "postcommit_prompt_prefix"
                                     )
-                                    if read_only_force_answer_contract_active:
+                                    if read_only_force_answer_contract_active or vision_splice is not None:
                                         prompt_prefix_commit_info = {
                                             "committed": False,
-                                            "reason": "transient_generation_contract",
+                                            "reason": (
+                                                "vision_session_frontier_skip"
+                                                if vision_splice is not None
+                                                else "transient_generation_contract"
+                                            ),
                                             "prefix_len": int(
                                                 getattr(session, "prefix_len", 0) or 0
                                             ),
@@ -24351,8 +34308,29 @@ def create_app(state: ServerState) -> FastAPI:
                                             prompt_prefix_commit_info["prefix_len"]
                                         )
                                     else:
+                                        # The trailing tool-result continuation
+                                        # hint is transient: the client never
+                                        # echoes it, so a committed stream that
+                                        # includes it can never be extended by
+                                        # any future prompt (strict prefix rule)
+                                        # - the committed frontier froze exactly
+                                        # there (2026-08-21: 15,389 while the
+                                        # true stream passed 76k). Commit only
+                                        # the stable prefix; the hint's KV stays
+                                        # live for this turn regardless.
+                                        _stable_prefix = template_observability.get(
+                                            "stable_prefix_len"
+                                        )
+                                        _prefix_commit_ids = prompt_ids
+                                        if (
+                                            isinstance(_stable_prefix, int)
+                                            and 0 < _stable_prefix < len(prompt_ids)
+                                        ):
+                                            _prefix_commit_ids = prompt_ids[
+                                                :_stable_prefix
+                                            ]
                                         prompt_prefix_commit = session.commit_prompt_prefix(
-                                            prompt_ids=prompt_ids,
+                                            prompt_ids=_prefix_commit_ids,
                                             finish_reason=str(
                                                 generated.get("finish_reason") or "stop"
                                             ),
@@ -24382,9 +34360,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             state=state,
                                             unsafe_reason=unsafe_reason,
                                             assistant_tool_calls=assistant_tool_calls,
-                                            prompt_prefix_len=(
-                                                prompt_prefix_len
-                                            ),
+                                            prompt_prefix_len=(prompt_prefix_len),
                                         )
                                     )
                                     if postcommit_snapshot is not None:
@@ -24404,6 +34380,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             ),
                                             assistant_tool_calls=assistant_tool_calls,
                                             thinking_enabled=thinking_enabled,
+                                            reasoning_effort=reasoning_effort,
                                             policy_fingerprint=postcommit_policy_fingerprint,
                                             unsafe_reason=unsafe_reason,
                                             tool_specs=postcommit_tool_specs,
@@ -24413,7 +34390,16 @@ def create_app(state: ServerState) -> FastAPI:
                                             ),
                                             keep_live_ref=session_keep_live_ref,
                                             tool_prompt_mode=postcommit_tool_prompt_mode,
-                                            strip_tool_call_preamble_text=opencode_client,
+                                            strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                                            committed_stream_ids=[
+                                                int(token) for token in prompt_ids
+                                            ]
+                                            + [
+                                                int(token)
+                                                for token in (
+                                                    generated.get("tokens") or []
+                                                )
+                                            ],
                                         )
                                     generated["stats"][
                                         "session_postcommit_snapshot"
@@ -24450,11 +34436,30 @@ def create_app(state: ServerState) -> FastAPI:
                                 state.runtime.tokenizer,
                                 answer_text,
                             )
+                            if (
+                                not assistant_tool_calls
+                                and str(generated.get("finish_reason") or "")
+                                == "length"
+                                and not answer_text
+                                and reasoning_text
+                            ):
+                                # Quiet-envelope truth stat (#F3): the row is
+                                # empty because max_tokens ran out inside the
+                                # reasoning block — stamped only when it
+                                # applies so unaffected envelopes stay
+                                # byte-stable.
+                                generated["stats"]["content_empty_reason"] = (
+                                    "truncated_inside_reasoning"
+                                )
                             if state.last_metrics:
                                 state.last_metrics[-1]["reasoning_reentries"] = (
                                     splitter.reentry_count
                                 )
-                            footer = _stats_footer_text(state, generated)
+                            footer = (
+                                _stats_footer_text(state, generated)
+                                if _stats_footer_allowed(state, headers, metadata)
+                                else ""
+                            )
                             if footer and not assistant_tool_calls:
                                 # The footer is server-injected, not model
                                 # output: bypass stop monitoring so a stop
@@ -24471,7 +34476,11 @@ def create_app(state: ServerState) -> FastAPI:
                             reset_orphan_stream_guards()
                             continue
                         elif kind == "close_unclosed_reasoning_for_repair":
-                            if _reasoning_parser_for_state(state) not in {"qwen3", "step3p5"}:
+                            if _reasoning_parser_for_state(state) not in {
+                                "qwen3",
+                                "step3p5",
+                                "poolside_v1",
+                            }:
                                 continue
                             for field, text in drain_stream_tokens([], force=True):
                                 for chunk in stream_content_delta_chunks(field, text):
@@ -24486,11 +34495,15 @@ def create_app(state: ServerState) -> FastAPI:
                                             yield mark_sse_sent(chunk)
                             for field, text in splitter.feed(THINK_CLOSE):
                                 if text:
-                                    for chunk in stream_content_delta_chunks(field, text):
+                                    for chunk in stream_content_delta_chunks(
+                                        field, text
+                                    ):
                                         yield mark_sse_sent(chunk)
                             decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
                             continue
                         elif kind == "error":
+                            if isinstance(item, BaseException):
+                                stream_error_item = item
                             yield mark_sse_sent(error_chunk(item))
                             yield mark_sse_sent("data: [DONE]\n\n")
                             return
@@ -24500,21 +34513,15 @@ def create_app(state: ServerState) -> FastAPI:
                                 # through the normal cancellation path, but for
                                 # the client this is a successful completion
                                 # that ended at the stop string.
-                                generated = {
-                                    "text": streamed_history_content(),
-                                    "tokens": list(streamed_token_ids),
-                                    "prompt_tokens": len(prompt_ids),
-                                    "completion_tokens": int(
-                                        streamed_progress_tokens
-                                    ),
-                                    "finish_reason": "stop",
-                                    "stats": {
-                                        "generation_mode": request_generation_mode,
-                                        "mtp_depth": request_depth,
-                                        "prompt_tokens": len(prompt_ids),
-                                        "completion_tokens": int(
-                                            streamed_progress_tokens
-                                        ),
+                                generated = build_generation_result(
+                                    text=streamed_history_content(),
+                                    tokens=list(streamed_token_ids),
+                                    prompt_tokens=len(prompt_ids),
+                                    completion_tokens=int(streamed_progress_tokens),
+                                    finish_reason="stop",
+                                    generation_mode=request_generation_mode,
+                                    mtp_depth=request_depth,
+                                    stats_extra={
                                         "stop_sequence_hit": True,
                                         "stop_sequence_matched": (
                                             stop_monitor.matched_stop
@@ -24524,10 +34531,8 @@ def create_app(state: ServerState) -> FastAPI:
                                         "hidden_generation_repair_used": False,
                                         "early_tool_cancel_used": False,
                                     },
-                                }
-                                generated = attach_response_observability(
-                                    generated
                                 )
+                                generated = attach_response_observability(generated)
                                 _attach_dashboard_progress_stats(
                                     state,
                                     request_id=response_id,
@@ -24555,9 +34560,7 @@ def create_app(state: ServerState) -> FastAPI:
                                         "tool_call_count": len(
                                             streamed_assistant_tool_calls
                                         ),
-                                        "tool_parser_source": (
-                                            "streaming_translator"
-                                        ),
+                                        "tool_parser_source": ("streaming_translator"),
                                         "tool_parse_status": "success",
                                         "tool_calls_emitted": len(
                                             streamed_assistant_tool_calls
@@ -24579,6 +34582,24 @@ def create_app(state: ServerState) -> FastAPI:
                                     state, generated["stats"]
                                 )
                                 break
+                            if await raw_request.is_disconnected():
+                                stream_cancelled_by_client = True
+                            else:
+                                # Explicit cancel acknowledged by the worker
+                                # with the transport still up: end the stream
+                                # with a visible terminal frame + [DONE]
+                                # instead of silently closing (#F36).
+                                yield mark_sse_sent(
+                                    error_chunk(
+                                        RuntimeError(
+                                            "request cancelled via "
+                                            f"{_cancel_via_label(cancel_event)} after "
+                                            f"{streamed_progress_tokens} "
+                                            "streamed tokens"
+                                        )
+                                    )
+                                )
+                                yield mark_sse_sent("data: [DONE]\n\n")
                             return
                         else:
                             yield mark_sse_sent(
@@ -24590,7 +34611,19 @@ def create_app(state: ServerState) -> FastAPI:
                             return
                 except asyncio.CancelledError:
                     stream_cancelled_by_client = True
-                    _cancel_stream_generation(cancel_event, generation_future)
+                    _cancel_stream_generation(
+                        cancel_event, generation_future, origin="client_disconnect"
+                    )
+                    raise
+                except GeneratorExit:
+                    # Starlette closes the async generator when the client
+                    # disconnects mid-stream. The old catch-all below yielded
+                    # after GeneratorExit ("async generator ignored
+                    # GeneratorExit" RuntimeError noise) and mis-tagged the
+                    # cancellation metric "stream_cancelled"; re-raise and let
+                    # the finally record the truthful client_disconnected
+                    # reason (#F36).
+                    stream_cancelled_by_client = True
                     raise
                 except BaseException as exc:
                     yield mark_sse_sent(error_chunk(exc))
@@ -24600,9 +34633,17 @@ def create_app(state: ServerState) -> FastAPI:
                     nonlocal_cancel_reason = (
                         "client_disconnected"
                         if stream_cancelled_by_client
-                        else "stream_cancelled"
+                        # Truthful cancel accounting (#381): the recorded
+                        # origin (stop_sequence, early_tool_finish,
+                        # post_endpoint, ...) beats the generic bucket.
+                        else (
+                            getattr(cancel_event, "origin", None)
+                            or "stream_cancelled"
+                        )
                     )
-                    _cancel_stream_generation(cancel_event, generation_future)
+                    _cancel_stream_generation(
+                        cancel_event, generation_future, origin="stream_teardown"
+                    )
                     if (
                         stream_cancelled_by_client
                         and session is not None
@@ -24612,7 +34653,26 @@ def create_app(state: ServerState) -> FastAPI:
                     if session is not None and not commit_event.is_set():
                         commit_state["commit"] = False
                         commit_event.set()
-                    if cancel_event.is_set() and generated is None:
+                    if stream_error_item is not None and generated is None:
+                        # The worker FAILED (or the engine refused with a
+                        # structured 507); the teardown above set the cancel
+                        # event, but recording this as a cancellation hid
+                        # every memory refusal from the request log (#415).
+                        if not cancelled_metric_recorded:
+                            _record_stream_error_metric(
+                                state,
+                                response_id=response_id,
+                                session_id=session_id,
+                                prompt_tokens=len(prompt_ids),
+                                streamed_completion_tokens=streamed_progress_tokens,
+                                stream_started_s=stream_started_s,
+                                error=stream_error_item,
+                                request_observability=request_observability,
+                                client_disconnected=stream_cancelled_by_client,
+                                token_times=streamed_token_times,
+                            )
+                            cancelled_metric_recorded = True
+                    elif cancel_event.is_set() and generated is None:
                         state.dashboard.lifetime.record_cancellation()
                         if not cancelled_metric_recorded:
                             _record_stream_cancellation_metric(
@@ -24625,9 +34685,17 @@ def create_app(state: ServerState) -> FastAPI:
                                 reason=nonlocal_cancel_reason,
                                 request_observability=request_observability,
                                 client_disconnected=stream_cancelled_by_client,
+                                mlx_finalize_scope=(
+                                    _claim_mtp_batch_cancellation_finalize(
+                                        route_selected=(defer_mtp_batch_mlx_finalize),
+                                        ownership=mtp_batch_finalize_ownership,
+                                    )
+                                ),
+                                token_times=streamed_token_times,
                             )
                             cancelled_metric_recorded = True
                     state.dashboard.in_flight.deregister(response_id)
+                    _flight(state).sweep(response_id)
                     state.dashboard.progress_events.forget(response_id)
 
                 if generated is None:
@@ -24656,6 +34724,7 @@ def create_app(state: ServerState) -> FastAPI:
                     ],
                     "usage": _usage_payload(generated),
                     "mtplx_stats": _public_mtplx_stats(generated),
+                    "timings": _build_timings(generated),
                 }
                 yield mark_sse_sent(f"data: {json.dumps(done)}\n\n")
                 yield mark_sse_sent("data: [DONE]\n\n")
@@ -24675,6 +34744,13 @@ def create_app(state: ServerState) -> FastAPI:
             prompt_tokens=len(prompt_ids),
         )
         state.dashboard.in_flight.register(nonstream_handle)
+        _flight(state).begin(
+            response_id,
+            session_id=session_id,
+            model=model,
+            prompt_tokens=len(prompt_ids),
+            stream=False,
+        )
         nonstream_started_s = time.perf_counter()
 
         def mark_nonstream_client_disconnected() -> None:
@@ -24701,28 +34777,23 @@ def create_app(state: ServerState) -> FastAPI:
             # session postcommit is skipped, matching the streaming stop path.
             assert nonstream_stop_monitor is not None
             stop_reasoning_text = "".join(nonstream_stop_reasoning_chunks).strip()
-            stop_generated: dict[str, Any] = {
-                "text": nonstream_stop_monitor.emitted_text,
-                "tokens": [],
-                "prompt_tokens": len(prompt_ids),
-                "completion_tokens": int(nonstream_completion_tokens),
-                "finish_reason": "stop",
-                "stats": {
-                    "generation_mode": request_generation_mode,
-                    "mtp_depth": request_depth,
-                    "prompt_tokens": len(prompt_ids),
-                    "completion_tokens": int(nonstream_completion_tokens),
+            stop_generated: dict[str, Any] = build_generation_result(
+                text=nonstream_stop_monitor.emitted_text,
+                tokens=[],
+                prompt_tokens=len(prompt_ids),
+                completion_tokens=int(nonstream_completion_tokens),
+                finish_reason="stop",
+                generation_mode=request_generation_mode,
+                mtp_depth=request_depth,
+                stats_extra={
                     "stop_sequence_hit": True,
-                    "stop_sequence_matched": (
-                        nonstream_stop_monitor.matched_stop
-                    ),
+                    "stop_sequence_matched": (nonstream_stop_monitor.matched_stop),
                     "openai_bridge_mode": "omlx_style",
                     "legacy_bridge_used": False,
                     "hidden_generation_repair_used": False,
                     "early_tool_cancel_used": False,
-                    "finish_reason": "stop",
                 },
-            }
+            )
             stop_generated = attach_response_observability(stop_generated)
             _merge_final_bridge_stats_into_latest_metrics(
                 state, stop_generated["stats"]
@@ -24748,6 +34819,7 @@ def create_app(state: ServerState) -> FastAPI:
                     ],
                     "usage": _usage_payload(stop_generated),
                     "mtplx_stats": _public_mtplx_stats(stop_generated),
+                    "timings": _build_timings(stop_generated),
                 }
             )
         except _StreamCancelled as exc:
@@ -24762,6 +34834,10 @@ def create_app(state: ServerState) -> FastAPI:
                 reason=nonstream_cancel_reason,
                 request_observability=request_observability,
                 client_disconnected=nonstream_client_disconnected,
+                mlx_finalize_scope=_claim_mtp_batch_cancellation_finalize(
+                    route_selected=defer_mtp_batch_mlx_finalize,
+                    ownership=mtp_batch_finalize_ownership,
+                ),
             )
             return JSONResponse(
                 status_code=499,
@@ -24772,11 +34848,30 @@ def create_app(state: ServerState) -> FastAPI:
                     error_type="request_cancelled",
                 ),
             )
+        except HTTPException as exc:
+            # Non-stream twin of the stream error receipt: a memory refusal
+            # must be findable in the request log, not only in the HTTP
+            # response the client saw (#415).
+            if int(getattr(exc, "status_code", 0) or 0) == 507:
+                _record_stream_error_metric(
+                    state,
+                    response_id=response_id,
+                    session_id=session_id,
+                    prompt_tokens=len(prompt_ids),
+                    streamed_completion_tokens=nonstream_completion_tokens,
+                    stream_started_s=nonstream_started_s,
+                    error=exc,
+                    request_observability=request_observability,
+                    client_disconnected=nonstream_client_disconnected,
+                    mode="nonstream",
+                )
+            raise
         finally:
             disconnect_monitor_task.cancel()
             with suppress(asyncio.CancelledError, TimeoutError):
                 await asyncio.wait_for(disconnect_monitor_task, timeout=0.25)
             state.dashboard.in_flight.deregister(response_id)
+            _flight(state).sweep(response_id)
             state.dashboard.progress_events.forget(response_id)
         generated.setdefault("stats", {})
         generated["stats"]["openai_bridge_mode"] = "omlx_style"
@@ -24820,7 +34915,20 @@ def create_app(state: ServerState) -> FastAPI:
             tool_calls = None
             extraction = None
         if tool_calls:
-            generated["finish_reason"] = "tool_calls"
+            # Honest finish on budget cuts (#196/#197), mirroring the
+            # streaming twin: a length-truncated turn that still parsed
+            # complete tool calls must keep "length" — reporting
+            # "tool_calls" would make the client treat the batch as
+            # complete while a trailing call was cut and swallowed.
+            if str(generated.get("finish_reason") or "") == "length":
+                generated["stats"]["tool_calls_truncated_by_length"] = True
+                finish_reason = "length"
+            else:
+                generated["finish_reason"] = "tool_calls"
+                finish_reason = "tool_calls"
+            # mtplx_stats.finish_reason mirrors the response-level value
+            # (truth contract).
+            generated["stats"]["finish_reason"] = finish_reason
             generated["stats"]["tool_parse_success"] = True
             generated["stats"]["tool_call_count"] = len(tool_calls)
             _record_tool_parse_event(
@@ -24829,9 +34937,7 @@ def create_app(state: ServerState) -> FastAPI:
                 response_id=response_id,
                 stream=False,
             )
-            _merge_final_bridge_stats_into_latest_metrics(
-                state, generated["stats"]
-            )
+            _merge_final_bridge_stats_into_latest_metrics(state, generated["stats"])
             assistant_content = (
                 extraction.cleaned_text.strip()
                 if extraction is not None and extraction.cleaned_text
@@ -24842,30 +34948,35 @@ def create_app(state: ServerState) -> FastAPI:
                 assistant_content=assistant_content,
                 assistant_tool_calls=tool_calls,
             )
-            _merge_final_bridge_stats_into_latest_metrics(
-                state, generated["stats"]
-            )
+            _merge_final_bridge_stats_into_latest_metrics(state, generated["stats"])
             message: dict[str, Any] = {
                 "role": "assistant",
                 "content": assistant_content or None,
                 "tool_calls": tool_calls,
             }
-            finish_reason = "tool_calls"
         else:
             reasoning_text = ""
-            if (
-                extraction is not None
-                and extraction.status == "malformed_as_content"
-            ):
+            if extraction is not None and extraction.status == "malformed_as_content":
                 display_text = _visible_malformed_tool_content(
                     extraction.cleaned_text,
                     state.runtime.tokenizer,
                 )
-                display_text = _strip_mtplx_internal_continuation_markers(
-                    display_text
-                )
+                display_text = _strip_mtplx_internal_continuation_markers(display_text)
                 fallback_reason = extraction.malformed_reason or "malformed_tool_call"
                 fallback_kind = _tool_parse_counter_key(fallback_reason)
+                if fallback_kind == "unknown_tool_name":
+                    # #349: a call to an undeclared tool was stripped from the
+                    # visible text without executing — a turn that was ONLY
+                    # that call came back as literal empty content. Replace
+                    # silence with the truth so the model self-corrects.
+                    display_text = _append_unexecuted_tool_notice(
+                        display_text,
+                        _unknown_tool_unexecuted_call_notice(
+                            _unknown_tool_name_from_reason(fallback_reason),
+                            _tool_names(tool_specs),
+                        ),
+                    )
+                    generated["stats"]["unexecuted_tool_call_notice"] = True
                 generated["stats"]["tool_parse_fallback"] = True
                 generated["stats"]["tool_parse_fallback_reason"] = fallback_reason
                 generated["stats"]["tool_parse_fallback_kind"] = fallback_kind
@@ -24885,7 +34996,16 @@ def create_app(state: ServerState) -> FastAPI:
                     state,
                     generated,
                     thinking_enabled=thinking_enabled,
+                    starts_in_think=_prompt_opens_thinking(state, prompt_ids),
                     suppress_visible_reasoning=suppress_visible_reasoning,
+                    footer_allowed=_stats_footer_allowed(state, headers, metadata),
+                    # Same gate as the streaming twin (#F3): recover only on a
+                    # natural stop with no tools declared. /v1/messages
+                    # inherits through chat_completions.
+                    recover_unclosed_reasoning=(
+                        str(generated.get("finish_reason") or "") == "stop"
+                        and not tools_active
+                    ),
                 )
                 if extraction is None:
                     # No tools were declared on this request, so any tool-call
@@ -24893,6 +35013,7 @@ def create_app(state: ServerState) -> FastAPI:
                     # client cannot execute or parse (#160: small models
                     # answer "look it up" prompts with raw
                     # <tool_call><function=web_search> XML in the app chat).
+                    pre_strip_text = display_text
                     display_text, orphan_blocks = _strip_orphan_tool_markup(
                         display_text
                     )
@@ -24901,6 +35022,16 @@ def create_app(state: ServerState) -> FastAPI:
                         generated["stats"]["orphan_tool_markup_blocks"] = int(
                             orphan_blocks
                         )
+                        # #349: deleting the markup silently left the model
+                        # believing it ran a tool and got nothing back, and
+                        # left the user a blank reply. Say what happened.
+                        display_text = _append_unexecuted_tool_notice(
+                            display_text,
+                            _no_tools_unexecuted_call_notice(
+                                _tool_markup_call_names(pre_strip_text)
+                            ),
+                        )
+                        generated["stats"]["unexecuted_tool_call_notice"] = True
             if stop_sequences:
                 # Post-trim safety net for matches the incremental monitor
                 # cannot see (e.g. a stop string completed only by the
@@ -24911,18 +35042,17 @@ def create_app(state: ServerState) -> FastAPI:
                 if matched_stop is not None:
                     display_text = trimmed_text
                     generated["finish_reason"] = "stop"
+                    # mtplx_stats.finish_reason mirrors the response-level
+                    # rewrite (truth contract).
+                    generated["stats"]["finish_reason"] = "stop"
                     generated["stats"]["stop_sequence_hit"] = True
                     generated["stats"]["stop_sequence_matched"] = matched_stop
-            _merge_final_bridge_stats_into_latest_metrics(
-                state, generated["stats"]
-            )
+            _merge_final_bridge_stats_into_latest_metrics(state, generated["stats"])
             await store_postcommit_snapshot(
                 generated,
                 assistant_content=display_text,
             )
-            _merge_final_bridge_stats_into_latest_metrics(
-                state, generated["stats"]
-            )
+            _merge_final_bridge_stats_into_latest_metrics(state, generated["stats"])
             message = {"role": "assistant", "content": display_text}
             if reasoning_text:
                 message["reasoning_content"] = reasoning_text
@@ -24942,6 +35072,7 @@ def create_app(state: ServerState) -> FastAPI:
                 ],
                 "usage": _usage_payload(generated),
                 "mtplx_stats": _public_mtplx_stats(generated),
+                "timings": _build_timings(generated),
             }
         )
 
@@ -24986,47 +35117,32 @@ def create_app(state: ServerState) -> FastAPI:
         chat_request = _anthropic_to_chat_request(request)
         headers = dict(raw_request.headers)
         metadata = _request_metadata(chat_request)
-        requested_tool_specs = _normalize_tool_specs(chat_request.tools)
-        tools_active = _tools_active_for_request(
-            requested_tool_specs,
-            chat_request.tool_choice,
-        )
-        messages_for_generation, _transcript_stats = _canonicalize_agent_transcript(
-            chat_request.messages,
-            tools_active=tools_active,
-        )
-        messages_for_generation, _backend_chat_policy_active = _with_backend_chat_policy(
-            state,
-            messages_for_generation,
-        )
-        client_controls_allowed = _client_controls_allowed(headers, metadata)
-        thinking_enabled = _thinking_enabled_for_request(
+        policy = resolve_request_policy(
             state,
             chat_request,
-            allow_client_controls=client_controls_allowed,
-        )
-        reasoning_effort = _reasoning_effort_for_state(
-            state,
-            thinking_enabled=thinking_enabled,
-            request_effort=chat_request.reasoning_effort,
-            allow_client_controls=client_controls_allowed,
-        )
-        tool_prompt_mode, _tool_prompt_mode_resolution = _tool_prompt_mode_for_request(
-            state.args,
             headers=headers,
             metadata=metadata,
-            tools_active=tools_active,
+            endpoint="count_tokens",
         )
+        # Image blocks become the vision placeholder here exactly as they do
+        # on the chat path, so the count covers what the prompt will carry.
+        try:
+            count_messages, _count_images = _vision_extract_and_flatten(
+                policy.messages_for_generation
+            )
+        except ValueError as vision_error:
+            raise HTTPException(status_code=400, detail=str(vision_error))
         prompt_ids = _encode_messages(
             state.runtime.tokenizer,
-            messages_for_generation,
-            enable_thinking=thinking_enabled,
-            reasoning_effort=reasoning_effort,
+            count_messages,
+            enable_thinking=policy.thinking_enabled,
+            reasoning_effort=policy.reasoning_effort,
             strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
             scoped_reasoning_history=_reasoning_history_scoped_active(state),
-            tools=requested_tool_specs if tools_active else None,
+            preserve_reasoning_history=_reasoning_history_preserve_echo_active(state),
+            tools=policy.tool_specs if policy.tools_active else None,
             tool_choice=chat_request.tool_choice,
-            tool_prompt_mode=tool_prompt_mode,
+            tool_prompt_mode=policy.tool_prompt_mode,
         )
         return {"input_tokens": len(prompt_ids)}
 
@@ -25035,73 +35151,101 @@ def create_app(state: ServerState) -> FastAPI:
         headers = dict(raw_request.headers)
         raw_metadata = _request_extra(request, "metadata", {})
         metadata = raw_metadata if isinstance(raw_metadata, Mapping) else {}
-        client_controls_allowed = _client_controls_allowed(headers, metadata)
         prompt_ids = _encode_prompt(state.runtime.tokenizer, request.prompt)
-        _validate_prompt_has_decode_room(
-            state,
-            prompt_token_count=len(prompt_ids),
+        if not prompt_ids:
+            # An empty body used to fall through into generation machinery and
+            # surface as a 500 with a Python exception string — external
+            # endpoint-discovery probes printed it as "python errors".
+            raise HTTPException(status_code=400, detail="prompt must not be empty")
+        _reject_prompt_over_context(state, len(prompt_ids))
+        # Same admission-time yield as chat: a completions request holds no
+        # session, so every pending idle commit is a stranger's — none can
+        # help this request and any can stall it. Failures surface exactly
+        # like the chat path's sweep: no swallowing.
+        completions_cross_yield: dict[str, Any] | None = None
+        _completions_sweep = getattr(
+            getattr(state, "sessions", None),
+            "abort_cross_session_postcommits",
+            None,
         )
-        request_generation_mode = _request_generation_mode_for_generation(
+        if _completions_sweep is not None and _postcommit_cross_session_yield_enabled():
+            completions_cross_yield = await asyncio.to_thread(
+                _completions_sweep,
+                except_session_id=None,
+            )
+        policy = resolve_request_policy(
             state,
             request,
-            allow_client_controls=client_controls_allowed,
-        )
-        request_depth = _request_depth_for_generation(
-            state,
-            request,
-            generation_mode=request_generation_mode,
-            allow_client_controls=client_controls_allowed,
-        )
-        effective_request_depth, _ = _long_context_mtp_depth_policy_for_request(
-            state,
-            generation_mode=request_generation_mode,
-            request_depth=request_depth,
+            headers=headers,
+            metadata=metadata,
+            endpoint="completions",
             prompt_tokens=len(prompt_ids),
         )
-        sampler_temperature = request.temperature if client_controls_allowed else None
-        sampler_top_p = request.top_p if client_controls_allowed else None
-        sampler_top_k = request.top_k if client_controls_allowed else None
-        sampler_presence_penalty = (
-            request.presence_penalty if client_controls_allowed else None
-        )
-        sampler_frequency_penalty = (
-            request.frequency_penalty if client_controls_allowed else None
-        )
+        request_generation_mode = policy.request_generation_mode
+        request_depth = policy.request_depth
+        effective_request_depth = policy.effective_request_depth
+        sampler_temperature = policy.sampler_temperature
+        sampler_top_p = policy.sampler_top_p
+        sampler_top_k = policy.sampler_top_k
+        sampler_presence_penalty = policy.sampler_presence_penalty
+        sampler_frequency_penalty = policy.sampler_frequency_penalty
+        request_draft_sampler = policy.request_draft_sampler
+        request_client_hint = _request_client_hint_from_headers(headers, metadata)
         request_observability = {
-            "request_client_hint": _request_client_hint_from_headers(headers, metadata),
-            "request_client_label": _request_client_hint_from_headers(headers, metadata)
-            or "openai",
-            "request_generation_mode": request_generation_mode,
-            "request_depth": int(request_depth),
-            "request_effective_mtp_depth": int(effective_request_depth),
-            "request_temperature": request.temperature,
-            "request_top_p": request.top_p,
-            "request_top_k": request.top_k,
-            "mtplx_control_owner": (
-                "client" if client_controls_allowed else "server"
-            ),
-            "client_controls_allowed": bool(client_controls_allowed),
+            "request_client_hint": request_client_hint,
+            "request_client_label": request_client_hint or "openai",
         }
-        if not client_controls_allowed:
-            ignored_fields = _ignored_client_control_fields(request)
-            if ignored_fields:
-                request_observability["client_control_fields_ignored"] = ignored_fields
-                request_observability["client_sampler_fields_ignored"] = [
-                    field
-                    for field in ignored_fields
-                    if field
-                    in {
-                        "temperature",
-                        "top_p",
-                        "top_k",
-                        "presence_penalty",
-                        "frequency_penalty",
-                    }
-                ]
+        request_observability.update(policy.as_observability())
+        request_observability["agent_rewrites"] = _agent_rewrites_mode()
+        if completions_cross_yield is not None:
+            request_observability["postcommit_cross_session_yield"] = (
+                completions_cross_yield
+            )
         stop_sequences = _normalize_stop_sequences(request.stop)
         model = state.model_id
         response_id = f"cmpl-{uuid.uuid4().hex}"
         created = int(time.time())
+
+        # OpenAI semantics: logprobs=0 is a real request ("sampled token
+        # logprob only"), not absence — the gate must never be truthiness
+        # based, or a harness sending 0 silently loses its logprobs lane.
+        requested_logprobs = (
+            None if request.logprobs is None else int(request.logprobs)
+        )
+        if requested_logprobs is not None and requested_logprobs < 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"logprobs must be >= 0, got {requested_logprobs}",
+            )
+        if bool(request.echo) and requested_logprobs is not None:
+            if int(request.max_tokens or 0) != 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "echo+logprobs is supported as prompt scoring only: "
+                        "set max_tokens to 0 (decode-time logprobs are not "
+                        "supported yet)"
+                    ),
+                )
+            return await _prompt_scoring_response(
+                state,
+                prompt_ids=prompt_ids,
+                top_k=requested_logprobs,
+                model=model,
+                response_id=response_id,
+                created=created,
+                request_observability=request_observability,
+            )
+        if requested_logprobs is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "logprobs on /v1/completions (including logprobs=0) "
+                    "requires echo=true with max_tokens=0 (prompt scoring); "
+                    "decode-time logprobs for generated tokens are not "
+                    "supported yet — omit logprobs to generate"
+                ),
+            )
 
         if request.stream:
             # Real incremental streaming: tokens flow through a queue from the
@@ -25110,16 +35254,20 @@ def create_app(state: ServerState) -> FastAPI:
             # first and then re-chunked the final text, which kept clients
             # staring at a silent stream for the whole generation.
             async def event_stream():
-                queue: Queue[tuple[str, Any]] = Queue()
-                cancel_event = Event()
+                queue = _LoopFedStreamQueue(asyncio.get_running_loop())
+                cancel_event = _AttributedCancelEvent()
                 decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
                 stop_monitor = _StopSequenceStreamMonitor(stop_sequences)
                 streamed_completion_tokens = 0
                 generated: dict[str, Any] | None = None
                 stop_hit = False
-                owner_stall_probe = _OwnerStallProbe(
-                    deadline_s=STREAM_STALL_DEADLINE_S
-                )
+                owner_stall_probe = _OwnerStallProbe(deadline_s=STREAM_STALL_DEADLINE_S)
+                sse_keepalive_interval_s = _sse_keepalive_interval_s()
+                # This stream sends no bytes at all before the first text
+                # chunk, so "last byte sent" starts at the stream start and
+                # only the keep-alive comments below can advance it in the
+                # pre-first-token window (#358).
+                last_sse_sent_s = time.perf_counter()
 
                 def on_tokens(new_tokens: list[int]) -> None:
                     _raise_if_stream_cancelled(cancel_event)
@@ -25140,6 +35288,7 @@ def create_app(state: ServerState) -> FastAPI:
                             presence_penalty=sampler_presence_penalty,
                             frequency_penalty=sampler_frequency_penalty,
                             seed=request.seed,
+                            draft_sampler=request_draft_sampler,
                             generation_mode=request_generation_mode,
                             depth=request_depth,
                             resolved_mtp_depth=effective_request_depth,
@@ -25173,37 +35322,53 @@ def create_app(state: ServerState) -> FastAPI:
                     daemon=True,
                 ).start()
 
+                # Constant stream envelope, serialized once (byte-identical
+                # to json.dumps of the equivalent dict).
+                _text_envelope_prefix = (
+                    'data: {"id": '
+                    + json.dumps(response_id)
+                    + ', "object": "text_completion", "created": '
+                    + json.dumps(created)
+                    + ', "model": '
+                    + json.dumps(model)
+                    + ', "choices": [{"index": 0, "text": '
+                )
+                _text_envelope_suffix = ', "finish_reason": null}]}\n\n'
+
                 def text_chunk(text: str) -> str:
-                    payload = {
-                        "id": response_id,
-                        "object": "text_completion",
-                        "created": created,
-                        "model": model,
-                        "choices": [
-                            {"index": 0, "text": text, "finish_reason": None}
-                        ],
-                    }
-                    return f"data: {json.dumps(payload)}\n\n"
+                    return (
+                        _text_envelope_prefix
+                        + json.dumps(text)
+                        + _text_envelope_suffix
+                    )
 
                 def error_chunk(exc: BaseException) -> str:
+                    if _is_allocation_failure(exc):
+                        # Shed caches + honest 507 instead of an anonymous
+                        # RuntimeError 500; the daemon stays up (#348).
+                        exc = _allocation_failure_http_exception(state, exc)
                     if isinstance(exc, HTTPException):
                         message = str(exc.detail)
                         status_code = exc.status_code
+                        error_code = (
+                            "insufficient_memory"
+                            if status_code == 507
+                            else type(exc).__name__
+                        )
                     else:
                         message = str(exc)
                         status_code = 500
+                        error_code = type(exc).__name__
                     payload = {
                         "id": response_id,
                         "object": "text_completion",
                         "created": created,
                         "model": model,
-                        "choices": [
-                            {"index": 0, "text": "", "finish_reason": "error"}
-                        ],
+                        "choices": [{"index": 0, "text": "", "finish_reason": "error"}],
                         **_openai_error_content(
                             message,
                             status_code=status_code,
-                            code=type(exc).__name__,
+                            code=error_code,
                         ),
                     }
                     return f"data: {json.dumps(payload)}\n\n"
@@ -25219,7 +35384,7 @@ def create_app(state: ServerState) -> FastAPI:
                         if stop_monitor.stopped and not stop_hit:
                             stop_hit = True
                             _cancel_stream_generation(
-                                cancel_event, generation_future
+                                cancel_event, generation_future, origin="stop_sequence"
                             )
                         if not text:
                             return []
@@ -25228,16 +35393,31 @@ def create_app(state: ServerState) -> FastAPI:
                 try:
                     while True:
                         try:
-                            kind, item = await asyncio.to_thread(
-                                queue.get, True, 0.25
-                            )
+                            kind, item = await queue.get(0.25)
                         except Empty:
+                            completion_client_disconnected = (
+                                await raw_request.is_disconnected()
+                            )
                             if (
                                 cancel_event.is_set() and not stop_hit
-                            ) or await raw_request.is_disconnected():
+                            ) or completion_client_disconnected:
                                 _cancel_stream_generation(
                                     cancel_event, generation_future
                                 )
+                                if not completion_client_disconnected:
+                                    # Explicit cancel with the transport still
+                                    # up: terminal frame + [DONE] instead of a
+                                    # silent close (#F36).
+                                    yield error_chunk(
+                                        RuntimeError(
+                                            "request cancelled via "
+                                            f"{_cancel_via_label(cancel_event)} "
+                                            "after "
+                                            f"{streamed_completion_tokens} "
+                                            "streamed tokens"
+                                        )
+                                    )
+                                    yield "data: [DONE]\n\n"
                                 return
                             frozen_for_s = owner_stall_probe.observe()
                             if (
@@ -25254,7 +35434,9 @@ def create_app(state: ServerState) -> FastAPI:
                                     streamed_tokens=streamed_completion_tokens,
                                 )
                                 _cancel_stream_generation(
-                                    cancel_event, generation_future
+                                    cancel_event,
+                                    generation_future,
+                                    origin="stream_stall",
                                 )
                                 yield error_chunk(
                                     TimeoutError(
@@ -25266,6 +35448,19 @@ def create_app(state: ServerState) -> FastAPI:
                                 )
                                 yield "data: [DONE]\n\n"
                                 return
+                            now_s = time.perf_counter()
+                            if (
+                                sse_keepalive_interval_s is not None
+                                and streamed_completion_tokens == 0
+                                and not generation_future.done()
+                                and now_s - last_sse_sent_s
+                                >= sse_keepalive_interval_s
+                            ):
+                                # Pre-first-token liveness (#358): see the
+                                # chat stream loop. Comments stop as soon as
+                                # the first token batch arrives.
+                                last_sse_sent_s = now_s
+                                yield SSE_KEEPALIVE_COMMENT
                             continue
                         if kind == "tokens":
                             streamed_completion_tokens += len(item)
@@ -25275,30 +35470,61 @@ def create_app(state: ServerState) -> FastAPI:
                             generated = item
                             for chunk in emit_text(decoder.finish()):
                                 yield chunk
+                            emitted_before_flush = stop_monitor.emitted_text
                             held_text = stop_monitor.flush()
+                            if (
+                                stop_sequences
+                                and not stop_hit
+                                and not stop_monitor.stopped
+                            ):
+                                # Post-trim safety net, parity with the
+                                # non-stream path below: a stop match that
+                                # completes only in the engine's final text
+                                # (never in the streamed deltas) must still
+                                # trim the unsent tail and finish "stop" —
+                                # emitted text never includes a stop string.
+                                trimmed_engine, matched_stop = (
+                                    _trim_text_at_stop_sequences(
+                                        str(generated.get("text") or ""),
+                                        stop_sequences,
+                                    )
+                                )
+                                if matched_stop is not None:
+                                    held_text = trimmed_engine[
+                                        len(emitted_before_flush) :
+                                    ]
+                                    stop_monitor.stopped = True
+                                    stop_monitor.matched_stop = matched_stop
                             for chunk in emit_text(held_text, monitor=False):
                                 yield chunk
                             break
                         elif kind == "cancelled":
                             if stop_hit:
-                                generated = {
-                                    "text": stop_monitor.emitted_text,
-                                    "tokens": [],
-                                    "prompt_tokens": len(prompt_ids),
-                                    "completion_tokens": int(
+                                generated = build_generation_result(
+                                    text=stop_monitor.emitted_text,
+                                    tokens=[],
+                                    prompt_tokens=len(prompt_ids),
+                                    completion_tokens=int(
                                         streamed_completion_tokens
                                     ),
-                                    "finish_reason": "stop",
-                                    "stats": {
-                                        "generation_mode": request_generation_mode,
-                                        "mtp_depth": request_depth,
-                                        "prompt_tokens": len(prompt_ids),
-                                        "completion_tokens": int(
-                                            streamed_completion_tokens
-                                        ),
-                                    },
-                                }
+                                    finish_reason="stop",
+                                    generation_mode=request_generation_mode,
+                                    mtp_depth=request_depth,
+                                )
                                 break
+                            if not await raw_request.is_disconnected():
+                                # Cancel acknowledged by the worker with the
+                                # transport still up: terminal frame + [DONE]
+                                # instead of a silent close (#F36).
+                                yield error_chunk(
+                                    RuntimeError(
+                                        "request cancelled server-side "
+                                        "after "
+                                        f"{streamed_completion_tokens} "
+                                        "streamed tokens"
+                                    )
+                                )
+                                yield "data: [DONE]\n\n"
                             return
                         elif kind == "error":
                             yield error_chunk(item)
@@ -25311,19 +35537,26 @@ def create_app(state: ServerState) -> FastAPI:
                             yield "data: [DONE]\n\n"
                             return
                 except asyncio.CancelledError:
-                    _cancel_stream_generation(cancel_event, generation_future)
+                    _cancel_stream_generation(
+                        cancel_event, generation_future, origin="client_disconnect"
+                    )
+                    raise
+                except GeneratorExit:
+                    # Client disconnect closes the async generator; yielding
+                    # from the catch-all below would raise "async generator
+                    # ignored GeneratorExit". Re-raise untouched (#F36).
                     raise
                 except BaseException as exc:
                     yield error_chunk(exc)
                     yield "data: [DONE]\n\n"
                     return
                 finally:
-                    _cancel_stream_generation(cancel_event, generation_future)
+                    _cancel_stream_generation(
+                        cancel_event, generation_future, origin="stream_teardown"
+                    )
 
                 if generated is None:
-                    yield error_chunk(
-                        RuntimeError("generation ended without a result")
-                    )
+                    yield error_chunk(RuntimeError("generation ended without a result"))
                     yield "data: [DONE]\n\n"
                     return
                 finish_reason = str(generated.get("finish_reason") or "stop")
@@ -25336,7 +35569,7 @@ def create_app(state: ServerState) -> FastAPI:
                 else:
                     footer = (
                         _stats_footer_text(state, generated)
-                        if state.args.stats_footer
+                        if _stats_footer_allowed(state, headers, metadata)
                         else ""
                     )
                     if footer:
@@ -25353,6 +35586,7 @@ def create_app(state: ServerState) -> FastAPI:
                     ],
                     "usage": _usage_payload(generated),
                     "mtplx_stats": _public_mtplx_stats(generated),
+                    "timings": _build_timings(generated),
                 }
                 yield f"data: {json.dumps(final_payload)}\n\n"
                 yield "data: [DONE]\n\n"
@@ -25364,25 +35598,19 @@ def create_app(state: ServerState) -> FastAPI:
         nonstream_completion_tokens = 0
         if stop_sequences:
             nonstream_stop_monitor = _StopSequenceStreamMonitor(stop_sequences)
-            nonstream_stop_decoder = _IncrementalTokenDecoder(
-                state.runtime.tokenizer
-            )
+            nonstream_stop_decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
 
         def nonstream_stop_on_tokens(new_tokens: list[int]) -> None:
             nonlocal nonstream_completion_tokens
             nonstream_completion_tokens += len(new_tokens)
             if nonstream_stop_monitor is None or nonstream_stop_decoder is None:
                 return
-            delta = nonstream_stop_decoder.feed(
-                [int(token) for token in new_tokens]
-            )
+            delta = nonstream_stop_decoder.feed([int(token) for token in new_tokens])
             if not delta:
                 return
             nonstream_stop_monitor.feed(delta)
             if nonstream_stop_monitor.stopped:
-                raise _StopSequenceHit(
-                    nonstream_stop_monitor.matched_stop or ""
-                )
+                raise _StopSequenceHit(nonstream_stop_monitor.matched_stop or "")
 
         try:
             generated = await asyncio.to_thread(
@@ -25398,6 +35626,7 @@ def create_app(state: ServerState) -> FastAPI:
                     presence_penalty=sampler_presence_penalty,
                     frequency_penalty=sampler_frequency_penalty,
                     seed=request.seed,
+                    draft_sampler=request_draft_sampler,
                     generation_mode=request_generation_mode,
                     depth=request_depth,
                     resolved_mtp_depth=effective_request_depth,
@@ -25414,27 +35643,21 @@ def create_app(state: ServerState) -> FastAPI:
             # the match as a normal completion instead of burning tokens
             # until EOS/max_tokens.
             assert nonstream_stop_monitor is not None
-            generated = {
-                "text": nonstream_stop_monitor.emitted_text,
-                "tokens": [],
-                "prompt_tokens": len(prompt_ids),
-                "completion_tokens": int(nonstream_completion_tokens),
-                "finish_reason": "stop",
-                "stats": {
-                    "generation_mode": request_generation_mode,
-                    "mtp_depth": request_depth,
-                    "prompt_tokens": len(prompt_ids),
-                    "completion_tokens": int(nonstream_completion_tokens),
+            generated = build_generation_result(
+                text=nonstream_stop_monitor.emitted_text,
+                tokens=[],
+                prompt_tokens=len(prompt_ids),
+                completion_tokens=int(nonstream_completion_tokens),
+                finish_reason="stop",
+                generation_mode=request_generation_mode,
+                mtp_depth=request_depth,
+                stats_extra={
                     "stop_sequence_hit": True,
-                    "stop_sequence_matched": (
-                        nonstream_stop_monitor.matched_stop
-                    ),
+                    "stop_sequence_matched": (nonstream_stop_monitor.matched_stop),
                 },
-            }
+            )
         finish_reason = str(generated.get("finish_reason") or "stop")
-        if stop_sequences and not generated.get("stats", {}).get(
-            "stop_sequence_hit"
-        ):
+        if stop_sequences and not generated.get("stats", {}).get("stop_sequence_hit"):
             # Post-trim safety net for matches the incremental monitor cannot
             # see (e.g. completed only by the decoder's held-back tail).
             trimmed_text, matched_stop = _trim_text_at_stop_sequences(
@@ -25447,7 +35670,11 @@ def create_app(state: ServerState) -> FastAPI:
                 generated.setdefault("stats", {})["stop_sequence_hit"] = True
                 generated["stats"]["stop_sequence_matched"] = matched_stop
         generated.setdefault("stats", {})["finish_reason"] = finish_reason
-        display_text = _display_text(state, generated)
+        display_text = _display_text(
+            state,
+            generated,
+            footer_allowed=_stats_footer_allowed(state, headers, metadata),
+        )
         return JSONResponse(
             {
                 "id": response_id,
@@ -25459,6 +35686,7 @@ def create_app(state: ServerState) -> FastAPI:
                 ],
                 "usage": _usage_payload(generated),
                 "mtplx_stats": _public_mtplx_stats(generated),
+                "timings": _build_timings(generated),
             }
         )
 
@@ -25469,17 +35697,23 @@ def create_app(state: ServerState) -> FastAPI:
         _record_tool_parse_event(state, event="openai_error_response")
         detail_payload = exc.detail if isinstance(exc.detail, dict) else None
         message = str(exc.detail)
+        code = type(exc).__name__
         if detail_payload is not None:
             detail_message = detail_payload.get("message")
             if isinstance(detail_message, str) and detail_message:
                 message = detail_message
+            # A structured detail may carry an OpenAI wire code (e.g.
+            # context_length_exceeded) that harnesses match on exactly.
+            detail_code = detail_payload.get("code")
+            if isinstance(detail_code, str) and detail_code:
+                code = detail_code
         return JSONResponse(
             status_code=exc.status_code,
             headers=getattr(exc, "headers", None),
             content=_openai_error_content(
                 message,
                 status_code=exc.status_code,
-                code=type(exc).__name__,
+                code=code,
                 detail=detail_payload,
             ),
         )
@@ -25507,16 +35741,82 @@ def create_app(state: ServerState) -> FastAPI:
             ),
         )
 
-    @app.exception_handler(Exception)
-    async def unhandled_exception(_request: Request, exc: Exception) -> JSONResponse:
+    @app.exception_handler(MTPBatchRequestError)
+    async def mtp_batch_request_exception_handler(
+        _request: Request, exc: MTPBatchRequestError
+    ) -> JSONResponse:
         _record_tool_parse_event(state, event="openai_error_response")
+        return JSONResponse(
+            status_code=400,
+            content=_openai_error_content(
+                str(exc),
+                status_code=400,
+                code="mtp_batch_request_error",
+            ),
+        )
+
+    @app.exception_handler(A3BMTPBatchCapacityError)
+    async def mtp_batch_capacity_exception_handler(
+        _request: Request, exc: A3BMTPBatchCapacityError
+    ) -> JSONResponse:
+        _record_tool_parse_event(state, event="openai_error_response")
+        return JSONResponse(
+            status_code=400,
+            content=_openai_error_content(
+                str(exc),
+                status_code=400,
+                code="mtp_batch_capacity_error",
+            ),
+        )
+
+    @app.exception_handler(Exception)
+    async def unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
+        _record_tool_parse_event(state, event="openai_error_response")
+        if _is_allocation_failure(exc):
+            # Non-streaming lanes land here on a Metal allocation failure.
+            # Shed caches and answer with the honest 507 (same contract as
+            # the streaming error frame) instead of a redacted 500 — the
+            # user can act on "insufficient memory"; they cannot act on
+            # "internal server error" (#348).
+            http_exc = _allocation_failure_http_exception(state, exc)
+            logging.getLogger("mtplx.server").warning(
+                "allocation failure served as 507: %s", exc
+            )
+            return JSONResponse(
+                status_code=http_exc.status_code,
+                content=_openai_error_content(
+                    str(http_exc.detail),
+                    status_code=http_exc.status_code,
+                    code="insufficient_memory",
+                ),
+            )
         request_id = uuid.uuid4().hex[:12]
+        # Full detail belongs in the server log, not the wire: exception
+        # class + repr in client bodies got quoted verbatim by external
+        # endpoint probes as "MTPLX python errors" (2026-08-05 showdown).
+        logging.getLogger("mtplx.server").exception(
+            "unhandled server error request_id=%s path=%s: %s",
+            request_id,
+            getattr(getattr(request, "url", None), "path", "?"),
+            exc,
+        )
+        if str(os.environ.get("MTPLX_DEBUG_ERRORS", "")).strip().lower() in (
+            "1",
+            "true",
+            "on",
+        ):
+            message = f"{type(exc).__name__}: {exc} (request_id={request_id})"
+        else:
+            message = (
+                "internal server error; see the MTPLX server log "
+                f"(request_id={request_id})"
+            )
         return JSONResponse(
             status_code=500,
             content=_openai_error_content(
-                f"{type(exc).__name__}: {exc} (request_id={request_id})",
+                message,
                 status_code=500,
-                code=type(exc).__name__,
+                code="internal_error",
             ),
         )
 
@@ -25607,7 +35907,9 @@ def _model_ref_is_gemma4_pair(model_ref: str | None) -> bool:
         return False
 
 
-def _gemma4_bundle_defaults(model_ref: str | None) -> tuple[dict[str, Any] | None, int | None]:
+def _gemma4_bundle_defaults(
+    model_ref: str | None,
+) -> tuple[dict[str, Any] | None, int | None]:
     if not model_ref:
         return None, None
     pair = resolve_gemma4_pair_paths(model_ref)
@@ -25628,27 +35930,159 @@ def _gemma4_bundle_defaults(model_ref: str | None) -> tuple[dict[str, Any] | Non
     return sampler, draft_block_size
 
 
+def _model_declared_sampler_defaults(model_ref: str | None) -> dict[str, Any] | None:
+    """Official sampler defaults declared by the model artifact itself.
+
+    Scoped to families whose artifact-declared sampler differs from the
+    project-wide 0.6/0.95/20 coding defaults — existing Qwen3.6/Gemma serving
+    defaults are deliberately left untouched (no-regression rule; widening
+    to another family needs its own receipts):
+
+    - hy_v3: ``generation_config.json`` (Tencent ships 0.9 / 1.0 / off).
+    - qwen4_exp: the pack's ``mtplx_runtime.json`` sampler block. The family
+      law is 1.0/0.95/20 (day-0 eval receipts); until 2026-08-27 requests
+      silently sampled at the generic 0.6 while /health advertised the
+      rebound family default — the drafts mirrored 0.6 too
+      (draft_sampler_resolved_temperature receipt, serve battery 13:04).
+    """
+    if not model_ref:
+        return None
+    try:
+        from mtplx.hf_loader import resolve_model_path
+
+        path = resolve_model_path(str(model_ref))
+        config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+        mt = str(config.get("model_type", "")).lower()
+        tmt = str((config.get("text_config") or {}).get("model_type") or "").lower()
+        if mt == "hy_v3":
+            gen = json.loads(
+                (path / "generation_config.json").read_text(encoding="utf-8")
+            )
+        elif "qwen4_exp" in (mt, tmt) or "qwen4_exp_text" in (mt, tmt):
+            runtime = json.loads(
+                (path / "mtplx_runtime.json").read_text(encoding="utf-8")
+            )
+            gen = runtime.get("sampler")
+            if not isinstance(gen, dict):
+                return None
+        else:
+            return None
+    except Exception:
+        return None
+    out: dict[str, Any] = {}
+    if isinstance(gen.get("temperature"), (int, float)):
+        out["temperature"] = float(gen["temperature"])
+    if isinstance(gen.get("top_p"), (int, float)):
+        out["top_p"] = float(gen["top_p"])
+    top_k = gen.get("top_k")
+    if isinstance(top_k, int):
+        # HF convention: top_k -1/0 = disabled; project sampler treats <=0 as off.
+        out["top_k"] = max(0, top_k)
+    return out or None
+
+
 def _apply_backend_server_defaults(
     args: argparse.Namespace,
     *,
     explicit_flags: set[str],
 ) -> None:
-    if (
-        not _server_flag_present(explicit_flags, "backend-id")
-        and _model_ref_is_gemma4_pair(getattr(args, "model", None))
-    ):
+    if not _server_flag_present(
+        explicit_flags, "backend-id"
+    ) and _model_ref_is_gemma4_pair(getattr(args, "model", None)):
         args.backend_id = GEMMA4_BACKEND
+
+    declared = _model_declared_sampler_defaults(getattr(args, "model", None))
+    if declared:
+        if "temperature" in declared and not _server_flag_present(
+            explicit_flags, "temperature", "default-temperature"
+        ):
+            args.temperature = declared["temperature"]
+        if "top_p" in declared and not _server_flag_present(
+            explicit_flags, "top-p", "default-top-p"
+        ):
+            args.top_p = declared["top_p"]
+        if "top_k" in declared and not _server_flag_present(explicit_flags, "top-k"):
+            args.top_k = declared["top_k"]
+        LOGGER.info(
+            "[serve-defaults] model-declared sampler defaults applied: %s", declared
+        )
 
     sync_backend_arg_aliases(args)
     backend = descriptor_for_backend_id(getattr(args, "backend_id", None))
+    required_tool_prompt_mode = backend.required_tool_prompt_mode
+    if required_tool_prompt_mode is not None:
+        requested_tool_prompt_mode = str(
+            getattr(args, "tool_prompt_mode", required_tool_prompt_mode)
+            or required_tool_prompt_mode
+        )
+        if (
+            _server_flag_present(explicit_flags, "tool-prompt-mode")
+            and requested_tool_prompt_mode != required_tool_prompt_mode
+        ):
+            raise ValueError(
+                f"{backend.display_name} requires --tool-prompt-mode "
+                f"{required_tool_prompt_mode}"
+            )
+        args.tool_prompt_mode = required_tool_prompt_mode
+    required_chat_template_profile = backend.required_chat_template_profile
+    if required_chat_template_profile is not None:
+        requested_profile = str(
+            getattr(args, "chat_template_profile", required_chat_template_profile)
+            or required_chat_template_profile
+        )
+        has_conflicting_profile = (
+            _server_flag_present(explicit_flags, "chat-template-profile")
+            and requested_profile != required_chat_template_profile
+        )
+        has_custom_path = bool(getattr(args, "chat_template_path", None))
+        if has_conflicting_profile or (
+            has_custom_path and not backend.allows_chat_template_path
+        ):
+            raise ValueError(
+                f"{backend.display_name} requires its tokenizer chat template"
+            )
+        args.chat_template_profile = required_chat_template_profile
+        args.chat_template_path = None
+    # Family-aware reasoning policy, not the raw lane descriptor — the
+    # daemon twin of _apply_backend_serve_defaults (public.py): a family
+    # sharing a generic lane (qwen4_exp on native_mtp, lfm2 on mlx_lm_ar)
+    # carries its own verified codec, and stamping the lane's parser here
+    # read as an operator override downstream — the child daemon served
+    # Flash-Next with parser "none" and no default effort (2026-08-28).
+    # The override applies when an explicitly passed --model names an
+    # override family (model intent wins; the runtime re-resolves the
+    # lane from the loaded model anyway), or when family and lane agree
+    # (REASONING_FAMILY_OVERRIDE_LANES). A DEFAULT model ref alone must
+    # never override an explicitly chosen lane — the daemon's default
+    # --model is the 27B HF id, and a ref-only override stamped qwen3
+    # onto the Laguna lane.
+    _model_ref = str(getattr(args, "model", "") or "")
+    _family = model_family_from_inspection(
+        model_ref=_model_ref, descriptor=backend
+    )
+    if _family in REASONING_FAMILY_OVERRIDE_LANES and (
+        _server_flag_present(explicit_flags, "model")
+        or reasoning_family_override_applies(_family, backend.backend_id)
+    ):
+        reasoning = reasoning_policy_for_model(
+            model_ref=_model_ref, descriptor=backend
+        )
+    else:
+        reasoning = backend.reasoning_codec
     if not _server_flag_present(explicit_flags, "reasoning-parser"):
-        args.reasoning_parser = backend.reasoning_codec.parser
+        args.reasoning_parser = reasoning.parser
+    if (
+        backend.default_max_response_tokens is not None
+        and not _server_flag_present(explicit_flags, "max-response-tokens")
+        and getattr(args, "max_response_tokens", None) is None
+    ):
+        args.max_response_tokens = int(backend.default_max_response_tokens)
     if (
         not _server_flag_present(explicit_flags, "reasoning-effort")
         and getattr(args, "reasoning_effort", None) in (None, "auto")
-        and backend.reasoning_codec.default_effort
+        and reasoning.default_effort
     ):
-        args.reasoning_effort = backend.reasoning_codec.default_effort
+        args.reasoning_effort = reasoning.default_effort
     if backend.backend_id != GEMMA4_BACKEND:
         return
 
@@ -25745,6 +36179,63 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     add_expert_streaming_args(parser)
     parser.add_argument("--model-id", default="mtplx-qwen36-27b-native-mtp")
+    parser.add_argument(
+        "--embedding-model",
+        action="append",
+        default=[],
+        metavar="REF[=SERVED_ID]",
+        help="Serve REF on /v1/embeddings (repeatable); loaded on first request",
+    )
+    parser.add_argument(
+        "--reranker-model",
+        action="append",
+        default=[],
+        metavar="REF[=SERVED_ID]",
+        help="Serve REF on /v1/rerank (repeatable); the same REF in both roles loads once",
+    )
+    parser.add_argument(
+        "--retrieval-max-resident",
+        type=int,
+        default=2,
+        help="How many retrieval models stay in memory; least-recently-used are unloaded",
+    )
+    parser.add_argument(
+        "--retrieval-max-tokens",
+        type=int,
+        default=0,
+        help="Truncate retrieval inputs to this many tokens (0 = per-model default)",
+    )
+    parser.add_argument(
+        "--retrieval-idle-timeout",
+        type=float,
+        default=0.0,
+        help="Unload retrieval models after this many idle seconds (0 = never)",
+    )
+    parser.add_argument(
+        "--stream-stall-deadline-s",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Fail a stream whose model owner makes no progress for this many "
+            "seconds (0 = off). Default: $MTPLX_STREAM_STALL_DEADLINE_S or 300. "
+            "Healthy work ticks progress on every prefill chunk and decode "
+            "step, so only a genuinely parked owner reaches the deadline."
+        ),
+    )
+    parser.add_argument(
+        "--retrieval-cache-dir",
+        default=None,
+        help="Model cache directory used to resolve retrieval references",
+    )
+    parser.add_argument(
+        "--retrieval-trust-remote-code",
+        action="store_true",
+        help=(
+            "Allow retrieval checkpoints that ship their own Python "
+            "(jina-style model.py/rerank.py) to execute it; off by default"
+        ),
+    )
     parser.add_argument("--backend-id", default="qwen3_next", help=argparse.SUPPRESS)
     parser.add_argument(
         "--assistant-model",
@@ -25783,6 +36274,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Read the API key from a local file instead of argv/env.",
     )
     parser.add_argument(
+        "--no-auth",
+        action="store_true",
+        help=(
+            "Serve without API-key auth even when MTPLX_API_KEY or a config "
+            "key is set. Localhost binds only — non-localhost still requires "
+            "a key (#235)."
+        ),
+    )
+    parser.add_argument(
+        "--cors-origin",
+        dest="cors_origins",
+        action="append",
+        metavar="ORIGIN",
+        default=None,
+        help=(
+            "Let browser pages served from this origin (for example "
+            "http://localhost:5173) call the API with credentials. Repeatable; "
+            "MTPLX_CORS_ORIGINS takes a comma-separated list. Pages MTPLX serves "
+            "itself are always allowed, every other origin is refused, and "
+            "/admin routes stay same-origin only."
+        ),
+    )
+    parser.add_argument(
         "--rate-limit",
         type=int,
         default=_env_int("MTPLX_RATE_LIMIT_PER_MINUTE", 0),
@@ -25803,7 +36317,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "on the solo MTP oracle (measured 2026-07-05: serialized MTP "
             "beats the batched-AR lane end to end on prefill-heavy "
             "concurrent loads); ar_batch opts concurrency into the batched "
-            "AR decode lane, which wins on decode-heavy many-client loads."
+            "AR decode lane, which wins on decode-heavy many-client loads. "
+            "hyper admits ONE request at a time (simultaneous requests "
+            "queue FIFO exactly like serial) and reserves batch width for "
+            "self-speculative rows of that request; at width 1 it rides "
+            "the untouched serial path (see mtplx/server/hyper.py)."
         ),
     )
     parser.add_argument(
@@ -25811,6 +36329,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=BATCHING_PRESET_CHOICES,
         default=os.environ.get("MTPLX_BATCHING_PRESET", "latency"),
         help="Concurrent batching policy preset: solo, latency, agent, or throughput.",
+    )
+    parser.add_argument(
+        "--mtp-batch-numerics",
+        choices=MTP_BATCH_NUMERICS_CHOICES,
+        default="throughput",
+        help="Qwen MTP route: fast B8, balanced B8, or serial B1-exact.",
     )
     parser.add_argument("--max-active-requests", type=int)
     parser.add_argument("--decode-batch-max", type=int)
@@ -25889,6 +36413,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=True,
         help="Load and inject the native MTP sidecar. Disable only for stock AR diagnostics.",
     )
+    parser.add_argument(
+        "--ngram-prewarm",
+        metavar="auto|all|off|GiB",
+        # Not a boolean, and default=None rather than "auto": the flag has an
+        # environment counterpart (MTPLX_NGRAM_PREWARM), and a default would
+        # be indistinguishable from the user typing it -- so the CLI would
+        # silently overrule every shell-set value.  None means "not given".
+        default=None,
+        help=(
+            "How much of the streamed n-gram table to read into the page "
+            "cache at model load. auto (default) warms min(table, free - KV "
+            "reservation - 6 GiB margin); all reads the whole table (~2.5 s "
+            "at ~12 GiB/s for 30 GiB); a bare number is a budget in GiB; off "
+            "serves at the as-found page-cache rate. Cold sidecar rows are "
+            "demand faults at ~1.4 GiB/s and cost 56 vs 68.8 tok/s on decode. "
+            "Environment: MTPLX_NGRAM_PREWARM, which this flag overrides."
+        ),
+    )
+    parser.add_argument(
+        "--no-ngram-prewarm",
+        dest="ngram_prewarm",
+        action="store_const",
+        const="off",
+        help="Alias for --ngram-prewarm off.",
+    )
+    parser.add_argument(
+        "--ngram-prewarm-order",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Row-hotness file (.npy of int64 row ids, most-gathered first) "
+            "deciding WHICH rows a partial pre-read warms. Defaults to "
+            "<model>/ngram-hotness.npy when present, else the file prefix is "
+            "read sequentially."
+        ),
+    )
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument(
         "--max-response-tokens",
@@ -25903,6 +36463,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=0,
         help="Override context window. Default reads the model/tokenizer config.",
+    )
+    parser.add_argument(
+        "--allow-swap",
+        action="store_true",
+        help=(
+            "Serve past this machine's memory fit (#427): the default window "
+            "is the model's own maximum again and prompts past the fit are "
+            "admitted instead of refused with 507. Expect swap and slow "
+            "decode there. MTPLX_ALLOW_SWAP=1 is the env form."
+        ),
     )
     parser.add_argument(
         "--temperature",
@@ -25931,7 +36501,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--adaptive-policy",
-        choices=["none", "streak", "expected_value"],
+        choices=["none", "streak", "expected_value", "cost"],
         default="none",
         help="Optional per-request native-MTP depth policy. Exact sampler semantics remain unchanged.",
     )
@@ -25945,8 +36515,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=_comma_floats,
         default=(0.92, 0.64, 0.32),
     )
-    parser.add_argument("--adaptive-ev-draft-cost-s", type=float, default=0.0048)
-    parser.add_argument("--adaptive-ev-extra-verify-cost-s", type=float, default=0.0060)
+    # Recalibrated 2026-08-07: the original 4.8ms/6.0ms constants made the
+    # depth-3 bar max(0.18, 10.8ms*40tok/s*1.1) = 0.475 expected extra
+    # tokens — unreachable for live Pi acceptance (prefix ~0.50 x stale D3
+    # prior 0.32), so D3 fired on only 13% of rounds despite 64.6% realized
+    # acceptance when proposed. Measured on the gate254 arms + live request
+    # logs (M5 Max, 27B Speed-V2, 13-18k ctx): M=3 vs M=4 verify sits in
+    # the same 70-92 ms/call band (marginal ~1-2 ms — an extra verify row
+    # in a weight-bound matmul is nearly free) and chained draft time is
+    # ~2 ms per extra depth. Honest costs put the bar at the designed 0.18
+    # floor; the policy's EWMA + exploration own the rest.
+    parser.add_argument("--adaptive-ev-draft-cost-s", type=float, default=0.0020)
+    parser.add_argument("--adaptive-ev-extra-verify-cost-s", type=float, default=0.0015)
     parser.add_argument("--adaptive-ev-baseline-tok-s", type=float, default=40.0)
     parser.add_argument("--adaptive-ev-safety-margin", type=float, default=0.10)
     parser.add_argument("--adaptive-ev-margin-center", type=float, default=1.0)
@@ -26008,15 +36588,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--reasoning-parser",
-        choices=["qwen3", "step3p5", "gemma4", "none"],
+        choices=["qwen3", "step3p5", "gemma4", "poolside_v1", "lfm2", "none"],
         default="qwen3",
         help="Parser for streamed reasoning tags. Use 'none' to stream all text as content.",
     )
     parser.add_argument(
         "--reasoning-effort",
-        choices=["auto", "low", "medium", "high"],
+        choices=list(REASONING_EFFORT_CHOICES),
         default="auto",
-        help="Backend reasoning effort. Step-3.7 Flash maps this to low/medium/high in its chat template.",
+        help=(
+            "Backend reasoning effort. Qwen 3.8 exposes xhigh/medium/low "
+            "(MTPLX coding default medium); Step-3.7 Flash maps this to low/medium/high "
+            "in its chat template."
+        ),
     )
     parser.add_argument(
         "--preserve-thinking",
@@ -26053,9 +36637,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             "Append every per-request telemetry record (the dashboard "
-            "'recent' schema) as one JSON line to this path. The durable "
+            "'recent' schema; numeric/hash fields only, no prompt or "
+            "completion content — user-preview text is digest-redacted "
+            "unless MTPLX_REQUEST_LOG_CONTENT=1) as one JSON line to this "
+            "path. The durable "
             "twin of the 100-entry RAM ring; scripts/session_forensics.py "
-            "reads it. Env: MTPLX_REQUEST_LOG_JSONL."
+            "reads it. Default: ON at ~/.mtplx/logs/request-log-<port>.jsonl "
+            "with 64MB x4 rotation; pass 'off' (or set "
+            "MTPLX_REQUEST_LOG_JSONL=off) to disable. Env: "
+            "MTPLX_REQUEST_LOG_JSONL."
+        ),
+    )
+    parser.add_argument(
+        "--flight-recorder",
+        default=None,
+        help=(
+            "Per-request flight recorder: begin/prefill/~1Hz sample/end "
+            "events (tokens, TPS, reasoning/content chars, live MTP "
+            "acceptance) plus postcommit outcomes, as JSONL. Feeds "
+            "GET /v1/mtplx/flight and `mtplx trace`. Default: ON at "
+            "~/.mtplx/metrics/flight-<port>.jsonl with 64MB x4 rotation; "
+            "pass 'off' or a custom path. Generated text is persisted "
+            "under ~/.mtplx/metrics/gen/ only for cancelled/errored "
+            "requests by default (MTPLX_FLIGHT_TEXT=abnormal|always|off). "
+            "Env: MTPLX_FLIGHT_RECORDER."
         ),
     )
     parser.add_argument(
@@ -26154,6 +36759,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--draft-top-p", type=float, default=0.95)
     parser.add_argument("--draft-top-k", type=int, default=20)
     parser.add_argument(
+        "--draft-sampler-source",
+        choices=["explicit", "default"],
+        default=None,
+        help=(
+            "Provenance of the launch draft sampler: 'explicit' (user-typed "
+            "flag; pins the draft sampler and disables the per-family "
+            "dynamic draft-temperature curve) or 'default' (injected/model "
+            "default; treated as the curve anchor). When omitted, a "
+            "directly passed --draft-temperature counts as explicit — the "
+            "launcher (mtplx serve/start) always stamps this flag, so an "
+            "operator typing draft flags at the daemon gets the same "
+            "explicit-flag provenance as everywhere else."
+        ),
+    )
+    parser.add_argument(
         "--mlx-cache-limit",
         help=(
             "MLX allocator cache limit, e.g. 0, 512MB, 1GB, or 'off' to "
@@ -26216,8 +36836,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--open-dashboard",
         action="store_true",
         help=(
-            "Open the live MTPLX dashboard (/dashboard) after startup "
-            "instead of the chat UI."
+            "Open the live MTPLX dashboard (/dashboard) after startup, "
+            "alongside any client UI selected by --open-browser."
         ),
     )
     parser.add_argument(
@@ -26232,7 +36852,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--fan-mode",
         choices=FAN_MODE_CHOICES,
-        default=normalize_fan_mode(os.environ.get("MTPLX_FAN_MODE") or FAN_MODE_DEFAULT),
+        default=normalize_fan_mode(
+            os.environ.get("MTPLX_FAN_MODE") or FAN_MODE_DEFAULT
+        ),
         help=(
             "Fan policy: default leaves Apple fan control alone, smart boosts "
             "only while visible requests generate, max reports sustained max mode."
@@ -26287,6 +36909,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(str(exc))
     args.api_key = resolved_key.value
     args.api_key_source = resolved_key.source
+    if getattr(args, "no_auth", False):
+        # #235: an explicit off-switch beats patching site-packages. The
+        # non-localhost guard downstream still refuses keyless remote binds,
+        # so this can only widen access on loopback.
+        args.api_key = None
+        args.api_key_source = "disabled_by_no_auth_flag"
+    try:
+        args.cors_origins = _parse_cors_origins(
+            getattr(args, "cors_origins", None), os.environ.get("MTPLX_CORS_ORIGINS")
+        )
+    except ValueError as exc:
+        parser.error(f"--cors-origin: {exc}")
     try:
         args.paged_kv_quantization = normalize_paged_kv_quantization(
             getattr(args, "paged_kv_quantization", "off")
@@ -26348,8 +36982,13 @@ def _start_aime_parent_watchdog_from_env() -> None:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     validate_server_security_args(args)
+    set_stream_stall_deadline_s(getattr(args, "stream_stall_deadline_s", None))
     _start_aime_parent_watchdog_from_env()
-    state = ServerState(args)
+    try:
+        state = ServerState(args)
+    except A3BMTPBatchInstallError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
     app = create_app(state)
     import uvicorn
 
@@ -26360,6 +36999,15 @@ def main(argv: list[str] | None = None) -> None:
         _startup_line("Listening: " + _startup_bind_label(args))
         _startup_line("Local Chat UI: " + chat_url)
         _startup_line("Local OpenAI API Base URL: " + _startup_openai_base_url(args))
+        network_url = network_url_for_bind(
+            getattr(args, "host", None), int(args.port), path="/v1"
+        )
+        if network_url:
+            _startup_line(
+                "Network OpenAI API Base URL: "
+                + network_url
+                + " (use from other devices and VM guests, with your API key)"
+            )
     else:
         _startup_line("Chat UI: " + chat_url)
         _startup_line("OpenAI API Base URL: " + _startup_openai_base_url(args))
@@ -26413,6 +37061,14 @@ def main(argv: list[str] | None = None) -> None:
             _startup_line(
                 "warning: --launch-hermes was set but no Hermes command was provided."
             )
+    # Main-thread insurance for the mlx 0.32.1 TLS-destructor teardown
+    # crash (#303): the owner thread parks (model_scheduler), and the main
+    # thread clears its own mlx streams before Py_Finalize.
+    import atexit
+
+    from mtplx.model_scheduler import _release_mlx_thread_state
+
+    atexit.register(_release_mlx_thread_state)
     # Graceful-with-deadline shutdown (#124): a browser tab holding an
     # infinite SSE stream (chat, dashboard, /metrics) otherwise makes
     # uvicorn wait forever on Ctrl-C. The deadline lets in-flight requests

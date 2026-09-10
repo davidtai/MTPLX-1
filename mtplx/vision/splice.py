@@ -30,6 +30,14 @@ class VisionSplice:
     # disabled for the request (bypass semantics).
     image_digests: tuple[int, ...] | None = None
     pad_counts: tuple[int, ...] | None = None
+    # Raw (t, h, w) patch grids per image, prompt order — the M-RoPE inputs.
+    image_grids: tuple[tuple[int, int, int], ...] | None = None
+    # M-RoPE position table [3, expanded_prompt_len] (mx.array) and the
+    # decode-time position delta, derived per request from ids + grids by
+    # mtplx.vision.mrope.build_mrope_positions. None/0 for families without
+    # an mrope contract; attention then keeps plain sequential rope.
+    mrope_table: Any | None = None
+    mrope_delta: int = 0
 
     @property
     def total_rows(self) -> int:
@@ -91,6 +99,58 @@ def vision_bank_key_ids(
         keyed[pos] = _BANK_KEY_FLAG | mixed
         row_in_image += 1
     return keyed
+
+
+def vision_image_spans(
+    prompt_ids: list[int], splice: VisionSplice
+) -> list[tuple[int, int]] | None:
+    """[start, end) prompt positions of each image's expanded pad run.
+
+    Computed on the RAW prompt ids (pads not yet surrogate-remapped) or on
+    keyed ids (surrogates carry the flag bit, never equal to the pad id) —
+    callers pass whichever sequence they hold alongside the pad layout. A
+    restore that lands strictly inside one of these spans would resurrect
+    KV whose embeddings came from other pixels even when token ids match
+    (the 2026-08-07 pillar alias-leg regression): image content rides
+    out-of-band of the ids, so id-equality inside a span is not
+    input-equality unless the WHOLE span matched.
+    """
+
+    pad_counts = splice.pad_counts
+    if not pad_counts:
+        return None
+    pad_id = splice.image_pad_token_id
+    positions = [
+        pos
+        for pos, token in enumerate(prompt_ids)
+        if token == pad_id or (int(token) & _BANK_KEY_FLAG)
+    ]
+    if len(positions) != sum(int(c) for c in pad_counts):
+        return None
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    for count in pad_counts:
+        count = int(count)
+        if count <= 0:
+            continue
+        run = positions[cursor : cursor + count]
+        spans.append((run[0], run[-1] + 1))
+        cursor += count
+    return spans
+
+
+def clamp_matched_outside_image_spans(
+    matched: int, spans: list[tuple[int, int]] | None
+) -> int:
+    """Snap a prefix-match that ends inside an image span back to its start."""
+
+    if not spans:
+        return int(matched)
+    m = int(matched)
+    for start, end in spans:
+        if start < m < end:
+            return int(start)
+    return m
 
 
 def _splice_rows_into_embedded(

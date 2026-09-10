@@ -49,7 +49,7 @@ public struct HuggingFaceProbe: Sendable {
             return OtherModelProbe(
                 verdict: .probeFailed,
                 hfRepo: rawRepo.trimmingCharacters(in: .whitespacesAndNewlines),
-                message: "Paste a Hugging Face repo or link.",
+                message: tr("Paste a Hugging Face repo or link."),
                 diagnostic: "invalid_repo_id"
             )
         }
@@ -67,7 +67,7 @@ public struct HuggingFaceProbe: Sendable {
             return OtherModelProbe(
                 verdict: .noMTP,
                 hfRepo: repo,
-                message: "No MTP heads. You'll lose speculative decoding (~2-3× slower)."
+                message: tr("MTP unavailable — runs autoregressive (no speculative speed boost, ~2-3× slower than an MTP build).")
             )
         }
 
@@ -76,13 +76,13 @@ public struct HuggingFaceProbe: Sendable {
             return OtherModelProbe(
                 verdict: .ready,
                 hfRepo: repo,
-                message: "MTP heads detected. Ready to download."
+                message: tr("MTP heads detected. Ready to download.")
             )
         }
         return OtherModelProbe(
             verdict: .missingSidecar,
             hfRepo: repo,
-            message: "Model declares MTP but mtp.safetensors isn't published. Speed will drop to standard decoding."
+            message: tr("Model declares MTP but mtp.safetensors isn't published. Speed will drop to standard decoding.")
         )
     }
 
@@ -118,7 +118,7 @@ public struct HuggingFaceProbe: Sendable {
                 hfRepo: rawRepo.trimmingCharacters(in: .whitespacesAndNewlines),
                 sourceFormat: .unknown,
                 hasMtpWeights: false,
-                message: "Paste a Hugging Face repo or link.",
+                message: tr("Paste a Hugging Face repo or link."),
                 diagnostic: "invalid_repo_id"
             )
         }
@@ -136,7 +136,7 @@ public struct HuggingFaceProbe: Sendable {
                 hfRepo: repo,
                 sourceFormat: format,
                 hasMtpWeights: true,
-                message: "Already MTPLX-branded — depth \(depth) verified. Install instead of rebuilding.",
+                message: tr("Already MTPLX-branded — depth %lld verified. Install instead of rebuilding.", depth),
                 diagnostic: nil
             )
         }
@@ -157,7 +157,7 @@ public struct HuggingFaceProbe: Sendable {
                     hfRepo: repo,
                     sourceFormat: .unknown,
                     hasMtpWeights: false,
-                    message: "Official MTPLX pair bundle (target + draft). Install it instead of rebuilding.",
+                    message: tr("Official MTPLX pair bundle (target + draft). Install it instead of rebuilding."),
                     diagnostic: nil
                 )
             }
@@ -180,7 +180,7 @@ public struct HuggingFaceProbe: Sendable {
                 hfRepo: repo,
                 sourceFormat: Self.classifySourceFormat(config: config, hasMTP: false),
                 hasMtpWeights: false,
-                message: "Architecture has no MTP heads. Forge cannot synthesize them — pick a model with `mtp_num_hidden_layers > 0` in config.json."
+                message: tr("Architecture has no MTP heads. Forge cannot synthesize them — pick a model with `mtp_num_hidden_layers > 0` in config.json.")
             )
         }
 
@@ -204,7 +204,15 @@ public struct HuggingFaceProbe: Sendable {
     /// object. `nil` on any failure — callers treat these fetches as
     /// best-effort signals, never hard errors.
     private func fetchRepoJSON(repo: String, path: String) async -> [String: Any]? {
-        guard let url = URL(string: "\(endpointBase)/\(repo)/resolve/main/\(path)") else {
+        await fetchRepoJSON(repo: repo, revision: "main", path: path)
+    }
+
+    private func fetchRepoJSON(
+        repo: String,
+        revision: String,
+        path: String
+    ) async -> [String: Any]? {
+        guard let url = URL(string: "\(endpointBase)/\(repo)/resolve/\(revision)/\(path)") else {
             return nil
         }
         do {
@@ -256,17 +264,17 @@ public struct HuggingFaceProbe: Sendable {
     private static func forgeableMessage(format: ForgeSourceFormat, hasSidecar: Bool) -> String {
         switch format {
         case .compressedTensorsAwq:
-            return "AWQ source detected (vLLM/SGLang format). Forge will convert the body to MLX-affine and extract the MTP sidecar."
+            return tr("AWQ source detected (vLLM/SGLang format). Forge will convert the body to MLX-affine and extract the MTP sidecar.")
         case .mlxAffineWithMtp:
-            return "MLX-affine artifact with packed MTP sidecar. Forge will requantize the body and re-pack."
+            return tr("MLX-affine artifact with packed MTP sidecar. Forge will requantize the body and re-pack.")
         case .mlxAffine:
-            return "MLX-affine source. Forge will package the MTP sidecar from " + (hasSidecar ? "mtp.safetensors." : "the main shards.")
+            return hasSidecar ? tr("MLX-affine source. Forge will package the MTP sidecar from mtp.safetensors.") : tr("MLX-affine source. Forge will package the MTP sidecar from the main shards.")
         case .bf16Native:
-            return "BF16 source with MTP heads. Forge will quantize the body and keep MTP weights at BF16 (safest)."
+            return tr("BF16 source with MTP heads. Forge will quantize the body and keep MTP weights at BF16 (safest).")
         case .hfVllm:
-            return "Hugging Face source. Forge will convert to MLX and pack the MTP sidecar."
+            return tr("Hugging Face source. Forge will convert to MLX and pack the MTP sidecar.")
         case .unknown:
-            return "Source detected but format is unfamiliar. Forge will attempt a BF16-native recipe; review the Plan step carefully."
+            return tr("Source detected but format is unfamiliar. Forge will attempt a BF16-native recipe; review the Plan step carefully.")
         }
     }
 
@@ -276,13 +284,21 @@ public struct HuggingFaceProbe: Sendable {
     }
 
     // MARK: - Step 1: GET <endpoint>/<repo>/resolve/main/config.json
+    //
+    // The Hub's raw-file route can occasionally stall long enough to
+    // trip URLSession's short onboarding timeout, especially for
+    // generated MLX configs with large per-tensor quantization maps.
+    // On transport errors, transient HTTP failures, or malformed raw
+    // responses, fall back to the model API's `config` expansion. The
+    // raw file remains authoritative and auth/404 handling stays
+    // unchanged.
 
     private func fetchConfig(repo: String) async -> ConfigOutcome {
         guard let url = URL(string: "\(endpointBase)/\(repo)/resolve/main/config.json") else {
             return .failed(OtherModelProbe(
                 verdict: .probeFailed,
                 hfRepo: repo,
-                message: "Could not build URL for config.json.",
+                message: tr("Could not build URL for config.json."),
                 diagnostic: "url_build_failed"
             ))
         }
@@ -295,7 +311,7 @@ public struct HuggingFaceProbe: Sendable {
                 return .failed(OtherModelProbe(
                     verdict: .probeFailed,
                     hfRepo: repo,
-                    message: "This repo is private or gated. Public Hugging Face models download without a login.",
+                    message: tr("This repo is private or gated. Public Hugging Face models download without a login."),
                     diagnostic: "http_\(status)"
                 ))
             case 404:
@@ -307,30 +323,80 @@ public struct HuggingFaceProbe: Sendable {
                 // instead of claiming the repo does not exist.
                 return .failed(await classifyMissingConfig(repo: repo))
             default:
+                if let config = await fetchConfigFromModelAPI(repo: repo) {
+                    return .ok(config)
+                }
                 return .failed(OtherModelProbe(
                     verdict: .probeFailed,
                     hfRepo: repo,
-                    message: "config.json is unavailable (HTTP \(status)).",
+                    message: tr("config.json is unavailable (HTTP %@).", String(status)),
                     diagnostic: "http_\(status)"
                 ))
             }
             guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+                if let config = await fetchConfigFromModelAPI(repo: repo) {
+                    return .ok(config)
+                }
                 return .failed(OtherModelProbe(
                     verdict: .probeFailed,
                     hfRepo: repo,
-                    message: "config.json was malformed.",
+                    message: tr("config.json was malformed."),
                     diagnostic: "config_decode_failed"
                 ))
             }
             return .ok(json)
         } catch {
+            if let config = await fetchConfigFromModelAPI(repo: repo) {
+                return .ok(config)
+            }
             return .failed(OtherModelProbe(
                 verdict: .probeFailed,
                 hfRepo: repo,
-                message: "Couldn't fetch config.json.",
+                message: tr("Couldn't fetch config.json."),
                 diagnostic: error.localizedDescription
             ))
         }
+    }
+
+    /// Uses Hugging Face's compact model metadata to recover from a
+    /// raw-file failure. The indexed config is accepted only when it
+    /// carries a positive MTP marker; the Hub intentionally omits many
+    /// model-specific fields from that representation, so treating its
+    /// absence as "no MTP" would create a false negative. Prefer the
+    /// returned immutable revision to retry the complete raw config,
+    /// retaining the indexed config only as a last positive signal.
+    /// Failures return nil so the caller preserves the original raw-file
+    /// diagnostic.
+    private func fetchConfigFromModelAPI(repo: String) async -> [String: Any]? {
+        guard var components = URLComponents(string: "\(endpointBase)/api/models/\(repo)") else {
+            return nil
+        }
+        components.queryItems = [
+            URLQueryItem(name: "expand", value: "config"),
+            URLQueryItem(name: "expand", value: "sha"),
+        ]
+        guard let url = components.url else { return nil }
+        guard let (status, body) = try? await runner(url, "GET"), status == 200 else {
+            return nil
+        }
+        guard let metadata = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+            return nil
+        }
+        let indexedConfig = (metadata["config"] as? [String: Any]) ?? [:]
+
+        if let revision = metadata["sha"] as? String,
+           !revision.isEmpty,
+           revision.unicodeScalars.allSatisfy({
+               CharacterSet.alphanumerics.contains($0)
+           }),
+           let config = await fetchRepoJSON(
+               repo: repo,
+               revision: revision,
+               path: "config.json"
+           ) {
+            return config
+        }
+        return Self.configDeclaresMTP(indexedConfig) ? indexedConfig : nil
     }
 
     // MARK: - Missing-config triage
@@ -344,7 +410,7 @@ public struct HuggingFaceProbe: Sendable {
         let fallback = OtherModelProbe(
             verdict: .probeFailed,
             hfRepo: repo,
-            message: "Repository or config.json not found on Hugging Face.",
+            message: tr("Repository or config.json not found on Hugging Face."),
             diagnostic: "http_404"
         )
         guard let url = URL(string: "\(endpointBase)/api/models/\(repo)") else {
@@ -363,14 +429,14 @@ public struct HuggingFaceProbe: Sendable {
             return OtherModelProbe(
                 verdict: .probeFailed,
                 hfRepo: repo,
-                message: "This repo doesn't exist on Hugging Face, or it's private or gated. Check the name; public models download without a login.",
+                message: tr("This repo doesn't exist on Hugging Face, or it's private or gated. Check the name; public models download without a login."),
                 diagnostic: "repo_not_found_or_gated"
             )
         case 404:
             return OtherModelProbe(
                 verdict: .probeFailed,
                 hfRepo: repo,
-                message: "This repo doesn't exist on Hugging Face. Check the name and try again.",
+                message: tr("This repo doesn't exist on Hugging Face. Check the name and try again."),
                 diagnostic: "repo_not_found"
             )
         default:
@@ -404,19 +470,19 @@ public struct HuggingFaceProbe: Sendable {
                 cardData: metadata["cardData"] as? [String: Any]
             )
             let pointer = source.map {
-                "This one was made from \($0). Paste that repo instead and Forge can convert it."
-            } ?? "Paste the original repo it was made from instead and Forge can convert it."
+                tr("This one was made from %@. Paste that repo instead and Forge can convert it.", $0)
+            } ?? tr("Paste the original repo it was made from instead and Forge can convert it.")
             return OtherModelProbe(
                 verdict: .probeFailed,
                 hfRepo: repo,
-                message: "GGUF repos aren't supported: GGUF is llama.cpp's format and MTPLX runs MLX models. \(pointer)",
+                message: tr("GGUF repos aren't supported: GGUF is llama.cpp's format and MTPLX runs MLX models. %@", pointer),
                 diagnostic: "gguf_repo"
             )
         }
         return OtherModelProbe(
             verdict: .probeFailed,
             hfRepo: repo,
-            message: "This repo exists but has no config.json, so MTPLX can't read it. If it's a converted export, paste the original repo instead.",
+            message: tr("This repo exists but has no config.json, so MTPLX can't read it. If it's a converted export, paste the original repo instead."),
             diagnostic: "config_missing"
         )
     }
@@ -440,12 +506,12 @@ public struct HuggingFaceProbe: Sendable {
             ?? (textConfig["architectures"] as? [String])?.first
         let modelType = (textConfig["model_type"] as? String)
             ?? (targetConfig["model_type"] as? String)
-        let described = (architecture ?? modelType).map { " (\($0) target + draft)" }
-            ?? " (target + draft)"
+        let described = (architecture ?? modelType).map { tr(" (%@ target + draft)", $0) }
+            ?? tr(" (target + draft)")
         return OtherModelProbe(
             verdict: .ready,
             hfRepo: repo,
-            message: "MTPLX pair bundle detected\(described). Ready to download."
+            message: tr("MTPLX pair bundle detected%@. Ready to download.", described)
         )
     }
 
@@ -554,7 +620,11 @@ public struct HuggingFaceProbe: Sendable {
     public static func defaultRunner(_ url: URL, _ method: String) async throws -> (Int, Data) {
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.timeoutInterval = 12
+        // Generated MLX configs can exceed 500 KB because they carry
+        // per-tensor quantization maps. Twelve seconds produced false
+        // "Unknown format" failures on otherwise public, forgeable
+        // repos; keep the probe bounded but allow slow Hub responses.
+        request.timeoutInterval = 30
         // Hugging Face honors a User-Agent and uses it to gate scraping
         // heuristics. Identify ourselves clearly so a probe failure is
         // traceable in HF logs back to MTPLX.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -22,6 +23,7 @@ from mtplx.hf_loader import (
     directory_size_bytes,
     hf_token_for_download,
     pull_model,
+    read_source_marker,
     repo_id_from_model_ref,
 )
 from mtplx.gemma4_pair import (
@@ -29,7 +31,7 @@ from mtplx.gemma4_pair import (
     is_gemma4_pair_repo_id,
     resolve_gemma4_pair_paths,
 )
-from mtplx.metadata_scrub import runtime_metadata_leaks, scrub_runtime_metadata
+from mtplx.metadata_scrub import scrub_json_documents, scrub_text_value
 from mtplx.mtp_patch import MTPContract
 from mtplx.version import __version__
 
@@ -287,7 +289,7 @@ _BODY_DTYPE_ALIASES = {
 def _host_chip_brand() -> str:
     try:
         result = subprocess.run(
-            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            ["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -444,16 +446,25 @@ def _probe_runtime_mtp_evidence(
     return False, str(compatibility.get("runtime_compatibility") or "missing-mtp-weights"), compatibility
 
 
-def _no_mtp_probe_message(diagnostic: str | None) -> str:
+def _no_mtp_probe_message(diagnostic: str | None, *, config_only: bool = False) -> str:
     if diagnostic == "incomplete-assistant-pair":
         return (
             "Gemma 4 assistant/target subfolder detected, but MTPLX Gemma "
             "requires the assistant-pair bundle root containing mtplx_pair.json, "
             "target/, and assistant/. Point Forge at the bundle root instead."
         )
+    if config_only:
+        return (
+            "Source is config-only — no model weights (*.safetensors) are "
+            "present, so there is nothing to forge. Download or point Forge "
+            "at the full checkpoint."
+        )
     return (
-        "Source does not contain runnable MTP weights; Forge refuses "
-        "to brand AR-only or config-only artifacts."
+        "Source has no MTP head, and Forge currently builds speculative "
+        "MTP artifacts only. This does NOT block running the model: MTPLX "
+        "serves MTP-less checkpoints autoregressive directly (mtplx run / "
+        "mtplx serve — MTP unavailable, mtp_off). AR-only Forge "
+        "conversion/quantization lands in a later update."
     )
 
 
@@ -738,7 +749,12 @@ def probe_source(source: str) -> dict[str, Any]:
             "has_mtp_weights": False,
             "estimated_size_bytes": estimated_size,
             "estimated_peak_gib": _estimated_peak_gib(estimated_size),
-            "message": _no_mtp_probe_message(mtp_diagnostic),
+            "message": _no_mtp_probe_message(
+                mtp_diagnostic,
+                config_only=not any(
+                    str(name).endswith(".safetensors") for name in files
+                ),
+            ),
             "diagnostic": mtp_diagnostic or "no_mtp_heads",
             "source_sha": source_sha,
             **compatibility_fields,
@@ -852,14 +868,40 @@ def _cmd_discover(args: Any) -> int:
     return 0
 
 
+# Downloads-sorted rows scanned per discover call. Bounded so a broad
+# --query cannot walk the whole hub; ~10x the full MTPLX result set
+# (109 repos for search=MTPLX, measured 2026-08-16).
+_DISCOVER_SCAN_LIMIT = 1000
+
+
+def is_discoverable_repo(repo: str) -> bool:
+    """Discover keeps every repo whose *name* carries the MTPLX brand —
+    any case, any position ("…-MTPLX", "MTPLX-…", "…-mtplx-4bit").
+
+    The old ``"-MTPLX-" in repo`` check was a fossil of the retired
+    ``<base>-MTPLX-<role>`` branding: Forge now brands artifacts
+    ``<base>-MTPLX`` (suffix), so the dash-bounded case-sensitive match
+    dropped the app's own output plus every lowercase/prefix community
+    variant (36 of the 109 live MTPLX repos on 2026-08-16, including
+    the #2-by-downloads one).
+    """
+    return "mtplx" in repo.rsplit("/", 1)[-1].lower()
+
+
 def discover_models(*, query: str, limit: int, offset: int = 0) -> list[dict[str, Any]]:
     api = _make_hf_api()
-    # huggingface_hub versions differ on offset support, so fetch enough rows and slice locally.
+    # Sorted by downloads descending; the name filter runs while we
+    # iterate, so rows keep coming until `limit` cards survive it. The
+    # old shape sliced at HF first (`limit + offset` rows) and filtered
+    # second, so every filtered row shrank the page and any repo ranked
+    # below the slice — exactly the fresh, low-download models — could
+    # never surface. huggingface_hub versions differ on offset support,
+    # so offset still pages locally over the matching rows.
     list_kwargs = {
         "search": query or "MTPLX",
         "sort": "downloads",
         "direction": -1,
-        "limit": max(limit + offset, limit),
+        "limit": _DISCOVER_SCAN_LIMIT,
     }
     try:
         models = api.list_models(**list_kwargs)
@@ -869,23 +911,23 @@ def discover_models(*, query: str, limit: int, offset: int = 0) -> list[dict[str
         list_kwargs.pop("direction", None)
         models = api.list_models(**list_kwargs)
     cards: list[dict[str, Any]] = []
+    matched = 0
     for model in models:
-        repo = (
+        repo = str(
             getattr(model, "modelId", None)
             or getattr(model, "id", None)
             or getattr(model, "model_id", None)
             or ""
         )
-        repo = str(repo)
-        if "-MTPLX-" not in repo:
+        if not is_discoverable_repo(repo):
             continue
-        if len(cards) < offset:
-            cards.append({"_skip": True})
+        matched += 1
+        if matched <= offset:
             continue
         cards.append(_discover_card(model, repo))
-        if len([card for card in cards if not card.get("_skip")]) >= limit:
+        if len(cards) >= limit:
             break
-    return [card for card in cards if not card.get("_skip")]
+    return cards
 
 
 def _discover_card(model: Any, repo: str) -> dict[str, Any]:
@@ -947,15 +989,45 @@ def _cmd_verify(args: Any) -> int:
         run = _run_dir(args.out, args.run_id)
     else:
         run = _run_dir(Path("outputs/forge-verify"), f"verify-{int(time.time())}")
+    existing = _read_runtime(model_path)
+    mtp_contract = _runtime_or_default_mtp_contract(existing, model_path)
     rows = _run_verify(
         model_path,
         run,
         max_fans=bool(getattr(args, "max", False)),
-        mtp_contract=_runtime_or_default_mtp_contract(_read_runtime(model_path), model_path),
+        mtp_contract=mtp_contract,
         max_tokens=_forge_verify_max_tokens(args),
         prompt_suite=_forge_verify_prompt_suite(args),
     )
-    payload = {"rows": rows}
+    payload: dict[str, Any] = {"rows": rows}
+    if rows and bool(getattr(args, "stamp", False)):
+        # In-place first-load smoke stamp: the same metadata stamper the
+        # build lane uses, fed by the rows just measured — no rebuild, no
+        # tree copy. This is what clears the 'unverified' marker on packs
+        # that were converted outside the forge build lane.
+        existing_provenance = (existing or {}).get("forge_provenance") or {}
+        source_repo = (
+            str(getattr(args, "source_repo", "") or "")
+            or str((existing or {}).get("base_trunk") or "")
+            or str(existing_provenance.get("source_repo") or "")
+            or model_path.name
+        )
+        probe = probe_source(str(model_path))
+        runtime_metadata = _stamp_runtime_metadata(
+            model_path,
+            branded_name=model_path.name,
+            source_repo=source_repo,
+            source_sha=str(existing_provenance.get("source_sha") or ""),
+            source_format=str(probe.get("source_format") or SOURCE_UNKNOWN),
+            recipe={},
+            forge_inputs={"lane": "verify-stamp"},
+            rows=rows,
+            mtp_contract=mtp_contract,
+            existing=existing,
+        )
+        atomic_write_json(model_path / "mtplx_runtime.json", runtime_metadata)
+        payload["stamped"] = str(model_path / "mtplx_runtime.json")
+        _err(f"[forge] runtime contract stamped in place: {payload['stamped']}")
     if bool(getattr(args, "json", False)):
         _json_out(payload)
     else:
@@ -1029,6 +1101,9 @@ def _cmd_build(args: Any) -> int:
     if _cancel_requested(args.run_id):
         raise ForgeError("forge cancelled", code=130)
 
+    _ensure_vision_tower(source_path, destination)
+    _validate_vision_payload(source_path, destination)
+
     _calibrate_sidecar(
         source_path,
         destination,
@@ -1038,6 +1113,7 @@ def _cmd_build(args: Any) -> int:
 
     existing_runtime = _read_runtime(destination) or _read_runtime(source_path)
     require_all_depths = True
+    verify_depths = _forge_verify_depths(destination)
     rows = _verify_rows_from_runtime(existing_runtime)
     calibration_diagnostic: str | None = None
     has_saved_contract = _runtime_has_mtp_contract(existing_runtime, destination)
@@ -1046,7 +1122,10 @@ def _cmd_build(args: Any) -> int:
         _saved_verify_rows_reuse_blocker(
             rows,
             existing_runtime,
+            model_path=destination,
+            source_path=source_path,
             require_all_depths=require_all_depths,
+            verify_depths=verify_depths,
         )
         if has_saved_contract or has_legacy_speed_grid
         else "missing saved MTP contract"
@@ -1079,7 +1158,9 @@ def _cmd_build(args: Any) -> int:
         )
     if not rows:
         raise ForgeError("verification produced no usable AR/MTP rows")
-    _require_verify_rows(rows, require_all_depths=require_all_depths)
+    _require_verify_rows(
+        rows, require_all_depths=require_all_depths, verify_depths=verify_depths
+    )
     _require_speed_win_or_write_outcome(
         destination,
         run,
@@ -1190,13 +1271,22 @@ def _convert_with_mlx_lm(
 ) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     _write_progress(run, "convert", progress=0.05, label="to_mlx", finished=False)
-    command = _mlx_lm_convert_command(
-        source,
-        destination,
-        recipe=recipe,
-        source_format=source_format,
-    )
-    _err("[forge] converting with mlx-lm")
+    if recipe.get("module_overrides"):
+        command = _mixed_convert_command(
+            source,
+            destination,
+            recipe=recipe,
+            source_format=source_format,
+        )
+        _err("[forge] converting with mlx-lm (mixed-precision module overrides)")
+    else:
+        command = _mlx_lm_convert_command(
+            source,
+            destination,
+            recipe=recipe,
+            source_format=source_format,
+        )
+        _err("[forge] converting with mlx-lm")
     stdout_path = run / "convert.stdout.log"
     stderr_path = run / "convert.stderr.log"
     started = time.monotonic()
@@ -1232,6 +1322,42 @@ def _convert_with_mlx_lm(
         finished=True,
         elapsed_s=round(time.monotonic() - started, 3),
     )
+
+
+def _mixed_convert_command(
+    source: Path,
+    destination: Path,
+    *,
+    recipe: dict[str, Any],
+    source_format: str,
+) -> list[str]:
+    # module_overrides quantize per-module via a custom predicate, which only
+    # the in-process mlx-lm API supports; BF16-native sources only, because
+    # packed sources dequantize through dedicated lanes with their own params.
+    if source_format != SOURCE_BF16_NATIVE:
+        raise ForgeError(
+            "recipe module_overrides require a BF16/native source, got "
+            f"{source_format}",
+            code=2,
+        )
+    raw_body_bits = recipe.get("body_bits")
+    if int(4 if raw_body_bits is None else raw_body_bits) <= 0:
+        raise ForgeError("recipe module_overrides require body_bits > 0", code=2)
+    command = [
+        sys.executable,
+        "-P",
+        "-m",
+        "mtplx.commands.forge_mixed_convert",
+        "--source",
+        str(source),
+        "--destination",
+        str(destination),
+        "--recipe-json",
+        json.dumps(recipe, sort_keys=True),
+    ]
+    if _body_dtype(recipe) == "fp16":
+        command.extend(["--dtype", "float16"])
+    return command
 
 
 def _mlx_lm_convert_command(
@@ -1514,6 +1640,7 @@ def _ensure_mtp_sidecar(source: Path, destination: Path) -> bool:
         return _extract_embedded_mtp(
             source,
             target,
+            config=config,
             sanitize_values=_should_sanitize_extracted_mtp_weights(config),
         )
     return False
@@ -1538,6 +1665,7 @@ def _extract_embedded_mtp(
     source: Path,
     target: Path,
     *,
+    config: dict[str, Any] | None = None,
     sanitize_values: bool = False,
 ) -> bool:
     index_path = source / "model.safetensors.index.json"
@@ -1547,7 +1675,38 @@ def _extract_embedded_mtp(
     weight_map = index.get("weight_map") if isinstance(index, dict) else None
     if not isinstance(weight_map, dict):
         return False
+
+    if config is None:
+        config_path = source / "config.json"
+        try:
+            config = _load_json(config_path) if config_path.exists() else {}
+        except Exception:
+            config = {}
+
+    # Prefix-keyed heads (Qwen, Gemma) win: their layout is unambiguous and
+    # predates this branch.  Only when no "mtp." key exists do we look for an
+    # appended-layer head (GLM MoE), whose keys stay unnormalised because
+    # glm_mtp_patch derives the local MTP index from the literal
+    # "model.layers.{start+i}." form.
     mtp_keys = [key for key in weight_map if artifacts.is_mtp_key(str(key))]
+    key_transform: Callable[[str], str] | None = artifacts.normalize_mtp_key
+    if not mtp_keys and artifacts.uses_appended_layer_mtp(config):
+        mtp_keys = [
+            key
+            for key in weight_map
+            if artifacts.is_appended_layer_mtp_key(str(key), config)
+        ]
+        key_transform = None
+    if not mtp_keys and artifacts.uses_mtp_layers_namespace(config):
+        # MiMo keeps the head in its own "model.mtp_layers.N." namespace beside
+        # the decoder stack.  mimo_mtp_patch reads that form directly, so the
+        # keys stay unnormalised here too.
+        mtp_keys = [
+            key
+            for key in weight_map
+            if artifacts.is_mtp_layers_namespace_key(str(key), config)
+        ]
+        key_transform = None
     if not mtp_keys:
         return False
 
@@ -1559,7 +1718,7 @@ def _extract_embedded_mtp(
         source,
         by_file,
         target,
-        key_transform=artifacts.normalize_mtp_key,
+        key_transform=key_transform,
         sanitize_values=sanitize_values,
     )
     return True
@@ -1627,9 +1786,15 @@ def _copy_safetensors_subset_sanitized(
 ) -> None:
     import mlx.core as mx
 
-    from mtplx.compressed_tensors import sanitize_plain_weight
+    from mtplx.compressed_tensors import sanitize_plain_weight, shift_delta_mtp_norms
 
-    tensors: dict[str, Any] = {}
+    # Collect the whole set first, decide the norm convention ONCE, then
+    # sanitize (#301). The old per-tensor path always-shifted three MTP norms
+    # regardless of source convention, so extracting from a checkpoint that
+    # already stores absolute gains double-shifted exactly those tensors —
+    # 0-2% acceptance, forged models slower than AR. by_file can span
+    # shards, hence collect-before-decide.
+    raw: dict[str, Any] = {}
     for filename, keys in by_file.items():
         shard = source_dir / filename
         try:
@@ -1639,10 +1804,14 @@ def _copy_safetensors_subset_sanitized(
         for key in keys:
             if key not in loaded:
                 raise ForgeError(f"MTP tensor {key} missing from {filename}")
-            output_key = str(key_transform(key) if key_transform is not None else key)
-            tensors[output_key] = sanitize_plain_weight(output_key, loaded[key])
-    if not tensors:
+            raw[str(key_transform(key) if key_transform is not None else key)] = loaded[key]
+    if not raw:
         raise ForgeError("embedded MTP extraction found no tensors to write")
+    tensors: dict[str, Any] = {
+        key: sanitize_plain_weight(key, value) for key, value in raw.items()
+    }
+    # Norm convention is a whole-sidecar property, not a per-tensor one (#301).
+    tensors = shift_delta_mtp_norms(tensors)
     mx.eval(list(tensors.values()))
     target.parent.mkdir(parents=True, exist_ok=True)
     mx.save_safetensors(str(target), tensors, metadata={"format": "mlx"})
@@ -1721,6 +1890,51 @@ def _validate_mtp_sidecar_payload(destination: Path) -> dict[str, Any] | None:
     config["mtplx_mtp_payload_audit"] = audit
     atomic_write_json(config_path, config)
     return audit
+
+
+def _ensure_vision_tower(source: Path, destination: Path) -> None:
+    """Restore the vision tower that text-only convert lanes drop.
+
+    ``mlx_lm.convert`` serializes only the text model, so multimodal sources
+    lose their vision tensors, ``vision_config``, and preprocessor sidecars
+    (issue #263). Graft them back from the source directory. A no-op for
+    text-only sources and for lanes (mirror, compressed-tensors) that already
+    preserved the tower.
+    """
+    if not source.is_dir():
+        return
+    from mtplx.vision_graft import VisionGraftError, graft_vision_tower
+
+    try:
+        report = graft_vision_tower(source, destination, verify_load=True)
+    except VisionGraftError as exc:
+        raise ForgeError(f"vision tower graft failed: {exc}") from exc
+    if report.get("status") == "grafted":
+        _err(
+            f"[forge] restored vision tower: {report.get('tensors')} tensors "
+            f"({report.get('bytes')} bytes) in {report.get('vision_file')}"
+        )
+
+
+def _validate_vision_payload(source: Path, destination: Path) -> None:
+    """Fail closed when a multimodal source produced a blind artifact."""
+    if not source.is_dir():
+        return
+    try:
+        source_config = _load_json(source / "config.json")
+    except Exception:
+        return
+    if not isinstance(source_config, dict) or not isinstance(
+        source_config.get("vision_config"), dict
+    ):
+        return
+    from mtplx.vision import vision_spec_for_model_dir
+
+    if vision_spec_for_model_dir(destination) is None:
+        raise ForgeError(
+            "source declares vision_config but the forged artifact resolves no "
+            "vision tower; the convert lane dropped it (issue #263)"
+        )
 
 
 def _audit_mtp_sidecar_payload(mtp_path: Path) -> dict[str, Any]:
@@ -2145,12 +2359,17 @@ def _start_max_session_if_requested(enabled: bool) -> Any | None:
     try:
         from mtplx.thermal import MaxSession
     except Exception as exc:
-        _err(f"[forge] max-fan contract calibration unavailable: {exc}")
-        return None
+        raise ForgeError(
+            f"verified max-fan mode is unavailable; refusing Forge model load: {exc}"
+        ) from exc
     session = MaxSession(log=lambda line: _err(f"[forge] {line}"))
     if not session.start():
-        _err("[forge] max-fan contract calibration did not verify; continuing without speed claims")
-        return None
+        verified = session.thermal.get("verified") or {}
+        detail = str(verified.get("message") or "fan ramp did not verify").strip()
+        raise ForgeError(
+            "verified max-fan mode did not start; refusing Forge model load: "
+            + detail
+        )
     return session
 
 
@@ -2330,6 +2549,13 @@ def _run_verify(
     max_tokens: int = FORGE_VERIFY_DEFAULT_MAX_TOKENS,
     prompt_suite: str = FORGE_VERIFY_DEFAULT_PROMPT_SUITE,
 ) -> list[dict[str, Any]]:
+    if _verify_rows_lane(model_path) == "family-serve":
+        return _run_verify_family_serve(
+            model_path,
+            run,
+            max_fans=max_fans,
+            max_tokens=max_tokens,
+        )
     tune_root = run / "tune"
     tune_run_id = "forge-verify"
     output_root = tune_root / tune_run_id
@@ -2350,13 +2576,15 @@ def _run_verify(
         "--run-id",
         tune_run_id,
         "--depths",
-        "1,2,3",
+        ",".join(str(depth) for depth in _forge_verify_depths(model_path)),
         "--max-tokens",
         str(max(1, int(max_tokens))),
         "--prompt-suite",
         str(prompt_suite),
         "--yes",
     ]
+    if max_fans:
+        command.append("--require-max-fans")
     if isinstance(mtp_contract, dict):
         base_hidden_variant = mtp_contract.get("base_hidden_variant")
         hidden_variant = mtp_contract.get("hidden_variant")
@@ -2406,6 +2634,185 @@ def _run_verify(
                 output_root=output_root,
             )
         )
+    return rows
+
+
+def _verify_rows_lane(model_path: Path) -> str:
+    """'tune' for families the tune instrument supports, 'family-serve' for
+    family-gated native backends it does not (qwen4_exp today): those
+    measure their rows through the real serve path, which is the only lane
+    that applies their family contract (batched verify, adaptive depth,
+    family sampler)."""
+    try:
+        inspection = inspect_model(model_path)
+    except Exception:
+        return "tune"
+    compatibility = getattr(inspection, "compatibility", {}) or {}
+    if str(compatibility.get("recommended_backend") or "") == "qwen4_exp":
+        return "family-serve"
+    return "tune"
+
+
+def _run_verify_family_serve(
+    model_path: Path,
+    run: Path,
+    *,
+    max_fans: bool,
+    max_tokens: int,
+    reps: int = 2,
+) -> list[dict[str, Any]]:
+    """First-load smoke rows for family-gated native backends, measured
+    through a locally booted `mtplx serve` (the path that applies the
+    family contract). Produces the same row shape the tune lane emits:
+    depth 0 = AR, depth N = the family's speculative default."""
+    import socket
+    import urllib.error
+    import urllib.request
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = int(probe.getsockname()[1])
+    base = f"http://127.0.0.1:{port}"
+    serve_log = run / "family-serve.log"
+    tokens_per_row = max(128, min(int(max_tokens), 512))
+    smart_fans = None
+    smart_request_id = None
+    if max_fans:
+        try:
+            from mtplx.thermal import SmartFanController
+
+            smart_fans = SmartFanController(log=_err)
+            smart_request_id = f"forge-verify-{int(time.time() * 1000)}"
+            smart_fans.begin_request(smart_request_id)
+        except Exception as exc:
+            _err(f"[forge] smart fan engage unavailable: {exc}")
+    _err(
+        "[forge] family-serve verify: booting mtplx serve on "
+        f"port {port} (rows: AR + family speculative default, "
+        f"{tokens_per_row} tokens x{reps})"
+    )
+    proc = None
+    rows: list[dict[str, Any]] = []
+    try:
+        with serve_log.open("w", encoding="utf-8") as log_handle:
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-P",
+                    "-m",
+                    "mtplx.cli",
+                    "serve",
+                    "--model",
+                    str(model_path),
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                    "--yes",
+                ],
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            deadline = time.monotonic() + 1800.0
+            while True:
+                if proc.poll() is not None:
+                    raise ForgeError(
+                        "family-serve verify: serve exited before /health "
+                        f"(see {serve_log})"
+                    )
+                try:
+                    with urllib.request.urlopen(f"{base}/health", timeout=5) as resp:
+                        if resp.status == 200:
+                            break
+                except (urllib.error.URLError, OSError):
+                    pass
+                if time.monotonic() > deadline:
+                    raise ForgeError(
+                        "family-serve verify: /health never came up "
+                        f"(see {serve_log})"
+                    )
+                time.sleep(2.0)
+
+            def _measure(mode: str, salt: str) -> dict[str, Any]:
+                body: dict[str, Any] = {
+                    "model": model_path.name,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Write a small Python function that merges "
+                                "overlapping intervals, then explain it. "
+                                f"(run {salt})"
+                            ),
+                        }
+                    ],
+                    "max_tokens": tokens_per_row,
+                    "stream": False,
+                }
+                headers = {"Content-Type": "application/json"}
+                if mode == "ar":
+                    body["generation_mode"] = "ar"
+                    headers["X-MTPLX-Allow-Client-Controls"] = "1"
+                request = urllib.request.Request(
+                    f"{base}/v1/chat/completions",
+                    data=json.dumps(body).encode("utf-8"),
+                    headers=headers,
+                )
+                with urllib.request.urlopen(request, timeout=1200) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                stats = payload.get("mtplx_stats") or {}
+                if not stats:
+                    raise ForgeError(
+                        "family-serve verify: response carried no mtplx_stats "
+                        f"(mode={mode})"
+                    )
+                return stats
+
+            _measure("mtp", "warmup")  # first-load warm; discarded
+            for depth, mode in ((0, "ar"), (None, "mtp")):
+                samples = [_measure(mode, f"{mode}-{index}") for index in range(reps)]
+                tok_s = [float(s.get("decode_tok_s") or s.get("tok_s") or 0.0) for s in samples]
+                best = max(samples, key=lambda s: float(s.get("decode_tok_s") or 0.0))
+                row_depth = depth
+                if row_depth is None:
+                    row_depth = int(
+                        best.get("speculative_depth")
+                        or best.get("depth")
+                        or 3
+                    )
+                acceptance = best.get("acceptance_by_position") or []
+                rows.append(
+                    {
+                        "depth": int(row_depth),
+                        "tok_s": max(tok_s),
+                        "tok_s_samples": tok_s,
+                        "acceptance_by_position": [
+                            float(value) for value in acceptance
+                        ],
+                        "generated_tokens": int(best.get("generated_tokens") or 0),
+                        "lane": "family-serve",
+                        "generation_mode": str(best.get("generation_mode") or mode),
+                    }
+                )
+                _err(
+                    f"[forge] family-serve row depth={row_depth}: "
+                    f"{max(tok_s):.2f} tok/s (samples {['%.1f' % value for value in tok_s]})"
+                )
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        if smart_fans is not None and smart_request_id is not None:
+            try:
+                smart_fans.end_request(smart_request_id, wait_for_restore=False)
+            except Exception:
+                pass
+    rows = _annotate_verify_rows(rows)
+    _write_verify(run, rows)
     return rows
 
 
@@ -2739,18 +3146,45 @@ def _annotate_verify_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return annotated
 
 
-def _verify_rows_have_all_depths(rows: list[dict[str, Any]]) -> bool:
-    depths = {int(row.get("depth") or 0) for row in rows if isinstance(row, dict)}
-    return all(depth in depths for depth in (0, 1, 2, 3))
+DEFAULT_FORGE_VERIFY_DEPTHS = (1, 2, 3)
+
+
+def _forge_verify_depths(model_path: Path) -> tuple[int, ...]:
+    """Depths forge asks tune to measure, taken from the model's tune policy.
+
+    Backends do not all reach D3. MiMo drafts one token per step, so a fixed
+    1,2,3 makes tune reject the whole run with "tune depths must be one of 1".
+    """
+    from mtplx.backends.descriptors import tune_policy_for_model
+
+    try:
+        policy = tune_policy_for_model(model_ref=str(model_path))
+    except Exception:
+        return DEFAULT_FORGE_VERIFY_DEPTHS
+    depths = tuple(
+        int(candidate[1:])
+        for candidate in getattr(policy, "candidates", ())
+        if str(candidate).startswith("D") and str(candidate)[1:].isdigit()
+    )
+    return depths or DEFAULT_FORGE_VERIFY_DEPTHS
+
+
+def _verify_rows_have_all_depths(
+    rows: list[dict[str, Any]],
+    depths: tuple[int, ...] = DEFAULT_FORGE_VERIFY_DEPTHS,
+) -> bool:
+    present = {int(row.get("depth") or 0) for row in rows if isinstance(row, dict)}
+    return all(depth in present for depth in (0, *depths))
 
 
 def _require_verify_rows(
     rows: list[dict[str, Any]],
     *,
     require_all_depths: bool = False,
+    verify_depths: tuple[int, ...] = DEFAULT_FORGE_VERIFY_DEPTHS,
 ) -> None:
     depths = {int(row.get("depth") or 0) for row in rows if isinstance(row, dict)}
-    required = (0, 1, 2, 3) if require_all_depths else (0,)
+    required = (0, *verify_depths) if require_all_depths else (0,)
     missing = [depth for depth in required if depth not in depths]
     if missing:
         raise ForgeError(
@@ -2787,12 +3221,16 @@ def _saved_verify_rows_reuse_blocker(
     rows: list[dict[str, Any]],
     runtime: dict[str, Any] | None,
     *,
+    model_path: Path,
+    source_path: Path | None = None,
     require_all_depths: bool,
+    verify_depths: tuple[int, ...] = DEFAULT_FORGE_VERIFY_DEPTHS,
 ) -> str | None:
     if not rows:
         return "missing saved verification rows"
-    if require_all_depths and not _verify_rows_have_all_depths(rows):
-        return "saved verification is missing AR/D1/D2/D3 rows"
+    if require_all_depths and not _verify_rows_have_all_depths(rows, verify_depths):
+        expected = ", ".join(["AR", *(f"D{depth}" for depth in verify_depths)])
+        return f"saved verification is missing {expected} rows"
     if not any(int(row.get("depth") or 0) > 0 for row in rows):
         return "saved verification has no MTP depth rows"
     if any(row.get("hit_token_budget") for row in rows):
@@ -2804,6 +3242,22 @@ def _saved_verify_rows_reuse_blocker(
 
     raw_evidence = runtime.get("speed_evidence") if isinstance(runtime, dict) else None
     if isinstance(raw_evidence, dict):
+        current_fingerprint = _verification_artifact_fingerprint(model_path)
+        saved_fingerprint = raw_evidence.get("artifact_fingerprint")
+        if saved_fingerprint:
+            if current_fingerprint is None:
+                return "current artifact cannot be fingerprinted"
+            if saved_fingerprint != current_fingerprint:
+                return "saved verification belongs to different artifact bytes"
+        elif source_path is not None:
+            source_fingerprint = _verification_artifact_fingerprint(source_path)
+            if (
+                current_fingerprint is not None
+                and source_fingerprint is not None
+                and current_fingerprint != source_fingerprint
+            ):
+                return "artifact changed after unbound saved verification"
+
         raw_verdict = str(raw_evidence.get("verdict") or "").strip()
         if raw_verdict and raw_verdict != "mtp_depth_wins":
             return f"saved speed evidence verdict is {raw_verdict}"
@@ -2811,12 +3265,109 @@ def _saved_verify_rows_reuse_blocker(
         if isinstance(raw_failure_reasons, list) and raw_failure_reasons:
             return "saved speed evidence has failure reasons"
 
+    if _verification_predates_forge(runtime):
+        return "saved verification predates the forged artifact"
+
     evidence = _speed_evidence(_annotate_verify_rows(rows))
     if evidence.get("verdict") != "mtp_depth_wins":
         return f"saved verification verdict is {evidence.get('verdict') or 'unknown'}"
     if evidence.get("failure_reasons"):
         return "saved verification has failure reasons"
     return None
+
+
+def _verification_artifact_fingerprint(model_path: Path) -> str | None:
+    """Bind reusable speed rows to the config and MTP payload they measured."""
+
+    config_path = model_path / "config.json"
+    if not config_path.is_file():
+        return None
+    try:
+        config = _load_json(config_path)
+        mtp_path = artifacts.expected_mtp_file(model_path, config)
+    except Exception:
+        return None
+    if not mtp_path.is_file():
+        return None
+
+    digest = hashlib.sha256()
+    for label, path in (("config.json", config_path), ("mtp", mtp_path)):
+        digest.update(label.encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            return None
+        digest.update(b"\0")
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _verification_predates_forge(runtime: dict[str, Any] | None) -> bool:
+    if not isinstance(runtime, dict):
+        return False
+    verified = runtime.get("verified_on")
+    provenance = runtime.get("forge_provenance")
+    if not isinstance(verified, dict) or not isinstance(provenance, dict):
+        return False
+    verified_at = str(verified.get("timestamp") or "").strip()
+    forged_at = str(provenance.get("forged_at") or "").strip()
+    if not verified_at or not forged_at:
+        return False
+    try:
+        verified_time = datetime.fromisoformat(verified_at.replace("Z", "+00:00"))
+        forged_time = datetime.fromisoformat(forged_at.replace("Z", "+00:00"))
+        return forged_time > verified_time
+    except (TypeError, ValueError):
+        return False
+
+
+def _recommended_profile_stamp(model_path: Path, *, best_depth: int) -> str:
+    """Profile per-model launch resolution will actually pick for this artifact.
+
+    A hard-coded "sustained" stamp lied for flagship-identified rebuilds
+    (drop-day forge-local builds carry first-party branded names): serve
+    resolves them to turbo, and a mismatched stamp then hid the artifact's
+    profile-scoped runtime contract on the profile it actually runs under
+    (``_profile_scoped_model_runtime_contract``). Identity at forge time is
+    exactly what serve-time identity will see: the artifact directory —
+    its existing mtplx_runtime.json id claim, else its branded dir name —
+    mapped through the same ``public_model_id_for_ref`` resolver. Artifacts
+    with no MTP depth win keep the "stable" recommendation.
+    """
+
+    if best_depth <= 0:
+        return "stable"
+    from mtplx.commands.public import resolved_default_profile_name_for_ref
+
+    return resolved_default_profile_name_for_ref(model_path)
+
+
+def _resolve_source_identity(source_repo: str, source_sha: str) -> tuple[str, str]:
+    """Name the trunk by its Hub repo id when ``source_repo`` is a local pull.
+
+    Forge is usually pointed at a directory under the model cache. Stamping
+    that directory as ``base_trunk`` and ``source_repo`` published the
+    maintainer's home directory with every pack. The pull marker inside the
+    directory records the repo id and commit it was synced from; a cache
+    directory without a marker still carries the repo id in its
+    ``owner--name`` layout. Anything else is returned untouched.
+    """
+
+    candidate = Path(source_repo).expanduser()
+    if not source_repo or not candidate.is_dir():
+        return source_repo, source_sha
+    marker = read_source_marker(candidate) or {}
+    repo_id = marker.get("repo_id")
+    if not (isinstance(repo_id, str) and repo_id.count("/") == 1):
+        repo_id = candidate.name.replace("--", "/") if candidate.name.count("--") == 1 else None
+    if not repo_id or repo_id.startswith("/") or repo_id.endswith("/"):
+        return source_repo, source_sha
+    resolved_sha = marker.get("resolved_sha")
+    if not source_sha and isinstance(resolved_sha, str) and resolved_sha:
+        source_sha = resolved_sha
+    return repo_id, source_sha
 
 
 def _stamp_runtime_metadata(
@@ -2833,6 +3384,7 @@ def _stamp_runtime_metadata(
     existing: dict[str, Any] | None,
 ) -> dict[str, Any]:
     metadata = dict(existing or {})
+    source_repo, source_sha = _resolve_source_identity(source_repo, source_sha)
     if _runtime_evidence_has_launch_blocker(metadata.get("exactness_baseline")):
         metadata["exactness_baseline"] = {}
     config = _load_json(model_path / "config.json") if (model_path / "config.json").exists() else {}
@@ -2854,9 +3406,22 @@ def _stamp_runtime_metadata(
     metadata["mtp_depth_max"] = max(verified_depth_max, int(metadata.get("mtp_depth_max") or 0))
     metadata.setdefault(
         "recommended_profile",
-        "sustained" if best_depth > 0 else "stable",
+        _recommended_profile_stamp(model_path, best_depth=best_depth),
     )
-    metadata.setdefault("sampler", {"temperature": 0.6, "top_p": 0.95, "top_k": 20})
+    # Stamp the FAMILY's sampler law, not a fixed 0.6 — the Qwen3.8/Qwen4
+    # families serve at temperature 1.0, and a contract advertising 0.6
+    # would mis-sample every client that honors it (the 27B misattribution
+    # class). Unknown families keep the historical default.
+    try:
+        from mtplx.backends.descriptors import sampler_defaults_for_model
+
+        family_sampler = sampler_defaults_for_model(
+            model_ref=str(model_path),
+            inspection=inspection.to_dict() if inspection is not None else None,
+        ).to_dict()
+    except Exception:
+        family_sampler = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
+    metadata.setdefault("sampler", family_sampler)
     metadata["verified_on"] = {
         "timestamp": _now_iso(),
         "hardware": platform.platform(),
@@ -2865,12 +3430,19 @@ def _stamp_runtime_metadata(
         "model": branded_name,
     }
     metadata.setdefault("exactness_baseline", {})
-    metadata["speed_evidence"] = _speed_evidence(rows)
+    speed_evidence = _speed_evidence(rows)
+    artifact_fingerprint = _verification_artifact_fingerprint(model_path)
+    if artifact_fingerprint is not None:
+        speed_evidence["artifact_fingerprint"] = artifact_fingerprint
+    metadata["speed_evidence"] = speed_evidence
     metadata["mtp_contract"] = dict(mtp_contract)
     if inspection and inspection.mtp is not None:
         metadata["mtp_sidecar"] = inspection.mtp.sidecar_format
     else:
         metadata.setdefault("mtp_sidecar", "mtp.safetensors")
+    vision_stamp = _vision_metadata_stamp(model_path)
+    if vision_stamp is not None:
+        metadata["vision"] = vision_stamp
     metadata["base_trunk"] = source_repo
     metadata.setdefault("artifact_role", "forge-local")
     metadata["forge_provenance"] = {
@@ -2886,6 +3458,32 @@ def _stamp_runtime_metadata(
         "published_to_hf": None,
     }
     return metadata
+
+
+def _vision_metadata_stamp(model_path: Path) -> dict[str, Any] | None:
+    """Provenance for artifacts that carry a vision tower, or None."""
+    from mtplx.vision import resolve_vision_prefix
+
+    index_path = model_path / "model.safetensors.index.json"
+    if not index_path.exists():
+        return None
+    try:
+        index = _load_json(index_path)
+    except Exception:
+        return None
+    weight_map = index.get("weight_map") if isinstance(index, dict) else None
+    if not isinstance(weight_map, dict):
+        return None
+    prefix = resolve_vision_prefix(weight_map)
+    if prefix is None:
+        return None
+    vision_keys = [key for key in weight_map if str(key).startswith(prefix)]
+    shards = sorted({str(weight_map[key]) for key in vision_keys})
+    return {
+        "tensor_count": len(vision_keys),
+        "prefix": prefix,
+        "shards": shards,
+    }
 
 
 def _speed_evidence(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -3139,38 +3737,36 @@ def _cmd_publish(args: Any) -> int:
     if _cancel_requested(args.run_id):
         raise ForgeError("forge cancelled", code=130)
     started = time.monotonic()
+    # Local metadata keeps the paths forge read and wrote: useful on this
+    # machine, a home directory anywhere else. The folder goes up without the
+    # documents that carry them and scrubbed copies follow in their place.
+    scrubbed = scrub_json_documents(local)
     _err(f"[forge] uploading {local}")
-    # The local mtplx_runtime.json carries absolute forge_inputs paths. Upload a
-    # scrubbed copy instead of the raw file, and keep the raw one out of the
-    # folder commit so it never lands in the repo's history.
-    scrubbed_runtime = _staged_scrubbed_runtime(local, run)
-    folder_kwargs: dict[str, Any] = {}
-    if scrubbed_runtime is not None:
-        folder_kwargs["ignore_patterns"] = ["mtplx_runtime.json"]
     upload_result = api.upload_folder(
         folder_path=str(local),
         repo_id=args.repo,
         repo_type="model",
         token=token,
         commit_message="Publish MTPLX forged model",
-        **folder_kwargs,
+        ignore_patterns=[document.name for document in scrubbed],
     )
     revision = _revision_from_upload_result(upload_result)
-    if _cancel_requested(args.run_id):
-        raise ForgeError("forge cancelled", code=130)
-    if scrubbed_runtime is not None:
-        runtime_result = api.upload_file(
-            path_or_fileobj=str(scrubbed_runtime),
-            path_in_repo="mtplx_runtime.json",
+    for document in scrubbed:
+        _err(f"[forge] {document.name}: {len(document.leaks)} local path(s) scrubbed before upload")
+        document_result = api.upload_file(
+            path_or_fileobj=document.payload,
+            path_in_repo=document.name,
             repo_id=args.repo,
             repo_type="model",
             token=token,
-            commit_message="Publish MTPLX runtime contract",
+            commit_message=f"Publish {document.name} without local paths",
         )
-        revision = _revision_from_upload_result(runtime_result) or revision
+        revision = _revision_from_upload_result(document_result) or revision
     if readme_path and readme_path.exists():
         readme_result = api.upload_file(
-            path_or_fileobj=str(readme_path),
+            path_or_fileobj=scrub_text_value(
+                readme_path.read_text(encoding="utf-8")
+            ).encode("utf-8"),
             path_in_repo="README.md",
             repo_id=args.repo,
             repo_type="model",
@@ -3202,33 +3798,6 @@ def _cmd_publish(args: Any) -> int:
         finished=True,
     )
     return 0
-
-
-def _staged_scrubbed_runtime(local: Path, run: Path) -> Path | None:
-    """Write a publish-safe ``mtplx_runtime.json`` into the run dir.
-
-    Returns the staged path, or ``None`` when the artifact has no runtime
-    contract (nothing to scrub, so the folder upload can carry everything).
-    The local artifact is never modified.
-    """
-
-    runtime_path = local / "mtplx_runtime.json"
-    if not runtime_path.is_file():
-        return None
-    try:
-        runtime = _load_json(runtime_path)
-    except Exception as exc:
-        raise ForgeError(f"could not read {runtime_path}: {exc}") from exc
-    scrubbed = scrub_runtime_metadata(runtime)
-    leaks = runtime_metadata_leaks(scrubbed)
-    if leaks:
-        raise ForgeError(
-            "refusing to publish: local paths survived metadata scrubbing: "
-            + ", ".join(sorted(set(leaks))[:5])
-        )
-    staged = run / "mtplx_runtime.publish.json"
-    atomic_write_json(staged, scrubbed)
-    return staged
 
 
 def _cmd_cancel(args: Any) -> int:

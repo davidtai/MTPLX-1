@@ -15,14 +15,40 @@ import MTPLXAppCore
 // can scroll up to detach (>120pt) and back to the bottom to reattach
 // (<28pt), matching Aphanes' tuning.
 
+/// Plain (non-observed) box for auto-scroll pacing state. Deliberately
+/// NOT individual `@State` vars: policy + task bookkeeping mutate on
+/// every revision/scroll tick (up to ~62 Hz while streaming), and as
+/// `@State` each write invalidated the whole conversation view — every
+/// bubble's body re-ran per tick (2026-08-17 field regression). Nothing
+/// in `body` reads these; scrolling goes through the AppKit driver.
+@MainActor
+final class ChatConversationScrollState {
+    var policy = ConversationAutoScrollPolicy()
+    var autoScrollTask: Task<Void, Never>?
+    var deferredScrollTask: Task<Void, Never>?
+    var finishScrollRepairTask: Task<Void, Never>?
+    var lastAutoScrollAt: ContinuousClock.Instant?
+    /// When the frame-change pin last glued the bottom.
+    var lastSynchronousPinAt: ContinuousClock.Instant?
+
+    func cancelTasks() {
+        autoScrollTask?.cancel()
+        deferredScrollTask?.cancel()
+        finishScrollRepairTask?.cancel()
+        autoScrollTask = nil
+        deferredScrollTask = nil
+        finishScrollRepairTask = nil
+    }
+}
+
 struct ChatConversationView: View {
     @ObservedObject var viewModel: ChatViewModel
-    @State private var policy = ConversationAutoScrollPolicy()
-    @State private var autoScrollTask: Task<Void, Never>?
-    @State private var deferredScrollTask: Task<Void, Never>?
-    @State private var finishScrollRepairTask: Task<Void, Never>?
-    @State private var lastAutoScrollAt: ContinuousClock.Instant?
+    let daemonState: DaemonState
+    let startupPhase: DaemonStartupPhase
+    let selectedModel: String
+    @State private var scroll = ChatConversationScrollState()
     @State private var scrollDriver = ChatConversationScrollDriver()
+    @State private var userScroll = ChatConversationUserScrollState()
     @State private var showFullHeavyTranscript = false
     @State private var renderPlan = ChatConversationRenderPlan(
         messages: [],
@@ -32,7 +58,21 @@ struct ChatConversationView: View {
 
     var body: some View {
         let plan = activeRenderPlan
-        ScrollView(.vertical, showsIndicators: true) {
+        ScrollView(.vertical, showsIndicators: false) {
+            // MUST be a plain (non-lazy) VStack. LazyVStack decides
+            // which rows to realize from SwiftUI's own scroll-position
+            // bookkeeping — but this transcript is scrolled by AppKit
+            // (ChatConversationScrollDriver moves the clip view
+            // directly, including synchronously inside the document's
+            // frameDidChange during layout). Under 60 Hz content growth
+            // the lazy container's realization window desyncs from the
+            // actual visible rect and culls rows that are on screen —
+            // intermittent flicker escalating to a fully BLANK
+            // transcript mid-generation (founder screenshot,
+            // 2026-08-18). Row count is already bounded without
+            // laziness: ChatConversationRenderPlan slices heavy
+            // transcripts to a 4-item tail behind the "earlier history"
+            // card, so eager realization stays viewport-scale.
             VStack(alignment: .leading, spacing: 16) {
                 if let hiddenTranscriptSummary = plan.hiddenTranscriptSummary {
                     HiddenTranscriptSummaryView(
@@ -75,33 +115,43 @@ struct ChatConversationView: View {
             }
             .background(
                 ChatConversationScrollObserverView(
+                    userScroll: userScroll,
                     onScrollViewResolved: { scrollView in
                         scrollDriver.updateScrollView(scrollView)
-                        if scrollView != nil, policy.shouldAutoScrollForStreamingUpdate {
+                        scrollDriver.userScroll = userScroll
+                        if scrollView != nil, scroll.policy.shouldAutoScrollForStreamingUpdate {
                             scheduleDeferredBottomScroll(delays: [.milliseconds(40)])
                         }
                     },
                     onScroll: { distanceToBottom, isUserInitiated in
+                        viewModel.uiPerfProbe.scrollTick(
+                            distanceToBottom: distanceToBottom,
+                            userInitiated: isUserInitiated
+                        )
                         performScrollActions(
-                            policy.didScroll(
+                            scroll.policy.didScroll(
                                 distanceToBottom: distanceToBottom,
                                 isUserInitiated: isUserInitiated
                             )
                         )
+                    },
+                    onDocumentFrameChanged: {
+                        synchronousBottomPinIfNeeded()
                     }
                 )
             )
         }
         .overlay(alignment: .center) {
             if plan.renderableMessages.isEmpty && !viewModel.isStreaming {
-                ChatConversationEmptyStateView()
+                ChatConversationEmptyStateView(
+                    daemonState: daemonState,
+                    startupPhase: startupPhase,
+                    selectedModel: selectedModel
+                )
             }
         }
         .background(Brand.bgOuter)
         .onReceive(viewModel.streamingContentDocument.revisionPublisher) { _ in
-            scrollToBottom()
-        }
-        .onReceive(viewModel.streamingReasoningDocument.revisionPublisher) { _ in
             scrollToBottom()
         }
         .onChange(of: viewModel.current?.id) { _, _ in
@@ -110,8 +160,8 @@ struct ChatConversationView: View {
         .onChange(of: viewModel.visibleMessages.count) { _, _ in
             updateRenderPlan()
             if viewModel.visibleMessages.last?.role == .user {
-                performScrollActions(policy.didSendUserMessage())
-            } else if !viewModel.isStreaming && policy.shouldAutoScrollForStreamingUpdate {
+                performScrollActions(scroll.policy.didSendUserMessage())
+            } else if !viewModel.isStreaming && scroll.policy.shouldAutoScrollForStreamingUpdate {
                 performScrollActions([.immediate, .deferred])
                 scheduleFinishScrollRepair()
             } else {
@@ -120,38 +170,71 @@ struct ChatConversationView: View {
         }
         .onChange(of: viewModel.isStreaming) { _, streaming in
             if streaming {
-                finishScrollRepairTask?.cancel()
-                finishScrollRepairTask = nil
-                performScrollActions(policy.didStartStreaming())
+                scroll.finishScrollRepairTask?.cancel()
+                scroll.finishScrollRepairTask = nil
+                performScrollActions(scroll.policy.didStartStreaming())
             } else {
-                performScrollActions(policy.didFinishStreaming())
+                performScrollActions(scroll.policy.didFinishStreaming())
                 scheduleFinishScrollRepair()
             }
         }
         .onAppear {
             updateRenderPlan()
-            performScrollActions(policy.didAppear())
+            performScrollActions(scroll.policy.didAppear())
         }
         .onDisappear {
-            autoScrollTask?.cancel()
-            deferredScrollTask?.cancel()
-            finishScrollRepairTask?.cancel()
-            autoScrollTask = nil
-            deferredScrollTask = nil
-            finishScrollRepairTask = nil
+            scroll.autoScrollTask?.cancel()
+            scroll.deferredScrollTask?.cancel()
+            scroll.finishScrollRepairTask?.cancel()
+            scroll.autoScrollTask = nil
+            scroll.deferredScrollTask = nil
+            scroll.finishScrollRepairTask = nil
         }
     }
 
+    // MARK: Synchronous bottom pin (2026-07-31 sawtooth fix)
+    //
+    // The founder's clip showed the streaming bubble's bottom edge
+    // oscillating at ~6 Hz with ±34 px amplitude: content grows in the
+    // flush's layout pass, but the scroll correction ran in an async
+    // Task gated to a 24/50 ms cadence — so for one-to-three frames the
+    // document was taller with the viewport unmoved (new line renders
+    // low), then the deferred task yanked it back up. This handler runs
+    // inside the document view's frameDidChange notification, i.e. in
+    // the SAME layout pass that grew the content: the clip origin moves
+    // with the growth and a grown-but-unscrolled frame never reaches
+    // the screen. No @State is touched here (the notification fires
+    // during AppKit layout); the cadenced path stays as a safety net
+    // and simply no-ops once the pin has already glued the bottom.
+    private func synchronousBottomPinIfNeeded() {
+        guard viewModel.isStreaming,
+              scroll.policy.shouldAutoScrollForStreamingUpdate else { return }
+        if scrollDriver.scrollToBottom(animated: false) {
+            scroll.lastSynchronousPinAt = ContinuousClock.now
+            viewModel.uiPerfProbe.scrollPinned()
+        }
+    }
+
+    /// A synchronous pin younger than this (the previous frame, at 30 Hz
+    /// or 60 Hz) proves the layout-pass pin is live, so the cadenced
+    /// safety net below would only wake up to find the bottom glued.
+    private static let synchronousPinFreshness: Duration = .milliseconds(40)
+
     private func scrollToBottom(force: Bool = false) {
-        guard force || policy.shouldAutoScrollForStreamingUpdate else { return }
+        guard force || scroll.policy.shouldAutoScrollForStreamingUpdate else { return }
         if force {
-            autoScrollTask?.cancel()
-            autoScrollTask = nil
+            scroll.autoScrollTask?.cancel()
+            scroll.autoScrollTask = nil
             performAutoScroll(animated: false)
             return
         }
 
-        guard autoScrollTask == nil else { return }
+        guard scroll.autoScrollTask == nil else { return }
+        if viewModel.isStreaming,
+           let pinnedAt = scroll.lastSynchronousPinAt,
+           ContinuousClock.now - pinnedAt < Self.synchronousPinFreshness {
+            return
+        }
 
         let minimumCadence: Duration
         if viewModel.isStreaming {
@@ -165,22 +248,22 @@ struct ChatConversationView: View {
         }
         let now = ContinuousClock.now
         let delay: Duration
-        if let lastAutoScrollAt {
-            let elapsed = now - lastAutoScrollAt
+        if let lastScrollAt = scroll.lastAutoScrollAt {
+            let elapsed = now - lastScrollAt
             delay = elapsed >= minimumCadence ? .zero : minimumCadence - elapsed
         } else {
             delay = .zero
         }
 
-        autoScrollTask = Task { @MainActor in
+        scroll.autoScrollTask = Task { @MainActor in
             if delay > .zero {
                 try? await Task.sleep(for: delay)
             } else {
                 await Task.yield()
             }
             guard !Task.isCancelled else { return }
-            autoScrollTask = nil
-            guard policy.shouldAutoScrollForStreamingUpdate else { return }
+            scroll.autoScrollTask = nil
+            guard scroll.policy.shouldAutoScrollForStreamingUpdate else { return }
             performAutoScroll(animated: false)
         }
     }
@@ -205,24 +288,24 @@ struct ChatConversationView: View {
     }
 
     private func scheduleDeferredBottomScroll(delays: [Duration]) {
-        deferredScrollTask?.cancel()
-        deferredScrollTask = Task { @MainActor in
+        scroll.deferredScrollTask?.cancel()
+        scroll.deferredScrollTask = Task { @MainActor in
             for delay in delays {
                 try? await Task.sleep(for: delay)
-                guard !Task.isCancelled, policy.shouldAutoScrollForStreamingUpdate else { return }
+                guard !Task.isCancelled, scroll.policy.shouldAutoScrollForStreamingUpdate else { return }
                 performAutoScroll(animated: false)
             }
         }
     }
 
     private func performAutoScroll(animated: Bool) {
-        lastAutoScrollAt = ContinuousClock.now
+        scroll.lastAutoScrollAt = ContinuousClock.now
         _ = scrollDriver.scrollToBottom(animated: animated)
     }
 
     private func scheduleFinishScrollRepair() {
-        finishScrollRepairTask?.cancel()
-        finishScrollRepairTask = Task { @MainActor in
+        scroll.finishScrollRepairTask?.cancel()
+        scroll.finishScrollRepairTask = Task { @MainActor in
             await Task.yield()
             guard !Task.isCancelled else { return }
             performFinishScrollRepairTick()
@@ -233,20 +316,20 @@ struct ChatConversationView: View {
     }
 
     private func performFinishScrollRepairTick() {
-        guard !viewModel.isStreaming, policy.shouldAutoScrollForStreamingUpdate else { return }
-        lastAutoScrollAt = ContinuousClock.now
+        guard !viewModel.isStreaming, scroll.policy.shouldAutoScrollForStreamingUpdate else { return }
+        scroll.lastAutoScrollAt = ContinuousClock.now
         _ = scrollDriver.clampToValidOffset()
         _ = scrollDriver.scrollToBottom(animated: false)
     }
 
     private func handleConversationChange() {
-        autoScrollTask?.cancel()
-        deferredScrollTask?.cancel()
-        finishScrollRepairTask?.cancel()
-        autoScrollTask = nil
-        deferredScrollTask = nil
-        finishScrollRepairTask = nil
-        performScrollActions(policy.didOpenConversation())
+        scroll.autoScrollTask?.cancel()
+        scroll.deferredScrollTask?.cancel()
+        scroll.finishScrollRepairTask?.cancel()
+        scroll.autoScrollTask = nil
+        scroll.deferredScrollTask = nil
+        scroll.finishScrollRepairTask = nil
+        performScrollActions(scroll.policy.didOpenConversation())
         showFullHeavyTranscript = false
         updateRenderPlan(showFullHeavyTranscript: false)
     }
@@ -298,19 +381,19 @@ struct ChatConversationView: View {
                 .font(.system(size: 14))
                 .foregroundStyle(Brand.warning)
             VStack(alignment: .leading, spacing: 4) {
-                Text(error.errorDescription ?? "Something went wrong.")
+                Text(error.errorDescription ?? tr("Something went wrong."))
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(Brand.typeHi)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 if case .daemonStopped = error {
-                    Text("Hit the play button to start a model, then send again.")
+                    Text(tr("Hit the play button to start a model, then send again."))
                         .font(.system(size: 11))
                         .foregroundStyle(Brand.typeSecondary)
                 }
             }
             if offersRetry(for: error) {
                 Button(action: { viewModel.retryLastUserMessage() }) {
-                    Label("Retry", systemImage: "arrow.clockwise")
+                    Label(tr("Retry"), systemImage: "arrow.clockwise")
                         .font(.system(size: 11, weight: .semibold))
                         .labelStyle(.titleAndIcon)
                         .padding(.horizontal, 9)
@@ -327,8 +410,8 @@ struct ChatConversationView: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(Brand.typeHi)
                 .disabled(!viewModel.canRetryLastUserMessage)
-                .help("Retry the last message")
-                .accessibilityLabel("Retry last message")
+                .help(tr("Retry the last message"))
+                .accessibilityLabel(tr("Retry last message"))
             }
         }
         .padding(12)
@@ -352,7 +435,9 @@ struct ChatConversationView: View {
 }
 
 private struct ChatConversationEmptyStateView: View {
-    @EnvironmentObject private var backend: MTPLXBackendStore
+    let daemonState: DaemonState
+    let startupPhase: DaemonStartupPhase
+    let selectedModel: String
 
     var body: some View {
         if let startupState {
@@ -363,7 +448,7 @@ private struct ChatConversationEmptyStateView: View {
     }
 
     private var startupState: ChatStartupStatusView.State? {
-        switch backend.daemonState.kind {
+        switch daemonState.kind {
         case .starting, .warming:
             return ChatStartupStatusView.State(
                 title: startupTitle,
@@ -371,8 +456,8 @@ private struct ChatConversationEmptyStateView: View {
             )
         case .stopping:
             return ChatStartupStatusView.State(
-                title: "Stopping MTPLX",
-                detail: "The app is closing the model server and restoring fans."
+                title: tr("Stopping MTPLX"),
+                detail: tr("The app is closing the model server and restoring fans.")
             )
         default:
             return nil
@@ -380,50 +465,50 @@ private struct ChatConversationEmptyStateView: View {
     }
 
     private var startupTitle: String {
-        switch backend.startupPhase {
+        switch startupPhase {
         case .launching:
-            return "Starting \(selectedModelName)"
+            return tr("Starting %@", selectedModelName)
         case .waitingForOwnedHealth:
-            return "Loading \(selectedModelName)"
+            return tr("Loading %@", selectedModelName)
         case .rampingFans:
-            return "Preparing cooling"
+            return tr("Preparing cooling")
         case .warming:
-            return "Warming up \(selectedModelName)"
+            return tr("Warming up %@", selectedModelName)
         case .ready:
-            return "\(selectedModelName) is ready"
+            return tr("%@ is ready", selectedModelName)
         case .failed:
-            return "Startup failed"
+            return tr("Startup failed")
         case .idle:
-            return "Starting \(selectedModelName)"
+            return tr("Starting %@", selectedModelName)
         }
     }
 
     private var startupDetail: String {
-        switch backend.startupPhase {
+        switch startupPhase {
         case .launching:
-            return "Starting the local model…"
+            return tr("Starting the local model…")
         case .waitingForOwnedHealth:
-            return "Mapping weights and building the draft head. Large Step loads can take a minute or two cold."
+            return tr("Mapping weights and building the draft head. Large Step loads can take a minute or two cold.")
         case .rampingFans:
-            return "Waiting for the requested fan profile."
+            return tr("Waiting for the requested fan profile.")
         case .warming:
-            return "Running the first warmup tokens before chat opens."
+            return tr("Running the first warmup tokens before chat opens.")
         case .failed(let message):
             return message
         case .ready:
-            return "You can send now."
+            return tr("You can send now.")
         case .idle:
-            return "Preparing the local engine."
+            return tr("Preparing the local engine.")
         }
     }
 
     private var selectedModelName: String {
-        if let option = MTPLXModelOption.option(matching: backend.configuration.model) {
+        if let option = MTPLXModelOption.option(matching: selectedModel) {
             return option.shortName
         }
-        let expanded = NSString(string: backend.configuration.model).expandingTildeInPath
+        let expanded = NSString(string: selectedModel).expandingTildeInPath
         let last = URL(fileURLWithPath: expanded).lastPathComponent
-        return last.isEmpty ? backend.configuration.model : last
+        return last.isEmpty ? selectedModel : last
     }
 }
 
@@ -559,22 +644,22 @@ private struct HiddenTranscriptSummaryView: View {
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(Brand.typeTertiary)
             VStack(alignment: .leading, spacing: 3) {
-                Text("Earlier heavy history hidden")
+                Text(tr("Earlier heavy history hidden"))
                     .font(.system(size: 11, weight: .heavy, design: .monospaced))
                     .tracking(0.6)
                     .foregroundStyle(Brand.typeSecondary)
-                Text("\(summary.messageCount) messages · \(Self.formatCount(summary.characterCount))")
+                Text(tr("%lld messages · %@", summary.messageCount, Self.formatCount(summary.characterCount)))
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(Brand.typeTertiary)
             }
             Spacer(minLength: 8)
             Button(action: onShow) {
-                Label("Show", systemImage: "arrow.down.right.and.arrow.up.left")
+                Label(tr("Show"), systemImage: "arrow.down.right.and.arrow.up.left")
                     .font(.system(size: 10, weight: .semibold))
             }
             .buttonStyle(.plain)
             .foregroundStyle(Brand.typeSecondary)
-            .help("Show older messages")
+            .help(tr("Show older messages"))
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -591,18 +676,25 @@ private struct HiddenTranscriptSummaryView: View {
 
     private static func formatCount(_ value: Int) -> String {
         if value >= 1000 {
-            return String(format: "%.1fk chars", Double(value) / 1000.0)
+            return tr("%.1fk chars", Double(value) / 1000.0)
         }
-        return "\(value) chars"
+        return tr("%lld chars", value)
     }
 }
 
 private struct ChatConversationScrollObserverView: NSViewRepresentable {
+    let userScroll: ChatConversationUserScrollState
     let onScrollViewResolved: @MainActor (NSScrollView?) -> Void
     let onScroll: @MainActor (CGFloat, Bool) -> Void
+    let onDocumentFrameChanged: @MainActor () -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onScrollViewResolved: onScrollViewResolved, onScroll: onScroll)
+        Coordinator(
+            userScroll: userScroll,
+            onScrollViewResolved: onScrollViewResolved,
+            onScroll: onScroll,
+            onDocumentFrameChanged: onDocumentFrameChanged
+        )
     }
 
     func makeNSView(context: Context) -> HostView {
@@ -614,6 +706,7 @@ private struct ChatConversationScrollObserverView: NSViewRepresentable {
     func updateNSView(_ nsView: HostView, context: Context) {
         context.coordinator.onScrollViewResolved = onScrollViewResolved
         context.coordinator.onScroll = onScroll
+        context.coordinator.onDocumentFrameChanged = onDocumentFrameChanged
         nsView.coordinator = context.coordinator
         DispatchQueue.main.async {
             context.coordinator.attachIfNeeded(from: nsView)
@@ -626,20 +719,27 @@ private struct ChatConversationScrollObserverView: NSViewRepresentable {
 
     @MainActor
     final class Coordinator: NSObject {
+        let userScroll: ChatConversationUserScrollState
         var onScrollViewResolved: @MainActor (NSScrollView?) -> Void
         var onScroll: @MainActor (CGFloat, Bool) -> Void
+        var onDocumentFrameChanged: @MainActor () -> Void
         weak var scrollView: NSScrollView?
         private var boundsObserver: NSObjectProtocol?
+        private var documentFrameObserver: NSObjectProtocol?
         private var liveScrollStartObserver: NSObjectProtocol?
         private var liveScrollEndObserver: NSObjectProtocol?
-        private var isUserLiveScrolling = false
+        private var wheelMonitor: Any?
 
         init(
+            userScroll: ChatConversationUserScrollState,
             onScrollViewResolved: @escaping @MainActor (NSScrollView?) -> Void,
-            onScroll: @escaping @MainActor (CGFloat, Bool) -> Void
+            onScroll: @escaping @MainActor (CGFloat, Bool) -> Void,
+            onDocumentFrameChanged: @escaping @MainActor () -> Void
         ) {
+            self.userScroll = userScroll
             self.onScrollViewResolved = onScrollViewResolved
             self.onScroll = onScroll
+            self.onDocumentFrameChanged = onDocumentFrameChanged
         }
 
         func attachIfNeeded(from hostView: HostView) {
@@ -653,14 +753,21 @@ private struct ChatConversationScrollObserverView: NSViewRepresentable {
             scrollView = resolvedScrollView
             onScrollViewResolved(resolvedScrollView)
             resolvedScrollView.contentView.postsBoundsChangedNotifications = true
+            // The live-scroll flag MUST flip synchronously in the
+            // notification block (queue .main delivers on the main
+            // thread): the frameDidChange pin below runs synchronously
+            // inside layout, and the old `Task { }` wrapper let the pin
+            // race a scroll the user had already started — the yank the
+            // founder felt as the app "grabbing the wheel back".
             liveScrollStartObserver = NotificationCenter.default.addObserver(
                 forName: NSScrollView.willStartLiveScrollNotification,
                 object: resolvedScrollView,
                 queue: .main
             ) { [weak hostView, weak resolvedScrollView] _ in
-                Task { @MainActor [weak hostView, weak resolvedScrollView] in
-                    guard let hostView, let resolvedScrollView, let coordinator = hostView.coordinator else { return }
-                    coordinator.isUserLiveScrolling = true
+                MainActor.assumeIsolated {
+                    guard let coordinator = hostView?.coordinator,
+                          let resolvedScrollView else { return }
+                    coordinator.userScroll.beginLiveScroll()
                     coordinator.onScroll(Self.distanceToBottom(for: resolvedScrollView), true)
                 }
             }
@@ -669,11 +776,31 @@ private struct ChatConversationScrollObserverView: NSViewRepresentable {
                 object: resolvedScrollView,
                 queue: .main
             ) { [weak hostView, weak resolvedScrollView] _ in
-                Task { @MainActor [weak hostView, weak resolvedScrollView] in
-                    guard let hostView, let resolvedScrollView, let coordinator = hostView.coordinator else { return }
+                MainActor.assumeIsolated {
+                    guard let coordinator = hostView?.coordinator,
+                          let resolvedScrollView else { return }
                     coordinator.onScroll(Self.distanceToBottom(for: resolvedScrollView), true)
-                    coordinator.isUserLiveScrolling = false
+                    coordinator.userScroll.endLiveScroll()
                 }
+            }
+            // Live-scroll notifications only cover phased (trackpad)
+            // gestures between touch-down and finger-lift. Momentum
+            // events and classic non-phased wheel mice bypass them
+            // entirely, so the pin used to fight both. A local monitor
+            // sees every wheel event before dispatch; any wheel over
+            // the transcript extends the inhibit window.
+            wheelMonitor = NSEvent.addLocalMonitorForEvents(
+                matching: .scrollWheel
+            ) { [weak hostView, weak resolvedScrollView] event in
+                MainActor.assumeIsolated {
+                    guard let coordinator = hostView?.coordinator,
+                          let resolvedScrollView,
+                          event.window === resolvedScrollView.window else { return }
+                    let point = resolvedScrollView.convert(event.locationInWindow, from: nil)
+                    guard resolvedScrollView.bounds.contains(point) else { return }
+                    coordinator.userScroll.noteWheelEvent()
+                }
+                return event
             }
             boundsObserver = NotificationCenter.default.addObserver(
                 forName: NSView.boundsDidChangeNotification,
@@ -682,10 +809,34 @@ private struct ChatConversationScrollObserverView: NSViewRepresentable {
             ) { [weak hostView, weak resolvedScrollView] _ in
                 Task { @MainActor [weak hostView, weak resolvedScrollView] in
                     guard let hostView, let resolvedScrollView, let coordinator = hostView.coordinator else { return }
+                    // isActive (not just live-scrolling) so momentum and
+                    // classic-wheel scrolls count as user-initiated and
+                    // the policy can detach past 120pt.
                     coordinator.onScroll(
                         Self.distanceToBottom(for: resolvedScrollView),
-                        coordinator.isUserLiveScrolling
+                        coordinator.userScroll.isActive
                     )
+                }
+            }
+            if let documentView = resolvedScrollView.documentView {
+                // queue: nil ⇒ the block runs SYNCHRONOUSLY on the
+                // posting thread. Frame changes post on the main thread
+                // during layout, which is the whole point: the bottom
+                // pin runs in the same display cycle that grew the
+                // content, so no grown-but-unscrolled frame is ever
+                // presented (the founder's ±34 px 6 Hz sawtooth).
+                documentView.postsFrameChangedNotifications = true
+                documentFrameObserver = NotificationCenter.default.addObserver(
+                    forName: NSView.frameDidChangeNotification,
+                    object: documentView,
+                    queue: nil
+                ) { [weak hostView] _ in
+                    guard Thread.isMainThread else { return }
+                    MainActor.assumeIsolated {
+                        guard let coordinator = hostView?.coordinator,
+                              !coordinator.userScroll.isActive else { return }
+                        coordinator.onDocumentFrameChanged()
+                    }
                 }
             }
         }
@@ -694,16 +845,23 @@ private struct ChatConversationScrollObserverView: NSViewRepresentable {
             if let boundsObserver {
                 NotificationCenter.default.removeObserver(boundsObserver)
             }
+            if let documentFrameObserver {
+                NotificationCenter.default.removeObserver(documentFrameObserver)
+            }
             if let liveScrollStartObserver {
                 NotificationCenter.default.removeObserver(liveScrollStartObserver)
             }
             if let liveScrollEndObserver {
                 NotificationCenter.default.removeObserver(liveScrollEndObserver)
             }
+            if let wheelMonitor {
+                NSEvent.removeMonitor(wheelMonitor)
+            }
+            wheelMonitor = nil
             boundsObserver = nil
+            documentFrameObserver = nil
             liveScrollStartObserver = nil
             liveScrollEndObserver = nil
-            isUserLiveScrolling = false
             scrollView = nil
             onScrollViewResolved(nil)
         }
@@ -747,9 +905,53 @@ private struct ChatConversationScrollObserverView: NSViewRepresentable {
     }
 }
 
+// MARK: User-scroll arbitration (founder stutter round three, 2026-08-18)
+//
+// Why this exists: the bottom pin used to lose every fight with a human.
+// The live-scroll flag was set inside a `Task { @MainActor }`, so the
+// SYNCHRONOUS frameDidChange pin raced it and yanked the viewport while
+// the user's fingers were still on the trackpad; the momentum phase ran
+// entirely unguarded (didEndLiveScroll fires at finger-lift); and a
+// classic non-phased wheel mouse never posts live-scroll notifications
+// at all. Meanwhile the policy's 28pt re-attach meant every yank reset
+// the user's escape distance — scrolling up mid-stream felt like the
+// app was grabbing the wheel back. One shared state object, updated
+// synchronously, consulted by every pin path:
+// - live-scroll begin/end set the flag in the notification block itself
+// - every wheel event over the transcript (phased, momentum, or classic)
+//   extends a short inhibit window, so momentum and wheel mice are
+//   covered by the same signal
+// - bounds changes report `isActive` as user-initiated, so the policy
+//   can legitimately detach (>120pt) during momentum/wheel scrolls.
+@MainActor
+final class ChatConversationUserScrollState {
+    private(set) var isLiveScrolling = false
+    private var inhibitUntil: CFTimeInterval = 0
+
+    var isActive: Bool {
+        isLiveScrolling || CACurrentMediaTime() < inhibitUntil
+    }
+
+    func beginLiveScroll() {
+        isLiveScrolling = true
+    }
+
+    func endLiveScroll() {
+        isLiveScrolling = false
+        // Momentum keeps delivering wheel events after finger-lift; the
+        // grace covers the gap until the first momentum event lands.
+        inhibitUntil = max(inhibitUntil, CACurrentMediaTime() + 0.35)
+    }
+
+    func noteWheelEvent() {
+        inhibitUntil = CACurrentMediaTime() + 0.30
+    }
+}
+
 @MainActor
 private final class ChatConversationScrollDriver {
     weak var scrollView: NSScrollView?
+    var userScroll: ChatConversationUserScrollState?
 
     func updateScrollView(_ scrollView: NSScrollView?) {
         self.scrollView = scrollView
@@ -757,6 +959,10 @@ private final class ChatConversationScrollDriver {
 
     @discardableResult
     func scrollToBottom(animated: Bool) -> Bool {
+        // Never pin against an active user scroll: the user wins, the
+        // policy detaches past 120pt, and streaming follows resume only
+        // when they return to the bottom.
+        if userScroll?.isActive == true { return false }
         _ = clampToValidOffset()
         guard let scrollView,
               let documentView = scrollView.documentView else { return false }

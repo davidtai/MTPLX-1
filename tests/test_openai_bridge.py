@@ -1,4 +1,5 @@
 import asyncio
+import time
 import gc
 import json
 from threading import Event, Lock
@@ -24,8 +25,10 @@ from mtplx.server.openai import (
     _aime_visible_working_for_request,
     _anthropic_content_to_text,
     _anthropic_payload_from_openai,
+    _record_stream_cancellation_metric,
     _anthropic_stream_from_openai_sse,
     _anthropic_to_chat_request,
+    _anthropic_usage_from_openai_usage,
     _IncrementalTokenDecoder,
     _StreamCancelled,
     _ThinkingContentStreamSplitter,
@@ -36,6 +39,7 @@ from mtplx.server.openai import (
     _effective_completion_tokens,
     _generation_params,
     _generation_final_postcommit_compatibility,
+    _history_ids_for_postcommit,
     _merge_final_bridge_stats_into_latest_metrics,
     _metrics_envelope,
     _monitor_request_disconnect,
@@ -267,7 +271,12 @@ def test_generation_final_postcommit_prefix_stores_boundary_and_reports_suffix()
     assert state.sessions.bank.puts[0]["token_ids"] == prompt_ids + generated_tokens
 
 
-def test_generation_final_postcommit_rejects_tool_call_history_rewrite():
+def test_generation_final_postcommit_tool_call_mismatch_refuses_empirically():
+    """Tool-call turns are no longer refused a priori (the retired
+    tool_call_history_rewrite gate starved every coding-agent tool round of
+    the zero-recompute fast path, 2026-08-21): the byte-compare decides. A
+    generated stream that does NOT match the retokenized render still
+    refuses — and never banks."""
     state = _postcommit_state()
     messages = [ChatMessage(role="user", content="call tool")]
     prompt_ids = _encode_messages(
@@ -298,8 +307,62 @@ def test_generation_final_postcommit_rejects_tool_call_history_rewrite():
     )
 
     assert compatibility["safe"] is False
-    assert compatibility["reason"] == "tool_call_history_rewrite"
+    assert compatibility["reason"] == "retokenized_history_mismatch"
     assert state.sessions.bank.puts == []
+
+
+def test_generation_final_postcommit_accepts_byte_identical_tool_call_turn():
+    """The payoff of retiring the a-priori refusal: a tool-call turn whose
+    generated stream byte-matches the retokenized render is safe — the live
+    generation-final KV banks with zero GPU recompute and the committed
+    frontier advances inline instead of starving on the idle postcommit."""
+    state = _postcommit_state()
+    messages = [ChatMessage(role="user", content="call tool")]
+    tool_calls = [
+        {"type": "function", "function": {"name": "lookup", "arguments": {}}}
+    ]
+    prompt_ids = _encode_messages(
+        state.runtime.tokenizer,
+        messages,
+        enable_thinking=False,
+        add_generation_prompt=True,
+    )
+    history_ids, _splice = _history_ids_for_postcommit(
+        state,
+        messages=messages,
+        assistant_content="",
+        assistant_tool_calls=tool_calls,
+        thinking_enabled=False,
+        reasoning_effort=None,
+        tool_specs=None,
+        tool_prompt_mode=None,
+        committed_stream_ids=[],
+    )
+    assert list(history_ids[: len(prompt_ids)]) == list(prompt_ids), (
+        "harness precondition: the retokenized history must start with the "
+        "request prompt for a byte-identical turn to be constructible"
+    )
+    generated_tokens = [int(t) for t in history_ids[len(prompt_ids) :]]
+    generated = {
+        "tokens": generated_tokens,
+        "_final_state": _final_state(generated_tokens),
+    }
+
+    compatibility = _generation_final_postcommit_compatibility(
+        state,
+        prompt_ids=prompt_ids,
+        generated=generated,
+        messages=messages,
+        assistant_content="",
+        assistant_tool_calls=tool_calls,
+        thinking_enabled=False,
+    )
+
+    assert compatibility["safe"] is True
+    assert compatibility["mode"] in (
+        "generation_final_exact",
+        "generation_final_prefix",
+    )
 
 
 def test_idle_async_postcommit_returns_pending_and_dispatches_retokenized_commit(
@@ -623,6 +686,106 @@ def test_anthropic_request_translates_to_openai_chat_request():
         ("user", "hi"),
         ("assistant", "hello"),
     ]
+
+
+def test_anthropic_missing_max_tokens_is_recorded_not_rejected():
+    """Anthropic's API requires max_tokens; our bridges tolerate its absence.
+    The defaulting is recorded for observability instead of 400ing (which
+    would break those bridges)."""
+
+    request = AnthropicMessagesRequest(
+        model="mtplx",
+        messages=[AnthropicMessage(role="user", content="hi")],
+    )
+    chat = _anthropic_to_chat_request(request)
+    assert getattr(chat, "anthropic_max_tokens_defaulted", False) is True
+
+    capped = AnthropicMessagesRequest(
+        model="mtplx",
+        max_tokens=64,
+        messages=[AnthropicMessage(role="user", content="hi")],
+    )
+    chat_capped = _anthropic_to_chat_request(capped)
+    assert getattr(chat_capped, "anthropic_max_tokens_defaulted", False) is False
+
+
+def test_request_observability_records_anthropic_max_tokens_defaulted():
+    from mtplx.server.openai import _request_observability
+
+    request = AnthropicMessagesRequest(
+        model="mtplx",
+        messages=[AnthropicMessage(role="user", content="hi")],
+    )
+    chat = _anthropic_to_chat_request(request)
+    observability = _request_observability(
+        chat,
+        headers={},
+        metadata={},
+        session_source=None,
+        request_generation_mode="mtp",
+        request_depth=3,
+    )
+    assert observability["anthropic_max_tokens_defaulted"] is True
+
+    capped = AnthropicMessagesRequest(
+        model="mtplx",
+        max_tokens=64,
+        messages=[AnthropicMessage(role="user", content="hi")],
+    )
+    observability_capped = _request_observability(
+        _anthropic_to_chat_request(capped),
+        headers={},
+        metadata={},
+        session_source=None,
+        request_generation_mode="mtp",
+        request_depth=3,
+    )
+    assert "anthropic_max_tokens_defaulted" not in observability_capped
+
+
+def test_anthropic_disable_parallel_tool_use_maps_to_parallel_tool_calls():
+    request = AnthropicMessagesRequest(
+        model="mtplx",
+        max_tokens=64,
+        messages=[AnthropicMessage(role="user", content="hi")],
+        tools=[{"name": "Bash", "input_schema": {"type": "object"}}],
+        tool_choice={"type": "auto", "disable_parallel_tool_use": True},
+    )
+
+    chat = _anthropic_to_chat_request(request)
+
+    assert chat.tool_choice == "auto"
+    assert chat.parallel_tool_calls is False
+
+
+def test_anthropic_disable_parallel_tool_use_false_allows_parallel():
+    request = AnthropicMessagesRequest(
+        model="mtplx",
+        max_tokens=64,
+        messages=[AnthropicMessage(role="user", content="hi")],
+        tools=[{"name": "Bash", "input_schema": {"type": "object"}}],
+        tool_choice={"type": "any", "disable_parallel_tool_use": False},
+    )
+
+    chat = _anthropic_to_chat_request(request)
+
+    assert chat.tool_choice == "required"
+    assert chat.parallel_tool_calls is True
+
+
+def test_anthropic_tool_choice_without_parallel_preference_stays_none():
+    request = AnthropicMessagesRequest(
+        model="mtplx",
+        max_tokens=64,
+        messages=[AnthropicMessage(role="user", content="hi")],
+        tools=[{"name": "Bash", "input_schema": {"type": "object"}}],
+        tool_choice={"type": "auto"},
+    )
+
+    chat = _anthropic_to_chat_request(request)
+
+    assert chat.tool_choice == "auto"
+    assert chat.parallel_tool_calls is None
 
 
 def test_anthropic_request_translates_claude_code_tools_and_history():
@@ -1003,8 +1166,134 @@ def test_anthropic_stream_translates_openai_sse_events():
     assert events[2][1]["delta"] == {"type": "text_delta", "text": "Hel"}
     assert events[3][1]["delta"] == {"type": "text_delta", "text": "lo"}
     assert events[5][1]["delta"]["stop_reason"] == "end_turn"
-    assert events[5][1]["usage"] == {"output_tokens": 2}
+    assert events[5][1]["usage"] == {
+        "input_tokens": 5,
+        "output_tokens": 2,
+        "cache_read_input_tokens": 0,
+    }
     assert events[5][1]["mtplx_stats"] == {"tok_s": 12.5}
+
+
+def test_anthropic_stream_keepalive_comments_tick_empty_thinking_deltas():
+    """Inner OpenAI keep-alive comments (pre-first-token prefill liveness,
+    #358) must surface as real message events — an early thinking block
+    ticked with EMPTY thinking_deltas. Claude Code's stream watchdog resets
+    only on yielded message events: its bundled SDK drops both raw SSE
+    comments and protocol `ping` frames (`if(a.event==="ping")continue`), so
+    a >300s prefill died client-side with "Stream idle timeout - no chunks
+    received" (measured live 2026-08-31, 137k–165k-token first turns on the
+    27B, killed at exactly 300.0s under both keep-alive shapes)."""
+
+    async def upstream():
+        yield ": keep-alive\n\n"
+        yield ": keep-alive\n\n"
+        yield (
+            'data: {"choices":[{"delta":{"reasoning_content":"hmm"},'
+            '"finish_reason":null}]}\n\n'
+        )
+        yield (
+            'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}],'
+            '"usage":{"prompt_tokens":3,"completion_tokens":1}}\n\n'
+        )
+        yield "data: [DONE]\n\n"
+
+    async def collect():
+        return [
+            chunk
+            async for chunk in _anthropic_stream_from_openai_sse(
+                upstream(),
+                model="mtplx",
+            )
+        ]
+
+    chunks = asyncio.run(collect())
+    assert not any(chunk.startswith(":") for chunk in chunks), (
+        "raw SSE comments must not leak through the Anthropic translator"
+    )
+    events = _anthropic_stream_events(chunks)
+    kinds = [event for event, _data in events]
+    assert "ping" not in kinds, "pings are dropped by Claude Code; do not emit them"
+    # Keep-alives open the thinking block early and tick it with empty deltas.
+    assert kinds[:4] == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_delta",
+    ]
+    assert events[1][1]["content_block"]["type"] == "thinking"
+    keepalive_block_index = events[1][1]["index"]
+    assert events[2][1]["delta"] == {"type": "thinking_delta", "thinking": ""}
+    assert events[3][1]["delta"] == {"type": "thinking_delta", "thinking": ""}
+    # Real reasoning continues in the SAME block the keep-alive opened.
+    assert events[4][0] == "content_block_delta"
+    assert events[4][1]["index"] == keepalive_block_index
+    assert events[4][1]["delta"] == {"type": "thinking_delta", "thinking": "hmm"}
+    # Text then closes thinking and opens its own block; stream ends normally.
+    assert kinds[-2:] == ["message_delta", "message_stop"]
+
+
+def test_anthropic_stream_and_nonstream_usage_parity():
+    """Streamed and non-streamed /v1/messages must report identical usage for
+    the same upstream OpenAI usage payload — including the session-cache
+    prefix hit (cache_read_input_tokens), which the stream path used to drop.
+    """
+
+    upstream_usage = {
+        "prompt_tokens": 1200,
+        "completion_tokens": 34,
+        "prompt_tokens_details": {"cached_tokens": 1024},
+    }
+
+    nonstream = _anthropic_payload_from_openai(
+        {
+            "model": "mtplx",
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "Hello"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": dict(upstream_usage),
+        }
+    )
+
+    async def upstream():
+        yield (
+            'data: {"choices":[{"delta":{"content":"Hello"},'
+            '"finish_reason":null}]}\n\n'
+        )
+        yield (
+            'data: '
+            + json.dumps(
+                {
+                    "choices": [{"delta": {}, "finish_reason": "stop"}],
+                    "usage": dict(upstream_usage),
+                }
+            )
+            + "\n\n"
+        )
+        yield "data: [DONE]\n\n"
+
+    async def collect():
+        return [
+            chunk
+            async for chunk in _anthropic_stream_from_openai_sse(
+                upstream(),
+                model="mtplx",
+            )
+        ]
+
+    events = _anthropic_stream_events(asyncio.run(collect()))
+    message_delta = next(data for event, data in events if event == "message_delta")
+
+    assert nonstream["usage"] == {
+        # Disjoint Anthropic semantics (#417): input_tokens is the non-cached
+        # remainder of the 1200-token prompt, not the OpenAI grand total.
+        "input_tokens": 176,
+        "output_tokens": 34,
+        "cache_read_input_tokens": 1024,
+    }
+    assert message_delta["usage"] == nonstream["usage"]
 
 
 def test_anthropic_stream_translates_openai_tool_call_deltas():
@@ -1245,11 +1534,17 @@ def test_postcommit_render_uses_same_preserve_thinking_policy():
 
 
 def test_incremental_token_decoder_does_not_redecode_cumulative_history():
+    # Guards the cache-reset/print-len contract: newline flushes drop the
+    # cache, later feeds decode only the fresh run, and reassembly stays
+    # byte-exact. (Release cadence itself is covered by
+    # tests/test_stream_visible_cadence.py.)
     decoder = _IncrementalTokenDecoder(TinyTokenizer())
 
     assert decoder.feed(_ids("hello ")) == "hello "
-    assert decoder.feed(_ids("wor")) == ""
-    assert decoder.feed(_ids("ld ")) == "world "
+    assert decoder.feed(_ids("wor")) == "wor"
+    assert decoder.feed(_ids("ld\n")) == "ld\n"
+    assert decoder._token_cache == []
+    assert decoder.feed(_ids("next")) == "next"
     assert decoder.finish() == ""
 
 
@@ -1259,6 +1554,95 @@ def test_incremental_token_decoder_flushes_think_close_without_waiting_for_space
     assert decoder.feed(_ids("reasoning ")) == "reasoning "
     assert decoder.feed(_ids("</think>")) == "</think>"
     assert decoder.feed(_ids("Answer ")) == "Answer "
+
+
+def test_incremental_token_decoder_releases_whitespace_free_run_per_token():
+    # Streamwar 2026-08-19: whitespace-free runs (table separator rows,
+    # long URLs, minified code/JSON) froze the visible stream under the
+    # old whitespace-boundary policy — 150-880 ms per line measured on
+    # the shipped build. Every token boundary must now release its text
+    # immediately; nothing may be held back.
+    decoder = _IncrementalTokenDecoder(TinyTokenizer())
+    run = "|" + "-" * 200
+    emitted = []
+    for ch in run:
+        emitted.append(decoder.feed(_ids(ch)))
+    assert all(piece == ch for piece, ch in zip(emitted, run))
+    assert "".join(emitted) == run
+    assert decoder.finish() == ""
+
+
+def test_incremental_token_decoder_cache_stays_bounded_on_long_line():
+    # One endless line (minified JSON tool arguments) must not regrow the
+    # token cache: 2026-08-18 found truncation silently no-op'ing, making
+    # every feed() re-decode a growing cache — O(n^2) tokenizer work on
+    # the agentic hot path. The tail ladder keeps it bounded.
+    decoder = _IncrementalTokenDecoder(TinyTokenizer())
+    run = "|" + "-" * 5000
+    emitted = []
+    for ch in run:
+        emitted.append(decoder.feed(_ids(ch)))
+    assert (
+        len(decoder._token_cache)
+        <= decoder._CACHE_TRUNCATE_THRESHOLD + decoder._CACHE_KEEP_TOKENS
+    ), f"cache grew to {len(decoder._token_cache)} tokens"
+    flushed = "".join(emitted)
+    assert flushed == run
+    assert decoder.finish() == ""
+
+
+def test_stream_cancellation_metric_records_producer_census():
+    # The founder's 2026-08-18 stutter run was client-cancelled and its
+    # record carried NO gap census — the one request that mattered was
+    # unmeasured. Cancelled records must carry the census computed from
+    # whatever token_times accumulated before the cancel.
+    state = SimpleNamespace(
+        last_metrics=[],
+        requests_cancelled=0,
+        last_request_at=0.0,
+        args=SimpleNamespace(request_log_jsonl="off", port=0),
+        dashboard=SimpleNamespace(
+            bus=SimpleNamespace(publish=lambda event: None),
+            lifetime=SimpleNamespace(record_cancellation=lambda: None),
+        ),
+    )
+    started = time.perf_counter() - 2.0
+    token_times = [started + 0.1 + 0.05 * i for i in range(20)]
+    token_times.append(token_times[-1] + 0.5)  # one 500ms producer gap
+    _record_stream_cancellation_metric(
+        state,
+        response_id="resp_cancel",
+        session_id="sess",
+        prompt_tokens=10,
+        streamed_completion_tokens=len(token_times),
+        stream_started_s=started,
+        reason="client_disconnected",
+        request_observability={},
+        client_disconnected=True,
+        mlx_finalize_scope="test",
+        token_times=token_times,
+    )
+    record = state.last_metrics[-1]
+    assert record["request_cancelled"] is True
+    assert record["producer_gap_ms_max"] >= 500.0 - 1.0
+    assert record["producer_gaps_over_200ms"] == 1
+    assert record["producer_gap_ms_p95"] is not None
+    assert record["sliding_decode_tok_s_first_32"] is not None
+    assert record["decode_tok_s"] > 0
+
+
+def test_incremental_token_decoder_escape_preserves_close_tag_flush():
+    # The escape must not break the reasoning close-tag fast path: a
+    # long no-space run followed by </think> still flushes the tag the
+    # moment it completes, and the total stream stays byte-identical.
+    decoder = _IncrementalTokenDecoder(TinyTokenizer())
+    run = "x" * 150 + "</think>"
+    emitted = []
+    for ch in run:
+        emitted.append(decoder.feed(_ids(ch)))
+    flushed = "".join(emitted)
+    assert flushed.endswith("</think>")
+    assert flushed + decoder.finish() == run
 
 
 def test_thinking_stream_splitter_keeps_reasoning_out_of_content():
@@ -1562,6 +1946,98 @@ def test_thinking_stream_splitter_keeps_orphan_parameter_markup_out_of_reasoning
     assert "</tool_call>" in content
 
 
+def _no_tools_splitter():
+    return _ThinkingContentStreamSplitter(
+        thinking_enabled=False,
+        suppress_orphan_tool_markup=True,
+    )
+
+
+def _collect_content(splitter, pieces):
+    chunks = []
+    for piece in pieces:
+        chunks.extend(splitter.feed(piece))
+    chunks.extend(splitter.finish())
+    return "".join(text for field, text in chunks if field == "content")
+
+
+def test_no_tools_stream_still_suppresses_closed_tool_spans_chunked():
+    content = _collect_content(
+        _no_tools_splitter(),
+        [
+            "Let me check. <tool",
+            '_call>\n{"name": "web_search"}\n</tool',
+            "_call> The answer is 4.",
+        ],
+    )
+    assert "tool_call" not in content
+    assert "web_search" not in content
+    assert "The answer is 4." in content
+
+
+def test_no_tools_stream_unclosed_span_salvages_prose_at_finish():
+    """The 2.7.1 turn-truncation known issue: an unclosed opener used to eat
+    the rest of the turn. The structural payload stays hidden, the prose the
+    model wrote after it survives."""
+
+    content = _collect_content(
+        _no_tools_splitter(),
+        [
+            "<tool_call>\n",
+            '{"name": "web_search", "arguments": {"query": "population"}}\n',
+            "Actually, I do not need a tool. The population is 39 million.",
+        ],
+    )
+    assert "web_search" not in content
+    assert "tool_call" not in content
+    assert "The population is 39 million." in content
+
+
+def test_no_tools_stream_unclosed_pure_payload_stays_hidden():
+    content = _collect_content(
+        _no_tools_splitter(),
+        [
+            "<function=web_search>\n",
+            '<parameter=query>weather</parameter>\n',
+        ],
+    )
+    assert content.strip() == ""
+
+
+def test_no_tools_stream_leaves_code_fenced_tool_examples_untouched():
+    """Users legitimately ask for tool-call syntax examples; fenced content
+    must stream through verbatim, matching the non-stream stripper."""
+
+    pieces = [
+        "Here is the syntax:\n``",
+        "`xml\n<tool_call>\n{\"name\": \"search\"}\n</tool_call>\n``",
+        "`\nThat is the format.",
+    ]
+    content = _collect_content(_no_tools_splitter(), pieces)
+    assert "<tool_call>" in content
+    assert '{"name": "search"}' in content
+    assert "That is the format." in content
+
+
+def test_sanitize_orphan_span_interior_variants():
+    from mtplx.server.openai import _sanitize_orphan_span_interior
+
+    # Payload + prose: prose survives, structure does not.
+    salvaged = _sanitize_orphan_span_interior(
+        '<tool_call>\n{"name": "x", "arguments": {"a": 1}}\nReal answer.'
+    )
+    assert salvaged == "Real answer."
+    # Pure payload: nothing survives.
+    assert (
+        _sanitize_orphan_span_interior('<function=web_search>\n{"q": "x"}')
+        == ""
+    )
+    # Stray opener with prose on later lines survives.
+    assert "keep me" in _sanitize_orphan_span_interior(
+        "<tool_call\nkeep me"
+    )
+
+
 def test_thinking_stream_splitter_strips_generated_chat_template_sentinels():
     splitter = _ThinkingContentStreamSplitter(thinking_enabled=True)
 
@@ -1756,8 +2232,12 @@ def test_generation_params_marks_server_cap_when_configured(monkeypatch):
     assert limits["context_cap_applied"] is False
 
 
-def test_uncapped_repetition_stop_only_enables_for_uncapped_requests(monkeypatch):
+def test_repetition_stop_arms_for_capped_requests(monkeypatch):
+    """#311: the literal-repetition stop arms on EVERY request. A client cap
+    is a token budget, not a licence to loop — Pi's maxTokens=8192 request
+    burned 5,803 '!' tokens with the old uncapped-only predicate."""
     monkeypatch.delenv("MTPLX_UNCAPPED_REPETITION_STOP", raising=False)
+    monkeypatch.delenv("MTPLX_REPETITION_STOP", raising=False)
     assert (
         _uncapped_repetition_stop_enabled(
             {
@@ -1767,6 +2247,7 @@ def test_uncapped_repetition_stop_only_enables_for_uncapped_requests(monkeypatch
         )
         is True
     )
+    # Capped request (the #311 shape): armed.
     assert (
         _uncapped_repetition_stop_enabled(
             {
@@ -1774,8 +2255,9 @@ def test_uncapped_repetition_stop_only_enables_for_uncapped_requests(monkeypatch
                 "server_max_response_tokens": None,
             }
         )
-        is False
+        is True
     )
+    # Server-capped: armed.
     assert (
         _uncapped_repetition_stop_enabled(
             {
@@ -1783,8 +2265,9 @@ def test_uncapped_repetition_stop_only_enables_for_uncapped_requests(monkeypatch
                 "server_max_response_tokens": 4096,
             }
         )
-        is False
+        is True
     )
+    # Both env names disarm; the new one wins over the historical one.
     monkeypatch.setenv("MTPLX_UNCAPPED_REPETITION_STOP", "off")
     assert (
         _uncapped_repetition_stop_enabled(
@@ -1795,6 +2278,48 @@ def test_uncapped_repetition_stop_only_enables_for_uncapped_requests(monkeypatch
         )
         is False
     )
+    monkeypatch.setenv("MTPLX_REPETITION_STOP", "1")
+    assert (
+        _uncapped_repetition_stop_enabled(
+            {
+                "uncapped_response_requested": False,
+                "server_max_response_tokens": 4096,
+            }
+        )
+        is True
+    )
+
+
+def test_repetition_stop_detects_single_token_punctuation_loop():
+    """#311's live shape: a 1-token block ('!') repeated to a capped budget."""
+    config = RepetitionStopConfig(
+        enabled=True,
+        min_tokens=16,
+        min_repeated_tokens=12,
+        min_repeats=4,
+        min_block_tokens=1,
+        max_block_tokens=4,
+    )
+    tokens = [201, 202, 203, 204] + [33] * 14
+    detected = _detect_repeated_token_suffix(tokens, config)
+    assert detected is not None
+    assert detected.block_tokens == 1
+    assert detected.repeated_tokens == 14
+    assert detected.trim_start == 4
+
+
+def test_repetition_stop_pregate_skips_impossible_suffixes():
+    """The O(1) pre-gate must not change the no-fire verdict on clean text."""
+    config = RepetitionStopConfig(
+        enabled=True,
+        min_tokens=12,
+        min_repeated_tokens=8,
+        min_repeats=4,
+        min_block_tokens=2,
+        max_block_tokens=4,
+    )
+    # Strictly increasing tokens: no period p has tokens[-1] == tokens[-1-p].
+    assert _detect_repeated_token_suffix(list(range(100, 140)), config) is None
 
 
 def test_repetition_stop_detects_and_trims_exact_token_loop():
@@ -2189,3 +2714,238 @@ def test_usage_payload_uses_repaired_completion_tokens():
         "completion_tokens": 34,
         "total_tokens": 46,
     }
+
+
+def test_marathon_postcommit_protection_env_resolution(monkeypatch):
+    """Marathon postcommit protection: off by default, threshold+wait armed
+    by env (the chess-gauntlet 79s re-prefill wall follow-up)."""
+    from mtplx.engine_session import (
+        _marathon_postcommit_protect_tokens,
+        _marathon_postcommit_wait_s,
+    )
+
+    monkeypatch.delenv("MTPLX_POSTCOMMIT_MARATHON_PROTECT_TOKENS", raising=False)
+    monkeypatch.delenv("MTPLX_POSTCOMMIT_MARATHON_WAIT_S", raising=False)
+    assert _marathon_postcommit_protect_tokens() == 0  # default OFF
+    assert _marathon_postcommit_wait_s() == 30.0
+    monkeypatch.setenv("MTPLX_POSTCOMMIT_MARATHON_PROTECT_TOKENS", "8000")
+    monkeypatch.setenv("MTPLX_POSTCOMMIT_MARATHON_WAIT_S", "12.5")
+    assert _marathon_postcommit_protect_tokens() == 8000
+    assert _marathon_postcommit_wait_s() == 12.5
+    monkeypatch.setenv("MTPLX_POSTCOMMIT_MARATHON_PROTECT_TOKENS", "garbage")
+    monkeypatch.setenv("MTPLX_POSTCOMMIT_MARATHON_WAIT_S", "-3")
+    assert _marathon_postcommit_protect_tokens() == 0
+    assert _marathon_postcommit_wait_s() == 30.0
+
+
+def test_anthropic_usage_excludes_cache_read_from_input_tokens():
+    # OpenAI prompt_tokens is the grand total (cached is a subset); Anthropic input_tokens and
+    # cache_read_input_tokens are disjoint. On a prefix-cache hit, input_tokens must be the
+    # non-cached remainder so Claude Code / Pi context + auto-compaction math does not double-count.
+    usage = {
+        "prompt_tokens": 44202,
+        "completion_tokens": 128,
+        "prompt_tokens_details": {"cached_tokens": 42154},
+    }
+    out = _anthropic_usage_from_openai_usage(usage)
+    assert out["cache_read_input_tokens"] == 42154
+    assert out["input_tokens"] == 44202 - 42154  # 2048, not the full 44202
+    assert out["output_tokens"] == 128
+    # disjoint Anthropic fields reconstruct the OpenAI grand total
+    assert out["input_tokens"] + out["cache_read_input_tokens"] == usage["prompt_tokens"]
+
+
+def test_anthropic_usage_no_cache_hit_passes_prompt_through():
+    out = _anthropic_usage_from_openai_usage(
+        {"prompt_tokens": 1000, "completion_tokens": 10}
+    )
+    assert out["input_tokens"] == 1000
+    assert out["cache_read_input_tokens"] == 0
+
+
+def test_anthropic_usage_clamps_cached_over_prompt():
+    out = _anthropic_usage_from_openai_usage(
+        {"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 999}}
+    )
+    assert out["input_tokens"] == 0
+    assert out["cache_read_input_tokens"] == 100
+
+
+# --- #441: Anthropic image blocks reach the vision tower ---------------------
+
+_TINY_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA"
+    "60e6kgAAAABJRU5ErkJggg=="
+)
+
+
+def _anthropic_image_block(data: str = _TINY_PNG_B64) -> dict:
+    return {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": data},
+    }
+
+
+def test_anthropic_text_only_content_stays_a_plain_string():
+    from mtplx.server.openai import (
+        _anthropic_content_to_chat_content,
+        _anthropic_content_to_text,
+    )
+
+    content = [
+        {"type": "text", "text": "hello"},
+        {"type": "thinking", "thinking": " pondering"},
+        {"type": "tool_result", "content": [{"type": "text", "text": " world"}]},
+    ]
+
+    rendered = _anthropic_content_to_chat_content(content)
+
+    assert isinstance(rendered, str)
+    assert rendered == _anthropic_content_to_text(content)
+    assert _anthropic_content_to_chat_content("plain") == "plain"
+    assert _anthropic_content_to_chat_content(None) == ""
+
+
+def test_anthropic_image_blocks_become_image_url_parts_in_order():
+    from mtplx.server.openai import _anthropic_content_to_chat_content
+
+    parts = _anthropic_content_to_chat_content(
+        [
+            {"type": "text", "text": "What is "},
+            {"type": "text", "text": "in this image?"},
+            _anthropic_image_block(),
+            {"type": "text", "text": "Answer briefly."},
+            {"type": "image", "source": {"type": "url", "url": "https://x/y.png"}},
+        ]
+    )
+
+    assert parts == [
+        {"type": "text", "text": "What is in this image?"},
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{_TINY_PNG_B64}"},
+        },
+        {"type": "text", "text": "Answer briefly."},
+        {"type": "image_url", "image_url": {"url": "https://x/y.png"}},
+    ]
+
+
+def test_anthropic_malformed_image_block_keeps_the_text_rendering():
+    from mtplx.server.openai import (
+        _anthropic_content_to_chat_content,
+        _anthropic_content_to_text,
+        _anthropic_image_block_to_openai_part,
+    )
+
+    broken = [
+        {"type": "image", "source": {"type": "base64", "data": ""}},
+        {"type": "image", "source": "not-a-dict"},
+        {"type": "image"},
+        {"type": "image", "source": {"type": "file", "file_id": "f1"}},
+    ]
+    for block in broken:
+        assert _anthropic_image_block_to_openai_part(block) is None
+
+    rendered = _anthropic_content_to_chat_content(broken)
+
+    assert isinstance(rendered, str)
+    assert rendered == _anthropic_content_to_text(broken)
+
+
+def test_anthropic_user_message_with_image_carries_parts_to_the_vision_path():
+    from mtplx.server.openai import (
+        AnthropicMessage,
+        _anthropic_message_to_chat_messages,
+        _vision_extract_and_flatten,
+        _VISION_PLACEHOLDER,
+    )
+
+    messages = _anthropic_message_to_chat_messages(
+        AnthropicMessage(
+            role="user",
+            content=[
+                {"type": "text", "text": "Read this: "},
+                _anthropic_image_block(),
+            ],
+        )
+    )
+
+    assert len(messages) == 1
+    assert messages[0].role == "user"
+    assert isinstance(messages[0].content, list)
+
+    flattened, images = _vision_extract_and_flatten(messages)
+
+    assert len(images) == 1
+    assert images[0][:8] == b"\x89PNG\r\n\x1a\n"
+    assert flattened[0].content == "Read this: " + _VISION_PLACEHOLDER
+
+
+def test_anthropic_tool_result_image_stays_an_image_on_the_tool_message():
+    """Claude Code's Read tool returns an image file as an ``image`` block
+    nested inside ``tool_result``; it must reach the tool message as a part,
+    not as base64 prose."""
+    from mtplx.server.openai import (
+        AnthropicMessage,
+        _anthropic_message_to_chat_messages,
+        _vision_extract_and_flatten,
+        _VISION_PLACEHOLDER,
+    )
+
+    messages = _anthropic_message_to_chat_messages(
+        AnthropicMessage(
+            role="user",
+            content=[
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [
+                        {"type": "text", "text": "file contents:"},
+                        _anthropic_image_block(),
+                    ],
+                },
+                {"type": "text", "text": "What does it show?"},
+            ],
+        )
+    )
+
+    assert [m.role for m in messages] == ["tool", "user"]
+    assert messages[0].tool_call_id == "toolu_1"
+    assert messages[0].content[0] == {"type": "text", "text": "file contents:"}
+    assert messages[0].content[1]["type"] == "image_url"
+    assert messages[1].content == "What does it show?"
+
+    flattened, images = _vision_extract_and_flatten(messages)
+
+    assert len(images) == 1
+    assert flattened[0].content == "file contents:" + _VISION_PLACEHOLDER
+    assert flattened[1].content == "What does it show?"
+
+
+def test_anthropic_request_with_image_round_trips_to_chat_request():
+    from mtplx.server.openai import (
+        AnthropicMessage,
+        AnthropicMessagesRequest,
+        _anthropic_to_chat_request,
+    )
+
+    request = AnthropicMessagesRequest(
+        model="mtplx",
+        max_tokens=32,
+        messages=[
+            AnthropicMessage(
+                role="user",
+                content=[{"type": "text", "text": "hi"}, _anthropic_image_block()],
+            ),
+            AnthropicMessage(role="assistant", content="hello"),
+            AnthropicMessage(role="user", content="text only"),
+        ],
+    )
+
+    chat = _anthropic_to_chat_request(request)
+
+    assert chat.messages[0].role == "user"
+    assert chat.messages[0].content[0] == {"type": "text", "text": "hi"}
+    assert chat.messages[0].content[1]["type"] == "image_url"
+    assert chat.messages[1].content == "hello"
+    assert chat.messages[2].content == "text only"

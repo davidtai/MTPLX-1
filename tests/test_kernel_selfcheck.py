@@ -8,7 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from mtplx import kernel_selfcheck, nax_verify
+from mtplx import gdn_capture, kernel_selfcheck, nax_verify
 from mtplx.kernel_selfcheck import (
     lane_disabled,
     report_for_health,
@@ -29,6 +29,8 @@ def _clean_selfcheck_state():
 def test_selfcheck_passes_on_this_machine(monkeypatch, dtype, bits) -> None:
     monkeypatch.setenv("MTPLX_NAX_VERIFY", "1")
     monkeypatch.setenv("MTPLX_GQA_PACKED_SDPA", "1")
+    monkeypatch.setenv("MTPLX_NAX_FLASH_ROUTE", "1")
+    monkeypatch.setenv("MTPLX_NAX_TILE_ROUTE", "1")
     report = run_kernel_selfcheck(dtype, bits, 64)
     lanes = report["lanes"]
     checked = {lane: s for lane, s in lanes.items() if s != "skipped"}
@@ -41,6 +43,24 @@ def test_selfcheck_passes_on_this_machine(monkeypatch, dtype, bits) -> None:
     assert lanes["qmm_m4"] == "ok"
     assert lanes["qmm_m6"] == "ok"
     assert lanes["gqa_packed_sdpa"] == "ok"
+    for lane in ("nax_flash_sdpa", "nax_flash_dsplit_sdpa", "nax_tile_sdpa"):
+        assert lanes[lane] == ("ok" if nax_verify.nax_available() else "skipped")
+
+
+def test_nax_attention_selfcheck_failure_is_local_to_its_lane(monkeypatch) -> None:
+    if not nax_verify.nax_available():
+        pytest.skip("NAX hardware/OS unavailable")
+    from mtplx.kernels import sdpa_nax_flash_dsplit as module
+
+    monkeypatch.setenv("MTPLX_NAX_VERIFY", "0")
+    monkeypatch.setenv("MTPLX_GQA_PACKED_SDPA", "1")
+    monkeypatch.setenv("MTPLX_NAX_FLASH_ROUTE", "1")
+    monkeypatch.setattr(module, "sdpa_nax_flash_dsplit", lambda **kwargs: None)
+    report = run_kernel_selfcheck(mx.bfloat16, 4, 64)
+    assert report["lanes"]["nax_flash_dsplit_sdpa"] == "fallback"
+    assert lane_disabled("nax_flash_dsplit_sdpa")
+    assert report["lanes"]["nax_flash_sdpa"] == "ok"
+    assert report["lanes"]["gqa_packed_sdpa"] == "ok"
 
 
 def test_selfcheck_mismatch_disables_lane_and_surfaces_in_health(monkeypatch) -> None:
@@ -135,7 +155,11 @@ def test_selfcheck_enabled_gating(monkeypatch) -> None:
     monkeypatch.delenv("MTPLX_KERNEL_SELFCHECK", raising=False)
     monkeypatch.delenv("MTPLX_NAX_VERIFY", raising=False)
     monkeypatch.delenv("MTPLX_GQA_PACKED_SDPA", raising=False)
+    monkeypatch.delenv("MTPLX_FUSE_GDN_POST_CONV", raising=False)
     assert selfcheck_enabled() is False
+    monkeypatch.setenv("MTPLX_FUSE_GDN_POST_CONV", "1")
+    assert selfcheck_enabled() is True
+    monkeypatch.delenv("MTPLX_FUSE_GDN_POST_CONV", raising=False)
     monkeypatch.setenv("MTPLX_NAX_VERIFY", "1")
     assert selfcheck_enabled() is True
     monkeypatch.setenv("MTPLX_KERNEL_SELFCHECK", "0")
@@ -145,143 +169,157 @@ def test_selfcheck_enabled_gating(monkeypatch) -> None:
     assert selfcheck_enabled() is True
 
 
+def test_postconv_fusion_has_a_fail_closed_selfcheck_lane(monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_FUSE_GDN_POST_CONV", "1")
+    monkeypatch.setattr(
+        kernel_selfcheck,
+        "_check_gdn_postconv_inline_g",
+        lambda mx_module, dtype: 0.0,
+        raising=False,
+    )
+    report = run_kernel_selfcheck(mx.bfloat16, 4, 64)
+    assert report["lanes"]["gdn_postconv_inline_g"] == "ok"
+
+
+def test_gdn_postconv_selfcheck_invokes_m1_and_m2(monkeypatch) -> None:
+    real_m1 = gdn_capture._a3b_compiled_target_gdn_postconv_m1_tgy4
+    real_m2 = gdn_capture._a3b_compiled_target_gdn_postconv_m2_tgy4
+    calls: list[int] = []
+
+    def m1(*args, **kwargs):
+        calls.append(1)
+        return real_m1(*args, **kwargs)
+
+    def m2(*args, **kwargs):
+        calls.append(2)
+        return real_m2(*args, **kwargs)
+
+    monkeypatch.setattr(gdn_capture, "_a3b_compiled_target_gdn_postconv_m1_tgy4", m1)
+    monkeypatch.setattr(gdn_capture, "_a3b_compiled_target_gdn_postconv_m2_tgy4", m2)
+
+    # Bit-exact (0.0) on mlx 0.31.2; mlx 0.32.0 shifted accumulation order
+    # somewhere in the stock capture vs route pair by ~1.1e-8. The production
+    # gate for this lane tolerates 0.03125; keep the test far tighter so a
+    # genuinely broken kernel still fails, without pinning MLX's internal
+    # reduction order.
+    assert kernel_selfcheck._check_gdn_postconv_inline_g(mx, mx.bfloat16) <= 1e-6
+    assert calls == [1, 2]
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ("m1_output", "m1_state", "m2_output", "m2_state"),
+)
+def test_postconv_selfcheck_rejects_output_or_captured_state_corruption(
+    monkeypatch,
+    corruption,
+) -> None:
+    observed_states = []
+    mode = {"value": "exact"}
+
+    def stock(q, k, v, a, b, state, mask, gdn):
+        mx.eval(state)
+        assert bool(mx.all(mx.isfinite(state)).item())
+        assert float(mx.abs(state).max()) > 0.0
+        observed_states.append(state)
+        logical_m = int(q.shape[1])
+        return (
+            mx.zeros((1, logical_m, 32, 128), dtype=mx.bfloat16),
+            mx.zeros((1, logical_m, 32, 128, 128), dtype=mx.float32),
+        )
+
+    def candidate(logical_m, conv_out, a, b, state, *, A_log, dt_bias):
+        out = mx.zeros((1, logical_m, 32, 128), dtype=mx.bfloat16)
+        states = mx.zeros((1, logical_m, 32, 128, 128), dtype=mx.float32)
+        if mode["value"] == f"m{logical_m}_output":
+            out = out + 0.125
+        if mode["value"] == f"m{logical_m}_state":
+            states = states + 0.125
+        return out, states
+
+    def m1(*args, **kwargs):
+        return candidate(1, *args, **kwargs)
+
+    def m2(*args, **kwargs):
+        return candidate(2, *args, **kwargs)
+
+    monkeypatch.setattr(gdn_capture, "_stock_gated_delta_capture", stock)
+    monkeypatch.setattr(
+        gdn_capture,
+        "_a3b_compiled_target_gdn_postconv_m1_tgy4",
+        m1,
+    )
+    monkeypatch.setattr(
+        gdn_capture,
+        "_a3b_compiled_target_gdn_postconv_m2_tgy4",
+        m2,
+    )
+
+    assert kernel_selfcheck._check_gdn_postconv_inline_g(mx, mx.bfloat16) == 0.0
+    mode["value"] = corruption
+    assert kernel_selfcheck._check_gdn_postconv_inline_g(mx, mx.bfloat16) > 0.03125
+    mx.eval(*observed_states)
+    assert len(observed_states) == 4
+    assert all(
+        bool(mx.array_equal(observed_states[0], state).item())
+        for state in observed_states[1:]
+    )
+
+
+def test_gdn_postconv_m2_primary_state_continues_exactly_through_m1() -> None:
+    conv_values = mx.arange(3 * 8192, dtype=mx.float32).reshape(1, 3, 8192)
+    conv_rows = (mx.sin(conv_values * 0.013) * 0.5).astype(mx.bfloat16)
+    gate_values = mx.arange(3 * 32, dtype=mx.float32).reshape(1, 3, 32)
+    a_rows = (mx.sin(gate_values * 0.11) * 0.5).astype(mx.bfloat16)
+    b_rows = (mx.cos(gate_values * 0.07) * 0.5).astype(mx.bfloat16)
+    state_values = mx.arange(32 * 128 * 128, dtype=mx.float32).reshape(
+        1, 32, 128, 128
+    )
+    state = mx.sin(state_values * 0.001) * 0.1
+    A_log = mx.linspace(0.0, 2.0, 32).astype(mx.bfloat16)
+    dt_bias = mx.linspace(-5.0, -3.0, 32).astype(mx.bfloat16)
+
+    conv_ad = conv_rows[:, :2]
+    a_ad = a_rows[:, :2]
+    b_ad = b_rows[:, :2]
+    conv_ac = mx.stack([conv_rows[:, 0], conv_rows[:, 2]], axis=1)
+    a_ac = mx.stack([a_rows[:, 0], a_rows[:, 2]], axis=1)
+    b_ac = mx.stack([b_rows[:, 0], b_rows[:, 2]], axis=1)
+    conv_c = conv_rows[:, 2:3]
+    a_c = a_rows[:, 2:3]
+    b_c = b_rows[:, 2:3]
+
+    out_ad, states_ad = gdn_capture._a3b_compiled_target_gdn_postconv_m2_tgy4(
+        conv_ad,
+        a_ad,
+        b_ad,
+        state,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+    out_ac, states_ac = gdn_capture._a3b_compiled_target_gdn_postconv_m2_tgy4(
+        conv_ac,
+        a_ac,
+        b_ac,
+        state,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+    out_c, states_c = gdn_capture._a3b_compiled_target_gdn_postconv_m1_tgy4(
+        conv_c,
+        a_c,
+        b_c,
+        states_ad[:, 0, :, :, :],
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+    mx.eval(out_ad, states_ad, out_ac, states_ac, out_c, states_c)
+
+    assert kernel_selfcheck._max_abs_diff(mx, out_c[:, 0], out_ac[:, 1]) == 0.0
+    assert kernel_selfcheck._max_abs_diff(mx, states_c[:, 0], states_ac[:, 1]) == 0.0
+
+
 def test_health_payload_before_any_run_is_safe() -> None:
     payload = report_for_health()
     assert payload == {"ran": False}
     json.dumps(payload)
-
-
-# --- Routed expert bank gather lane (expert-streaming specs) ------------------
-#
-# These use only stock mx.gather_qmm / mx.quantized_matmul / mx.quantize, so
-# they run on both the GPU and the CPU (unlike the nax/gqa Metal lanes above,
-# which are GPU-only). They deliberately leave MTPLX_NAX_VERIFY /
-# MTPLX_GQA_PACKED_SDPA unset so only the expert_gather lane engages.
-
-
-@pytest.mark.parametrize(
-    "spec_attr,expected_bits,expected_group_size",
-    [
-        ("HY3_EXPERT_OQ2E", 2, 128),
-        ("HY3_EXPERT_Q2", 2, 64),
-        ("HY3_EXPERT_ONLY_Q4", 4, 64),
-    ],
-)
-def test_expert_signature_derived_from_spec(
-    spec_attr, expected_bits, expected_group_size
-) -> None:
-    import mtplx.expert_streaming_models as esm
-
-    spec = getattr(esm, spec_attr)
-    sig = kernel_selfcheck._expert_quant_signature(spec)
-    assert sig == (mx.bfloat16, expected_bits, expected_group_size)
-
-
-def test_expert_signature_none_without_spec() -> None:
-    assert kernel_selfcheck._expert_quant_signature(None) is None
-
-
-def test_expert_signature_none_for_shadow_codec() -> None:
-    # Shadow-codec (q1 lane) banks do not run the affine gather_qmm path, so
-    # they must yield no expert signature and add no gather lane.
-    from mtplx.expert_streaming_models import GLM52_EXPERT_Q1T
-
-    assert GLM52_EXPERT_Q1T.expert_codec != "affine"
-    assert kernel_selfcheck._expert_quant_signature(GLM52_EXPERT_Q1T) is None
-
-
-@pytest.mark.parametrize("group_size", [64, 128], ids=["gs64", "gs128"])
-def test_expert_gather_lane_passes_on_healthy_bank(group_size) -> None:
-    report = run_kernel_selfcheck(
-        mx.bfloat16, 4, 64, expert_signature=(mx.bfloat16, 2, group_size)
-    )
-    assert report["lanes"]["expert_gather"] == "ok"
-    assert report["dmax"]["expert_gather"] <= kernel_selfcheck._QMM_TOLERANCE
-    assert not lane_disabled("expert_gather")
-
-
-def test_expert_gather_lane_fails_closed_on_corrupt_kernel(monkeypatch) -> None:
-    original = mx.gather_qmm
-
-    def corrupted(*args, **kwargs):
-        return original(*args, **kwargs) + 1000.0
-
-    monkeypatch.setattr(mx, "gather_qmm", corrupted)
-    report = run_kernel_selfcheck(
-        mx.bfloat16, 4, 64, expert_signature=(mx.bfloat16, 2, 128)
-    )
-    assert report["lanes"]["expert_gather"] == "fallback"
-    assert lane_disabled("expert_gather")
-
-    health = report_for_health()
-    assert health["ran"] is True
-    assert health["expert_gather"] == "fallback"
-    json.dumps(health)  # JSON primitives only
-
-
-def test_expert_gather_lane_fails_closed_on_wrong_group_size() -> None:
-    # A group_size that does not divide the synthetic bank's K raises inside
-    # the probe; the recorder catches it as a hard fallback (dmax == inf),
-    # exactly as a broken resident lane surfaces.
-    report = run_kernel_selfcheck(
-        mx.bfloat16, 4, 64, expert_signature=(mx.bfloat16, 2, 96)
-    )
-    assert report["lanes"]["expert_gather"] == "fallback"
-    assert report["dmax"]["expert_gather"] == float("inf")
-    assert lane_disabled("expert_gather")
-
-
-def test_expert_gather_check_mismatched_group_size_raises() -> None:
-    # The literal "wrong group_size fed to the check": bank quantized at gs=64,
-    # gather run at gs=128. gather_qmm's weight/scales contract fails closed.
-    with pytest.raises(Exception):
-        y = kernel_selfcheck._check_expert_gather(
-            mx, mx.bfloat16, 2, 128, bank_group_size=64
-        )
-        mx.eval(y)
-
-
-def test_no_expert_lane_without_signature() -> None:
-    # Non-streaming path: no expert_signature -> the report carries no expert
-    # lane at all (not even "skipped"), keeping dense loads byte-identical.
-    report = run_kernel_selfcheck(mx.bfloat16, 4, 64)
-    assert "expert_gather" not in report["lanes"]
-    assert "expert_gather" not in report["dmax"]
-    assert not lane_disabled("expert_gather")
-
-
-def test_maybe_run_dense_model_adds_no_expert_lane(monkeypatch) -> None:
-    monkeypatch.setenv("MTPLX_KERNEL_SELFCHECK", "1")
-    monkeypatch.delenv("MTPLX_NAX_VERIFY", raising=False)
-    monkeypatch.delenv("MTPLX_GQA_PACKED_SDPA", raising=False)
-    report = kernel_selfcheck.maybe_run_model_selfcheck(object())
-    assert report is not None
-    assert "expert_gather" not in report["lanes"]
-    assert not lane_disabled("expert_gather")
-
-
-def test_maybe_run_streaming_spec_adds_expert_lane(monkeypatch) -> None:
-    monkeypatch.setenv("MTPLX_KERNEL_SELFCHECK", "1")
-    monkeypatch.delenv("MTPLX_NAX_VERIFY", raising=False)
-    monkeypatch.delenv("MTPLX_GQA_PACKED_SDPA", raising=False)
-    from mtplx.expert_streaming_models import HY3_EXPERT_OQ2E
-
-    report = kernel_selfcheck.maybe_run_model_selfcheck(
-        object(), expert_spec=HY3_EXPERT_OQ2E
-    )
-    assert report is not None
-    assert report["lanes"]["expert_gather"] == "ok"
-    assert not lane_disabled("expert_gather")
-    assert report_for_health()["expert_gather"] == "ok"
-
-
-def test_maybe_run_disabled_skips_expert_lane(monkeypatch) -> None:
-    monkeypatch.setenv("MTPLX_KERNEL_SELFCHECK", "0")
-    from mtplx.expert_streaming_models import HY3_EXPERT_OQ2E
-
-    assert (
-        kernel_selfcheck.maybe_run_model_selfcheck(
-            object(), expert_spec=HY3_EXPERT_OQ2E
-        )
-        is None
-    )

@@ -10,6 +10,21 @@ mtplx doctor --json
 
 `doctor` should report missing MLX as an actionable runtime dependency issue, not as a traceback. Help, inspect, and init should still work.
 
+## Downloads Fail: huggingface.co Unreachable
+
+Model downloads go through `huggingface_hub`, which honors `HF_ENDPOINT`. On
+networks where huggingface.co is blocked, point it at a mirror:
+
+```bash
+HF_ENDPOINT=https://hf-mirror.com mtplx pull Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed
+```
+
+The same variable applies to `mtplx start` / `mtplx serve` when they pull on
+first use. In the app, set Settings → Advanced → HF download mirror; the app
+passes it to the daemon and to every pull, and your Hugging Face token is
+never sent to a mirror. `mtplx pull` names this knob in its hint whenever a
+download fails for a network reason and no endpoint is configured.
+
 ## Model Refuses To Run
 
 Run:
@@ -18,11 +33,15 @@ Run:
 mtplx inspect model --model /path/or/repo --json
 ```
 
-The model must be Tier 1 verified for normal v0.1 runs. Architecture-compatible unverified models require an explicit unsafe override and cannot be used for release claims.
+The model must be `verified` tier for the default path (`mtplx inspect` prints the tier). Architecture-compatible unverified models load with an explicit unverified label and cannot be used for release claims.
 
 ## Slow Long Responses
 
-This is a known v0.1 caveat. Use the benchmark output and profile name when filing an issue. Do not compare `--max` diagnostic runs against no-fan product claims.
+This is a known caveat. Use the benchmark output and profile name when filing an issue. Do not compare `--max` diagnostic runs against no-fan product claims.
+
+## Model Repeats Itself / Loops
+
+If an agent or chat session degenerates into repeating the same phrase or tool call, raise the presence penalty. It is available per request (`presence_penalty` in the OpenAI payload), as a server default (`--default-presence-penalty 1.0` on `start`/`serve`), live via `mtplx settings set`, or with the Presence Penalty dial in the app and dashboard. Values around 0.5–1.5 break repetition; 0 (the default) is an exact no-op. Qwen recommends keeping penalties at 0 for coding and tool-calling work, so prefer fixing the prompt or context before reaching for the dial in agent flows.
 
 ## Model Repeats Itself / Loops
 

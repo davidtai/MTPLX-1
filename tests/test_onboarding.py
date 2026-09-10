@@ -11,8 +11,54 @@ import builtins
 import json
 from pathlib import Path
 
-from mtplx.profiles import DEFAULT_FP16_HF_MODEL_ID
+import pytest
+
+from mtplx import default_models as default_models_module
+from mtplx.default_models import QWEN38_FP16_SUFFIX, QWEN38_OPTIMIZED_SPEED_MODEL_ENV
+from mtplx.profiles import (
+    DEFAULT_FP16_HF_MODEL_ID,
+    QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+)
 from mtplx.ui import onboarding
+
+
+@pytest.fixture(autouse=True)
+def _no_installed_qwen38(monkeypatch):
+    # Pin the public policy: a complete local Qwen 3.8 build on this Mac is
+    # legitimately preferred ("installed locally"); switch it off here so the
+    # screens resolve the published repos unless a test installs its own.
+    monkeypatch.setenv(QWEN38_OPTIMIZED_SPEED_MODEL_ENV, "off")
+    monkeypatch.setattr(default_models_module, "_QWEN38_OPTIMIZED_SPEED_FP16_LOCAL_CANDIDATES", ())
+
+
+def _select_rows(monkeypatch, *titles: str) -> None:
+    """Answer the numbered model screen by row title, not by position.
+
+    The row list depends on the machine (installed models, chip tier, memory
+    tier, the Qwen 3.8 line-up), so tests name what a user would read on
+    screen; free-text prompts (repo ids, paths) still come from ``input``.
+    """
+
+    wanted = list(titles)
+    panels: list[list[tuple[str, str, str]]] = []
+    real_panel = onboarding._step_panel
+
+    def fake_panel(*, step, total, title, options):
+        panels.append(list(options))
+        return real_panel(step=step, total=total, title=title, options=options)
+
+    def fake_choice(prompt, choices, default=None):
+        if not wanted:
+            raise AssertionError(f"unexpected numbered prompt {prompt!r} with choices {choices}")
+        want = wanted.pop(0)
+        options = panels[-1] if panels else []
+        for number, title, _detail in options:
+            if title.startswith(want) or want in title:
+                return number
+        raise AssertionError(f"row {want!r} not offered; rows: {[o[1] for o in options]}")
+
+    monkeypatch.setattr(onboarding, "_step_panel", fake_panel)
+    monkeypatch.setattr(onboarding, "_prompt_choice", fake_choice)
 
 
 def test_state_load_returns_none_when_missing(tmp_path, monkeypatch):
@@ -44,8 +90,70 @@ def test_state_round_trip(tmp_path, monkeypatch):
         json.load(handle)
 
 
+def _pin_modern_64gib(monkeypatch):
+    monkeypatch.setattr(
+        default_models_module,
+        "detect_apple_silicon",
+        lambda: {
+            "apple_silicon_generation": "m5",
+            "chip": "Apple M5 Max",
+            "memory_gib": 64.0,
+        },
+    )
+
+
+def test_normalize_state_states_a_moved_default_once(monkeypatch):
+    """A saved verified default follows the current default; when that moves
+    the model, the panel is told what the user actually ran last time, and
+    the note disappears once saved model and default agree again."""
+
+    _pin_modern_64gib(monkeypatch)
+    last = {"model": "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2", "target": "cli"}
+
+    refreshed = onboarding._normalize_quickstart_state(last)
+
+    assert refreshed["model"] == "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed"
+    assert refreshed["previous_default_model"] == (
+        "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2"
+    )
+    note = onboarding._default_moved_note(refreshed)
+    assert note is not None
+    assert "Qwen3.6-27B-MTPLX-Optimized-Speed-V2" in note
+    assert "moved here" in note
+
+    # Next run: the saved model already is the default -> no note, key dropped.
+    again = onboarding._normalize_quickstart_state(refreshed)
+    assert again["model"] == "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed"
+    assert "previous_default_model" not in again
+    assert onboarding._default_moved_note(again) is None
+
+
+def test_normalize_state_leaves_custom_models_alone(monkeypatch):
+    _pin_modern_64gib(monkeypatch)
+    last = {"model": "someone/custom-model", "target": "cli"}
+    assert onboarding._normalize_quickstart_state(last) is last
+    assert onboarding._default_moved_note(last) is None
+
+
+def test_confirm_same_as_last_prints_the_moved_default_note(monkeypatch, capsys):
+    monkeypatch.setattr(onboarding, "_console", lambda: None)
+    monkeypatch.setattr(builtins, "input", lambda prompt="": "")
+    last = {
+        "model": "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed",
+        "previous_default_model": "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
+        "profile": "turbo",
+        "target": "cli",
+    }
+    assert onboarding.confirm_same_as_last(last) is True
+    out = capsys.readouterr().out
+    assert "Qwen3.8-27B-MTPLX-Optimized-Speed" in out
+    assert "moved here from Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2" in out
+
+
 def test_mode_label_covers_all_modes():
     """Mode labels explain runtime mechanics and hardware-neutral speed gain."""
+    auto = onboarding.mode_label({"profile": onboarding.PROFILE_AUTO, "max": False})
+    assert "Auto" in auto and "engine" in auto
     stable = onboarding.mode_label({"profile": "stable", "max": False})
     legacy = onboarding.mode_label({"profile": "performance-cold", "max": False})
     sustained = onboarding.mode_label({"profile": "sustained", "max": False})
@@ -72,7 +180,8 @@ def test_run_onboarding_screens_with_stubbed_input(monkeypatch, capsys):
     """Walk all four screens with stubbed ``input`` answers.
 
     Screens: model, mode, interface, dashboard-companion (only asked for
-    server-spawning targets; openwebui is one of them).
+    server-spawning targets; openwebui is one of them). The mode default is
+    Auto: no profile pin, engine resolves per model.
     """
     answers = iter(["1", "1", "1", "2"])
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
@@ -80,7 +189,8 @@ def test_run_onboarding_screens_with_stubbed_input(monkeypatch, capsys):
 
     state = onboarding.run_onboarding_screens()
     assert state["model"] == expected_model
-    assert state["profile"] == "sustained"
+    assert state["profile"] == onboarding.PROFILE_AUTO
+    assert "profile_explicit" not in state
     assert state["max"] is False
     assert state["target"] == "openwebui"
     assert state["open_dashboard"] is False
@@ -135,41 +245,48 @@ def test_run_onboarding_screens_uses_fp16_default_when_policy_selects_it(monkeyp
 
     state = onboarding.run_onboarding_screens()
 
-    assert state["model"] == DEFAULT_FP16_HF_MODEL_ID
+    # The fp16 lane resolves the Qwen 3.8 Optimized Speed FP16 sibling
+    # (2026-08-15); the 3.6 FP16 build stays reachable through its own repo.
+    assert state["model"] == QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID
+    assert state["model"] != DEFAULT_FP16_HF_MODEL_ID
     assert state["model_selection"]["variant"] == "fp16"
-    assert state["model_selection"]["precision"] == "FP16"
+    assert state["model_selection"]["precision"].startswith(QWEN38_FP16_SUFFIX)
 
 
 def test_run_onboarding_sustained_max_sets_max_flag_when_thermal_available(monkeypatch):
     """Picking Sustained Max + a working fan controller -> ``profile=sustained,max=True``."""
-    answers = iter(["1", "2", "2"])
+    answers = iter(["1", "3", "2"])
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
     monkeypatch.setattr(onboarding, "ensure_thermal_control_installed", lambda: True)
     state = onboarding.run_onboarding_screens()
     assert state["profile"] == "sustained"
+    assert state["profile_explicit"] is True
     assert state["max"] is True
     assert state["target"] == "terminal"
 
 
 def test_run_onboarding_fan_mode_falls_back_to_sustained_when_thermal_unavailable(monkeypatch):
-    """Picking a fan-backed mode + declined/failed install -> Sustained no-fan."""
-    answers = iter(["1", "3", "2"])
+    """Picking a fan-backed mode (Burst) + declined install -> Sustained no-fan."""
+    answers = iter(["1", "4", "2"])
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
     monkeypatch.setattr(onboarding, "ensure_thermal_control_installed", lambda: False)
     state = onboarding.run_onboarding_screens()
     assert state["profile"] == "sustained"
+    assert state["profile_explicit"] is True
     assert state["max"] is False
     assert state["target"] == "terminal"
 
 
 def test_run_onboarding_sustained_mode_is_explicit(monkeypatch):
-    # openwebui target → dashboard companion prompt fires; answer "No" (2).
-    answers = iter(["1", "1", "1", "2"])
+    # Deliberate Sustained pick (mode 2). openwebui target → dashboard
+    # companion prompt fires; answer "No" (2).
+    answers = iter(["1", "2", "1", "2"])
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
 
     state = onboarding.run_onboarding_screens()
 
     assert state["profile"] == "sustained"
+    assert state["profile_explicit"] is True
     assert state["max"] is False
     assert state["target"] == "openwebui"
 
@@ -180,7 +297,7 @@ def test_run_onboarding_can_select_pi(monkeypatch):
 
     state = onboarding.run_onboarding_screens()
 
-    assert state["profile"] == "sustained"
+    assert state["profile"] == onboarding.PROFILE_AUTO
     assert state["max"] is False
     assert state["target"] == "pi"
     assert state["open_dashboard"] is False
@@ -192,7 +309,7 @@ def test_run_onboarding_can_select_opencode(monkeypatch):
 
     state = onboarding.run_onboarding_screens()
 
-    assert state["profile"] == "sustained"
+    assert state["profile"] == onboarding.PROFILE_AUTO
     assert state["max"] is False
     assert state["target"] == "opencode"
     assert state["open_dashboard"] is False
@@ -239,7 +356,8 @@ def test_run_serve_onboarding_screens_defaults_to_api_server(monkeypatch):
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
     state = onboarding.run_serve_onboarding_screens(host="127.0.0.1", port=8765)
     assert state["model"] == onboarding._verified_default_model()
-    assert state["profile"] == "sustained"
+    assert state["profile"] == onboarding.PROFILE_AUTO
+    assert "profile_explicit" not in state
     assert state["max"] is False
     assert state["target"] == "server"
     assert state["open_browser"] is False
@@ -408,7 +526,12 @@ def test_run_quickstart_flow_returning_user_says_same(tmp_path, monkeypatch):
     assert state["target"] == "pi"
 
 
-def test_run_quickstart_flow_returning_user_reuses_sustained(tmp_path, monkeypatch):
+def test_run_quickstart_flow_returning_user_reuses_migrated_legacy_sustained(
+    tmp_path, monkeypatch
+):
+    """Legacy wizard-default Sustained (no explicit marker) migrates to Auto
+    once and is reused as Auto; the model/interface are untouched."""
+
     monkeypatch.setenv("MTPLX_QUICKSTART_STATE", str(tmp_path / "returning-sustained.json"))
     onboarding.save_state(
         {
@@ -423,8 +546,11 @@ def test_run_quickstart_flow_returning_user_reuses_sustained(tmp_path, monkeypat
     state = onboarding.run_quickstart_flow(fresh=False)
 
     assert state is not None
-    assert state["profile"] == "sustained"
+    assert state["profile"] == onboarding.PROFILE_AUTO
     assert state["model"] == "mtplx/foo"
+    persisted = onboarding.load_state()
+    assert persisted is not None
+    assert persisted["profile"] == onboarding.PROFILE_AUTO
 
 
 def test_run_quickstart_flow_refreshes_saved_verified_default(tmp_path, monkeypatch):
@@ -443,7 +569,7 @@ def test_run_quickstart_flow_refreshes_saved_verified_default(tmp_path, monkeypa
     state = onboarding.run_quickstart_flow(fresh=False)
 
     assert state is not None
-    assert state["model"] == DEFAULT_FP16_HF_MODEL_ID
+    assert state["model"] == QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID
     assert state["model_selection"]["variant"] == "fp16"
 
 
@@ -465,7 +591,7 @@ def test_run_quickstart_flow_legacy_stable_state_is_not_reused(tmp_path, monkeyp
     state = onboarding.run_quickstart_flow(fresh=False)
     assert state is not None
     assert state["model"] == onboarding._verified_default_model()
-    assert state["profile"] == "sustained"
+    assert state["profile"] == onboarding.PROFILE_AUTO
     assert state["max"] is False
     assert state["target"] == "openwebui"
 
@@ -518,7 +644,7 @@ def test_run_quickstart_flow_returning_user_says_no(tmp_path, monkeypatch):
     state = onboarding.run_quickstart_flow(fresh=False)
     assert state is not None
     assert state["model"] == onboarding._verified_default_model()
-    assert state["profile"] == "sustained"
+    assert state["profile"] == onboarding.PROFILE_AUTO
     assert state["target"] == "openwebui"
 
 
@@ -547,12 +673,11 @@ def test_screen_model_picks_verified_default_when_configured_offered(monkeypatch
 def test_screen_model_picks_hardware_default_when_configured_offered(monkeypatch):
     monkeypatch.setenv("MTPLX_DEFAULT_MODEL_VARIANT", "fp16")
     configured = "/Users/test/Documents/MTPLX/models/Qwen3.6-27B-MTPLX"
-    answers = iter(["2"])  # explicit "verified default"
-    monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
+    _select_rows(monkeypatch, "verified default")  # explicit, not the configured row
 
     chosen = onboarding.screen_model(configured=configured)
 
-    assert chosen == DEFAULT_FP16_HF_MODEL_ID
+    assert chosen == QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID
 
 
 def test_screen_model_no_configured_uses_default_first(monkeypatch):
@@ -574,9 +699,16 @@ def test_screen_model_optimized_quality_prefers_local_model(tmp_path, monkeypatc
     (local_quality / "mtp.safetensors").write_bytes(b"mtp")
     (local_quality / "model-00001-of-00001.safetensors").write_bytes(b"model")
     monkeypatch.setenv(default_models.QUALITY_MODEL_ENV, str(local_quality))
-
-    answers = iter(["2"])
-    monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
+    # The 3.6 "Optimized Quality" row is offered on tiers that do not get the
+    # Qwen 3.8 line-up (here: a 24 GiB modern Mac routed to the 9B default).
+    monkeypatch.setattr(
+        onboarding,
+        "_verified_default_selection",
+        lambda: default_models.select_default_model(
+            hardware={"chip": "Apple M4", "apple_silicon_generation": "m4", "memory_gib": 24.0}
+        ),
+    )
+    _select_rows(monkeypatch, "Optimized Quality")
 
     chosen = onboarding.screen_model(configured=None)
 
@@ -587,9 +719,9 @@ def test_screen_model_optimized_quality_prefers_local_model(tmp_path, monkeypatc
 
 
 def test_custom_hf_repo_rejects_pasted_terminal_output(monkeypatch, capsys):
+    _select_rows(monkeypatch, "Custom Hugging Face repo")
     answers = iter(
         [
-            "3",
             "Last login: Mon May  4 00:55:41 on ttys000",
             "trevon/Qwen3.5-27B-MLX-MTP",
         ]
@@ -604,9 +736,9 @@ def test_custom_hf_repo_rejects_pasted_terminal_output(monkeypatch, capsys):
 
 
 def test_custom_hf_repo_blank_after_invalid_does_not_accept_default(monkeypatch, capsys):
+    _select_rows(monkeypatch, "Custom Hugging Face repo")
     answers = iter(
         [
-            "3",
             "Last login: Mon May  4 00:55:41 on ttys000",
             "",
             "trevon/Qwen3.5-27B-MLX-MTP",
@@ -622,9 +754,9 @@ def test_custom_hf_repo_blank_after_invalid_does_not_accept_default(monkeypatch,
 
 
 def test_custom_hf_repo_accepts_huggingface_url(monkeypatch):
+    _select_rows(monkeypatch, "Custom Hugging Face repo")
     answers = iter(
         [
-            "3",
             "https://huggingface.co/trevon/Qwen3.5-27B-MLX-MTP/tree/main",
         ]
     )
@@ -1022,7 +1154,7 @@ def test_screen_model_local_folder_routes_through_picker(tmp_path, monkeypatch):
         return str(target)
 
     monkeypatch.setattr(onboarding, "_pick_local_model", fake_picker)
-    monkeypatch.setattr(builtins, "input", lambda _prompt="": "4")
+    _select_rows(monkeypatch, "Local folder")
 
     chosen = onboarding.screen_model(configured=None)
 
@@ -1046,6 +1178,14 @@ def test_quickstart_applies_saved_tuned_depth(monkeypatch):
     monkeypatch.setattr(public, "_software_context", lambda: {"mtplx_version": "test", "mlx_version": "test"})
     monkeypatch.setattr(public, "_mlx_backend_context", lambda: {"stock_mlx_likely": True})
     monkeypatch.setattr(public, "_tune_state_key", lambda *_args, **_kwargs: ("key", {}))
+    # The lookup now flows through the shared save-side key constructor,
+    # which resolves and support-checks the model like a real tune would.
+    monkeypatch.setattr(
+        public, "_resolve_runtime_model_path", lambda model, cache_dir=None: (model, None)
+    )
+    monkeypatch.setattr(
+        public, "_tune_support_payload", lambda model, **_kwargs: {"tune_supported": True}
+    )
     monkeypatch.setattr(
         public,
         "_load_tune_record",
@@ -1085,6 +1225,14 @@ def test_quickstart_tuning_prompt_can_save_and_apply(monkeypatch):
     monkeypatch.setattr(public, "_software_context", lambda: {"mtplx_version": "test", "mlx_version": "test"})
     monkeypatch.setattr(public, "_mlx_backend_context", lambda: {"stock_mlx_likely": True})
     monkeypatch.setattr(public, "_tune_state_key", lambda *_args, **_kwargs: ("key", {}))
+    # The lookup now flows through the shared save-side key constructor,
+    # which resolves and support-checks the model like a real tune would.
+    monkeypatch.setattr(
+        public, "_resolve_runtime_model_path", lambda model, cache_dir=None: (model, None)
+    )
+    monkeypatch.setattr(
+        public, "_tune_support_payload", lambda model, **_kwargs: {"tune_supported": True}
+    )
     monkeypatch.setattr("mtplx.ui.onboarding.screen_tuning_offer", lambda: True)
     calls = []
     records = iter(
@@ -1194,13 +1342,45 @@ def test_screen_model_preselects_app_model_when_installed(tmp_path, monkeypatch,
     assert "installed" in output
 
 
-def test_screen_model_keeps_legacy_numbering_without_installed(monkeypatch):
-    answers = iter(["2"])
-    monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
+def test_screen_model_offers_qwen38_line_up_without_installed(monkeypatch):
+    # No installed rows: verified default first, then the two Qwen 3.8
+    # siblings, then the custom/local escapes (modern Mac, >= 33 GiB).
+    from mtplx import default_models
+
+    monkeypatch.setattr(
+        onboarding,
+        "_verified_default_selection",
+        lambda: default_models.select_default_model(
+            hardware={"chip": "Apple M5 Max", "apple_silicon_generation": "m5", "memory_gib": 128.0}
+        ),
+    )
+    _select_rows(monkeypatch, "Qwen 3.8 27B Bare Speed")
 
     chosen = onboarding.screen_model(configured=None, installed=[])
 
-    assert chosen == onboarding.optimized_quality_model_ref()
+    assert chosen == onboarding.qwen38_bare_speed_model_ref()
+
+
+def test_screen_model_offers_fp16_line_up_on_legacy_silicon(monkeypatch, capsys):
+    # M1/M2 with enough memory: the same three picks as FP16 siblings.
+    from mtplx import default_models
+
+    monkeypatch.setattr(
+        onboarding,
+        "_verified_default_selection",
+        lambda: default_models.select_default_model(
+            hardware={"chip": "Apple M2 Ultra", "apple_silicon_generation": "m2", "memory_gib": 64.0}
+        ),
+    )
+    _select_rows(monkeypatch, "Qwen 3.8 27B Optimized Quality FP16")
+
+    chosen = onboarding.screen_model(configured=None, installed=[])
+
+    captured = capsys.readouterr().out
+    assert chosen == onboarding.qwen38_optimized_quality_fp16_model_ref()
+    assert "Qwen 3.8 27B Optimized Speed FP16  ·  verified default" in captured
+    assert "Qwen 3.8 27B Bare Speed FP16" in captured
+    assert QWEN38_FP16_SUFFIX in captured
 
 
 def test_returning_user_can_pick_same_as_the_app(tmp_path, monkeypatch):

@@ -50,3 +50,8 @@ benchmark_outputs/
 
 # AI assistant artifacts
 context-snapshot.json
+
+
+
+
+.devspace/

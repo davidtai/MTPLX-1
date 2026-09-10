@@ -20,7 +20,7 @@ from mtplx.chat_encoding import (
 
 QWEN_THINK_OPEN = "<think>"
 QWEN_THINK_CLOSE = "</think>"
-QWEN_STYLE_REASONING_PARSERS = {"qwen3", "step3p5"}
+QWEN_STYLE_REASONING_PARSERS = {"qwen3", "step3p5", "poolside_v1"}
 QWEN_STYLE_REASONING_TAG_NAMES = (
     "think",
     "thinks",
@@ -38,7 +38,9 @@ QWEN_STYLE_REASONING_OPEN_RE = re.compile(
     re.IGNORECASE,
 )
 QWEN_STYLE_REASONING_CLOSE_RE = re.compile(
-    rf"</\s*(?:{_QWEN_STYLE_TAG_NAME_PATTERN})\s*>",
+    # \b[^>\n]* tolerates suffixed spellings such as Hy3's </think:opensource>
+    # (single special tokens whose text carries an :opensource suffix).
+    rf"</\s*(?:{_QWEN_STYLE_TAG_NAME_PATTERN})\b[^>\n]*>",
     re.IGNORECASE,
 )
 QWEN_STYLE_REASONING_CONTROL_RE = re.compile(
@@ -47,8 +49,18 @@ QWEN_STYLE_REASONING_CONTROL_RE = re.compile(
 )
 QWEN_STYLE_REASONING_BLOCK_RE = re.compile(
     rf"<\s*(?:{_QWEN_STYLE_TAG_NAME_PATTERN})\b[^>\n]*>"
-    rf".*?</\s*(?:{_QWEN_STYLE_TAG_NAME_PATTERN})\s*>",
+    rf".*?</\s*(?:{_QWEN_STYLE_TAG_NAME_PATTERN})\b[^>\n]*>",
     re.IGNORECASE | re.DOTALL,
+)
+
+# Streaming holdback: never emit the tail of the pending buffer while it could
+# still be the prefix of an unfinished reasoning tag. Must cover the longest
+# concrete spelling including suffixed forms ("</reasoning:opensource>" — Hy3
+# renames its chat tokens with an :opensource suffix at the same ids).
+STREAM_TAG_HOLDBACK = max(
+    max(len(name) for name in QWEN_STYLE_REASONING_TAG_NAMES)
+    + len("</:opensource>"),
+    32,
 )
 
 
@@ -126,7 +138,7 @@ def split_qwen_reasoning_text(
 
     content = re.sub(
         rf"<\s*(?:{_QWEN_STYLE_TAG_NAME_PATTERN})\b[^>\n]*>"
-        rf"(.*?)</\s*(?:{_QWEN_STYLE_TAG_NAME_PATTERN})\s*>",
+        rf"(.*?)</\s*(?:{_QWEN_STYLE_TAG_NAME_PATTERN})\b[^>\n]*>",
         _capture,
         raw,
         flags=re.IGNORECASE | re.DOTALL,
@@ -272,6 +284,14 @@ def normalize_reasoning_tags(
         if not thinking_enabled:
             return parts.content
         return _format_qwen_reasoning_history(parts)
+    if parser_id == "lfm2":
+        # LFM templates never prefill an open think tag, so text without one is
+        # entirely visible content; the prefilled-thinking normalizer would
+        # misfile it as reasoning.
+        parts = split_qwen_reasoning_text(text, thinking_enabled=thinking_enabled)
+        if not thinking_enabled:
+            return parts.content
+        return _format_qwen_reasoning_history(parts)
     if parser_id in QWEN_STYLE_REASONING_PARSERS:
         return normalize_qwen_thinking_tags(
             text,
@@ -289,6 +309,8 @@ def split_reasoning_text(
     parser_id = str(parser or "none").lower()
     if parser_id == "gemma4":
         return split_gemma4_reasoning_text(text, thinking_enabled=thinking_enabled)
+    if parser_id == "lfm2":
+        return split_qwen_reasoning_text(text, thinking_enabled=thinking_enabled)
     if parser_id in QWEN_STYLE_REASONING_PARSERS:
         return split_qwen_reasoning_text(text, thinking_enabled=thinking_enabled)
     return ReasoningTextParts("", str(text or "").strip())
@@ -353,10 +375,7 @@ class QwenThinkingContentStreamSplitter(ReasoningContentStreamSplitter):
 
     def _drain_disabled(self, *, final: bool) -> list[tuple[str, str]]:
         chunks: list[tuple[str, str]] = []
-        keep = max(
-            max(len(name) for name in QWEN_STYLE_REASONING_TAG_NAMES) + len("</>"),
-            16,
-        )
+        keep = STREAM_TAG_HOLDBACK
         initial_hold = 384
         while self._pending:
             if self._disabled_inside_reasoning:
@@ -413,10 +432,7 @@ class QwenThinkingContentStreamSplitter(ReasoningContentStreamSplitter):
         # (e.g. "</reasoning>"); using only the "<think>"/"</think>" lengths
         # let a longer alias tag split across chunks leak into visible content.
         # Mirrors _drain_disabled's window.
-        keep = max(
-            max(len(name) for name in QWEN_STYLE_REASONING_TAG_NAMES) + len("</>"),
-            16,
-        )
+        keep = STREAM_TAG_HOLDBACK
         while self._pending:
             if self._inside_thinking:
                 close_match = QWEN_STYLE_REASONING_CLOSE_RE.search(self._pending)
@@ -459,6 +475,21 @@ class QwenThinkingContentStreamSplitter(ReasoningContentStreamSplitter):
             self._inside_thinking = True
             self._reentry_count += 1
         return chunks
+
+
+class Lfm2ThinkingContentStreamSplitter(QwenThinkingContentStreamSplitter):
+    """Think-tag splitter for templates that do not prefill the open tag.
+
+    LFM generation prompts end at ``<|im_start|>assistant`` with no opened
+    ``<think>``, so the stream starts in visible content and enters the
+    reasoning channel only when the model emits a literal open tag. The
+    inherited splitter assumes a prefilled open tag and would classify a
+    no-thinking response as reasoning until a close tag that never arrives.
+    """
+
+    def __init__(self, *, thinking_enabled: bool) -> None:
+        super().__init__(thinking_enabled=thinking_enabled)
+        self._inside_thinking = False
 
 
 class Gemma4ThinkingContentStreamSplitter(ReasoningContentStreamSplitter):
@@ -583,6 +614,8 @@ def stream_splitter_for_parser(
         return Gemma4ThinkingContentStreamSplitter(
             thinking_enabled=thinking_enabled,
         )
+    if parser_id == "lfm2":
+        return Lfm2ThinkingContentStreamSplitter(thinking_enabled=thinking_enabled)
     if parser_id in QWEN_STYLE_REASONING_PARSERS:
         return QwenThinkingContentStreamSplitter(thinking_enabled=thinking_enabled)
     return QwenThinkingContentStreamSplitter(thinking_enabled=False)

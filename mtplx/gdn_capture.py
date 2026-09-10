@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
-import os
+from functools import partial
 from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+
+logger = logging.getLogger(__name__)
+
+# One-time warning latch for an explicitly requested but unavailable
+# headquarter tape kernel (PR #209 review edit).
+_HEADQUARTER_IMPORT_WARNED = False
 
 
 def _env_enabled(name: str, *, default: bool = False) -> bool:
@@ -16,6 +24,390 @@ def _env_enabled(name: str, *, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+_GDN_POSTCONV_STATS: dict[str, Any] = {
+    "enabled": False,
+    "installed": False,
+    "installation_status": "disabled",
+    "installation_error": None,
+    "gdn_layers": 0,
+    "validated_contract": None,
+    "implementation": "inline_g",
+}
+_A3B_GDN_POSTCONV_LAYER_TYPES = tuple(
+    "linear_attention" if index % 4 != 3 else "full_attention" for index in range(40)
+)
+
+
+class A3BGDNPostconvConfigError(RuntimeError):
+    """The exact A3B GDN post-conv lane could not be installed."""
+
+
+@dataclass(frozen=True)
+class A3BGDNPostconvInstallPlan:
+    """Externally validated A3B GDN ownership awaiting its self-check."""
+
+    gdns: tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class A3BGDNPostconvFactory:
+    """Selfchecked, order-stable callables for the exact M1/M2/M3 traces.
+
+    ``m3_implementations`` is the k=2 (3-row) verify recurrence; it defaults to
+    empty so K1-only construction paths are unchanged and is populated whenever
+    the postconv is installed.
+    """
+
+    m1_implementations: tuple[Callable[..., Any], ...]
+    m2_implementations: tuple[Callable[..., Any], ...]
+    m3_implementations: tuple[Callable[..., Any], ...] = ()
+    b8_t2_implementations: tuple[Callable[..., Any], ...] = ()
+    # Native three-row cohort verify (B3/T2). The kernel source is byte-shared
+    # with the B8/T2 launch; only the grid z extent (rows*Hv) and output batch
+    # extent differ, and each row's arithmetic is independent of grid size.
+    b3_t2_implementations: tuple[Callable[..., Any], ...] = ()
+
+
+def _a3b_gdn_postconv_contract() -> dict[str, Any]:
+    return {
+        "batch": 1,
+        "logical_m": [1, 2, 3],
+        "routes": {
+            "m1_correction": {
+                "conv_shape": [1, 1, 8192],
+                "gate_shapes": {"a": [1, 1, 32], "b": [1, 1, 32]},
+                "output_shape": [1, 1, 32, 128],
+                "captured_states_shape": [1, 1, 32, 128, 128],
+            },
+            "m2_verify": {
+                "conv_shape": [1, 2, 8192],
+                "gate_shapes": {"a": [1, 2, 32], "b": [1, 2, 32]},
+                "output_shape": [1, 2, 32, 128],
+                "captured_states_shape": [1, 2, 32, 128, 128],
+            },
+            "m3_verify": {
+                "conv_shape": [1, 3, 8192],
+                "gate_shapes": {"a": [1, 3, 32], "b": [1, 3, 32]},
+                "output_shape": [1, 3, 32, 128],
+                "captured_states_shape": [1, 3, 32, 128, 128],
+            },
+        },
+        "state_shape": [1, 32, 128, 128],
+        "input_dtype": "bfloat16",
+        "state_dtype": "float32",
+        "key_heads": 16,
+        "value_heads": 32,
+        "key_axis": 128,
+        "value_axis": 128,
+        "threadgroup": [32, 4, 1],
+    }
+
+
+def a3b_gdn_postconv_enabled() -> bool:
+    return _env_enabled("MTPLX_FUSE_GDN_POST_CONV")
+
+
+def _fail_a3b_gdn_postconv_configuration(message: str) -> None:
+    _GDN_POSTCONV_STATS["installed"] = False
+    _GDN_POSTCONV_STATS["installation_status"] = "configuration_error"
+    _GDN_POSTCONV_STATS["installation_error"] = str(message)
+    raise A3BGDNPostconvConfigError(message)
+
+
+# Post-conv recurrence implementation selection.  ``inline_g`` (default) is the
+# accepted TGY4 route; ``headquarter`` is the C1 redesigned-execution kernel.
+_A3B_GDN_POSTCONV_IMPL_ENV = "MTPLX_A3B_GDN_POSTCONV_IMPL"
+_A3B_GDN_POSTCONV_IMPL_DEFAULT = "inline_g"
+_A3B_GDN_POSTCONV_IMPLS = ("inline_g", "headquarter")
+
+
+def _a3b_gdn_postconv_impl_selection() -> str:
+    """Resolve the requested post-conv implementation, fail-closed on unknown.
+
+    Unset/empty selects the default ``inline_g`` route so the installed stack is
+    byte-identical to the accepted baseline; any other value than the exact
+    supported names hard-fails through the postconv configuration convention.
+    """
+    raw = os.environ.get(_A3B_GDN_POSTCONV_IMPL_ENV)
+    value = (raw or "").strip().lower()
+    if value == "":
+        return _A3B_GDN_POSTCONV_IMPL_DEFAULT
+    if value not in _A3B_GDN_POSTCONV_IMPLS:
+        _fail_a3b_gdn_postconv_configuration(
+            f"A3B GDN postconv {_A3B_GDN_POSTCONV_IMPL_ENV} must be one of "
+            "'inline_g' or 'headquarter' (unset defaults to 'inline_g'); "
+            f"got {raw!r}"
+        )
+    return value
+
+
+def _a3b_gdn_postconv_headquarter_requested() -> bool:
+    """Non-raising probe of whether the headquarter route is explicitly requested."""
+    raw = os.environ.get(_A3B_GDN_POSTCONV_IMPL_ENV)
+    return (raw or "").strip().lower() == "headquarter"
+
+
+def _validate_a3b_quant_projection(
+    gdn: Any,
+    name: str,
+    scales_shape: tuple[int, ...],
+    layer_index: int,
+) -> None:
+    projection = getattr(gdn, name, None)
+    scales = getattr(projection, "scales", None)
+    if (
+        int(getattr(projection, "bits", -1)) != 4
+        or int(getattr(projection, "group_size", -1)) != 64
+        or getattr(projection, "mode", None) != "affine"
+        or tuple(getattr(scales, "shape", ())) != scales_shape
+        or getattr(scales, "dtype", None) != mx.bfloat16
+    ):
+        _fail_a3b_gdn_postconv_configuration(
+            "A3B GDN postconv projection_quantization mismatch for "
+            f"{name} at GDN layer {layer_index}"
+        )
+
+
+def prepare_a3b_gdn_postconv(
+    model: Any,
+    *,
+    config: dict[str, Any],
+) -> A3BGDNPostconvInstallPlan | None:
+    """Validate checkpoint/model facts once for the exact A3B M1/M2 lanes."""
+    _reset_gdn_postconv_stats_for_tests()
+    if not a3b_gdn_postconv_enabled():
+        return None
+    _GDN_POSTCONV_STATS["enabled"] = True
+    if not _env_enabled("MTPLX_COMPILED_TARGET_PREFIX"):
+        _fail_a3b_gdn_postconv_configuration(
+            "A3B GDN postconv compiled_target_prefix_flag must be enabled"
+        )
+    if _env_enabled("MTPLX_NATIVE_GDN_TAIL"):
+        _fail_a3b_gdn_postconv_configuration(
+            "A3B GDN postconv topology conflicts with MTPLX_NATIVE_GDN_TAIL"
+        )
+
+    text_config = config.get("text_config")
+    if (
+        config.get("model_type") != "qwen3_5_moe"
+        or config.get("architectures") != ["Qwen3_5MoeForConditionalGeneration"]
+        or not isinstance(text_config, dict)
+        or text_config.get("model_type") != "qwen3_5_moe_text"
+        or int(text_config.get("hidden_size", -1)) != 2048
+    ):
+        _fail_a3b_gdn_postconv_configuration(
+            "A3B GDN postconv topology requires the exact A3B model"
+        )
+    if text_config.get("dtype") != "bfloat16":
+        _fail_a3b_gdn_postconv_configuration(
+            "A3B GDN postconv config_dtype requires bfloat16"
+        )
+
+    text_model = getattr(model, "language_model", None)
+    inner = getattr(text_model, "model", None)
+    layers = list(getattr(inner, "layers", ()) or ())
+    if len(layers) != 40 or int(text_config.get("num_hidden_layers", -1)) != 40:
+        _fail_a3b_gdn_postconv_configuration(
+            "A3B GDN postconv layer_count requires exactly 40 layers"
+        )
+    actual_linear = [bool(getattr(layer, "is_linear", False)) for layer in layers]
+    configured_types = tuple(text_config.get("layer_types", ()))
+    expected_linear = [
+        kind == "linear_attention" for kind in _A3B_GDN_POSTCONV_LAYER_TYPES
+    ]
+    if (
+        actual_linear != expected_linear
+        or configured_types != _A3B_GDN_POSTCONV_LAYER_TYPES
+    ):
+        _fail_a3b_gdn_postconv_configuration(
+            "A3B GDN postconv topology requires exact 30-layer ownership"
+        )
+    gdns = [
+        getattr(layer, "linear_attn", None)
+        for layer, is_linear in zip(layers, actual_linear)
+        if is_linear
+    ]
+    if len(gdns) != 30 or any(gdn is None for gdn in gdns):
+        _fail_a3b_gdn_postconv_configuration(
+            "A3B GDN postconv topology requires all 30 GDN modules"
+        )
+
+    config_geometry = {
+        "linear_num_value_heads": 32,
+        "linear_num_key_heads": 16,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+    }
+    if (
+        any(
+            int(text_config.get(name, -1)) != expected
+            for name, expected in config_geometry.items()
+        )
+        or float(text_config.get("rms_norm_eps", -1.0)) != 1e-6
+    ):
+        _fail_a3b_gdn_postconv_configuration(
+            "A3B GDN postconv head_geometry mismatch in model config"
+        )
+
+    for index, gdn in enumerate(gdns):
+        if getattr(gdn, "sharding_group", None) is not None:
+            _fail_a3b_gdn_postconv_configuration(
+                f"A3B GDN postconv sharding is forbidden at GDN layer {index}"
+            )
+        if (
+            int(getattr(gdn, "conv_dim", -1)) != 8192
+            or int(getattr(gdn, "key_dim", -1)) != 2048
+            or int(getattr(gdn, "conv_kernel_size", -1)) != 4
+        ):
+            _fail_a3b_gdn_postconv_configuration(
+                f"A3B GDN postconv conv_geometry mismatch at GDN layer {index}"
+            )
+        if (
+            int(getattr(gdn, "num_k_heads", -1)) != 16
+            or int(getattr(gdn, "num_v_heads", -1)) != 32
+            or int(getattr(gdn, "head_k_dim", -1)) != 128
+            or int(getattr(gdn, "head_v_dim", -1)) != 128
+        ):
+            _fail_a3b_gdn_postconv_configuration(
+                f"A3B GDN postconv head_geometry mismatch at GDN layer {index}"
+            )
+        parameters = (
+            ("A_log", (32,)),
+            ("dt_bias", (32,)),
+            ("conv1d.weight", (8192, 4, 1)),
+        )
+        for parameter_name, expected_shape in parameters:
+            node = gdn
+            for part in parameter_name.split("."):
+                node = getattr(node, part, None)
+            if tuple(getattr(node, "shape", ())) != expected_shape:
+                _fail_a3b_gdn_postconv_configuration(
+                    "A3B GDN postconv parameter_shape mismatch for "
+                    f"{parameter_name} at GDN layer {index}"
+                )
+            if getattr(node, "dtype", None) != mx.bfloat16:
+                _fail_a3b_gdn_postconv_configuration(
+                    "A3B GDN postconv parameter_dtype requires BF16 for "
+                    f"{parameter_name} at GDN layer {index}"
+                )
+        _validate_a3b_quant_projection(gdn, "in_proj_qkv", (8192, 32), index)
+        _validate_a3b_quant_projection(gdn, "in_proj_a", (32, 32), index)
+        _validate_a3b_quant_projection(gdn, "in_proj_b", (32, 32), index)
+
+    _GDN_POSTCONV_STATS.update(
+        {
+            "installation_status": "awaiting_selfcheck",
+            "installation_error": None,
+            "gdn_layers": 30,
+            "validated_contract": _a3b_gdn_postconv_contract(),
+        }
+    )
+    return A3BGDNPostconvInstallPlan(gdns=tuple(gdns))
+
+
+def install_a3b_gdn_postconv(
+    plan: A3BGDNPostconvInstallPlan,
+    selfcheck_report: dict[str, Any] | None,
+) -> A3BGDNPostconvFactory:
+    """Install the exact M1/M2 callables only after their combined self-check."""
+    lanes = {} if selfcheck_report is None else selfcheck_report.get("lanes", {})
+    implementation = _a3b_gdn_postconv_impl_selection()
+    if implementation == "headquarter":
+        required_lane = "gdn_postconv_headquarter"
+        m1_apply = _apply_enabled_a3b_gdn_postconv_m1_headquarter
+        m2_apply = _apply_enabled_a3b_gdn_postconv_m2_headquarter
+        m3_apply = _apply_enabled_a3b_gdn_postconv_m3_headquarter
+        b8_t2_apply = _apply_enabled_a3b_gdn_postconv_b8_t2_headquarter
+        b3_t2_apply = _apply_enabled_a3b_gdn_postconv_b3_t2_headquarter
+    else:
+        required_lane = "gdn_postconv_inline_g"
+        m1_apply = _apply_enabled_a3b_gdn_postconv_m1_tgy4
+        m2_apply = _apply_enabled_a3b_gdn_postconv_m2_tgy4
+        m3_apply = _apply_enabled_a3b_gdn_postconv_m3_tgy4
+        b8_t2_apply = _apply_enabled_a3b_gdn_postconv_b8_t2_tgy4
+        b3_t2_apply = _apply_enabled_a3b_gdn_postconv_b3_t2_tgy4
+    if lanes.get(required_lane) != "ok":
+        _fail_a3b_gdn_postconv_configuration(
+            "A3B GDN postconv selfcheck did not validate the exact M1/M2 kernels"
+            + (
+                ""
+                if implementation == _A3B_GDN_POSTCONV_IMPL_DEFAULT
+                else f" for the {implementation} route"
+            )
+        )
+    factory = A3BGDNPostconvFactory(
+        m1_implementations=tuple(
+            partial(
+                m1_apply,
+                A_log=gdn.A_log,
+                dt_bias=gdn.dt_bias,
+            )
+            for gdn in plan.gdns
+        ),
+        m2_implementations=tuple(
+            partial(
+                m2_apply,
+                A_log=gdn.A_log,
+                dt_bias=gdn.dt_bias,
+            )
+            for gdn in plan.gdns
+        ),
+        m3_implementations=tuple(
+            partial(
+                m3_apply,
+                A_log=gdn.A_log,
+                dt_bias=gdn.dt_bias,
+            )
+            for gdn in plan.gdns
+        ),
+        b8_t2_implementations=tuple(
+            partial(
+                b8_t2_apply,
+                A_log=gdn.A_log,
+                dt_bias=gdn.dt_bias,
+            )
+            for gdn in plan.gdns
+        ),
+        b3_t2_implementations=tuple(
+            partial(
+                b3_t2_apply,
+                A_log=gdn.A_log,
+                dt_bias=gdn.dt_bias,
+            )
+            for gdn in plan.gdns
+        ),
+    )
+    _GDN_POSTCONV_STATS["installed"] = True
+    _GDN_POSTCONV_STATS["installation_status"] = "installed"
+    _GDN_POSTCONV_STATS["implementation"] = implementation
+    return factory
+
+
+def gdn_postconv_stats() -> dict[str, Any]:
+    """Report the immutable installation contract, never hot-path counters."""
+    report = dict(_GDN_POSTCONV_STATS)
+    contract = report.get("validated_contract")
+    report["validated_contract"] = (
+        dict(contract) if isinstance(contract, dict) else None
+    )
+    return report
+
+
+def _reset_gdn_postconv_stats_for_tests() -> None:
+    _GDN_POSTCONV_STATS.update(
+        {
+            "enabled": False,
+            "installed": False,
+            "installation_status": "disabled",
+            "installation_error": None,
+            "gdn_layers": 0,
+            "validated_contract": None,
+            "implementation": "inline_g",
+        }
+    )
 
 
 def _cache_context_len(cache: Any) -> int:
@@ -822,6 +1214,166 @@ def _make_linear_gated_delta_from_conv_inline_g_kernel():
     )
 
 
+def _make_linear_gated_delta_from_conv_headquarter_kernel():
+    # C1 "headquarter" redesigned execution: one threadgroup per (head, Dv-quarter)
+    # => grid (SIMDS*32, QUARTERS, B*Hv), threadgroup (SIMDS*32, 1, 1) = 8 simdgroups.
+    # simd 0 computes the head's q/k rms-norm+scale + g/beta once into threadgroup
+    # memory (redundancy 32x -> 4x), one producer->consumer barrier, then each
+    # simdgroup drives RPS=(Dv/QUARTERS)/SIMDS=4 dv rows with fp32 state resident in
+    # registers across the T loop.  Source verbatim from the G3a C1 bench candidate
+    # (bit-exact vs inline_g: parity 0.0 on y and states at m1 and m2).
+    if not mx.metal.is_available():
+        return None
+
+    source = """
+    // --- geometry -----------------------------------------------------------
+    auto n = thread_position_in_grid.z;          // b_idx*Hv + hv_idx
+    auto b_idx = n / Hv;
+    auto hv_idx = n % Hv;
+    auto hk_idx = hv_idx / (Hv / Hk);
+    auto quarter = thread_position_in_grid.y;     // 0..QUARTERS-1
+    uint tptg = thread_position_in_threadgroup.x; // 0..(SIMDS*32-1)
+    uint simd_id = tptg / 32u;                     // 0..SIMDS-1
+    uint dk_idx = thread_index_in_simdgroup;       // 0..31
+    constexpr int n_per_t = Dk / 32;               // 4  (float4 per lane)
+    constexpr int QSIZE = Dv / Quarters;           // dv rows per quarter (32)
+    constexpr int RPS = QSIZE / Simds;             // dv rows per simdgroup (4)
+    int base_dv = int(quarter) * QSIZE + int(simd_id) * RPS;
+
+    float inv_scale = 1.0f / metal::sqrt(float(Dk));
+    float q_scale = inv_scale * inv_scale;
+    float k_scale = static_cast<float>(static_cast<InT>(inv_scale));
+
+    threadgroup float q_shared[Dk];
+    threadgroup float k_shared[Dk];
+    threadgroup float g_shared;
+    threadgroup float beta_shared;
+
+    // running fp32 state for this simdgroup's RPS rows, resident in registers
+    float S[RPS][n_per_t];
+    for (int r = 0; r < RPS; ++r) {
+      const device float4* s4 = reinterpret_cast<const device float4*>(
+        state_in + (n * Dv + (base_dv + r)) * Dk);
+      float4 sv = s4[dk_idx];
+      S[r][0] = sv.x; S[r][1] = sv.y; S[r][2] = sv.z; S[r][3] = sv.w;
+    }
+
+    for (int t = 0; t < T; ++t) {
+      auto conv_t = conv_out + (b_idx * T + t) * ConvDim;
+      auto q_t = conv_t + hk_idx * Dk;
+      auto k_t = conv_t + KeyDim + hk_idx * Dk;
+      auto v_t = conv_t + 2 * KeyDim + hv_idx * Dv;
+      auto a_t = a + (b_idx * T + t) * Hv;
+      auto b_t = b + (b_idx * T + t) * Hv;
+
+      // --- producer: simd 0 computes shared q/k (+ g/beta) once -------------
+      if (simd_id == 0u) {
+        if (dk_idx == 0u) {
+          InT b_val = b_t[hv_idx];
+          auto beta_y = 1 / (1 + metal::exp(metal::abs(b_val)));
+          InT beta_val = (b_val < InT(0)) ? beta_y : 1 - beta_y;
+
+          InT a_val = a_t[hv_idx] + dt_bias[hv_idx];
+          constexpr InT inf = metal::numeric_limits<InT>::infinity();
+          InT maxval = metal::max(a_val, InT(0));
+          InT minval = metal::min(a_val, InT(0));
+          InT softplus_val = (minval == -inf || maxval == inf)
+            ? maxval
+            : (maxval + log1p(metal::exp(minval - maxval)));
+          float decay_a = metal::exp(float(A_log[hv_idx]));
+          beta_shared = static_cast<float>(beta_val);
+          g_shared = metal::exp(-decay_a * float(softplus_val));
+        }
+
+        float q_sum = 0.0f;
+        float k_sum = 0.0f;
+        float q_raw[n_per_t];
+        float k_raw[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          q_raw[i] = static_cast<float>(q_t[s_idx]);
+          k_raw[i] = static_cast<float>(k_t[s_idx]);
+          q_sum += q_raw[i] * q_raw[i];
+          k_sum += k_raw[i] * k_raw[i];
+        }
+        q_sum = simd_sum(q_sum);
+        k_sum = simd_sum(k_sum);
+        float q_inv = metal::precise::rsqrt(q_sum / float(Dk) + 1.0e-6f);
+        float k_inv = metal::precise::rsqrt(k_sum / float(Dk) + 1.0e-6f);
+        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          auto q_norm = static_cast<InT>(q_raw[i] * q_inv);
+          auto k_norm = static_cast<InT>(k_raw[i] * k_inv);
+          q_shared[s_idx] =
+            static_cast<float>(static_cast<InT>(static_cast<float>(q_norm) * q_scale));
+          k_shared[s_idx] =
+            static_cast<float>(static_cast<InT>(static_cast<float>(k_norm) * k_scale));
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);   // BARRIER 1 (producer->consumer)
+
+      // --- consumer: each simdgroup drives its RPS rows --------------------
+      float g_local = g_shared;
+      float beta_local = beta_shared;
+      float qloc[n_per_t];
+      float kloc[n_per_t];
+      for (int i = 0; i < n_per_t; ++i) {
+        auto s_idx = n_per_t * dk_idx + i;
+        qloc[i] = q_shared[s_idx];
+        kloc[i] = k_shared[s_idx];
+      }
+
+      float kv[RPS];
+      for (int r = 0; r < RPS; ++r) {
+        float acc = 0.0f;
+        for (int i = 0; i < n_per_t; ++i) {
+          S[r][i] = S[r][i] * g_local;
+          acc += S[r][i] * kloc[i];
+        }
+        kv[r] = acc;
+      }
+      for (int r = 0; r < RPS; ++r) { kv[r] = simd_sum(kv[r]); }
+
+      float delta[RPS];
+      for (int r = 0; r < RPS; ++r) {
+        delta[r] = (static_cast<float>(v_t[base_dv + r]) - kv[r]) * beta_local;
+      }
+
+      float out[RPS];
+      for (int r = 0; r < RPS; ++r) {
+        float acc = 0.0f;
+        for (int i = 0; i < n_per_t; ++i) {
+          S[r][i] = S[r][i] + kloc[i] * delta[r];
+          acc += S[r][i] * qloc[i];
+        }
+        out[r] = acc;
+      }
+      for (int r = 0; r < RPS; ++r) { out[r] = simd_sum(out[r]); }
+
+      auto y_t = y + ((b_idx * T + t) * Hv + hv_idx) * Dv;
+      for (int r = 0; r < RPS; ++r) {
+        int dv = base_dv + r;
+        if (dk_idx == 0u) {
+          y_t[dv] = static_cast<InT>(out[r]);
+        }
+        device float4* o4 = reinterpret_cast<device float4*>(
+          states + (((b_idx * T + t) * Hv + hv_idx) * Dv + dv) * Dk);
+        o4[dk_idx] = float4(S[r][0], S[r][1], S[r][2], S[r][3]);
+      }
+
+      if (t + 1 < T) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);  // BARRIER 2 (WAR guard, T>1 only)
+      }
+    }
+    """
+    return mx.fast.metal_kernel(
+        name="mtplx_linear_gated_delta_from_conv_headquarter_v1",
+        input_names=["conv_out", "a", "b", "A_log", "dt_bias", "state_in", "T"],
+        output_names=["y", "states"],
+        source=source,
+    )
+
+
 _linear_conv1d_kernel = _make_linear_conv1d_kernel()
 _linear_gated_delta_kernel = _make_linear_gated_delta_kernel()
 _linear_gated_delta_final_kernel = _make_linear_gated_delta_final_kernel()
@@ -837,6 +1389,9 @@ _linear_gated_delta_from_conv_tape_replay_kernel = (
 )
 _linear_gated_delta_from_conv_inline_g_kernel = (
     _make_linear_gated_delta_from_conv_inline_g_kernel()
+)
+_linear_gated_delta_from_conv_headquarter_kernel = (
+    _make_linear_gated_delta_from_conv_headquarter_kernel()
 )
 
 _LINEAR_GDN_ALIASES = {"linear_gdn", "linear_gdn_len5"}
@@ -1300,6 +1855,32 @@ def _linear_gated_delta_from_conv_tape_capture(
     state: mx.array,
     gdn: Any,
 ):
+    # Alternative execution layout for the same contract (A3B C1 lineage).
+    # Fail-closed: any ineligibility returns None from the wrapper and we
+    # fall through to the incumbent TGY kernel below.
+    if (
+        os.environ.get("MTPLX_LINEAR_GDN_TAPE_IMPL", "").strip().lower()
+        == "headquarter"
+    ):
+        try:
+            from .kernels.gdn_tape_headquarter import headquarter_tape_capture
+        except ImportError as exc:
+            # The user explicitly opted in; falling back must be loud, not
+            # silent, or the incumbent masquerades as the requested kernel.
+            headquarter_tape_capture = None
+            global _HEADQUARTER_IMPORT_WARNED
+            if not _HEADQUARTER_IMPORT_WARNED:
+                _HEADQUARTER_IMPORT_WARNED = True
+                logger.warning(
+                    "MTPLX_LINEAR_GDN_TAPE_IMPL=headquarter requested but the "
+                    "kernel module is unavailable (%s); using the incumbent "
+                    "tape kernel",
+                    exc,
+                )
+        if headquarter_tape_capture is not None:
+            result = headquarter_tape_capture(conv_out, g, beta, state, gdn)
+            if result is not None:
+                return result
     if _linear_gated_delta_from_conv_tape_kernel is None:
         return None
     B, T, conv_dim = conv_out.shape
@@ -1435,6 +2016,520 @@ def _linear_gated_delta_from_conv_inline_g_capture(
     )
 
 
+def _a3b_compiled_target_gdn_postconv_m1_tgy4(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Launch the fixed A3B compiled-target M1 recurrence with TGY4."""
+    return _linear_gated_delta_from_conv_inline_g_kernel(
+        inputs=[conv_out, a, b, A_log, dt_bias, state, 1],
+        template=[
+            ("InT", mx.bfloat16),
+            ("StT", mx.float32),
+            ("Dk", 128),
+            ("Dv", 128),
+            ("Hk", 16),
+            ("Hv", 32),
+            ("KeyDim", 2048),
+            ("ConvDim", 8192),
+        ],
+        grid=(32, 128, 32),
+        threadgroup=(32, 4, 1),
+        output_shapes=[(1, 1, 32, 128), (1, 1, 32, 128, 128)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )
+
+
+def _a3b_compiled_target_gdn_postconv_m2_tgy4(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Launch the fixed A3B compiled-target M2 recurrence with TGY4."""
+    return _linear_gated_delta_from_conv_inline_g_kernel(
+        inputs=[conv_out, a, b, A_log, dt_bias, state, 2],
+        template=[
+            ("InT", mx.bfloat16),
+            ("StT", mx.float32),
+            ("Dk", 128),
+            ("Dv", 128),
+            ("Hk", 16),
+            ("Hv", 32),
+            ("KeyDim", 2048),
+            ("ConvDim", 8192),
+        ],
+        grid=(32, 128, 32),
+        threadgroup=(32, 4, 1),
+        output_shapes=[(1, 2, 32, 128), (1, 2, 32, 128, 128)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )
+
+
+def _a3b_compiled_target_gdn_postconv_b8_t2_tgy4(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Launch the fixed eight-row A3B M2 recurrence with TGY4."""
+    return _linear_gated_delta_from_conv_inline_g_kernel(
+        inputs=[conv_out, a, b, A_log, dt_bias, state, 2],
+        template=[
+            ("InT", mx.bfloat16),
+            ("StT", mx.float32),
+            ("Dk", 128),
+            ("Dv", 128),
+            ("Hk", 16),
+            ("Hv", 32),
+            ("KeyDim", 2048),
+            ("ConvDim", 8192),
+        ],
+        grid=(32, 128, 256),
+        threadgroup=(32, 4, 1),
+        output_shapes=[(8, 2, 32, 128), (8, 2, 32, 128, 128)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )
+
+
+def _a3b_compiled_target_gdn_postconv_b3_t2_tgy4(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Launch the fixed three-row A3B M2 recurrence with TGY4.
+
+    Identical arithmetic to the eight-row launch: the inline_g source derives
+    ``b_idx = grid.z / Hv`` so the batch extent lives only in the grid z size
+    (rows * Hv = 3 * 32 = 96) and the output batch dimension.
+    """
+    return _linear_gated_delta_from_conv_inline_g_kernel(
+        inputs=[conv_out, a, b, A_log, dt_bias, state, 2],
+        template=[
+            ("InT", mx.bfloat16),
+            ("StT", mx.float32),
+            ("Dk", 128),
+            ("Dv", 128),
+            ("Hk", 16),
+            ("Hv", 32),
+            ("KeyDim", 2048),
+            ("ConvDim", 8192),
+        ],
+        grid=(32, 128, 96),
+        threadgroup=(32, 4, 1),
+        output_shapes=[(3, 2, 32, 128), (3, 2, 32, 128, 128)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )
+
+
+def _apply_enabled_a3b_gdn_postconv_m1_tgy4(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Execute the construction-installed exact A3B M1/TGY4 route."""
+    return _a3b_compiled_target_gdn_postconv_m1_tgy4(
+        conv_out,
+        a,
+        b,
+        state,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+
+
+def _apply_enabled_a3b_gdn_postconv_m2_tgy4(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Execute the construction-installed exact A3B M2/TGY4 route."""
+    return _a3b_compiled_target_gdn_postconv_m2_tgy4(
+        conv_out,
+        a,
+        b,
+        state,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+
+
+def _apply_enabled_a3b_gdn_postconv_b8_t2_tgy4(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Execute the construction-installed eight-row A3B M2/TGY4 route."""
+    return _a3b_compiled_target_gdn_postconv_b8_t2_tgy4(
+        conv_out,
+        a,
+        b,
+        state,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+
+
+def _apply_enabled_a3b_gdn_postconv_b3_t2_tgy4(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Execute the construction-installed three-row A3B M2/TGY4 route."""
+    return _a3b_compiled_target_gdn_postconv_b3_t2_tgy4(
+        conv_out,
+        a,
+        b,
+        state,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+
+
+def _a3b_compiled_target_gdn_postconv_m1_headquarter(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Launch the fixed A3B compiled-target M1 recurrence with the C1 headquarter kernel."""
+    return _linear_gated_delta_from_conv_headquarter_kernel(
+        inputs=[conv_out, a, b, A_log, dt_bias, state, 1],
+        template=[
+            ("InT", mx.bfloat16),
+            ("StT", mx.float32),
+            ("Dk", 128),
+            ("Dv", 128),
+            ("Hk", 16),
+            ("Hv", 32),
+            ("KeyDim", 2048),
+            ("ConvDim", 8192),
+            ("Quarters", 4),
+            ("Simds", 8),
+        ],
+        grid=(256, 4, 32),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(1, 1, 32, 128), (1, 1, 32, 128, 128)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )
+
+
+def _a3b_compiled_target_gdn_postconv_m2_headquarter(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Launch the fixed A3B compiled-target M2 recurrence with the C1 headquarter kernel."""
+    return _linear_gated_delta_from_conv_headquarter_kernel(
+        inputs=[conv_out, a, b, A_log, dt_bias, state, 2],
+        template=[
+            ("InT", mx.bfloat16),
+            ("StT", mx.float32),
+            ("Dk", 128),
+            ("Dv", 128),
+            ("Hk", 16),
+            ("Hv", 32),
+            ("KeyDim", 2048),
+            ("ConvDim", 8192),
+            ("Quarters", 4),
+            ("Simds", 8),
+        ],
+        grid=(256, 4, 32),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(1, 2, 32, 128), (1, 2, 32, 128, 128)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )
+
+
+def _a3b_compiled_target_gdn_postconv_b8_t2_headquarter(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Launch the fixed eight-row A3B M2 recurrence with headquarter."""
+    return _linear_gated_delta_from_conv_headquarter_kernel(
+        inputs=[conv_out, a, b, A_log, dt_bias, state, 2],
+        template=[
+            ("InT", mx.bfloat16),
+            ("StT", mx.float32),
+            ("Dk", 128),
+            ("Dv", 128),
+            ("Hk", 16),
+            ("Hv", 32),
+            ("KeyDim", 2048),
+            ("ConvDim", 8192),
+            ("Quarters", 4),
+            ("Simds", 8),
+        ],
+        grid=(256, 4, 256),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(8, 2, 32, 128), (8, 2, 32, 128, 128)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )
+
+
+def _a3b_compiled_target_gdn_postconv_b3_t2_headquarter(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Launch the fixed three-row A3B M2 recurrence with headquarter.
+
+    Same source as the eight-row launch; the grid z extent carries the batch
+    (rows * Hv = 96) and the outputs carry three rows.
+    """
+    return _linear_gated_delta_from_conv_headquarter_kernel(
+        inputs=[conv_out, a, b, A_log, dt_bias, state, 2],
+        template=[
+            ("InT", mx.bfloat16),
+            ("StT", mx.float32),
+            ("Dk", 128),
+            ("Dv", 128),
+            ("Hk", 16),
+            ("Hv", 32),
+            ("KeyDim", 2048),
+            ("ConvDim", 8192),
+            ("Quarters", 4),
+            ("Simds", 8),
+        ],
+        grid=(256, 4, 96),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(3, 2, 32, 128), (3, 2, 32, 128, 128)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )
+
+
+def _apply_enabled_a3b_gdn_postconv_m1_headquarter(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Execute the construction-installed exact A3B M1 headquarter route."""
+    return _a3b_compiled_target_gdn_postconv_m1_headquarter(
+        conv_out,
+        a,
+        b,
+        state,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+
+
+def _apply_enabled_a3b_gdn_postconv_m2_headquarter(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Execute the construction-installed exact A3B M2 headquarter route."""
+    return _a3b_compiled_target_gdn_postconv_m2_headquarter(
+        conv_out,
+        a,
+        b,
+        state,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+
+
+def _apply_enabled_a3b_gdn_postconv_b8_t2_headquarter(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Execute the construction-installed eight-row A3B M2 headquarter route."""
+    return _a3b_compiled_target_gdn_postconv_b8_t2_headquarter(
+        conv_out,
+        a,
+        b,
+        state,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+
+
+def _apply_enabled_a3b_gdn_postconv_b3_t2_headquarter(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Execute the construction-installed three-row A3B M2 headquarter route."""
+    return _a3b_compiled_target_gdn_postconv_b3_t2_headquarter(
+        conv_out,
+        a,
+        b,
+        state,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+
+
+def _a3b_compiled_target_gdn_postconv_m3_tgy4(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Launch the A3B compiled-target M3 (k=2, 3-row) recurrence with TGY4.
+
+    Identical to the M2 launch except the logical sequence length is 3 -- the
+    inline_g kernel scans ``logical_m`` positions, so the k=2 verify
+    ``[primary, d1, d2]`` recurrence reuses the exact M1/M2 arithmetic per row.
+    """
+    return _linear_gated_delta_from_conv_inline_g_kernel(
+        inputs=[conv_out, a, b, A_log, dt_bias, state, 3],
+        template=[
+            ("InT", mx.bfloat16),
+            ("StT", mx.float32),
+            ("Dk", 128),
+            ("Dv", 128),
+            ("Hk", 16),
+            ("Hv", 32),
+            ("KeyDim", 2048),
+            ("ConvDim", 8192),
+        ],
+        grid=(32, 128, 32),
+        threadgroup=(32, 4, 1),
+        output_shapes=[(1, 3, 32, 128), (1, 3, 32, 128, 128)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )
+
+
+def _a3b_compiled_target_gdn_postconv_m3_headquarter(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Launch the A3B compiled-target M3 (k=2, 3-row) recurrence with headquarter."""
+    return _linear_gated_delta_from_conv_headquarter_kernel(
+        inputs=[conv_out, a, b, A_log, dt_bias, state, 3],
+        template=[
+            ("InT", mx.bfloat16),
+            ("StT", mx.float32),
+            ("Dk", 128),
+            ("Dv", 128),
+            ("Hk", 16),
+            ("Hv", 32),
+            ("KeyDim", 2048),
+            ("ConvDim", 8192),
+            ("Quarters", 4),
+            ("Simds", 8),
+        ],
+        grid=(256, 4, 32),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(1, 3, 32, 128), (1, 3, 32, 128, 128)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )
+
+
+def _apply_enabled_a3b_gdn_postconv_m3_tgy4(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Execute the construction-installed exact A3B M3/TGY4 route (k=2)."""
+    return _a3b_compiled_target_gdn_postconv_m3_tgy4(
+        conv_out,
+        a,
+        b,
+        state,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+
+
+def _apply_enabled_a3b_gdn_postconv_m3_headquarter(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Execute the construction-installed exact A3B M3 headquarter route (k=2)."""
+    return _a3b_compiled_target_gdn_postconv_m3_headquarter(
+        conv_out,
+        a,
+        b,
+        state,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+
+
 def _stock_gated_delta_capture(
     q: mx.array,
     k: mx.array,
@@ -1473,6 +2568,17 @@ def _stock_gated_delta_capture(
     return mx.concatenate(outs, axis=1), mx.stack(states, axis=1)
 
 
+gdn_capture_fallback_counts: dict[str, int] = {}
+
+
+def _count_gdn_capture_fallback(reason: str) -> None:
+    """Per-backend counter for capture-lane degradations (Route Tape reads the
+    delta per round). Follows the nax_qlinear_fallback_counts pattern: these
+    paths must be loud in telemetry even though they stay silent in control
+    flow — a capture that degrades to stock still returns correct output."""
+    gdn_capture_fallback_counts[reason] = gdn_capture_fallback_counts.get(reason, 0) + 1
+
+
 def gdn_forward_with_capture(
     gdn: Any,
     inputs: mx.array,
@@ -1482,6 +2588,7 @@ def gdn_forward_with_capture(
     capture_backend: str | None = None,
 ):
     if getattr(gdn, "sharding_group", None) is not None:
+        _count_gdn_capture_fallback("sharding_group")
         return gdn(inputs, mask=mask, cache=cache), None
 
     from mlx_lm.models.gated_delta import compute_g
@@ -1501,6 +2608,8 @@ def gdn_forward_with_capture(
     conv_capture = None
     if _env_enabled("MTPLX_LINEAR_CONV1D_CAPTURE"):
         conv_capture = _linear_conv1d_capture(qkv, conv_state, gdn.conv1d.weight)
+        if conv_capture is None:
+            _count_gdn_capture_fallback("conv1d_capture_stock")
     if conv_capture is None:
         conv_capture = _stock_conv1d_capture(qkv, conv_state, gdn)
     conv_out, conv_states = conv_capture
@@ -1523,6 +2632,7 @@ def gdn_forward_with_capture(
             gdn,
         )
         if delta_result is None:
+            _count_gdn_capture_fallback(f"delta_none:{backend}")
             return gdn(inputs, mask=mask, cache=cache), None
         out, states = delta_result
     elif backend == "linear_gdn_from_conv_tape":
@@ -1536,6 +2646,7 @@ def gdn_forward_with_capture(
             gdn,
         )
         if delta_result is None:
+            _count_gdn_capture_fallback(f"delta_none:{backend}")
             return gdn(inputs, mask=mask, cache=cache), None
         out, final_state, tape = delta_result
         states = final_state[:, None, :, :, :]
@@ -1555,6 +2666,7 @@ def gdn_forward_with_capture(
             capture_start=capture_start,
         )
         if delta_result is None:
+            _count_gdn_capture_fallback(f"delta_none:{backend}")
             return gdn(inputs, mask=mask, cache=cache), None
         out, states = delta_result
     elif backend in {"linear_gdn", "linear_gdn_from_conv"}:
@@ -1586,6 +2698,7 @@ def gdn_forward_with_capture(
             k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
             delta_result = _linear_gated_delta_capture(q, k, v, g, beta, state)
         if delta_result is None:
+            _count_gdn_capture_fallback(f"delta_none:{backend}")
             return gdn(inputs, mask=mask, cache=cache), None
         out, states = delta_result
     elif backend == "linear_gdn_final":
@@ -1604,6 +2717,7 @@ def gdn_forward_with_capture(
         g = compute_g(gdn.A_log, a, gdn.dt_bias)
         delta_result = _linear_gated_delta_final(q, k, v, g, beta, state)
         if delta_result is None:
+            _count_gdn_capture_fallback(f"delta_none:{backend}")
             return gdn(inputs, mask=mask, cache=cache), None
         out, final_state = delta_result
         states = final_state[:, None, :, :, :]
@@ -1693,6 +2807,194 @@ def gdn_forward_with_capture(
     return out, {"conv_states": conv_states, "states": states}
 
 
+def _a3b_gdn_forward_with_fixed_postconv(
+    gdn: Any,
+    inputs: mx.array,
+    cache: Any,
+    postconv_implementation: Callable[..., Any],
+):
+    """Build the unchecked exact A3B GDN graph with stock surroundings."""
+    B, S, _ = inputs.shape
+    qkv = gdn.in_proj_qkv(inputs)
+    z = gdn.in_proj_z(inputs).reshape(B, S, 32, 128)
+    b = gdn.in_proj_b(inputs)
+    a = gdn.in_proj_a(inputs)
+    conv_state = cache[0]
+    conv_out, conv_states = _stock_conv1d_capture(qkv, conv_state, gdn)
+    out, states = postconv_implementation(conv_out, a, b, cache[1])
+    cache[0] = mx.contiguous(conv_states[:, -1, :, :])
+    cache[1] = states[:, -1, :, :, :]
+    out = gdn.norm(out, z)
+    out = gdn.out_proj(out.reshape(B, S, -1))
+    return out, {"conv_states": conv_states, "states": states}
+
+
+def _b8_t2_rowwise_b1_qlinear(
+    inputs: mx.array,
+    implementation: Callable[[mx.array], mx.array],
+) -> mx.array:
+    """Run the fixed B8/T2 input as eight unchanged B1/T2 projections."""
+
+    return mx.concatenate(
+        tuple(implementation(inputs[row : row + 1]) for row in range(8)),
+        axis=0,
+    )
+
+
+def _a3b_gdn_forward_with_fixed_postconv_bound_projections(
+    gdn: Any,
+    inputs: mx.array,
+    cache: Any,
+    postconv_implementation: Callable[..., Any],
+    b1_qkv_implementation: Callable[[mx.array], mx.array],
+    z_implementation: Callable[[mx.array], mx.array],
+    b_implementation: Callable[[mx.array], mx.array],
+    a_implementation: Callable[[mx.array], mx.array],
+):
+    """Build the balanced B8 graph with construction-bound projections."""
+
+    B, S, _ = inputs.shape
+    qkv = b1_qkv_implementation(inputs)
+    z = z_implementation(inputs).reshape(B, S, 32, 128)
+    b = b_implementation(inputs)
+    a = a_implementation(inputs)
+    conv_state = cache[0]
+    conv_out, conv_states = _stock_conv1d_capture(qkv, conv_state, gdn)
+    out, states = postconv_implementation(conv_out, a, b, cache[1])
+    cache[0] = mx.contiguous(conv_states[:, -1, :, :])
+    cache[1] = states[:, -1, :, :, :]
+    out = gdn.norm(out, z)
+    out = gdn.out_proj(out.reshape(B, S, -1))
+    return out, {"conv_states": conv_states, "states": states}
+
+
+def forward_with_a3b_gdn_postconv_capture(
+    model: Any,
+    inputs: mx.array,
+    cache: list[Any],
+    *,
+    hidden_variant: str | None,
+    postconv_implementations: tuple[Callable[..., Any], ...],
+):
+    """Build the unchecked exact 40-layer A3B target trace."""
+    text_model = model.language_model
+    inner = text_model.model
+    hidden_states = inner.embed_tokens(inputs)
+
+    from mlx_lm.models.base import create_attention_mask
+
+    attention_mask = create_attention_mask(hidden_states, cache[3])
+    captures: dict[int, dict[str, mx.array]] = {}
+    implementation_iter = iter(postconv_implementations)
+    for layer_idx, (layer, layer_cache, kind) in enumerate(
+        zip(inner.layers, cache, _A3B_GDN_POSTCONV_LAYER_TYPES)
+    ):
+        normed = layer.input_layernorm(hidden_states)
+        if kind == "linear_attention":
+            r, capture = _a3b_gdn_forward_with_fixed_postconv(
+                layer.linear_attn,
+                normed,
+                layer_cache,
+                next(implementation_iter),
+            )
+            captures[layer_idx] = capture
+        else:
+            r = layer.self_attn(normed, mask=attention_mask, cache=layer_cache)
+        h = hidden_states + r
+        mlp_input = layer.post_attention_layernorm(h)
+        hidden_states = h + layer.mlp(mlp_input)
+
+    pre_norm = hidden_states
+    post_norm = inner.norm(hidden_states)
+    logits = (
+        inner.embed_tokens.as_linear(post_norm)
+        if text_model.args.tie_word_embeddings
+        else text_model.lm_head(post_norm)
+    )
+    hidden = pre_norm if hidden_variant == "pre_norm" else post_norm
+    return logits, hidden, captures
+
+
+def forward_with_a3b_gdn_postconv_capture_bound_projections(
+    model: Any,
+    inputs: mx.array,
+    cache: list[Any],
+    *,
+    hidden_variant: str | None,
+    postconv_implementations: tuple[Callable[..., Any], ...],
+    qkv_implementations: tuple[Callable[[mx.array], mx.array], ...],
+    z_implementations: tuple[Callable[[mx.array], mx.array], ...],
+    b_implementations: tuple[Callable[[mx.array], mx.array], ...],
+    a_implementations: tuple[Callable[[mx.array], mx.array], ...],
+):
+    """Build the unchecked layer-zero-B1-QKV/Z/B balanced B8/T2 trace."""
+
+    text_model = model.language_model
+    inner = text_model.model
+    hidden_states = inner.embed_tokens(inputs)
+
+    from mlx_lm.models.base import create_attention_mask
+
+    attention_mask = create_attention_mask(hidden_states, cache[3])
+    captures: dict[int, dict[str, mx.array]] = {}
+    postconv_iter = iter(postconv_implementations)
+    qkv_iter = iter(qkv_implementations)
+    z_iter = iter(z_implementations)
+    b_iter = iter(b_implementations)
+    a_iter = iter(a_implementations)
+    for layer_idx, (layer, layer_cache, kind) in enumerate(
+        zip(inner.layers, cache, _A3B_GDN_POSTCONV_LAYER_TYPES)
+    ):
+        normed = layer.input_layernorm(hidden_states)
+        if kind == "linear_attention":
+            r, capture = _a3b_gdn_forward_with_fixed_postconv_bound_projections(
+                layer.linear_attn,
+                normed,
+                layer_cache,
+                next(postconv_iter),
+                next(qkv_iter),
+                next(z_iter),
+                next(b_iter),
+                next(a_iter),
+            )
+            captures[layer_idx] = capture
+        else:
+            r = layer.self_attn(normed, mask=attention_mask, cache=layer_cache)
+        h = hidden_states + r
+        mlp_input = layer.post_attention_layernorm(h)
+        hidden_states = h + layer.mlp(mlp_input)
+
+    pre_norm = hidden_states
+    post_norm = inner.norm(hidden_states)
+    logits = (
+        inner.embed_tokens.as_linear(post_norm)
+        if text_model.args.tie_word_embeddings
+        else text_model.lm_head(post_norm)
+    )
+    hidden = pre_norm if hidden_variant == "pre_norm" else post_norm
+    return logits, hidden, captures
+
+
+def _fused_post_norm_tg_override() -> int | None:
+    """Threadgroup override for the fused post-norm residual lane.
+
+    None (the default) lets fused_add_rmsnorm mirror mx.fast.rms_norm's own
+    exact-fit/looped dispatch, which is bitwise-identical to the unfused
+    reference at every probed axis/row/dtype. A fixed value forces the looped
+    kernel at that lane count and changes the fp32 partial-sum partition — the
+    shipped 512 produced one-ULP fp16 flips at axes 3072/5120 from 64 rows up
+    (#319). Env knob exists for A/B archaeology only.
+    """
+    raw = os.environ.get("MTPLX_FUSE_POST_NORM_RESIDUAL_TG", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 def forward_with_gdn_capture(
     model: Any,
     inputs: mx.array,
@@ -1704,26 +3006,9 @@ def forward_with_gdn_capture(
 ):
     text_model = getattr(model, "language_model", model)
     inner = text_model.model
-    layers = tuple(inner.layers)
-    hybrid_metadata = hasattr(inner, "fa_idx") and hasattr(inner, "ssm_idx")
-    if not hybrid_metadata:
-        if any(bool(getattr(layer, "is_linear", False)) for layer in layers):
-            raise RuntimeError(
-                "hybrid capture target is missing fa_idx/ssm_idx metadata"
-            )
-        result = text_model(
-            inputs,
-            cache=cache,
-            return_hidden=return_hidden,
-            hidden_variant=hidden_variant,
-        )
-        if return_hidden:
-            logits, hidden = result
-            return logits, hidden, {}
-        return result, {}
     hidden_states = inner.embed_tokens(inputs)
     if cache is None:
-        cache = [None] * len(layers)
+        cache = [None] * len(inner.layers)
 
     from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
@@ -1743,7 +3028,7 @@ def forward_with_gdn_capture(
         and context_len >= max(0, layer_eval_threshold)
     )
 
-    for layer_idx, (layer, layer_cache) in enumerate(zip(layers, cache)):
+    for layer_idx, (layer, layer_cache) in enumerate(zip(inner.layers, cache)):
         mask = ssm_mask if layer.is_linear else fa_mask
         normed = layer.input_layernorm(hidden_states)
         if layer.is_linear:
@@ -1782,12 +3067,22 @@ def forward_with_gdn_capture(
                 h = hidden_states + r
                 mlp_input = layer.post_attention_layernorm(h)
             else:
+                # 512-lane dispatch diverges from the unfused reference at
+                # fp16 above 64 rows (2^15 grid boundary; probed 2026-08-24,
+                # #319). bf16 is bit-exact at 512, so it keeps the tuned
+                # width; fp16 takes the default 1024-lane loop, bit-exact at
+                # every probed shape. MTPLX_FUSE_POST_NORM_RESIDUAL_TG
+                # overrides both for A/B archaeology only.
                 h, mlp_input = fused_add_rmsnorm(
                     hidden_states,
                     r,
                     layer.post_attention_layernorm.weight,
                     layer.post_attention_layernorm.eps,
-                    threadgroup_size=512,
+                    threadgroup_size=(
+                        override
+                        if (override := _fused_post_norm_tg_override()) is not None
+                        else (512 if hidden_states.dtype == mx.bfloat16 else None)
+                    ),
                 )
         else:
             h = hidden_states + r
@@ -1807,173 +3102,6 @@ def forward_with_gdn_capture(
         hidden = pre_norm if hidden_variant == "pre_norm" else post_norm
         return logits, hidden, captures
     return logits, captures
-
-
-@dataclass(frozen=True)
-class _StockCapturedLayerCommit:
-    layer_index: int
-    own_conv: Callable[[Any], Any]
-    own_gdn: Callable[[Any], Any]
-    replace_state: Callable[[Any, list[Any]], None]
-
-    def __call__(
-        self,
-        cache: list[Any],
-        captures: dict[int, dict[str, mx.array]],
-        capture_index: int,
-    ) -> None:
-        capture = captures[self.layer_index]
-        conv_state = self.own_conv(
-            capture["conv_states"][:, capture_index, :, :]
-        )
-        gdn_state = self.own_gdn(
-            capture["states"][:, capture_index, :, :, :]
-        )
-        self.replace_state(cache[self.layer_index], [conv_state, gdn_state])
-
-
-@dataclass(frozen=True)
-class CapturedPrefixCommitPlan:
-    """Construction-qualified direct commit for stock GDN captures.
-
-    Cache ownership, layer kinds, capture schema, shapes, dtypes, backend, and
-    detach policy are proven before installation.  Runtime keep/verify widths
-    genuinely vary (the final depth-3 cycle can be shorter), so commit uses
-    those two values directly without rechecking the installed invariants.
-    """
-
-    max_verified_tokens: int
-    _recurrent_commits: tuple[_StockCapturedLayerCommit, ...]
-    trimmable_layer_indices: tuple[int, ...]
-
-    @property
-    def recurrent_layer_indices(self) -> tuple[int, ...]:
-        return tuple(route.layer_index for route in self._recurrent_commits)
-
-    def commit(
-        self,
-        cache: list[Any],
-        captures: dict[int, dict[str, mx.array]],
-        *,
-        keep_tokens: int,
-        verified_tokens: int,
-    ) -> None:
-        capture_index = keep_tokens - 1
-        trim_tokens = verified_tokens - keep_tokens
-        for route in self._recurrent_commits:
-            route(cache, captures, capture_index)
-        for layer_index in self.trimmable_layer_indices:
-            cache[layer_index].trim(trim_tokens)
-
-
-def qualify_captured_prefix_commit(
-    cache: list[Any],
-    captures: dict[int, dict[str, mx.array]],
-    *,
-    max_verified_tokens: int,
-    capture_backend: str,
-    detach_components: set[str],
-) -> CapturedPrefixCommitPlan:
-    """Fail closed before measurement and return a direct stock committer."""
-
-    if capture_backend != "stock":
-        raise RuntimeError("direct commit requires the stock capture backend")
-    if detach_components:
-        raise RuntimeError("direct commit does not permit capture detach components")
-    if max_verified_tokens < 1:
-        raise RuntimeError("direct commit max_verified_tokens must be positive")
-    if captures.get("__final_only__"):
-        raise RuntimeError("direct commit cannot install from a final-only capture")
-
-    from .cache_state import replace_recurrent_cache_state
-
-    recurrent: list[_StockCapturedLayerCommit] = []
-    trimmable: list[int] = []
-    for layer_index, entry in enumerate(cache):
-        is_trimmable = getattr(entry, "is_trimmable", None)
-        if callable(is_trimmable) and bool(is_trimmable()):
-            if layer_index in captures:
-                raise RuntimeError(
-                    f"unexpected capture for trimmable layer {layer_index}"
-                )
-            if not callable(getattr(entry, "trim", None)):
-                raise RuntimeError(
-                    f"trimmable layer {layer_index} has no fixed trim operation"
-                )
-            trimmable.append(layer_index)
-            continue
-
-        state = getattr(entry, "state", None)
-        if not isinstance(state, (list, tuple)) or len(state) != 2:
-            raise RuntimeError(
-                f"cache layer {layer_index} is neither trimmable nor recurrent"
-            )
-        capture = captures.get(layer_index)
-        if capture is None:
-            raise RuntimeError(f"missing capture for recurrent layer {layer_index}")
-        if not isinstance(capture, dict) or set(capture) != {
-            "conv_states",
-            "states",
-        }:
-            raise RuntimeError(
-                f"recurrent layer {layer_index} does not use the stock capture schema"
-            )
-        if not all(isinstance(value, mx.array) for value in state):
-            raise RuntimeError(
-                f"recurrent cache layer {layer_index} has non-array state"
-            )
-        conv_states = capture["conv_states"]
-        gdn_states = capture["states"]
-        if not isinstance(conv_states, mx.array) or not isinstance(gdn_states, mx.array):
-            raise RuntimeError(
-                f"recurrent layer {layer_index} capture leaves are not arrays"
-            )
-        if len(conv_states.shape) != 4 or len(gdn_states.shape) != 5:
-            raise RuntimeError(
-                f"recurrent layer {layer_index} capture ranks are invalid"
-            )
-        if (
-            int(conv_states.shape[1]) != max_verified_tokens
-            or int(gdn_states.shape[1]) != max_verified_tokens
-        ):
-            raise RuntimeError(
-                f"recurrent layer {layer_index} capture width does not match "
-                f"{max_verified_tokens}"
-            )
-        if (
-            tuple(conv_states.shape[:1] + conv_states.shape[2:])
-            != tuple(state[0].shape)
-            or tuple(gdn_states.shape[:1] + gdn_states.shape[2:])
-            != tuple(state[1].shape)
-        ):
-            raise RuntimeError(
-                f"recurrent layer {layer_index} capture shapes do not match cache state"
-            )
-        if conv_states.dtype != state[0].dtype or gdn_states.dtype != state[1].dtype:
-            raise RuntimeError(
-                f"recurrent layer {layer_index} capture dtypes do not match cache state"
-            )
-        recurrent.append(
-            _StockCapturedLayerCommit(
-                layer_index=layer_index,
-                own_conv=mx.contiguous,
-                own_gdn=_contiguous_recurrent_leaf,
-                replace_state=replace_recurrent_cache_state,
-            )
-        )
-
-    capture_layers = {key for key in captures if isinstance(key, int)}
-    recurrent_layers = {route.layer_index for route in recurrent}
-    if capture_layers != recurrent_layers:
-        unexpected = sorted(capture_layers - recurrent_layers)
-        raise RuntimeError(f"unexpected recurrent capture layers: {unexpected}")
-    if not recurrent:
-        raise RuntimeError("direct commit requires at least one recurrent layer")
-    return CapturedPrefixCommitPlan(
-        max_verified_tokens=int(max_verified_tokens),
-        _recurrent_commits=tuple(recurrent),
-        trimmable_layer_indices=tuple(trimmable),
-    )
 
 
 def commit_captured_prefix(
@@ -1999,6 +3127,13 @@ def commit_captured_prefix(
     capture_index = keep_tokens - 1
     for capture in captures.values():
         if isinstance(capture, dict):
+            if "conv_states" not in capture:
+                # A family-native capture (Flash-Next's fixed-M4 rows keyed by
+                # its own GDN row names, no conv tape) is committed by the
+                # model's own commit_verified_window; this walker only knows
+                # the qwen3-next conv_states/states layout. Decline instead of
+                # raising KeyError so the caller falls through (#463).
+                return False
             capture_start = int(capture.get("capture_start", 0))
             if capture_index - capture_start < 0:
                 return False
@@ -2047,4 +3182,95 @@ def commit_captured_prefix(
             replace_recurrent_cache_state(entry, [conv_state, gdn_state])
         elif trim_tokens and hasattr(entry, "is_trimmable") and entry.is_trimmable():
             entry.trim(trim_tokens)
+    return True
+
+
+def _select_captured_rows(value: mx.array, indices: list[int]) -> mx.array:
+    """Select one captured time position per batch row without a host round trip."""
+    batch = int(value.shape[0])
+    if batch != len(indices):
+        raise ValueError(
+            f"capture batch has {batch} rows, but {len(indices)} positions were given"
+        )
+    selector = mx.array(indices, dtype=mx.int32).reshape(
+        (batch, 1) + (1,) * (int(value.ndim) - 2)
+    )
+    selector = mx.broadcast_to(selector, (batch, 1) + tuple(value.shape[2:]))
+    return mx.contiguous(mx.take_along_axis(value, selector, axis=1)[:, 0])
+
+
+def commit_captured_rows(
+    cache: list[Any],
+    captures: dict[int, dict[str, mx.array]],
+    keep_tokens_by_row: list[int] | tuple[int, ...],
+    verified_tokens: int,
+) -> bool:
+    """Commit a different verified prefix length for every fixed cohort row.
+
+    This is the Qwen 35B A3B ``[B, 2]`` MTP commit boundary.  Full-attention
+    entries must already be :class:`RaggedBatchKVCache` instances so their
+    logical offsets can move independently.  Recurrent entries are rebound to
+    the captured state at each row's authoritative position.  The installed
+    post-conv capture path supplies both states directly; tape replay is not a
+    supported hot-path fallback.
+    """
+    verified = int(verified_tokens)
+    keeps = [int(value) for value in keep_tokens_by_row]
+    if not keeps or any(value <= 0 or value > verified for value in keeps):
+        return False
+    if captures.get("__final_only__"):
+        return False
+
+    from .cache_state import _is_trimmable
+    from .ragged_kv_cache import RaggedBatchKVCache
+
+    adjusted_by_layer: dict[int, list[int]] = {}
+    for layer_idx, entry in enumerate(cache):
+        capture = captures.get(layer_idx)
+        if capture is not None:
+            if "tape" in capture:
+                return False
+            if "conv_states" not in capture or "states" not in capture:
+                return False
+            capture_start = int(capture.get("capture_start", 0))
+            adjusted = [value - 1 - capture_start for value in keeps]
+            if any(value < 0 for value in adjusted):
+                return False
+            if len(keeps) != int(capture["conv_states"].shape[0]):
+                return False
+            adjusted_by_layer[layer_idx] = adjusted
+        elif _is_trimmable(entry):
+            if isinstance(entry, RaggedBatchKVCache):
+                if entry.offsets is not None and int(entry.offsets.size) != len(keeps):
+                    return False
+            elif len(set(keeps)) != 1:
+                return False
+        elif entry is not None and hasattr(entry, "state"):
+            # The installed A3B layout has exactly 30 recurrent entries and
+            # every one must have a post-conv capture.  Missing ownership is a
+            # cohort failure, never permission to keep speculative final state.
+            return False
+
+    for layer_idx, entry in enumerate(cache):
+        capture = captures.get(layer_idx)
+        if capture is not None:
+            adjusted = adjusted_by_layer[layer_idx]
+            conv_state = _select_captured_rows(capture["conv_states"], adjusted)
+            gdn_state = _select_captured_rows(capture["states"], adjusted)
+            # Rebind the two leaves directly.  OwnedRecurrentStateCache's
+            # item assignment is deliberately lazy; replace_state would add a
+            # per-cycle synchronization and copy to this enabled hot path.
+            if hasattr(entry, "__setitem__"):
+                entry[0] = conv_state
+                entry[1] = gdn_state
+            else:
+                entry.state = [conv_state, gdn_state]
+        elif isinstance(entry, RaggedBatchKVCache):
+            entry.offsets = (
+                entry.offsets - verified + mx.array(keeps, dtype=mx.int32)
+            ).astype(mx.int32)
+        elif _is_trimmable(entry):
+            trim = verified - keeps[0]
+            if trim:
+                entry.trim(trim)
     return True

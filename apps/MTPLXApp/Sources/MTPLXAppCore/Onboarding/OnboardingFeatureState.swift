@@ -2,9 +2,13 @@ import Foundation
 
 // MARK: - OnboardingStep
 //
-// The six-step linear flow. Order is canonical; `goNext` / `goBack`
+// The seven-step linear flow. Order is canonical; `goNext` / `goBack`
 // walk the case array in declaration order so the enum doubles as the
 // progress indicator's source of truth.
+//
+// `language` comes first so every later step already renders in the
+// language the user picked; the choice persists through LanguageStore
+// and can be changed again in Settings.
 //
 // `runtimeSetup` sits before download on purpose: the download and
 // tune steps both shell the `mtplx` CLI, so the runtime (plus fan
@@ -13,12 +17,18 @@ import Foundation
 // "Skip tune" could finish onboarding with no runtime installed.
 
 public enum OnboardingStep: String, CaseIterable, Equatable, Sendable {
+    case language
     case welcome
     case hardwareScan = "hardware_scan"
     case modelPick = "model_pick"
     case runtimeSetup = "runtime_setup"
     case download
     case tune
+
+    /// Position in the canonical flow, for the "Step N of M" capsule.
+    public var index: Int {
+        Self.allCases.firstIndex(of: self) ?? 0
+    }
 }
 
 // MARK: - ModelPickChoice
@@ -33,6 +43,12 @@ public enum ModelPickChoice: Equatable, Sendable, Hashable {
     case none
     case curatedQwen35FourBit
     case curatedQwen35NineBSpeed
+    case curatedQwen38OptimizedSpeed
+    case curatedQwen38BareSpeed
+    case curatedQwen38OptimizedQuality
+    case curatedFlashNextBareSpeed
+    case curatedFlashNextOptimizedSpeed
+    case curatedSpeedV2
     case curatedSpeed
     case curatedQwen35BSpeed
     case curatedQwen35BBalance
@@ -137,24 +153,19 @@ public struct OnboardingFeatureState: Equatable, Sendable {
     public var pick: ModelPickChoice
     public var otherProbe: OtherModelProbe?
     public var localProbe: LocalModelProbe?
-    /// User explicitly opted to continue past a `.noMTP` warning.
-    /// Resets to false whenever `pick` changes.
-    public var hasAcknowledgedOtherWarning: Bool
 
     public init(
-        step: OnboardingStep = .welcome,
+        step: OnboardingStep = .language,
         hardware: DetectedHardware? = nil,
         pick: ModelPickChoice = .none,
         otherProbe: OtherModelProbe? = nil,
-        localProbe: LocalModelProbe? = nil,
-        hasAcknowledgedOtherWarning: Bool = false
+        localProbe: LocalModelProbe? = nil
     ) {
         self.step = step
         self.hardware = hardware
         self.pick = pick
         self.otherProbe = otherProbe
         self.localProbe = localProbe
-        self.hasAcknowledgedOtherWarning = hasAcknowledgedOtherWarning
     }
 
     // MARK: Derived
@@ -174,6 +185,29 @@ public struct OnboardingFeatureState: Equatable, Sendable {
             let useFP16 = hardware?.tier == .legacyApple
             let id = useFP16 ? "qwen35-9b-optimized-speed-fp16" : "qwen35-9b-optimized-speed"
             return catalog.first { $0.id == id }
+        case .curatedQwen38OptimizedSpeed:
+            // The 3.8 trio has FP16 precision siblings (2026-08-15): same
+            // quantized packs, 16-bit tensors cast to fp16, so M1/M2 Macs
+            // get the identical model on the chip's native precision.
+            let useFP16 = hardware?.tier == .legacyApple
+            let id = useFP16 ? "qwen38-27b-optimized-speed-fp16" : "qwen38-27b-optimized-speed"
+            return catalog.first { $0.id == id }
+        case .curatedQwen38BareSpeed:
+            let useFP16 = hardware?.tier == .legacyApple
+            let id = useFP16 ? "qwen38-27b-bare-speed-fp16" : "qwen38-27b-bare-speed"
+            return catalog.first { $0.id == id }
+        case .curatedQwen38OptimizedQuality:
+            let useFP16 = hardware?.tier == .legacyApple
+            let id = useFP16 ? "qwen38-27b-optimized-quality-fp16" : "qwen38-27b-optimized-quality"
+            return catalog.first { $0.id == id }
+        case .curatedFlashNextBareSpeed:
+            // Flash-Next is modern-tier only with no FP16 sibling, so
+            // there is no legacy swap — the pair passes through unchanged.
+            return catalog.first { $0.id == "flash-next-bare-speed" }
+        case .curatedFlashNextOptimizedSpeed:
+            return catalog.first { $0.id == "flash-next-optimized-speed" }
+        case .curatedSpeedV2:
+            return catalog.first { $0.id == "optimized-speed-v2" }
         case .curatedSpeed:
             let useFP16 = hardware?.tier == .legacyApple
             let id = useFP16 ? "optimized-speed-fp16" : "optimized-speed"
@@ -209,6 +243,12 @@ public struct OnboardingFeatureState: Equatable, Sendable {
             return nil
         case .curatedQwen35FourBit,
              .curatedQwen35NineBSpeed,
+             .curatedQwen38OptimizedSpeed,
+             .curatedQwen38BareSpeed,
+             .curatedQwen38OptimizedQuality,
+             .curatedFlashNextBareSpeed,
+             .curatedFlashNextOptimizedSpeed,
+             .curatedSpeedV2,
              .curatedSpeed,
              .curatedQwen35BSpeed,
              .curatedQwen35BBalance,
@@ -260,14 +300,10 @@ public struct OnboardingFeatureState: Equatable, Sendable {
         pick = choice
         otherProbe = nil
         localProbe = nil
-        hasAcknowledgedOtherWarning = false
     }
 
     public mutating func record(_ probe: OtherModelProbe) {
         otherProbe = probe
-        // A fresh probe always invalidates a previous acknowledgement
-        // so the user has to consciously re-confirm the warning.
-        hasAcknowledgedOtherWarning = false
     }
 
     public mutating func record(_ probe: LocalModelProbe) {
@@ -280,7 +316,7 @@ public struct OnboardingFeatureState: Equatable, Sendable {
     /// flag — it covers the user-input-driven cases only.
     public var canAdvance: Bool {
         switch step {
-        case .welcome:
+        case .language, .welcome:
             return true
         case .hardwareScan:
             return hardware != nil
@@ -290,6 +326,12 @@ public struct OnboardingFeatureState: Equatable, Sendable {
                 return false
             case .curatedQwen35FourBit,
                  .curatedQwen35NineBSpeed,
+                 .curatedQwen38OptimizedSpeed,
+                 .curatedQwen38BareSpeed,
+                 .curatedQwen38OptimizedQuality,
+                 .curatedFlashNextBareSpeed,
+                 .curatedFlashNextOptimizedSpeed,
+                 .curatedSpeedV2,
                  .curatedSpeed,
                  .curatedQwen35BSpeed,
                  .curatedQwen35BBalance,
@@ -300,10 +342,12 @@ public struct OnboardingFeatureState: Equatable, Sendable {
             case .other:
                 guard let probe = otherProbe else { return false }
                 switch probe.verdict {
-                case .ready, .missingSidecar:
+                case .ready, .missingSidecar, .noMTP:
+                    // MTP unavailable is informational, never a gate
+                    // (founder directive 2026-08-26): the engine serves
+                    // MTP-less checkpoints autoregressive, so the app
+                    // advances the same way the CLI does.
                     return true
-                case .noMTP:
-                    return hasAcknowledgedOtherWarning
                 case .probeFailed:
                     return false
                 }

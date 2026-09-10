@@ -10,6 +10,7 @@ from mtplx.cache_state import (
     TailOwnedKVCache,
     TensorOffsetVllmMetalPagedKVCache,
     VllmMetalPagedKVCache,
+    _dynamic_paged_num_blocks,
     _paged_gqa_sdpa_route_decision_from_env,
     _paged_gqa_sdpa_route_from_env,
     configure_owned_recurrent_state_cache,
@@ -25,8 +26,10 @@ from mtplx.cache_state import (
     owned_recurrent_state_stats,
     rollback_after_verify,
     restore_cache,
+    restore_untrimmable_cache_masked,
     snapshot_cache,
     snapshot_untrimmable_cache,
+    snapshot_untrimmable_cache_lazy,
     tail_owned_attention_kv_stats,
     trim_verified_window_to_prefix,
 )
@@ -133,6 +136,202 @@ def test_rollback_after_verify_trims_kv_and_restores_recurrent_state():
     assert kv.trimmed == 3
 
 
+def test_owned_recurrent_state_restore_masked_bitwise():
+    # Gate d: per-row masked restore of the recurrent leaves is bitwise exact --
+    # reverted rows return to the snapshot, kept rows stay advanced (the fold-in
+    # REPLAY rewind).  Two batch-major leaves model [conv_tail, gdn_matrix].
+    mx.random.seed(70)
+    B = 4
+    conv0 = mx.random.normal((B, 2, 3))  # conv tail (sliding-window, positional)
+    gdn0 = mx.random.normal((B, 4, 4))  # gdn matrix state
+    owned = OwnedRecurrentStateCache(size=2, initial=[conv0, gdn0])
+    snap = snapshot_untrimmable_cache([owned])
+
+    pre_conv = owned.state[0] + 0.0
+    pre_gdn = owned.state[1] + 0.0
+    # advance ALL rows (speculative write path = plain __setitem__ rebind).
+    adv_conv = mx.random.normal((B, 2, 3))
+    adv_gdn = mx.random.normal((B, 4, 4))
+    owned[0] = adv_conv
+    owned[1] = adv_gdn
+
+    # revert rows 0 and 2, keep rows 1 and 3 advanced.
+    mask = mx.array([True, False, True, False])
+    updates_before = owned.owner_updates
+    owned.restore_masked(snap.states[0], mask)
+    # restore_masked REBINDS (lazy where), it must NOT touch the owned buffers.
+    assert owned.owner_updates == updates_before
+
+    for r in (0, 2):
+        assert bool(mx.all(owned.state[0][r] == pre_conv[r]).item()), f"conv row {r}"
+        assert bool(mx.all(owned.state[1][r] == pre_gdn[r]).item()), f"gdn row {r}"
+    for r in (1, 3):
+        assert bool(mx.all(owned.state[0][r] == adv_conv[r]).item()), f"conv row {r}"
+        assert bool(mx.all(owned.state[1][r] == adv_gdn[r]).item()), f"gdn row {r}"
+
+
+def test_snapshot_untrimmable_cache_lazy_selects_like_eager():
+    # FIX 2: the lazy variant selects entries identically to the eager clone --
+    # trimmable KV -> None state, recurrent -> captured; only the leaf retention
+    # (view vs clone) differs.
+    mx.random.seed(72)
+    owned = OwnedRecurrentStateCache(
+        size=2, initial=[mx.random.normal((3, 5)), mx.random.normal((3, 6))]
+    )
+    kv = TrimmableDummyCache()
+    cache = [owned, kv]
+    eager = snapshot_untrimmable_cache(cache)
+    lazy = snapshot_untrimmable_cache_lazy(cache)
+    # trimmable entry -> None state in BOTH; recurrent entry -> captured in both.
+    assert lazy.states[1] is None and eager.states[1] is None
+    assert lazy.states[0] is not None and eager.states[0] is not None
+    # the lazy leaves are bitwise-equal to the eager clones at capture time.
+    for lazy_leaf, eager_leaf in zip(lazy.states[0], eager.states[0]):
+        assert bool(mx.all(lazy_leaf == eager_leaf).item())
+
+
+def test_snapshot_untrimmable_cache_lazy_view_survives_decode_cycle_mutations():
+    # FIX 2 gate (i): a lazy zero-copy view snapshot stays bitwise-identical to
+    # the pre-snapshot state across a full decode cycle's worth of recurrent
+    # mutations -- the GDN forward advances state by REBINDING cache slots
+    # (__setitem__), and the masked REPLAY rewind rebinds via mx.where, neither of
+    # which may write through the retained view.
+    mx.random.seed(73)
+    B = 4
+    conv0 = mx.random.normal((B, 2, 3))
+    gdn0 = mx.random.normal((B, 4, 4))
+    owned = OwnedRecurrentStateCache(size=2, initial=[conv0, gdn0])
+
+    pre_conv = owned.state[0] + 0.0  # independent reference of the captured value
+    pre_gdn = owned.state[1] + 0.0
+    snap = snapshot_untrimmable_cache_lazy([owned])
+    updates_before = owned.owner_updates
+    allocs_before = owned.owner_allocations
+
+    # advance ALL rows (the forward's speculative rebind path).
+    owned[0] = mx.random.normal((B, 2, 3))
+    owned[1] = mx.random.normal((B, 4, 4))
+    # a masked rewind (mx.where rebind) mid-cycle, as the fold-in loop does.
+    owned.restore_masked(snap.states[0], mx.array([True, False, True, False]))
+    # second advance on top, to model the next cycle's forward.
+    owned[0] = mx.random.normal((B, 2, 3))
+    owned[1] = mx.random.normal((B, 4, 4))
+    mx.eval(owned.state[0], owned.state[1])
+
+    # The snapshot VIEW still equals the value captured, bitwise, for every row.
+    assert bool(mx.all(snap.states[0][0] == pre_conv).item()), "conv view mutated"
+    assert bool(mx.all(snap.states[0][1] == pre_gdn).item()), "gdn view mutated"
+    # And capturing the view did zero owner-buffer work (no eager clone/eval).
+    assert owned.owner_updates == updates_before
+    assert owned.owner_allocations == allocs_before
+
+
+def test_snapshot_untrimmable_cache_lazy_restore_matches_clone_bitwise():
+    # FIX 2 gate (ii): restoring the REPLAY rows from a lazy-view snapshot is
+    # bitwise-identical to restoring them from an eager clone snapshot, on tiny
+    # Metal tensors -- the two snapshot paths are interchangeable for the rewind.
+    mx.random.seed(74)
+    B = 4
+    conv0 = mx.random.normal((B, 2, 3))
+    gdn0 = mx.random.normal((B, 4, 4))
+    owned_lazy = OwnedRecurrentStateCache(size=2, initial=[conv0, gdn0])
+    owned_clone = OwnedRecurrentStateCache(size=2, initial=[conv0, gdn0])
+
+    snap_lazy = snapshot_untrimmable_cache_lazy([owned_lazy])
+    snap_clone = snapshot_untrimmable_cache([owned_clone])
+
+    # advance both identically, then revert the SAME rows from each snapshot kind.
+    adv_conv = mx.random.normal((B, 2, 3))
+    adv_gdn = mx.random.normal((B, 4, 4))
+    mask = mx.array([True, False, True, False])
+    for owned, snap in ((owned_lazy, snap_lazy), (owned_clone, snap_clone)):
+        owned[0] = adv_conv
+        owned[1] = adv_gdn
+        owned.restore_masked(snap.states[0], mask)
+        mx.eval(owned.state[0], owned.state[1])
+
+    assert bool(mx.all(owned_lazy.state[0] == owned_clone.state[0]).item())
+    assert bool(mx.all(owned_lazy.state[1] == owned_clone.state[1]).item())
+
+
+def test_restore_untrimmable_cache_masked_all_false_is_noop_bitwise():
+    # FIX 1 basis: an all-False mask restore is mathematically
+    # mx.where(False, snap, cur) == cur, so gating the call out when no row
+    # replays is byte-identical.  Pin that equivalence directly.
+    mx.random.seed(75)
+    B = 3
+    owned = OwnedRecurrentStateCache(
+        size=2, initial=[mx.random.normal((B, 5)), mx.random.normal((B, 6))]
+    )
+    snap = snapshot_untrimmable_cache([owned])
+    owned[0] = mx.random.normal((B, 5))  # advance every row
+    owned[1] = mx.random.normal((B, 6))
+    advanced0 = owned.state[0] + 0.0
+    advanced1 = owned.state[1] + 0.0
+
+    restore_untrimmable_cache_masked([owned], snap, mx.array([False, False, False]))
+    mx.eval(owned.state[0], owned.state[1])
+    # every row kept its advanced state -- the restore was a no-op.
+    assert bool(mx.all(owned.state[0] == advanced0).item())
+    assert bool(mx.all(owned.state[1] == advanced1).item())
+
+
+def test_restore_untrimmable_cache_masked_skips_trimmable_and_reverts_recurrent():
+    # The helper reverts only the masked rows of the recurrent (non-trimmable)
+    # entry and never touches the trimmable KV (its snapshot state is None -- the
+    # ragged fold-in KV lane rewinds a missed row by overwriting its draft slot).
+    mx.random.seed(71)
+    B = 3
+    owned = OwnedRecurrentStateCache(
+        size=2, initial=[mx.random.normal((B, 5)), mx.random.normal((B, 6))]
+    )
+    kv = TrimmableDummyCache()
+    cache = [owned, kv]
+    snap = snapshot_untrimmable_cache(cache)
+    pre0 = owned.state[0] + 0.0
+
+    owned[0] = mx.random.normal((B, 5))
+    owned[1] = mx.random.normal((B, 6))
+    restore_untrimmable_cache_masked(cache, snap, mx.array([True, False, True]))
+
+    assert bool(mx.all(owned.state[0][0] == pre0[0]).item())
+    assert not bool(mx.all(owned.state[0][1] == pre0[1]).item())  # row 1 kept advanced
+    assert bool(mx.all(owned.state[0][2] == pre0[2]).item())
+    assert kv.trimmed == 0  # trimmable KV untouched
+
+
+def test_restore_untrimmable_cache_masked_generic_list_state_fallback():
+    # The list-state fallback drives the CPU test fake: per-row history revert.
+    class _ListRecurrent:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def is_trimmable(self):
+            return False
+
+        @property
+        def state(self):
+            return self._rows
+
+        @state.setter
+        def state(self, value):
+            self._rows = value
+
+        @property
+        def meta_state(self):
+            return None
+
+    entry = _ListRecurrent([[1, 2], [3], [4, 5, 6]])
+    snap = snapshot_untrimmable_cache([entry])
+    # advance every row (append), then revert rows 0 and 2 only.
+    entry.state = [[1, 2, 9], [3, 9], [4, 5, 6, 9]]
+    restore_untrimmable_cache_masked([entry], snap, [True, False, True])
+    assert entry.state == [[1, 2], [3, 9], [4, 5, 6]]
+    # reverted rows are COPIES -- a later append cannot corrupt the snapshot.
+    entry.state[0].append(99)
+    assert snap.states[0][0] == [1, 2]
+
+
 def test_trim_verified_window_to_prefix_requires_all_trimmable_snapshot():
     kv = TrimmableDummyCache()
     kv.offset = 8
@@ -159,87 +358,6 @@ def test_trim_verified_window_to_prefix_requires_all_trimmable_snapshot():
         keep_tokens=2,
     )
     assert kv.offset == 8
-
-
-def test_trim_verified_window_to_prefix_supports_mlx_cache_list():
-    from mlx_lm.models.cache import CacheList, KVCache
-
-    main = KVCache()
-    indexer = KVCache()
-    tail = mx.zeros((1, 1, 8, 1), dtype=mx.bfloat16)
-    main.update_and_fetch(tail, tail)
-    indexer.update_and_fetch(tail, tail)
-    wrapped = CacheList(main, indexer)
-    snap = snapshot_untrimmable_cache([wrapped])
-
-    assert trim_verified_window_to_prefix(
-        [wrapped],
-        snap,
-        verified_tokens=5,
-        keep_tokens=2,
-    )
-    assert main.offset == 5
-    assert indexer.offset == 5
-
-
-def test_trim_verified_window_to_prefix_preflights_every_nested_cache():
-    from mlx_lm.models.cache import CacheList, KVCache
-
-    main = KVCache()
-    indexer = KVCache()
-    main_tail = mx.zeros((1, 1, 8, 1), dtype=mx.bfloat16)
-    indexer_tail = mx.zeros((1, 1, 2, 1), dtype=mx.bfloat16)
-    main.update_and_fetch(main_tail, main_tail)
-    indexer.update_and_fetch(indexer_tail, indexer_tail)
-    wrapped = CacheList(main, indexer)
-    snap = snapshot_untrimmable_cache([wrapped])
-
-    assert not trim_verified_window_to_prefix(
-        [wrapped],
-        snap,
-        verified_tokens=5,
-        keep_tokens=2,
-    )
-    assert main.offset == 8
-    assert indexer.offset == 2
-
-
-def test_restore_cache_uses_cache_list_state_setter():
-    from mlx_lm.models.cache import CacheList, KVCache
-
-    main = KVCache()
-    indexer = KVCache()
-    prefix = mx.arange(8).reshape(1, 1, 8, 1)
-    main.update_and_fetch(prefix, prefix)
-    indexer.update_and_fetch(prefix + 10, prefix + 20)
-    wrapped = CacheList(main, indexer)
-    snapshot = snapshot_cache([wrapped])
-    mx.eval(*snapshot.states[0][0], *snapshot.states[0][1])
-
-    tail = mx.full((1, 1, 2, 1), 99)
-    main.update_and_fetch(tail, tail)
-    indexer.update_and_fetch(tail, tail)
-    restore_cache([wrapped], snapshot)
-
-    assert main.offset == 8
-    assert indexer.offset == 8
-    assert main.keys.tolist() == prefix.tolist()
-    assert indexer.keys.tolist() == (prefix + 10).tolist()
-
-
-def test_restore_cache_preserves_arrays_cache_container_identity():
-    from mlx_lm.models.cache import ArraysCache
-
-    cache = ArraysCache(2)
-    cache.cache[:] = [mx.array([1]), mx.array([2])]
-    original_container = cache.cache
-    snapshot = snapshot_cache([cache])
-
-    cache.cache[:] = [mx.array([9]), mx.array([10])]
-    restore_cache([cache], snapshot)
-
-    assert cache.cache is original_container
-    assert [item.tolist() for item in cache.cache] == [[1], [2]]
 
 
 def test_detach_recurrent_cache_state_replaces_requested_list_leaves():
@@ -651,6 +769,79 @@ def test_paged_kv_grows_on_dynamic_overflow(monkeypatch):
 
     assert paged.capacity >= 6
     assert paged.paged_stats()["grow_events"] == 1
+
+
+def test_install_reconfig_on_live_cache_grows_instead_of_redefining(monkeypatch):
+    """#310 re-config contract: on a LIVE allocated cache, install honors a
+    bigger num_blocks by GROWING the pages — it never redefines geometry on
+    buffers that were not reallocated, and never touches block_size."""
+
+    monkeypatch.setattr("mtplx.cache_state._load_vllm_metal_ops", lambda: object())
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV", "1")
+    monkeypatch.delenv("MTPLX_CONTEXT_WINDOW_TOKENS", raising=False)
+
+    paged = VllmMetalPagedKVCache(block_size=4, num_blocks=4)
+    keys = mx.zeros((1, 2, 10, 3), dtype=mx.float32)
+    values = mx.zeros((1, 2, 10, 3), dtype=mx.float32)
+    paged.update_without_fetch(keys, values)
+    assert paged.capacity == 16
+
+    cache = [paged]
+    stats = install_vllm_metal_paged_attention_kv_cache(
+        cache,
+        block_size=16,
+        num_blocks=64,
+    )
+
+    assert cache[0] is paged
+    assert stats["entries"] == 1
+    assert paged.capacity >= 16 * 64  # requested room honored by growing
+    assert paged.capacity == int(paged.key_cache.shape[0]) * int(
+        paged.key_cache.shape[1]
+    )
+    assert paged.num_blocks == int(paged.key_cache.shape[0])
+    assert paged.block_size == 4  # a live buffer is never reinterpreted
+    assert int(paged.offset) == 10
+
+
+def test_meta_state_restore_on_live_cache_keeps_physical_geometry():
+    """#310 restore contract: `state` already rebuilt the pages, so the
+    snapshot's geometry is history — only the offset is restored, and an
+    offset beyond the live pages fails loud instead of truncating."""
+
+    paged = VllmMetalPagedKVCache(block_size=16, num_blocks=4)
+    keys = mx.zeros((1, 2, 10, 3), dtype=mx.float32)
+    values = mx.zeros((1, 2, 10, 3), dtype=mx.float32)
+    paged.update_without_fetch(keys, values)
+    assert paged.capacity == 64
+
+    paged.meta_state = ("16", "4096", "50")
+    assert paged.offset == 50
+    assert paged.num_blocks == int(paged.key_cache.shape[0]) == 4
+    assert paged.capacity == 64
+
+    with pytest.raises(ValueError, match="exceeds page capacity"):
+        paged.meta_state = ("16", "4096", "100")
+
+    # Unallocated cache: the snapshot IS the plan (unchanged behavior).
+    fresh = VllmMetalPagedKVCache(block_size=4, num_blocks=2)
+    fresh.meta_state = ("16", "4096", "100")
+    assert fresh.block_size == 16
+    assert fresh.num_blocks == 4096
+    assert fresh.offset == 100
+
+
+def test_dynamic_paged_num_blocks_floor_is_configured_blocks(monkeypatch):
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV", "1")
+    for name in (
+        "MTPLX_DYNAMIC_PAGED_KV_TOKENS",
+        "MTPLX_DYNAMIC_PAGED_KV_MIN_BLOCKS",
+        "MTPLX_DYNAMIC_PAGED_KV_PREVIOUS_HIGH_WATER",
+        "MTPLX_DYNAMIC_PAGED_KV_MARGIN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert _dynamic_paged_num_blocks(block_size=16, configured_blocks=1024) == 1024
 
 
 def test_paged_active_array_assertion_guards_dense_fallback(monkeypatch):
@@ -1073,6 +1264,256 @@ def test_vllm_metal_paged_q8_kv_quant_attention_matches_stock_with_tolerance(mon
     assert stats["kv_quant_dequant_time_s"] >= 0.0
 
 
+def test_kv_quant_dequant_memo_is_incremental_and_exact(monkeypatch):
+    """The dequant fallback must not re-dequantize the whole prefix per call
+    (the q8 decode collapse): the memo extends tail-only, and its output is
+    exactly the fresh-dequant result."""
+
+    if not mx.metal.is_available():
+        pytest.skip("Metal is unavailable")
+    monkeypatch.setenv("MTPLX_KV_QUANT_2PASS_KERNEL", "0")
+
+    mx.random.seed(4242)
+    keys = mx.random.normal((1, 2, 100, 16), dtype=mx.float16)
+    values = mx.random.normal((1, 2, 100, 16), dtype=mx.float16)
+    tail_k = mx.random.normal((1, 2, 5, 16), dtype=mx.float16)
+    tail_v = mx.random.normal((1, 2, 5, 16), dtype=mx.float16)
+
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=32,
+        kv_quant_config=PagedKVQuantConfig("q8"),
+    )
+    cache.update_without_fetch(keys, values)
+    first_k, first_v = cache._active_arrays()
+    mx.eval(first_k, first_v)
+    assert cache.kv_quant_dequant_tokens == 100
+
+    cache.update_without_fetch(tail_k, tail_v)
+    second_k, second_v = cache._active_arrays()
+    mx.eval(second_k, second_v)
+    # Incremental: only the 5 new rows were dequantized on the second call.
+    assert cache.kv_quant_dequant_tokens == 105
+
+    # Exactness: a fresh cache with identical content dequantizes to the
+    # same bytes (same quantized storage -> same dequant math).
+    fresh = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=32,
+        kv_quant_config=PagedKVQuantConfig("q8"),
+    )
+    fresh.update_without_fetch(keys, values)
+    fresh.update_without_fetch(tail_k, tail_v)
+    fresh_k, fresh_v = fresh._active_arrays()
+    mx.eval(fresh_k, fresh_v)
+    assert float(mx.abs(second_k - fresh_k).max().item()) == 0.0
+    assert float(mx.abs(second_v - fresh_v).max().item()) == 0.0
+
+    # Pure repeat call at the same offset is a memo hit.
+    before_hits = cache.kv_quant_dequant_memo_hits
+    repeat_k, repeat_v = cache._active_arrays()
+    mx.eval(repeat_k, repeat_v)
+    assert cache.kv_quant_dequant_memo_hits == before_hits + 1
+
+
+def test_kv_quant_dequant_memo_survives_trim_and_rewrite(monkeypatch):
+    """Rollback shape: trim retracts rows, new rows land at the frontier.
+    The memo must serve the surviving prefix and re-dequantize the rewrite —
+    output must equal a never-memoized cache with the same final content."""
+
+    if not mx.metal.is_available():
+        pytest.skip("Metal is unavailable")
+    monkeypatch.setenv("MTPLX_KV_QUANT_2PASS_KERNEL", "0")
+
+    mx.random.seed(515)
+    base_k = mx.random.normal((1, 2, 40, 16), dtype=mx.float16)
+    base_v = mx.random.normal((1, 2, 40, 16), dtype=mx.float16)
+    rewrite_k = mx.random.normal((1, 2, 6, 16), dtype=mx.float16)
+    rewrite_v = mx.random.normal((1, 2, 6, 16), dtype=mx.float16)
+
+    memoized = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=16,
+        kv_quant_config=PagedKVQuantConfig("q8"),
+    )
+    memoized.update_without_fetch(base_k, base_v)
+    warm_k, warm_v = memoized._active_arrays()
+    mx.eval(warm_k, warm_v)  # memo now covers 40 rows
+    memoized.trim(10)
+    memoized.update_without_fetch(rewrite_k, rewrite_v)
+    got_k, got_v = memoized._active_arrays()
+    mx.eval(got_k, got_v)
+
+    fresh = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=16,
+        kv_quant_config=PagedKVQuantConfig("q8"),
+    )
+    fresh.update_without_fetch(base_k[..., :30, :], base_v[..., :30, :])
+    fresh.update_without_fetch(rewrite_k, rewrite_v)
+    want_k, want_v = fresh._active_arrays()
+    mx.eval(want_k, want_v)
+
+    assert got_k.shape == want_k.shape
+    assert float(mx.abs(got_k - want_k).max().item()) == 0.0
+    assert float(mx.abs(got_v - want_v).max().item()) == 0.0
+
+
+def test_kv_quant_q8_kernel_engages_and_matches_dequant_path(monkeypatch):
+    """The inline-dequant q8 kernel must actually engage (counter receipt —
+    a silently ineligible shape would compare dequant against itself) and
+    agree with the dequant fallback within kernel arithmetic tolerance."""
+
+    if not mx.metal.is_available():
+        pytest.skip("Metal is unavailable")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_IMPL", "mlx_vector_paged")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_2PASS_THRESHOLD", "64")
+
+    mx.random.seed(8642)
+    kv_len = 230
+    dim = 128
+    queries = 0.3 * mx.random.normal((1, 8, 4, dim), dtype=mx.bfloat16)
+    keys = 0.5 * mx.random.normal((1, 2, kv_len, dim), dtype=mx.bfloat16)
+    values = 0.5 * mx.random.normal((1, 2, kv_len, dim), dtype=mx.bfloat16)
+    scale = dim**-0.5
+
+    def build_cache():
+        cache = VllmMetalPagedKVCache(
+            block_size=16,
+            num_blocks=16,
+            kv_quant_config=PagedKVQuantConfig("q8"),
+        )
+        cache.update_without_fetch(keys, values)
+        return cache
+
+    monkeypatch.setenv("MTPLX_KV_QUANT_2PASS_KERNEL", "1")
+    kernel_cache = build_cache()
+    kernel_out = kernel_cache.paged_attention(queries, scale=scale, mask="causal")
+    assert kernel_out is not None
+    mx.eval(kernel_out)
+    assert kernel_cache.kv_quant_kernel_calls == 1
+    assert kernel_cache.kv_quant_attention_calls == 1
+
+    monkeypatch.setenv("MTPLX_KV_QUANT_2PASS_KERNEL", "0")
+    dequant_cache = build_cache()
+    dequant_out = dequant_cache.paged_attention(queries, scale=scale, mask="causal")
+    assert dequant_out is not None
+    mx.eval(dequant_out)
+    assert dequant_cache.kv_quant_kernel_calls == 0
+    assert dequant_cache.kv_quant_dequant_calls >= 1
+
+    diff = mx.max(
+        mx.abs(kernel_out.astype(mx.float32) - dequant_out.astype(mx.float32))
+    )
+    mx.eval(diff)
+    assert float(diff.item()) <= 5e-3
+
+
+def test_kv_quant_q4_kernel_route_matches_dequant(monkeypatch):
+    """2026-08-26 route flip: q4 now takes the v5 bits=4 kernel when the
+    geometry allows. Guard the NEW invariants: the kernel route engages
+    exactly once, and its output matches the legacy dequant route (the old
+    "never kernels" behavior, reachable via the revert lever)."""
+    if not mx.metal.is_available():
+        pytest.skip("Metal is unavailable")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_IMPL", "mlx_vector_paged")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_2PASS_THRESHOLD", "64")
+    monkeypatch.setenv("MTPLX_KV_QUANT_2PASS_KERNEL", "1")
+
+    mx.random.seed(11311)
+    # Shipped geometry (D=256, GQA 6): the q4 kernel's verified envelope.
+    # D=128 deviates from its own dequant math (2026-08-26 forensics) and
+    # now BAILS — pinned below.
+    dim = 256
+    queries = 0.3 * mx.random.normal((1, 24, 2, dim), dtype=mx.bfloat16)
+    keys = 0.5 * mx.random.normal((1, 4, 200, dim), dtype=mx.bfloat16)
+    values = 0.5 * mx.random.normal((1, 4, 200, dim), dtype=mx.bfloat16)
+
+    def _make_cache():
+        cache = VllmMetalPagedKVCache(
+            block_size=16,
+            num_blocks=16,
+            kv_quant_config=PagedKVQuantConfig("q4"),
+        )
+        cache.update_without_fetch(keys, values)
+        return cache
+
+    monkeypatch.setenv("MTPLX_KV_QUANT_Q4_KERNEL", "1")
+    kernel_cache = _make_cache()
+    kernel_out = kernel_cache.paged_attention(
+        queries, scale=dim**-0.5, mask="causal"
+    )
+    assert kernel_out is not None
+    mx.eval(kernel_out)
+    assert kernel_cache.kv_quant_kernel_calls == 1
+    assert kernel_cache.kv_quant_attention_calls == 1
+
+    monkeypatch.setenv("MTPLX_KV_QUANT_Q4_KERNEL", "0")
+    dequant_cache = _make_cache()
+    dequant_out = dequant_cache.paged_attention(
+        queries, scale=dim**-0.5, mask="causal"
+    )
+    assert dequant_out is not None
+    mx.eval(dequant_out)
+    assert dequant_cache.kv_quant_kernel_calls == 0
+
+    diff = mx.max(
+        mx.abs(kernel_out.astype(mx.float32) - dequant_out.astype(mx.float32))
+    )
+    mx.eval(diff)
+    assert float(diff.item()) <= 5e-3
+
+
+def test_kv_quant_q4_kernel_bails_outside_envelope():
+    """D=128 q4 deviates from its own dequant math (2026-08-26 forensics:
+    0.006-0.026 abs vs <2e-4 at D=256). The kernel must fail closed there."""
+    if not mx.metal.is_available():
+        pytest.skip("Metal is unavailable")
+    from mtplx.kernels.sdpa_gqa_packed_quant import sdpa_gqa_packed_tail_quant
+    from mtplx.kv_quant import quantize_symmetric
+
+    mx.random.seed(5)
+    dim = 128
+    q = 0.3 * mx.random.normal((1, 8, 2, dim)).astype(mx.bfloat16)
+    k = 0.5 * mx.random.normal((1, 2, 392, dim)).astype(mx.bfloat16)
+    v = 0.5 * mx.random.normal((1, 2, 392, dim)).astype(mx.bfloat16)
+    kq, ks = quantize_symmetric(k, bits=4)
+    vq, vs = quantize_symmetric(v, bits=4)
+    mx.eval(q, kq, ks, vq, vs)
+    out = sdpa_gqa_packed_tail_quant(
+        queries=q, k_q=kq, k_scale=ks.astype(mx.float32),
+        v_q=vq, v_scale=vs.astype(mx.float32),
+        offset=200, scale=dim**-0.5, bits=4,
+    )
+    assert out is None
+
+
+def test_install_hybrid_cache_counts_attention_entries_and_skips_rest(monkeypatch):
+    """Hybrid-model shape: only real KV entries convert; recurrent/GDN-style
+    entries are skipped and counted."""
+
+    from mlx_lm.models.cache import KVCache
+
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_KV_QUANT", "q8")
+
+    class RecurrentEntry:
+        # No keys/values attributes: the installer must skip it.
+        def is_trimmable(self) -> bool:
+            return False
+
+    cache: list = []
+    for index in range(16):
+        cache.append(KVCache())
+        cache.extend(RecurrentEntry() for _ in range(3))
+
+    stats = configure_tail_owned_attention_kv_cache(cache)
+
+    assert stats["entries"] == 16
+    assert stats["skipped"] == 48
+    assert sum(isinstance(entry, VllmMetalPagedKVCache) for entry in cache) == 16
+
+
 def test_paged_gqa_sdpa_route_env_is_explicit_and_long_context_only(monkeypatch):
     assert (
         _paged_gqa_sdpa_route_from_env(
@@ -1246,6 +1687,25 @@ def test_vllm_metal_paged_attention_matches_stock_attention_with_tolerance():
     diff = mx.max(mx.abs(expected.astype(mx.float32) - actual.astype(mx.float32)))
     mx.eval(diff)
     assert float(diff.item()) <= 2e-2
+
+
+def test_vllm_metal_native_cache_key_tracks_mlx_library_bytes(
+    tmp_path, monkeypatch
+):
+    import vllm_metal.metal.build as native_build
+
+    assert native_build._mlx_abi_fingerprint() in native_build._OUT.name
+    package = tmp_path / "mlx"
+    library = package / "lib" / "libmlx.dylib"
+    library.parent.mkdir(parents=True)
+    library.write_bytes(b"first ABI")
+    monkeypatch.setattr(native_build, "_find_package_path", lambda _name: package)
+
+    first = native_build._mlx_abi_fingerprint()
+    library.write_bytes(b"second ABI")
+    second = native_build._mlx_abi_fingerprint()
+
+    assert first != second
 
 
 def test_vllm_metal_partitioned_paged_attention_matches_stock_attention(monkeypatch):
@@ -1497,7 +1957,10 @@ def test_promote_default_still_follows_env_for_paged_entries(monkeypatch):
     assert isinstance(cache[0], TensorOffsetVllmMetalPagedKVCache)
 
 
-def test_promote_preserve_paged_refuses_quantized_paged_entries(monkeypatch):
+def test_promote_preserve_paged_refuses_out_of_class_quantized_entries(monkeypatch):
+    """2026-08-26: quantized paged entries in the supported v5 geometry now
+    PROMOTE (see the quantized-adapter tests); an out-of-class geometry
+    (D=16 here) must still fail closed with the geometry reason."""
     from mtplx.graphbank import promote_kv_cache_offsets
 
     monkeypatch.delenv("MTPLX_GRAPHBANK_PRESERVE_PAGED_KV", raising=False)
@@ -1517,7 +1980,7 @@ def test_promote_preserve_paged_refuses_quantized_paged_entries(monkeypatch):
     )
 
     assert promoted == 0
-    assert failures == {"quantized_paged_kv_cache": 1}
+    assert failures == {"quantized_paged_kv_geometry": 1}
     assert cache[0] is quantized
 
 
