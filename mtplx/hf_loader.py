@@ -13,10 +13,16 @@ import shutil
 import stat
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Iterator
 
 from mtplx.artifacts import _hf_repo_id_from_ref
+from mtplx.expert_admission import (
+    TrustedFileDigest,
+    admit_expert_artifact,
+    ensure_expert_admitted,
+    load_valid_admission_receipt,
+)
 from mtplx.models.laguna_config import (
     LAGUNA_S_2_1_REPO_ID,
     LAGUNA_S_2_1_REPO_BYTES,
@@ -78,15 +84,6 @@ def read_bounded_artifact_member(
         raise ExpertManifestError(
             f"could not read artifact member {name}: {exc}"
         ) from exc
-
-
-@dataclass(frozen=True)
-class RepoFile:
-    path: str
-    size_bytes: int | None
-    sha256: str | None = None
-
-
 
 
 def _declares_streamed_experts(path: Path) -> bool:
@@ -717,8 +714,20 @@ def cached_model_is_complete(path: Path) -> bool:
         return False
     index_names = ("model.safetensors.index.json", "pytorch_model.bin.index.json")
     if any((path / name).is_file() for name in index_names):
-        return any(_complete_indexed_weights(path, name) for name in index_names)
-    return _complete_unindexed_weights(path)
+        weights_complete = any(
+            _complete_indexed_weights(path, name) for name in index_names
+        )
+    else:
+        weights_complete = _complete_unindexed_weights(path)
+    if not weights_complete:
+        return False
+    # A model that declares streamed experts is only "complete" when its
+    # authoritative expert bank is present and verifies (fork feature).
+    expert_status = expert_artifact_status(path)
+    return not (
+        expert_status["streamed_experts"]
+        and not expert_status["ok"]
+    )
 
 
 def _pair_bundle_is_complete(path: Path) -> bool:
@@ -774,6 +783,19 @@ def resolve_model_path(model_ref: str, *, cache_dir: str | Path | None = None) -
     if repo_id is None:
         raise FileNotFoundError(f"Model path is not available locally: {local}")
     cached = cached_model_path(repo_id, cache_dir=cache_dir)
+    if cached.is_dir():
+        # A streamed model with a missing or corrupt expert bank must fail
+        # loudly with the reason, not fall through to a generic "not cached"
+        # message (fork feature).
+        expert_status = expert_artifact_status(cached)
+        if (
+            expert_status["streamed_experts"]
+            and not expert_status["ok"]
+        ):
+            raise FileNotFoundError(
+                f"Cached streamed model {repo_id} has invalid expert artifacts: "
+                f"{expert_status['reason']}. Run: mtplx pull {repo_id}"
+            )
     if _cached_model_ready_for_repo(cached, repo_id):
         return cached
     # Branded local builds (forge output, `mtplx models` rows) live under the
@@ -1506,6 +1528,44 @@ def pull_model(
     if destination is None:
         destination = cached_model_path(repo_id, cache_dir=root)
 
+    # Expert-streaming repositories carry an ``expert-manifest.json`` sidecar
+    # and a multipart expert bank that must be verified and admitted at pull
+    # time. Route those through the streaming pull path (fork feature) while
+    # every plain model keeps upstream's provenance-marker pull below. The
+    # remote inventory query is best-effort: for a plain repo it fails the
+    # immutable-sha check and is discarded, so plain pulls are unaffected.
+    local_expert_status = (
+        expert_artifact_status(destination)
+        if destination.is_dir()
+        else {"streamed_experts": False, "ok": True}
+    )
+    local_streamed = bool(local_expert_status.get("streamed_experts"))
+    exact_streaming_repo = _repo_is_exact_streaming_catalog(repo_id)
+    streaming_inventory: RepoInventory | None = None
+    streaming_inventory_error: RuntimeError | None = None
+    try:
+        streaming_inventory = _query_repo_inventory(repo_id, revision=revision)
+    except RuntimeError as exc:
+        streaming_inventory_error = exc
+    remote_streamed = (
+        _inventory_declares_experts(streaming_inventory)
+        if streaming_inventory is not None
+        else False
+    )
+    if exact_streaming_repo or local_streamed or remote_streamed:
+        return _pull_streamed_model(
+            repo_id,
+            root=root,
+            destination=destination,
+            revision=revision,
+            inventory=streaming_inventory,
+            inventory_error=streaming_inventory_error,
+            exact_streaming_repo=exact_streaming_repo,
+            local_expert_status=local_expert_status,
+            progress_callback=progress_callback,
+            progress_interval_s=progress_interval_s,
+        )
+
     started_size = directory_size_bytes(destination)
     started_disk_bytes = started_size
     marker = read_source_marker(destination)
@@ -1806,3 +1866,1108 @@ def hf_cache_report(*, cache_dir: str | Path | None = None) -> dict[str, Any]:
             "`hf auth login` token, else nothing; public models never need one"
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Expert-streaming pull integration (restored fork feature, re-threaded onto
+# upstream's rewritten loader). Plain-model pulls never reach this code.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RepoInventory:
+    resolved_revision: str
+    files: tuple[RepoFile, ...]
+
+
+def _repo_file_from_sibling(sibling: Any) -> RepoFile | None:
+    name = getattr(sibling, "rfilename", None) or getattr(sibling, "path", None)
+    if not isinstance(name, str) or not name.strip():
+        return None
+    size = getattr(sibling, "size", None)
+    lfs = getattr(sibling, "lfs", None)
+    if isinstance(lfs, dict):
+        digest = lfs.get("sha256")
+    else:
+        digest = getattr(lfs, "sha256", None)
+    sha256 = (
+        digest.lower()
+        if isinstance(digest, str)
+        and re.fullmatch(r"[0-9a-fA-F]{64}", digest) is not None
+        else None
+    )
+    return RepoFile(
+        path=name,
+        size_bytes=size if isinstance(size, int) else None,
+        sha256=sha256,
+    )
+
+
+def _repo_inventory_from_info(info: Any, repo_id: str) -> RepoInventory:
+    resolved_revision = getattr(info, "sha", None)
+    if (
+        not isinstance(resolved_revision, str)
+        or re.fullmatch(r"[0-9a-fA-F]{40}", resolved_revision) is None
+    ):
+        raise RuntimeError(
+            f"Hugging Face repo {repo_id} did not resolve to an immutable commit SHA"
+        )
+    files = tuple(
+        repo_file
+        for sibling in (getattr(info, "siblings", None) or [])
+        if (repo_file := _repo_file_from_sibling(sibling)) is not None
+    )
+    if not files:
+        raise RuntimeError(
+            f"Hugging Face repo {repo_id} did not return downloadable files."
+        )
+    return RepoInventory(
+        resolved_revision=resolved_revision.lower(),
+        files=files,
+    )
+
+
+
+def _query_repo_inventory(
+    repo_id: str,
+    *,
+    revision: str | None = None,
+) -> RepoInventory:
+    try:
+        from huggingface_hub import HfApi
+
+        info, _token = _model_info_with_anonymous_fallback(
+            HfApi(), repo_id=repo_id, revision=revision
+        )
+        return _repo_inventory_from_info(info, repo_id)
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(_classify_pull_error(exc, repo_id)) from exc
+
+
+def _repo_is_exact_streaming_catalog(repo_id: str) -> bool:
+    try:
+        from mtplx.default_models import streaming_catalog_models
+
+        return repo_id.casefold() in {
+            model.hf_model_id.casefold()
+            for model in streaming_catalog_models()
+        }
+    except Exception:
+        return False
+
+
+def _inventory_declares_experts(inventory: RepoInventory) -> bool:
+    return any(repo_file.path == EXPERT_MANIFEST_FILE for repo_file in inventory.files)
+
+
+def _is_immutable_hub_revision(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and re.fullmatch(r"[0-9a-fA-F]{40}", value) is not None
+    )
+
+
+
+def _safe_repo_relative_path(repo_file: RepoFile) -> PurePosixPath:
+    relative = PurePosixPath(repo_file.path)
+    if (
+        not repo_file.path
+        or "\\" in repo_file.path
+        or relative.is_absolute()
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise RuntimeError(
+            f"unsafe file path in Hugging Face repo: {repo_file.path}"
+        )
+    return relative
+
+
+@contextlib.contextmanager
+def _open_safe_repo_parent(
+    destination: Path,
+    repo_file: RepoFile,
+) -> Iterator[tuple[int, Path, str]]:
+    """Open every parent with ``openat`` so symlink swaps cannot escape."""
+
+    relative = _safe_repo_relative_path(repo_file)
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor: int | None = None
+    parent = destination
+    try:
+        try:
+            descriptor = os.open(destination, directory_flags)
+        except OSError as exc:
+            raise RuntimeError(
+                f"model download directory must be a real directory, not a symlink: "
+                f"{destination} ({exc})"
+            ) from exc
+        for component in relative.parts[:-1]:
+            try:
+                os.mkdir(component, dir_fd=descriptor)
+            except FileExistsError:
+                pass
+            try:
+                child_descriptor = os.open(
+                    component,
+                    directory_flags,
+                    dir_fd=descriptor,
+                )
+            except OSError as exc:
+                raise RuntimeError(
+                    f"download path contains an unsafe intermediate symlink "
+                    f"or non-directory member: {parent / component} ({exc})"
+                ) from exc
+            os.close(descriptor)
+            descriptor = child_descriptor
+            parent /= component
+        yield descriptor, parent, relative.name
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _regular_file_metadata(path: Path) -> os.stat_result | None:
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError(f"could not inspect download file {path}: {exc}") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise RuntimeError(f"download file must not be a symlink: {path}")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError(f"download file is not a regular file: {path}")
+    return metadata
+
+
+def _regular_file_metadata_at(
+    directory_descriptor: int,
+    name: str,
+    display_path: Path,
+) -> os.stat_result | None:
+    try:
+        metadata = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError(
+            f"could not inspect download file {display_path}: {exc}"
+        ) from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise RuntimeError(f"download file must not be a symlink: {display_path}")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError(
+            f"download file is not a regular file: {display_path}"
+        )
+    return metadata
+
+
+def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _hash_descriptor(
+    descriptor: int,
+    digest: Any,
+    *,
+    limit: int | None = None,
+) -> int:
+    total = 0
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while limit is None or total < limit:
+        size = DOWNLOAD_CHUNK_SIZE if limit is None else min(
+            DOWNLOAD_CHUNK_SIZE, limit - total
+        )
+        try:
+            chunk = os.read(descriptor, size)
+        except InterruptedError:
+            continue
+        if not chunk:
+            break
+        digest.update(chunk)
+        total += len(chunk)
+    return total
+
+
+def _trusted_file_digest(
+    descriptor: int,
+    digest: Any,
+) -> TrustedFileDigest:
+    metadata = os.fstat(descriptor)
+    return TrustedFileDigest(
+        sha256=digest.hexdigest(),
+        st_dev=metadata.st_dev,
+        st_ino=metadata.st_ino,
+        st_size=metadata.st_size,
+        st_mtime_ns=metadata.st_mtime_ns,
+        st_ctime_ns=metadata.st_ctime_ns,
+    )
+
+
+def _rehash_trusted_descriptor(
+    descriptor: int,
+    *,
+    display_path: str,
+) -> TrustedFileDigest:
+    before = os.fstat(descriptor)
+    digest = hashlib.sha256()
+    read_bytes = _hash_descriptor(descriptor, digest)
+    after = os.fstat(descriptor)
+    if (
+        read_bytes != before.st_size
+        or _file_identity(before) != _file_identity(after)
+    ):
+        raise RuntimeError(
+            f"download file changed while hashing installed bytes: {display_path}"
+        )
+    return TrustedFileDigest(
+        sha256=digest.hexdigest(),
+        st_dev=after.st_dev,
+        st_ino=after.st_ino,
+        st_size=after.st_size,
+        st_mtime_ns=after.st_mtime_ns,
+        st_ctime_ns=after.st_ctime_ns,
+    )
+
+
+def _hash_existing_file(
+    path: Path,
+    *,
+    directory_descriptor: int | None = None,
+    name: str | None = None,
+) -> TrustedFileDigest:
+    open_kwargs: dict[str, Any] = {}
+    open_target: Path | str = path
+    if directory_descriptor is not None and name is not None:
+        open_kwargs["dir_fd"] = directory_descriptor
+        open_target = name
+    descriptor = os.open(
+        open_target,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        **open_kwargs,
+    )
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError(f"download file is not a regular file: {path}")
+        digest = hashlib.sha256()
+        read_bytes = _hash_descriptor(descriptor, digest)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if read_bytes != before.st_size or _file_identity(before) != _file_identity(after):
+        raise RuntimeError(f"download file changed while hashing: {path}")
+    return TrustedFileDigest(
+        sha256=digest.hexdigest(),
+        st_dev=after.st_dev,
+        st_ino=after.st_ino,
+        st_size=after.st_size,
+        st_mtime_ns=after.st_mtime_ns,
+        st_ctime_ns=after.st_ctime_ns,
+    )
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        try:
+            written = os.write(descriptor, view)
+        except InterruptedError:
+            continue
+        if written <= 0:
+            raise OSError("short write while downloading model file")
+        view = view[written:]
+
+
+def _partial_metadata_payload(
+    repo_file: RepoFile,
+    *,
+    repo_id: str,
+    revision: str | None,
+) -> dict[str, Any] | None:
+    if repo_file.sha256 is None:
+        return None
+    return {
+        "schema": 1,
+        "repo_id": repo_id,
+        "revision": revision,
+        "path": repo_file.path,
+        "size_bytes": repo_file.size_bytes,
+        "validator": f"sha256:{repo_file.sha256}",
+    }
+
+
+def _read_partial_metadata_at(
+    directory_descriptor: int,
+    metadata_name: str,
+) -> dict[str, Any] | None:
+    try:
+        descriptor = os.open(
+            metadata_name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_descriptor,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 64 * 1024:
+            return None
+        payload = bytearray()
+        while len(payload) <= 64 * 1024:
+            chunk = os.read(descriptor, min(8192, 64 * 1024 + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        if len(payload) > 64 * 1024:
+            return None
+        decoded = json.loads(payload.decode("utf-8"))
+        return decoded if isinstance(decoded, dict) else None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    finally:
+        os.close(descriptor)
+
+
+def _write_partial_metadata_at(
+    directory_descriptor: int,
+    metadata_name: str,
+    payload: dict[str, Any],
+) -> None:
+    temporary_name = metadata_name + ".tmp"
+    try:
+        os.unlink(temporary_name, dir_fd=directory_descriptor)
+    except FileNotFoundError:
+        pass
+    descriptor = os.open(
+        temporary_name,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=directory_descriptor,
+    )
+    try:
+        _write_all(
+            descriptor,
+            (
+                json.dumps(payload, sort_keys=True, separators=(",", ":"))
+                + "\n"
+            ).encode("utf-8"),
+        )
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(
+        temporary_name,
+        metadata_name,
+        src_dir_fd=directory_descriptor,
+        dst_dir_fd=directory_descriptor,
+    )
+    os.fsync(directory_descriptor)
+
+
+def _remove_partial_state_at(
+    directory_descriptor: int,
+    partial_name: str,
+    metadata_name: str,
+) -> None:
+    removed = False
+    for name in (partial_name, metadata_name, metadata_name + ".tmp"):
+        try:
+            os.unlink(name, dir_fd=directory_descriptor)
+            removed = True
+        except FileNotFoundError:
+            continue
+    if removed:
+        os.fsync(directory_descriptor)
+
+
+def _response_header(response: Any, name: str) -> str | None:
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    value = headers.get(name)
+    if value is None:
+        value = headers.get(name.lower())
+    return value if isinstance(value, str) else None
+
+
+def _validate_content_range(
+    response: Any,
+    *,
+    expected_start: int,
+    expected_size: int | None,
+) -> None:
+    value = _response_header(response, "Content-Range")
+    match = (
+        re.fullmatch(r"bytes ([0-9]+)-([0-9]+)/([0-9]+|\*)", value)
+        if value is not None
+        else None
+    )
+    if match is None:
+        raise RuntimeError("invalid or missing Content-Range for resumed download")
+    start, end = int(match.group(1)), int(match.group(2))
+    if start != expected_start or end < start:
+        raise RuntimeError(
+            f"Content-Range does not match requested offset {expected_start}: {value}"
+        )
+    if (
+        expected_size is not None
+        and (
+            match.group(3) == "*"
+            or int(match.group(3)) != expected_size
+        )
+    ):
+        raise RuntimeError(
+            f"Content-Range does not match expected size {expected_size}: {value}"
+        )
+
+def _download_repo_file_at(
+    repo_file: RepoFile,
+    *,
+    directory_descriptor: int,
+    parent: Path,
+    target_name: str,
+    repo_id: str,
+    revision: str | None,
+    destination: Path,
+    session: Any,
+    hf_hub_url: Callable[..., str],
+    build_hf_headers: Callable[..., dict[str, str]],
+    hf_raise_for_status: Callable[[Any], None],
+    callback: DownloadProgressCallback | None,
+    total_bytes: int | None,
+    started_at: float,
+    progress_interval_s: float,
+    last_emit_at: float,
+    last_emit_size: int,
+) -> tuple[float, int, TrustedFileDigest]:
+    target = parent / target_name
+    expected_size = repo_file.size_bytes
+    partial_name = target_name + ".incomplete"
+    partial = parent / partial_name
+    partial_metadata_name = partial_name + ".meta.json"
+    expected_partial_metadata = _partial_metadata_payload(
+        repo_file,
+        repo_id=repo_id,
+        revision=revision,
+    )
+    target_metadata = _regular_file_metadata_at(
+        directory_descriptor,
+        target_name,
+        target,
+    )
+    partial_metadata = _regular_file_metadata_at(
+        directory_descriptor,
+        partial_name,
+        partial,
+    )
+
+    # Installed paths are immutable once admission can retain their inode.
+    # A refresh never opens ``target`` for writing: it stages a separate
+    # partial and atomically replaces the pathname after verification.
+    if (
+        target_metadata is not None
+        and expected_size is not None
+        and target_metadata.st_size == expected_size
+        and repo_file.sha256 is not None
+    ):
+        existing_digest = _hash_existing_file(
+            target,
+            directory_descriptor=directory_descriptor,
+            name=target_name,
+        )
+        if existing_digest.sha256 == repo_file.sha256:
+            _remove_partial_state_at(
+                directory_descriptor,
+                partial_name,
+                partial_metadata_name,
+            )
+            emitted_at, emitted_size = _emit_current_download_size(
+                callback,
+                repo_id=repo_id,
+                destination=destination,
+                total_bytes=total_bytes,
+                started_at=started_at,
+                last_emit_at=last_emit_at,
+                last_emit_size=last_emit_size,
+                file_path=repo_file.path,
+            )
+            return emitted_at, emitted_size, existing_digest
+    # A nonmatching target stays linked and available to its existing receipt
+    # and any retained readers until the new partial has been fully downloaded,
+    # verified, and fsynced. ``install_verified_partial`` is the only refresh
+    # path that replaces it.
+    recorded_partial_metadata = _read_partial_metadata_at(
+        directory_descriptor,
+        partial_metadata_name,
+    )
+    resumable = (
+        expected_partial_metadata is not None
+        and recorded_partial_metadata == expected_partial_metadata
+    )
+    if partial_metadata is not None and not resumable:
+        _remove_partial_state_at(
+            directory_descriptor,
+            partial_name,
+            partial_metadata_name,
+        )
+        partial_metadata = None
+    elif partial_metadata is None and recorded_partial_metadata is not None:
+        _remove_partial_state_at(
+            directory_descriptor,
+            partial_name,
+            partial_metadata_name,
+        )
+    existing = partial_metadata.st_size if partial_metadata is not None else 0
+    if expected_size is not None and existing > expected_size:
+        _remove_partial_state_at(
+            directory_descriptor,
+            partial_name,
+            partial_metadata_name,
+        )
+        existing = 0
+    if expected_partial_metadata is not None:
+        _write_partial_metadata_at(
+            directory_descriptor,
+            partial_metadata_name,
+            expected_partial_metadata,
+        )
+        resumable = True
+    else:
+        resumable = False
+
+    descriptor = os.open(
+        partial_name,
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=directory_descriptor,
+    )
+    try:
+        prefix_before = os.fstat(descriptor)
+        if not stat.S_ISREG(prefix_before.st_mode):
+            raise RuntimeError(f"partial download is not a regular file: {partial}")
+        existing = prefix_before.st_size
+        digest = hashlib.sha256()
+        if existing:
+            hashed = _hash_descriptor(descriptor, digest, limit=existing)
+            prefix_after = os.fstat(descriptor)
+            if (
+                hashed != existing
+                or _file_identity(prefix_before) != _file_identity(prefix_after)
+            ):
+                raise RuntimeError(
+                    f"partial download changed while hashing: {repo_file.path}"
+                )
+
+        def install_verified_partial() -> TrustedFileDigest:
+            os.fsync(descriptor)
+            final_metadata = os.fstat(descriptor)
+            if (
+                expected_size is not None
+                and final_metadata.st_size != expected_size
+            ):
+                raise RuntimeError(
+                    f"incomplete download for {repo_file.path}: "
+                    f"expected {expected_size} bytes, got {final_metadata.st_size}"
+                )
+            trusted = _trusted_file_digest(descriptor, digest)
+            if (
+                repo_file.sha256 is not None
+                and trusted.sha256 != repo_file.sha256
+            ):
+                _remove_partial_state_at(
+                    directory_descriptor,
+                    partial_name,
+                    partial_metadata_name,
+                )
+                raise RuntimeError(
+                    f"SHA-256 mismatch for {repo_file.path}: "
+                    f"expected {repo_file.sha256}, got {trusted.sha256}"
+                )
+            os.replace(
+                partial_name,
+                target_name,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+            )
+            os.fsync(directory_descriptor)
+            _remove_partial_state_at(
+                directory_descriptor,
+                partial_name,
+                partial_metadata_name,
+            )
+            after_install = os.fstat(descriptor)
+            if (
+                trusted.st_dev,
+                trusted.st_ino,
+                trusted.st_size,
+                trusted.st_mtime_ns,
+                trusted.st_ctime_ns,
+            ) != _file_identity(after_install):
+                trusted = _rehash_trusted_descriptor(
+                    descriptor,
+                    display_path=repo_file.path,
+                )
+                if (
+                    repo_file.sha256 is not None
+                    and trusted.sha256 != repo_file.sha256
+                ):
+                    raise RuntimeError(
+                        f"SHA-256 mismatch for installed {repo_file.path}: "
+                        f"expected {repo_file.sha256}, got {trusted.sha256}"
+                    )
+            return trusted
+
+        headers = build_hf_headers(token=hf_token_for_download())
+        if existing > 0:
+            headers["Range"] = f"bytes={existing}-"
+        url = hf_hub_url(
+            repo_id=repo_id,
+            filename=repo_file.path,
+            revision=revision,
+        )
+        response_stream = _open_hub_stream(session, url, headers)
+        with response_stream as response:
+            status_code = int(getattr(response, "status_code", 200))
+            if status_code == 206:
+                if not resumable or repo_file.sha256 is None:
+                    raise RuntimeError(
+                        "unexpected Content-Range without a strongly validated "
+                        "resumable partial"
+                    )
+                _validate_content_range(
+                    response,
+                    expected_start=existing,
+                    expected_size=expected_size,
+                )
+            if existing > 0 and status_code == 200:
+                os.ftruncate(descriptor, 0)
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                digest = hashlib.sha256()
+                existing = 0
+            elif (
+                existing > 0
+                and status_code == 416
+                and resumable
+                and repo_file.sha256 is not None
+                and expected_size is not None
+                and existing == expected_size
+            ):
+                trusted = install_verified_partial()
+                emitted_at, emitted_size = _emit_current_download_size(
+                    callback,
+                    repo_id=repo_id,
+                    destination=destination,
+                    total_bytes=total_bytes,
+                    started_at=started_at,
+                    last_emit_at=last_emit_at,
+                    last_emit_size=last_emit_size,
+                    file_path=repo_file.path,
+                )
+                return emitted_at, emitted_size, trusted
+            hf_raise_for_status(response)
+            os.lseek(descriptor, 0, os.SEEK_END)
+            for chunk in _iter_response_bytes(response):
+                if not chunk:
+                    continue
+                _write_all(descriptor, chunk)
+                digest.update(chunk)
+                now = time.monotonic()
+                if now - last_emit_at >= progress_interval_s:
+                    last_emit_at, last_emit_size = _emit_current_download_size(
+                        callback,
+                        repo_id=repo_id,
+                        destination=destination,
+                        total_bytes=total_bytes,
+                        started_at=started_at,
+                        last_emit_at=last_emit_at,
+                        last_emit_size=last_emit_size,
+                        file_path=repo_file.path,
+                    )
+        trusted = install_verified_partial()
+    finally:
+        os.close(descriptor)
+
+    emitted_at, emitted_size = _emit_current_download_size(
+        callback,
+        repo_id=repo_id,
+        destination=destination,
+        total_bytes=total_bytes,
+        started_at=started_at,
+        last_emit_at=last_emit_at,
+        last_emit_size=last_emit_size,
+        file_path=repo_file.path,
+    )
+    return emitted_at, emitted_size, trusted
+
+
+
+
+def _download_repo_file_streamed(
+    repo_file: RepoFile,
+    *,
+    repo_id: str,
+    revision: str | None,
+    destination: Path,
+    session: Any,
+    hf_hub_url: Callable[..., str],
+    build_hf_headers: Callable[..., dict[str, str]],
+    hf_raise_for_status: Callable[[Any], None],
+    callback: DownloadProgressCallback | None,
+    total_bytes: int | None,
+    started_at: float,
+    progress_interval_s: float,
+    last_emit_at: float,
+    last_emit_size: int,
+) -> tuple[float, int, TrustedFileDigest]:
+    with _open_safe_repo_parent(
+        destination,
+        repo_file,
+    ) as (directory_descriptor, parent, target_name):
+        return _download_repo_file_at(
+            repo_file,
+            directory_descriptor=directory_descriptor,
+            parent=parent,
+            target_name=target_name,
+            repo_id=repo_id,
+            revision=revision,
+            destination=destination,
+            session=session,
+            hf_hub_url=hf_hub_url,
+            build_hf_headers=build_hf_headers,
+            hf_raise_for_status=hf_raise_for_status,
+            callback=callback,
+            total_bytes=total_bytes,
+            started_at=started_at,
+            progress_interval_s=progress_interval_s,
+            last_emit_at=last_emit_at,
+            last_emit_size=last_emit_size,
+        )
+
+
+def _download_streamed_snapshot(
+    *,
+    repo_id: str,
+    inventory: RepoInventory,
+    destination: Path,
+    progress_callback: DownloadProgressCallback | None,
+    progress_interval_s: float,
+) -> tuple[Path, int | None, dict[str, TrustedFileDigest]]:
+    (
+        _HfApi,
+        hf_hub_url,
+        get_session,
+        build_hf_headers,
+        hf_raise_for_status,
+    ) = _hub_runtime()
+    repo_files = inventory.files
+
+    total_bytes = sum(
+        repo_file.size_bytes
+        for repo_file in repo_files
+        if isinstance(repo_file.size_bytes, int) and repo_file.size_bytes > 0
+    ) or None
+    session = get_session()
+    started_at = time.monotonic()
+    last_emit_at = started_at
+    last_emit_size = directory_size_bytes(destination)
+    downloaded_digests: dict[str, TrustedFileDigest] = {}
+    for repo_file in repo_files:
+        try:
+            last_emit_at, last_emit_size, digest = _download_repo_file_streamed(
+                repo_file,
+                repo_id=repo_id,
+                revision=inventory.resolved_revision,
+                destination=destination,
+                session=session,
+                hf_hub_url=hf_hub_url,
+                build_hf_headers=build_hf_headers,
+                hf_raise_for_status=hf_raise_for_status,
+                callback=progress_callback,
+                total_bytes=total_bytes,
+                started_at=started_at,
+                progress_interval_s=max(0.1, progress_interval_s),
+                last_emit_at=last_emit_at,
+                last_emit_size=last_emit_size,
+            )
+            downloaded_digests[repo_file.path] = digest
+        except Exception as exc:
+            raise RuntimeError(_classify_pull_error(exc, repo_id)) from exc
+    return destination, total_bytes, downloaded_digests
+
+
+
+
+
+def _pull_streamed_model(
+    repo_id: str,
+    *,
+    root: Path,
+    destination: Path,
+    revision: str | None,
+    inventory: "RepoInventory | None",
+    inventory_error: "RuntimeError | None",
+    exact_streaming_repo: bool,
+    local_expert_status: dict[str, Any],
+    progress_callback: DownloadProgressCallback | None,
+    progress_interval_s: float,
+) -> dict[str, Any]:
+    started_size = directory_size_bytes(destination)
+    local_ready = (
+        destination.exists()
+        and _cached_model_ready_for_repo(destination, repo_id)
+    )
+    local_streamed = bool(local_expert_status.get("streamed_experts"))
+    resolved_revision = (
+        inventory.resolved_revision if inventory is not None else revision
+    )
+    remote_streamed = (
+        _inventory_declares_experts(inventory)
+        if inventory is not None
+        else False
+    )
+    expert_repo = exact_streaming_repo or local_streamed or remote_streamed
+    admission: dict[str, Any] | None = None
+    reuse_allowed = False
+
+    if local_ready and expert_repo:
+        if inventory is not None:
+            receipt = load_valid_admission_receipt(
+                destination,
+                revision=inventory.resolved_revision,
+            )
+            reuse_allowed = (
+                receipt is not None
+                and receipt.get("repo_id") == repo_id
+            )
+        else:
+            # Offline expert reuse is allowed only when a prior admission is
+            # bound to an immutable Hub SHA. A mutable requested revision or
+            # an identity-only cache check is insufficient.
+            receipt = load_valid_admission_receipt(destination)
+            receipt_revision = (
+                receipt.get("revision") if receipt is not None else None
+            )
+            reuse_allowed = (
+                receipt is not None
+                and receipt.get("repo_id") == repo_id
+                and _is_immutable_hub_revision(receipt_revision)
+                and (
+                    revision is None
+                    or (
+                        _is_immutable_hub_revision(revision)
+                        and str(receipt_revision).casefold()
+                        == str(revision).casefold()
+                    )
+                )
+            )
+            if reuse_allowed:
+                resolved_revision = receipt_revision
+    elif local_ready and not expert_repo:
+        reuse_allowed = _local_matches_remote_index(
+            destination,
+            repo_id,
+            resolved_revision,
+        )
+
+    if reuse_allowed:
+        resolved = destination
+        reused_existing = True
+        resumed_existing = False
+        validation = validate_mtplx_model_files(resolved)
+        if repo_id.lower().startswith("youssofal/qwen3.6-27b-mtplx") and not validation["ok"]:
+            raise RuntimeError(
+                "cached MTPLX model is incomplete: "
+                + ", ".join(validation["missing_files"] or [str(validation.get("contract_error"))])
+            )
+        if expert_repo:
+            _emit_download_progress(
+                progress_callback,
+                {
+                    "event": "verifying",
+                    "repo_id": repo_id,
+                    "path": str(resolved),
+                    "size_bytes": directory_size_bytes(resolved),
+                    "total_bytes": directory_size_bytes(resolved),
+                },
+            )
+            admission = ensure_expert_admitted(
+                resolved,
+                repo_id=repo_id,
+                revision=resolved_revision,
+            )
+        _emit_download_progress(
+            progress_callback,
+            {
+                "event": "complete",
+                "repo_id": repo_id,
+                "path": str(resolved),
+                "size_bytes": directory_size_bytes(resolved),
+                "total_bytes": directory_size_bytes(resolved),
+                "delta_bytes": 0,
+                "reused_existing": True,
+            },
+        )
+    else:
+        if inventory is None:
+            if inventory_error is not None:
+                raise inventory_error
+            raise RuntimeError(
+                f"could not resolve immutable Hugging Face metadata for {repo_id}"
+            )
+        reused_existing = False
+        resumed_existing = destination.exists() and started_size > 0
+        destination.mkdir(parents=True, exist_ok=True)
+        total_bytes = sum(
+            repo_file.size_bytes
+            for repo_file in inventory.files
+            if isinstance(repo_file.size_bytes, int)
+            and repo_file.size_bytes > 0
+        ) or None
+        _emit_download_progress(
+            progress_callback,
+            {
+                "event": "resume" if resumed_existing else "start",
+                "repo_id": repo_id,
+                "path": str(destination),
+                "size_bytes": started_size,
+                "total_bytes": total_bytes,
+            },
+        )
+        progress_suppression = (
+            _suppress_hf_hub_progress()
+            if progress_callback is not None
+            else contextlib.nullcontext()
+        )
+        downloaded_digests: dict[str, TrustedFileDigest] = {}
+        with progress_suppression:
+            if progress_callback is not None or expert_repo:
+                (
+                    resolved,
+                    total_bytes_from_download,
+                    downloaded_digests,
+                ) = _download_streamed_snapshot(
+                    repo_id=repo_id,
+                    inventory=inventory,
+                    destination=destination,
+                    progress_callback=progress_callback,
+                    progress_interval_s=progress_interval_s,
+                )
+                if total_bytes_from_download:
+                    total_bytes = total_bytes_from_download
+            else:
+                try:
+                    from huggingface_hub import snapshot_download
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"huggingface_hub is required for mtplx pull: {exc}"
+                    ) from exc
+                path = snapshot_download(
+                    repo_id=repo_id,
+                    repo_type="model",
+                    revision=inventory.resolved_revision,
+                    local_dir=str(destination),
+                    token=hf_token_for_download(),
+                )
+                resolved = Path(path)
+        _emit_download_progress(
+            progress_callback,
+            {
+                "event": "verifying",
+                "repo_id": repo_id,
+                "path": str(resolved),
+                "size_bytes": directory_size_bytes(resolved),
+                "total_bytes": total_bytes,
+            },
+        )
+        validation = validate_mtplx_model_files(resolved)
+        if not cached_model_is_complete(resolved):
+            expert_status = expert_artifact_status(resolved)
+            if (
+                expert_status["streamed_experts"]
+                and not expert_status["ok"]
+            ):
+                raise RuntimeError(
+                    "downloaded streamed model has invalid expert artifacts: "
+                    + str(expert_status["reason"])
+                )
+            raise RuntimeError(
+                "downloaded model is incomplete: weight shards are missing or still partial"
+            )
+        if repo_id.lower().startswith("youssofal/qwen3.6-27b-mtplx") and not validation["ok"]:
+            raise RuntimeError(
+                "downloaded MTPLX model is incomplete: "
+                + ", ".join(validation["missing_files"] or [str(validation.get("contract_error"))])
+            )
+        expert_status = expert_artifact_status(resolved)
+        if expert_repo and not expert_status.get("streamed_experts"):
+            raise RuntimeError(
+                f"downloaded expert repository {repo_id} has no "
+                f"{EXPERT_MANIFEST_FILE}"
+            )
+        if expert_status.get("streamed_experts"):
+            admission = admit_expert_artifact(
+                resolved,
+                repo_id=repo_id,
+                revision=inventory.resolved_revision,
+                trusted_bank_digests=downloaded_digests,
+            )
+        final_size = directory_size_bytes(resolved)
+        _emit_download_progress(
+            progress_callback,
+            {
+                "event": "complete",
+                "repo_id": repo_id,
+                "path": str(resolved),
+                "size_bytes": final_size,
+                "total_bytes": total_bytes if total_bytes else final_size,
+                "delta_bytes": final_size - started_size,
+            },
+        )
+    return {
+        "repo_id": repo_id,
+        "path": str(resolved),
+        "cache_dir": str(root),
+        "revision": revision,
+        "resolved_revision": resolved_revision,
+        "expert_admission": admission,
+        "reused_existing": reused_existing,
+        "resumed_existing": resumed_existing,
+        "started_size_bytes": started_size,
+        "size_bytes": directory_size_bytes(resolved),
+        "has_runtime_contract": (resolved / "mtplx_runtime.json").exists(),
+        "has_config": (resolved / "config.json").exists(),
+        "validation": validate_mtplx_model_files(resolved),
+    }
+
+

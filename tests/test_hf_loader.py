@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import time
 from types import ModuleType, SimpleNamespace
@@ -11,7 +12,9 @@ import pytest
 
 from mtplx.hf_loader import (
     RepoFile,
+    RepoInventory,
     _call_hub_with_anonymous_fallback,
+    _download_repo_file_streamed,
     cached_model_is_complete,
     cached_model_path,
     directory_size_bytes,
@@ -36,9 +39,16 @@ from mtplx.profiles import (
 
 
 class _FakeHubResponse:
-    def __init__(self, chunks: list[bytes | tuple[bytes, float]], status_code: int = 200):
+    def __init__(
+        self,
+        chunks: list[bytes | tuple[bytes, float]],
+        status_code: int = 200,
+        *,
+        headers: dict[str, str] | None = None,
+    ):
         self._chunks = chunks
         self.status_code = status_code
+        self.headers = headers or {}
 
     def __enter__(self):
         return self
@@ -93,30 +103,60 @@ def _install_fake_hub(
     captured: dict[str, object] | None = None,
     blob_ids: dict[str, str] | None = None,
     sha256: dict[str, str] | None = None,
+    resolved_revision: str | None = None,
+    lfs_overrides: dict[str, str] | None = None,
 ) -> _FakeHubSession:
     captured = captured if captured is not None else {}
     session = _FakeHubSession(files)
     hub = ModuleType("huggingface_hub")
     hub.__path__ = []
 
+    def _payload_bytes(payload) -> bytes:
+        if isinstance(payload, list):
+            return b"".join(
+                item[0] if isinstance(item, tuple) else item for item in payload
+            )
+        return payload
+
+    def _payload_size(payload) -> int:
+        return len(_payload_bytes(payload))
+
+    def _sibling_lfs(name, payload):
+        # Streaming/expert repos resolve to an immutable commit sha and expose
+        # a per-file LFS sha256 so pull-time admission can verify the bank.
+        # Plain repos keep the upstream fake: LFS metadata only when the test
+        # supplies an explicit ``sha256`` map.
+        if resolved_revision is not None:
+            return SimpleNamespace(
+                sha256=(lfs_overrides or {}).get(
+                    name, hashlib.sha256(_payload_bytes(payload)).hexdigest()
+                )
+            )
+        return {"sha256": sha256[name]} if sha256 and name in sha256 else None
+
     class FakeHfApi:
         def model_info(self, **kwargs):
             captured["model_info_token"] = kwargs.get("token")
+            captured["model_info_calls"] = (
+                int(captured.get("model_info_calls", 0)) + 1
+            )
             return SimpleNamespace(
+                sha=resolved_revision,
                 siblings=[
                     SimpleNamespace(
                         rfilename=name,
-                        size=sum(len(item[0] if isinstance(item, tuple) else item) for item in payload) if isinstance(payload, list) else len(payload),
+                        size=_payload_size(payload),
                         blob_id=(blob_ids or {}).get(name),
-                        lfs={"sha256": sha256[name]} if sha256 and name in sha256 else None,
+                        lfs=_sibling_lfs(name, payload),
                     )
                     for name, payload in files.items()
-                ]
+                ],
             )
 
     def fake_hf_hub_url(*, repo_id, filename, revision=None):
         captured["repo_id"] = repo_id
         captured["revision"] = revision
+        captured.setdefault("download_revisions", []).append(revision)
         return f"fake://{filename}"
 
     hub.HfApi = FakeHfApi
@@ -1336,3 +1376,357 @@ def test_pull_model_rejects_a_landed_file_whose_sha256_differs(tmp_path: Path, m
 
     assert not (cached / _SHARD).exists()
     assert not (cached / f"{_SHARD}.incomplete").exists()
+
+
+# ---------------------------------------------------------------------------
+# Restored fork expert-bank downloader helpers and tests. These drive the
+# streaming downloader (_download_repo_file_streamed) directly; other fork
+# suites (test_expert_admission) import _download_one from here.
+# ---------------------------------------------------------------------------
+
+
+class _RangeSession:
+    def __init__(
+        self,
+        payload: bytes,
+        *,
+        status_code: int,
+        content_range: str | None = None,
+    ) -> None:
+        self.payload = payload
+        self.status_code = status_code
+        self.content_range = content_range
+        self.requests: list[dict[str, object]] = []
+
+    def get(self, url: str, **kwargs):
+        self.requests.append({"url": url, **kwargs})
+        headers = (
+            {"Content-Range": self.content_range}
+            if self.content_range is not None
+            else None
+        )
+        return _FakeHubResponse(
+            [self.payload],
+            status_code=self.status_code,
+            headers=headers,
+        )
+
+
+
+
+def _download_one(
+    tmp_path: Path,
+    repo_file: RepoFile,
+    *,
+    payload: bytes,
+    status_code: int,
+    content_range: str | None = None,
+):
+    session = _RangeSession(
+        payload,
+        status_code=status_code,
+        content_range=content_range,
+    )
+    seen_revisions: list[str | None] = []
+    result = _download_repo_file_streamed(
+        repo_file,
+        repo_id="owner/model",
+        revision="d" * 40,
+        destination=tmp_path,
+        session=session,
+        hf_hub_url=lambda **kwargs: (
+            seen_revisions.append(kwargs.get("revision")) or "fake://file"
+        ),
+        build_hf_headers=lambda **_kwargs: {},
+        hf_raise_for_status=lambda response: response.raise_for_status(),
+        callback=None,
+        total_bytes=repo_file.size_bytes,
+        started_at=time.monotonic(),
+        progress_interval_s=0,
+        last_emit_at=time.monotonic(),
+        last_emit_size=0,
+    )
+    return result, session, seen_revisions
+
+
+
+def _write_partial_metadata(
+    root: Path,
+    repo_file: RepoFile,
+    *,
+    revision: str = "d" * 40,
+) -> None:
+    assert repo_file.sha256 is not None
+    (root / f"{repo_file.path}.incomplete.meta.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "repo_id": "owner/model",
+                "revision": revision,
+                "path": repo_file.path,
+                "size_bytes": repo_file.size_bytes,
+                "validator": f"sha256:{repo_file.sha256}",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+
+def test_download_repo_file_hashes_resumed_prefix_and_appends_206(
+    tmp_path: Path,
+) -> None:
+    complete = b"abcdef"
+    partial = tmp_path / "experts.bin.incomplete"
+    partial.write_bytes(complete[:3])
+    repo_file = RepoFile(
+        path="experts.bin",
+        size_bytes=len(complete),
+        sha256=hashlib.sha256(complete).hexdigest(),
+    )
+    _write_partial_metadata(tmp_path, repo_file)
+
+    (_emit_at, _emit_size, digest), session, revisions = _download_one(
+        tmp_path,
+        repo_file,
+        payload=complete[3:],
+        status_code=206,
+        content_range="bytes 3-5/6",
+    )
+
+    assert (tmp_path / "experts.bin").read_bytes() == complete
+    assert session.requests[0]["headers"]["Range"] == "bytes=3-"
+    assert digest.sha256 == repo_file.sha256
+    assert revisions == ["d" * 40]
+
+
+def test_download_repo_file_resets_prefix_and_hasher_on_range_200(
+    tmp_path: Path,
+) -> None:
+    complete = b"abcdef"
+    (tmp_path / "experts.bin.incomplete").write_bytes(complete[:3])
+    repo_file = RepoFile(
+        path="experts.bin",
+        size_bytes=len(complete),
+        sha256=hashlib.sha256(complete).hexdigest(),
+    )
+    _write_partial_metadata(tmp_path, repo_file)
+
+    (_emit_at, _emit_size, digest), _session, _revisions = _download_one(
+        tmp_path,
+        repo_file,
+        payload=complete,
+        status_code=200,
+    )
+
+    assert (tmp_path / "experts.bin").read_bytes() == complete
+    assert digest.sha256 == repo_file.sha256
+
+
+def test_download_repo_file_installs_exact_partial_on_range_416(
+    tmp_path: Path,
+) -> None:
+    complete = b"abcdef"
+    (tmp_path / "experts.bin.incomplete").write_bytes(complete)
+    repo_file = RepoFile(
+        path="experts.bin",
+        size_bytes=len(complete),
+        sha256=hashlib.sha256(complete).hexdigest(),
+    )
+    _write_partial_metadata(tmp_path, repo_file)
+
+    (_emit_at, _emit_size, digest), _session, _revisions = _download_one(
+        tmp_path,
+        repo_file,
+        payload=b"",
+        status_code=416,
+    )
+
+    assert (tmp_path / "experts.bin").read_bytes() == complete
+    assert digest.sha256 == repo_file.sha256
+
+
+def test_download_repo_file_rejects_lfs_digest_mismatch_before_install(
+    tmp_path: Path,
+) -> None:
+    complete = b"abcdef"
+    repo_file = RepoFile(
+        path="experts.bin",
+        size_bytes=len(complete),
+        sha256="0" * 64,
+    )
+
+    with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
+        _download_one(
+            tmp_path,
+            repo_file,
+            payload=complete,
+            status_code=200,
+        )
+
+    assert not (tmp_path / "experts.bin").exists()
+
+
+def test_download_repo_file_rejects_intermediate_symlink_escape(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "nested").symlink_to(outside, target_is_directory=True)
+    repo_file = RepoFile(path="nested/experts.bin", size_bytes=1, sha256=None)
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        _download_one(
+            tmp_path,
+            repo_file,
+            payload=b"x",
+            status_code=200,
+        )
+
+    assert not (outside / "experts.bin").exists()
+
+
+def test_download_repo_file_rejects_mismatched_content_range(
+    tmp_path: Path,
+) -> None:
+    complete = b"abcdef"
+    (tmp_path / "experts.bin.incomplete").write_bytes(complete[:3])
+    (tmp_path / "experts.bin.incomplete.meta.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "repo_id": "owner/model",
+                "revision": "d" * 40,
+                "path": "experts.bin",
+                "size_bytes": len(complete),
+                "validator": f"sha256:{hashlib.sha256(complete).hexdigest()}",
+            }
+        ),
+        encoding="utf-8",
+    )
+    repo_file = RepoFile(
+        path="experts.bin",
+        size_bytes=len(complete),
+        sha256=hashlib.sha256(complete).hexdigest(),
+    )
+
+    with pytest.raises(RuntimeError, match="Content-Range"):
+        _download_one(
+            tmp_path,
+            repo_file,
+            payload=complete[3:],
+            status_code=206,
+            content_range="bytes 0-2/6",
+        )
+
+    assert not (tmp_path / "experts.bin").exists()
+
+
+def test_download_repo_file_never_resumes_digestless_partial_or_accepts_416(
+    tmp_path: Path,
+) -> None:
+    partial = tmp_path / "config.json.incomplete"
+    partial.write_bytes(b"old")
+    repo_file = RepoFile(path="config.json", size_bytes=3, sha256=None)
+
+    with pytest.raises(RuntimeError, match="HTTP 416"):
+        _download_one(
+            tmp_path,
+            repo_file,
+            payload=b"",
+            status_code=416,
+        )
+
+    assert not (tmp_path / "config.json").exists()
+
+
+def test_download_repo_file_discards_cross_revision_partial_metadata(
+    tmp_path: Path,
+) -> None:
+    complete = b"NEWNEW"
+    (tmp_path / "experts.bin.incomplete").write_bytes(b"old")
+    (tmp_path / "experts.bin.incomplete.meta.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "repo_id": "owner/model",
+                "revision": "a" * 40,
+                "path": "experts.bin",
+                "size_bytes": len(complete),
+                "validator": f"sha256:{hashlib.sha256(complete).hexdigest()}",
+            }
+        ),
+        encoding="utf-8",
+    )
+    repo_file = RepoFile(
+        path="experts.bin",
+        size_bytes=len(complete),
+        sha256=hashlib.sha256(complete).hexdigest(),
+    )
+
+    (_emit_at, _emit_size, _digest), session, _revisions = _download_one(
+        tmp_path,
+        repo_file,
+        payload=complete,
+        status_code=200,
+    )
+
+    assert "Range" not in session.requests[0]["headers"]
+    assert (tmp_path / "experts.bin").read_bytes() == complete
+
+
+def test_verified_final_removes_stale_partial_and_metadata(
+    tmp_path: Path,
+) -> None:
+    complete = b"abcdef"
+    (tmp_path / "experts.bin").write_bytes(complete)
+    (tmp_path / "experts.bin.incomplete").write_bytes(b"stale")
+    (tmp_path / "experts.bin.incomplete.meta.json").write_text(
+        "{}",
+        encoding="utf-8",
+    )
+    repo_file = RepoFile(
+        path="experts.bin",
+        size_bytes=len(complete),
+        sha256=hashlib.sha256(complete).hexdigest(),
+    )
+
+    _download_one(
+        tmp_path,
+        repo_file,
+        payload=b"",
+        status_code=200,
+    )
+
+    assert not (tmp_path / "experts.bin.incomplete").exists()
+    assert not (tmp_path / "experts.bin.incomplete.meta.json").exists()
+
+
+def test_downloader_replaces_final_without_mutating_retained_inode(
+    tmp_path: Path,
+) -> None:
+    old = b"OLDOLD"
+    complete = b"NEWNEW"
+    target = tmp_path / "experts.bin"
+    target.write_bytes(old)
+    retained = os.open(target, os.O_RDONLY)
+    repo_file = RepoFile(
+        path="experts.bin",
+        size_bytes=len(complete),
+        sha256=hashlib.sha256(complete).hexdigest(),
+    )
+    try:
+        _download_one(
+            tmp_path,
+            repo_file,
+            payload=complete,
+            status_code=200,
+        )
+
+        assert os.pread(retained, len(old), 0) == old
+        assert target.read_bytes() == complete
+    finally:
+        os.close(retained)
+
+
+
