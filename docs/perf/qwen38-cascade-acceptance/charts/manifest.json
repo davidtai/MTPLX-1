@@ -54,12 +54,12 @@
     "sha256": "c4747722fe0d98c71038b21cd52b7a20ca8ce2f7dfb8bc60087e3bcb56acecb4"
   },
   {
-    "alt": "HumanEval strict and completed-task pass@1 as grouped bars per cascade operating point: cascade off, OPT alpha 0.0 to 0.75, TokenV3 alpha 0.75 and 0.95",
-    "bytes": 123272,
-    "caption": "_HumanEval pass@1 per cascade operating point, one seed at the cell's sampler, re-scored offline: strict (truncated tasks count as failures) and completed-task (truncated tasks excluded). The OPT rule (Equation 10) loses accuracy at every alpha; the TokenV3 rule (Equation 15) holds the cascade-off level at 0.75 and 0.95. OPT alpha 1.0 did not finish 164 tasks in 3 h and has no bar. Equal alphas are NOT comparable across the two rules._",
+    "alt": "HumanEval strict and completed-task pass@1 as grouped bars per operating point: cascade off, #478 typical 0.2, OPT alpha 0.0 to 0.75, TokenV3 alpha 0.75 and 0.95",
+    "bytes": 132371,
+    "caption": "_HumanEval pass@1 per cascade operating point, one seed at the cell's sampler, re-scored offline, with #478 typical 0.2 beside cascade off as the second reference: strict (truncated tasks count as failures) and completed-task (truncated tasks excluded). The OPT rule (Equation 10) loses accuracy at every alpha; the TokenV3 rule (Equation 15) holds the cascade-off level at 0.75 and 0.95. OPT alpha 1.0 did not finish 164 tasks in 3 h and has no bar. Equal alphas are NOT comparable across the two rules._",
     "file": "cascade_humaneval_by_alpha.svg",
     "key": "cascade_humaneval_by_alpha",
     "label": "HumanEval by cascade operating point",
-    "sha256": "d7295797e5702a8fe63c260b0ed5e733183a933e7619358e33f5f14f2294fdd8"
+    "sha256": "7008eed4da1c881dee646ee9563264eca8708e8950ed0d3594e5caadb5721bc8"
   }
 ]
