@@ -18820,6 +18820,18 @@ def _qwen4_install_reports(state: Any) -> dict[str, Any]:
             out["ngram_prewarm"] = prewarm
     except Exception:
         pass
+    try:
+        from mtplx.models.qwen4_exp import verify_sdpa_head_chunk_report
+
+        # Present once the small-q_len verify SDPA has fired (like the other
+        # lanes: a receipt, not a null placeholder), so the battery can gate on
+        # the observable rather than the serve log. Its q_len/heads_per_chunk/
+        # chunks are the engagement proof for the 261K window.
+        receipt = verify_sdpa_head_chunk_report()
+        if receipt is not None:
+            out["verify_sdpa_head_chunk"] = receipt
+    except Exception:
+        pass
     return out
 
 

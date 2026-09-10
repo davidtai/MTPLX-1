@@ -1438,6 +1438,146 @@ def _compiled_qsa_indexer_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+# MLX's fused vector (small-q_len) attention kernel serves at most this many
+# (query_length * heads-per-kv-group) rows per dispatch; above it, SDPA falls to
+# an unfused path that materializes the [n_heads, q_len, T] score plane and
+# GQA-expands k/v. See _verify_sdpa.
+_VECTOR_SDPA_QLEN_HEADS_LIMIT = 32
+
+
+def _verify_sdpa_head_chunk_enabled() -> bool:
+    """MTPLX_QWEN4_VERIFY_SDPA_HEAD_CHUNK: keep the small-q_len verify SDPA on
+    the fused kernel by splitting query heads.  Default ON; ``0``/``off`` opts
+    out.  Resolved AT USE so the server's auto-arm/setdefault sequence (which
+    can stamp env after this module imports) is honored, and tests can flip it.
+    """
+
+    raw = (os.environ.get("MTPLX_QWEN4_VERIFY_SDPA_HEAD_CHUNK") or "").strip().lower()
+    return raw not in {"0", "off", "false", "no"}
+
+
+# First-engagement receipt (host-only; printed once and surfaced in /health).
+_VERIFY_SDPA_HEAD_CHUNK_ENGAGED: Optional[dict] = None
+
+
+def _record_verify_sdpa_head_chunk(
+    q_len: int, heads_per_chunk: int, chunks: int, n_kv_heads: int
+) -> None:
+    global _VERIFY_SDPA_HEAD_CHUNK_ENGAGED
+    if _VERIFY_SDPA_HEAD_CHUNK_ENGAGED is not None:
+        return
+    _VERIFY_SDPA_HEAD_CHUNK_ENGAGED = {
+        "engaged": True,
+        "q_len": int(q_len),
+        "heads_per_chunk": int(heads_per_chunk),
+        "chunks": int(chunks),
+        "n_kv_heads": int(n_kv_heads),
+    }
+    try:
+        print(
+            f"[mtplx] verify SDPA head-chunked: q_len={int(q_len)} "
+            f"heads_per_chunk={int(heads_per_chunk)} chunks={int(chunks)}",
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
+def verify_sdpa_head_chunk_report() -> Optional[dict]:
+    """Engagement receipt for /health, or None if the lane has not fired."""
+
+    return (
+        dict(_VERIFY_SDPA_HEAD_CHUNK_ENGAGED)
+        if _VERIFY_SDPA_HEAD_CHUNK_ENGAGED is not None
+        else None
+    )
+
+
+def reset_verify_sdpa_head_chunk_engagement() -> None:
+    """Test hook: clear the one-shot engagement latch."""
+
+    global _VERIFY_SDPA_HEAD_CHUNK_ENGAGED
+    _VERIFY_SDPA_HEAD_CHUNK_ENGAGED = None
+
+
+def _verify_sdpa_head_chunk_plan(q_len: int, n_q_heads: int, n_kv_heads: int):
+    """(heads_per_chunk, chunks) for the head-chunk band, or None to pass through.
+
+    Chunk only the small-q_len band the fused vector kernel declines
+    (``q_len * gqa > 32``) and that MLX would not already route to the flash
+    kernel (``q_len <= 32``); wide prefill chunks keep their single flash call.
+    """
+
+    if n_kv_heads <= 0 or n_q_heads % n_kv_heads != 0:
+        return None
+    gqa = n_q_heads // n_kv_heads
+    if gqa <= 0:
+        return None
+    if not (
+        q_len * gqa > _VECTOR_SDPA_QLEN_HEADS_LIMIT
+        and q_len <= _VECTOR_SDPA_QLEN_HEADS_LIMIT
+    ):
+        return None
+    heads_per_chunk = max(1, min(gqa, _VECTOR_SDPA_QLEN_HEADS_LIMIT // max(1, q_len)))
+    chunks = n_kv_heads * ((gqa + heads_per_chunk - 1) // heads_per_chunk)
+    return heads_per_chunk, chunks
+
+
+def _sdpa_head_chunked(q, k, v, *, scale, mask, heads_per_chunk: int):
+    """Fused SDPA over query-head chunks, each paired with its own single kv
+    head so k/v is never GQA-expanded and no [n_heads, q_len, T] plane forms.
+
+    Every chunk's ``q_len * (heads_in_chunk / 1) <= 32`` so it stays on the
+    fused vector kernel.  The heads in one chunk all belong to the same kv
+    head, so the per-head arithmetic is exactly the full GQA attention's;
+    outputs concatenate back in head order.
+    """
+
+    B, n_q_heads, S, D = q.shape
+    n_kv_heads = k.shape[1]
+    gqa = n_q_heads // n_kv_heads
+    qg = q.reshape(B, n_kv_heads, gqa, S, D)
+    outs = []
+    for j in range(n_kv_heads):
+        kj = k[:, j : j + 1]
+        vj = v[:, j : j + 1]
+        for hs in range(0, gqa, heads_per_chunk):
+            he = min(hs + heads_per_chunk, gqa)
+            qc = qg[:, j, hs:he]  # [B, he-hs, S, D]
+            outs.append(
+                mx.fast.scaled_dot_product_attention(
+                    qc, kj, vj, scale=scale, mask=mask
+                )
+            )
+    return mx.concatenate(outs, axis=1)
+
+
+def _verify_sdpa(q, k, v, *, scale, mask):
+    """SDPA that stays on the fused kernel across the small-q_len verify band.
+
+    MLX's fused vector-attention kernel requires ``q_len * (n_q_heads /
+    n_kv_heads) <= 32``; a multi-row speculative verify over a long KV
+    (q_len 3-8 x GQA 12) exceeds it and falls to an unfused path that
+    materializes the ``[n_q_heads, q_len, T]`` fp32 score plane (O(T)) and
+    GQA-expands k/v -- the term that tips a 262K-context decode over the Metal
+    limit (kIOGPUCommandBufferCallbackErrorOutOfMemory).  Splitting the query
+    heads keeps every dispatch on the bounded fused kernel with no O(T) plane.
+    """
+
+    n_q_heads = q.shape[1]
+    S = q.shape[2]
+    n_kv_heads = k.shape[1]
+    if _verify_sdpa_head_chunk_enabled():
+        plan = _verify_sdpa_head_chunk_plan(S, n_q_heads, n_kv_heads)
+        if plan is not None:
+            heads_per_chunk, chunks = plan
+            _record_verify_sdpa_head_chunk(S, heads_per_chunk, chunks, n_kv_heads)
+            return _sdpa_head_chunked(
+                q, k, v, scale=scale, mask=mask, heads_per_chunk=heads_per_chunk
+            )
+    return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+
+
 def qsa_prefill_lane_auto_supported() -> bool:
     """Device gate for the auto default: the lane's fast consumer must exist.
 
@@ -3795,9 +3935,7 @@ class Attention(nn.Module):
         else:
             mask = None
 
-        out = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=self.scale, mask=mask
-        )
+        out = _verify_sdpa(q, k, v, scale=self.scale, mask=mask)
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
         return self.o_proj(out * mx.sigmoid(gate))
 
