@@ -1297,8 +1297,40 @@ def _attach_runtime_diagnostics(
     )
 
 
+@dataclass(frozen=True)
+class GenerationFeaturePolicy:
+    sustained_prefill: bool
+
+
+def bind_generation_feature_policy(
+    environ: Mapping[str, str],
+) -> GenerationFeaturePolicy:
+    return GenerationFeaturePolicy(
+        sustained_prefill=str(environ.get("MTPLX_SUSTAINED_PREFILL", ""))
+        .strip()
+        .lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+
+def install_generation_feature_policy(
+    environ: Mapping[str, str],
+) -> GenerationFeaturePolicy:
+    """Install one immutable policy after construction-time env is finalized."""
+
+    global _GENERATION_FEATURE_POLICY
+    policy = bind_generation_feature_policy(environ)
+    _GENERATION_FEATURE_POLICY = policy
+    return policy
+
+
+_GENERATION_FEATURE_POLICY = bind_generation_feature_policy(os.environ)
+
+
 def _sustained_prefill_enabled() -> bool:
-    return _env_truthy("MTPLX_SUSTAINED_PREFILL")
+    # Bound once at construction-time env finalization (install_generation_feature_policy)
+    # so the decode hot path performs no os.environ read.
+    return _GENERATION_FEATURE_POLICY.sustained_prefill
 
 
 def _final_logits_prefill_enabled() -> bool:
