@@ -8,7 +8,7 @@ The everyday path is start first. Servers, integrations, QA, and kernels live he
 Benchmark and QA:
   bench *                      Nightly gates, no-fan runs, envelope compare
   qa *                         Exactness and distribution gates
-  profile *                    Dispatch, thermal, compile, and eval attribution
+  profile *                    Compile audit; dispatch/thermal/eval-attribution need the research workspace
 Support:
   doctor --deep                Deep install and integration checks
   debug bundle                 Redacted support bundle
@@ -19,6 +19,13 @@ Models:
   models                       List local cached models
   model architectures          Architecture support matrix
   model publish-check          HF staging readiness
+Server and scripting:
+  list                         List locally cached models
+  remove                       Remove a cached model (confirms first; --yes to skip)
+  config *                     Show or edit the MTPLX user config
+  env                          Reproducible environment snapshot
+  dashboard                    Open the live dashboard against a running server
+  integrate *                  Print client integration settings
 Kernel Lab:
   debug hotpath                Next verify-cycle boundary map
   runtime-smoke                Load/inject/generate smoke

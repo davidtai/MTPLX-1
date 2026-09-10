@@ -88,6 +88,22 @@ def _missing_links(root: Path, files: tuple[Path, ...]) -> tuple[str, ...]:
     return tuple(sorted(missing))
 
 
+def _has_unbalanced_quote(command: str) -> bool:
+    """Whether ``command`` ends inside an open single/double quote.
+
+    A valid multi-line shell command may carry a quoted argument that spans
+    several physical lines (e.g. a ``jq '...'`` filter). shlex reports such a
+    partial command as a ``No closing quotation`` ValueError; that is the
+    signal to keep accumulating physical lines rather than a real defect.
+    """
+
+    try:
+        shlex.split(command, comments=True)
+    except ValueError:
+        return True
+    return False
+
+
 def _logical_shell_lines(block: str) -> tuple[tuple[int, str], ...]:
     logical: list[tuple[int, str]] = []
     current = ""
@@ -100,6 +116,12 @@ def _logical_shell_lines(block: str) -> tuple[tuple[int, str], ...]:
             current += stripped[:-1] + " "
             continue
         current += stripped
+        # A quoted argument may legally span multiple physical lines. Keep
+        # accumulating (preserving the newline inside the quote) until the
+        # command's quotes balance, so shlex sees the whole command.
+        if _has_unbalanced_quote(current):
+            current += "\n"
+            continue
         if current and not current.lstrip().startswith("#"):
             logical.append((start, current))
         current = ""
@@ -119,6 +141,31 @@ def _mtplx_argv(tokens: list[str]) -> list[str] | None:
             argv.append(value)
         return argv
     return None
+
+
+_ALTERNATION_RE = re.compile(r"^\w+(?:/\w+)+$")
+
+
+def _is_illustrative_command(command: str, argv: list[str]) -> bool:
+    """Whether a documented ``mtplx`` command is illustrative, not literal.
+
+    Such commands are syntactically valid shell (checked by shlex) but carry
+    placeholder syntax a reader substitutes, so argparse-validating them is
+    meaningless: ``...`` elisions, ``<placeholder>`` angle brackets, ``get/set``
+    slash alternations, and a bare ``--help``/``-h`` invocation (which argparse
+    answers with a zero-exit ``SystemExit``).
+    """
+
+    if "..." in command:
+        return True
+    if "--help" in argv or "-h" in argv:
+        return True
+    for token in argv:
+        if "<" in token or ">" in token:
+            return True
+        if _ALTERNATION_RE.match(token):
+            return True
+    return False
 
 
 def _shell_checks(
@@ -143,9 +190,11 @@ def _shell_checks(
                 argv = _mtplx_argv(tokens)
                 if argv is None or not argv:
                     continue
-                if "..." in command:
+                if _is_illustrative_command(command, argv):
                     # Deliberate illustrative tokens are syntax-checked by
-                    # shlex above but cannot be meaningfully argparse-checked.
+                    # shlex above but cannot be meaningfully argparse-checked:
+                    # "..." elisions, angle-bracket <placeholders>, slash
+                    # alternations (get/set), and a bare --help invocation.
                     continue
                 try:
                     with contextlib.redirect_stderr(io.StringIO()):

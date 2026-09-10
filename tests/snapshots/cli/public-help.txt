@@ -5,20 +5,24 @@
   ██║ ╚═╝ ██║    ██║    ██║      ███████╗ ██╔╝ ██╗
   ╚═╝     ╚═╝    ╚═╝    ╚═╝      ╚══════╝ ╚═╝  ╚═╝
 
-  v2.3.1rc1  ·  Native MTP speculative decoding on Apple Silicon
+  v2.11.2  ·  Native MTP speculative decoding on Apple Silicon
 
 Commands
-  start        Interactive setup → chat (model · mode · web/CLI/Pi/OpenCode/Swival)
-  tune         Find the fastest AR/D1/D2/D3 depth for this Mac
+  start        Interactive setup → chat (model · mode · web/CLI/Pi/OpenCode/Swival/Hermes/Dashboard)
+  tune         Find the fastest AR/MTP draft depth for this Mac (AR, D1-D8)
   help         Detailed help; `help commands` / `help flags` / `help <name>`
   setup        Prepare config and the model cache
   quickstart   Run the local OpenAI/Anthropic server
-  connect      Copy settings for Open WebUI or Claude Code
+  serve        Start the local server with an explicit model and mode
+  connect      Copy settings for Open WebUI, Claude Code, OpenCode, or Swival
   ask          Ask the verified local model once
+  run          Run one verified completion from an argument, a flag, or a pipe
+  chat         Run one native-MTP chat generation as a smoke check
   status       Check install, model, and integration health
   stop         Stop the MTPLX daemon answering on a port
   settings     Get or set live daemon settings
   inspect      Check whether a model is MTPLX-compatible
+  trace        Diagnose coding sessions: timelines, TPS curves, autopsies, live status
   forge        Forge, verify, brand, discover, and publish MTP models
   hardware     Inspect Apple Silicon / MLX acceleration eligibility
   models       List models in the local MTPLX cache
@@ -31,7 +35,7 @@ Examples
   mtplx start opencode --port 18083    Configure OpenCode Desktop for MTPLX-owned generation
   mtplx start swival --port 18084      Print Swival generic-provider command
   mtplx start hermes --port 18085      Launch Hermes Agent against MTPLX
-  mtplx quickstart --profile sustained --port 8000  API server only, no chat
+  mtplx quickstart --port 8000         API server only, no chat
 
   more: `mtplx help <command>` · `mtplx help advanced` · `mtplx --help` · `mtplx --version`
 

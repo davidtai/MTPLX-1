@@ -6,7 +6,7 @@ On later runs it offers "same as last time?" so the chat is one keypress away.
 
 What gets asked:
   1. Model — your configured model, the verified default, custom HF, or local
-  2. Mode  — Sustained, Turbo, Sustained Max, or Burst (Stable remains available via --profile safe)
+  2. Mode  — Auto (recommended; Turbo auto-selects for the quantized flagships), Sustained, Sustained Max, or Burst (Stable remains available via --profile safe)
   3. Where — Web UI (default), terminal CLI, Pi, OpenCode Desktop, Swival, or Hermes
 
 Power-user shortcuts (any of these skip the onboarding wizard):
@@ -42,7 +42,9 @@ Inside terminal chat:
   /mtp off         Switch the next turn to target-only AR generation
   /mtp on          Switch the next turn back to MTP without reloading
   /stats           Print the last response stats again
-  /speed           Run a 192-token comparison sample
+  /speed           Run a 192-token speed sample
+  /reasoning on|off|auto
+                   Control reasoning for the next turns
   /exit            Quit
 
 Aliases:
@@ -52,4 +54,6 @@ Aliases:
   `opencode`, `oc`      -> OpenCode Desktop coding-agent connection
   `swival`, `sv`        -> Swival generic-provider connection
   `hermes`              -> Hermes Agent with terminal/file/web/browser/messaging tools
+  `dashboard`, `live`   -> live engine dashboard
+  (hyphenated forms like `open-webui`, `open-code`, `hermes-agent` also work)
 
