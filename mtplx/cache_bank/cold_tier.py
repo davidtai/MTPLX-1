@@ -2378,15 +2378,26 @@ class SessionBankColdTier:
         # replaces it. The manifest total is captured before and after; the
         # larger of the two is paired with the physical bytes so an entry
         # committed mid-walk can never masquerade as orphan bytes.
+        #
+        # The before/after manifest totals are read through the same
+        # generation-keyed aggregate cache that stats() uses (issue #280): a
+        # cold-start scan is triggered by the first stats() poll, so opening
+        # its own sqlite connection here would land asynchronously during a
+        # later poll and read as "a repeated poll re-opened the manifest".
+        # _manifest_stats_row()[2] is the identical SUM(physical_nbytes)
+        # aggregate; while the store generation is unchanged it reuses the
+        # cached row (no fresh connect), and a mutation mid-walk bumps the
+        # generation, which both invalidates the cache (a fresh read is then
+        # taken, as the mutation case intends) and is caught by the torn check.
         with self._disk_usage_lock:
             generation = self._store_generation
-        manifest_before = self._current_bytes()
+        manifest_before = int(self._manifest_stats_row()[2])
         usage = self._scan_managed_disk_usage()
         if self._stop.is_set():
             # Interrupted by close(): a partial walk is not a snapshot.
             usage["disk_usage_stale"] = True
             return usage
-        manifest_after = self._current_bytes()
+        manifest_after = int(self._manifest_stats_row()[2])
         with self._disk_usage_lock:
             torn = self._store_generation != generation
             usage["manifest_physical_bytes_at_scan"] = max(manifest_before, manifest_after)
