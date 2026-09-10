@@ -16709,6 +16709,66 @@ def _typical_acceptance_health_payload() -> dict[str, Any]:
     }
 
 
+def _cascade_acceptance_health_payload() -> dict[str, Any]:
+    """Resolved speculative-cascade acceptance lane state, for ``/health``.
+
+    A SECOND lossy verify rule beside typical acceptance (Narasimhan et al.
+    2024, arXiv:2405.19261, "Faster Cascades via Speculative Decoding", Eq.
+    (10)). OFF unless the operator sets MTPLX_FABLE_CASCADE_THRESHOLD (server
+    flag ``--cascade-threshold``); unset leaves the exact speculative law
+    unchanged. When on it is NOT distribution-exact: it accepts the draft token
+    whenever ``max_v q(v) >= max_v p(v) - alpha*D_TV(p,q)`` and otherwise defers
+    to the exact ``min(1, p/q)`` coin + residual. Mutually exclusive with the
+    typical lane (both set is a fail-loud misconfiguration). See
+    docs/perf/qwen38-cascade-acceptance.md.
+    """
+    raw = os.environ.get("MTPLX_FABLE_CASCADE_THRESHOLD")
+    enabled = raw is not None and str(raw).strip() != ""
+    alpha: float | None = None
+    if enabled:
+        try:
+            alpha = float(raw)
+        except ValueError:
+            alpha = None
+            enabled = False
+    typical_on = False
+    tv = os.environ.get("MTPLX_FABLE_TYPICAL_THRESHOLD")
+    try:
+        typical_on = tv is not None and float(tv) > 0.0
+    except ValueError:
+        typical_on = False
+    rule_raw = os.environ.get("MTPLX_FABLE_CASCADE_RULE")
+    rule_name = str(rule_raw).strip().lower() if rule_raw not in (None, "") else "tokenv3"
+    rule_text = {
+        "opt": "defer iff max_q < max_p - alpha*D_TV(p,q); else accept draft (Eq. 10)",
+        "tokenv1": "defer token v iff q(v) < max_p - alpha; else accept (Eq. 13)",
+        "tokenv2": "defer token v iff p(v) < max_p - alpha; else accept (Eq. 14)",
+        "tokenv3": "defer token v iff p(v) < max_p*(1-alpha); else accept (Eq. 15)",
+    }.get(rule_name, rule_name)
+    return {
+        "enabled": enabled,
+        "alpha": alpha,
+        "threshold": alpha,
+        "rule_name": rule_name,
+        "rule": rule_text,
+        "divergence": "D_TV(p,q) = sum_v max(0, p(v)-q(v)) over scored top-k",
+        "rates": {
+            "defer_rate": "cascade_deferred / cascade_positions -- the paper's deferral rate r (fraction of cascade-decided positions the rule deferred to the target); per-request value in VerifyStats.cascade_defer_rate and the [cascade-accept] verdict line",
+            "accept_rate": "cascade_accepted / cascade_positions -- kept-draft rate over cascade-decided positions (no-defer accepts + coin-accepted deferred tokens); NOT the deferral rate",
+            "resample_rate": "cascade_resamples / cascade_positions -- deferred tokens that lost the exact coin; accept_rate + resample_rate == 1 over cascade-decided positions",
+        },
+        "distribution_exact": not enabled,
+        "mutually_exclusive_with_typical": True,
+        "conflict": bool(enabled and typical_on),
+        "citation": "arXiv:2405.19261 Eq. (10)",
+        "note": (
+            "OFF unless --cascade-threshold (MTPLX_FABLE_CASCADE_THRESHOLD) is "
+            "set; when on it is NOT distribution-exact and engages only at "
+            "temperature > 0; mutually exclusive with --typical-threshold"
+        ),
+    }
+
+
 def _startup_health_payload(state: "ServerState") -> dict[str, Any]:
     chat_template_report = getattr(state, "chat_template_report", {}) or {}
     tool_prompt_mode = _tool_prompt_mode_from_args(state.args)
@@ -29324,6 +29384,7 @@ def create_app(state: ServerState) -> FastAPI:
             ),
             "startup": _startup_health_payload(state),
             "typical_acceptance": _typical_acceptance_health_payload(),
+            "cascade_acceptance": _cascade_acceptance_health_payload(),
             "thermal": _thermal_health_payload(
                 fan_mode=fan_mode,
                 smart_status=smart_status,
@@ -36620,6 +36681,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--cascade-threshold",
+        type=float,
+        default=None,
+        metavar="ALPHA",
+        help=(
+            "Enable speculative-cascade acceptance (arXiv:2405.19261 Eq. (10)) "
+            "at this deferral cost alpha: accept the draft token when "
+            "max_q >= max_p - alpha*D_TV(p,q), else defer to the exact "
+            "min(1,p/q) coin + residual. Unset = OFF = exact speculative "
+            "sampling (the default); any set value (including 0) turns it on. "
+            "Higher alpha widens the accept band (fewer defers). NOT "
+            "distribution-exact; engages only at temperature > 0. Mutually "
+            "exclusive with --typical-threshold (setting both is an error). "
+            "Environment: MTPLX_FABLE_CASCADE_THRESHOLD, which this flag "
+            "overrides. See docs/perf/qwen38-cascade-acceptance.md."
+        ),
+    )
+    parser.add_argument(
+        "--cascade-rule",
+        choices=("opt", "tokenv1", "tokenv2", "tokenv3"),
+        # default=None (sentinel) so an unset flag does not override a
+        # shell-set MTPLX_FABLE_CASCADE_RULE; the effective default resolves in
+        # generation._cascade_accept_rule() (tokenv3).
+        default=None,
+        help=(
+            "Which speculative-cascade deferral rule --cascade-threshold "
+            "applies (arXiv:2405.19261 v2). tokenv3 (default) = the "
+            "token-specific multiplicative rule (Eq. 15, Sec. 4.4), the only "
+            "rule with exact-level accuracy; opt = the position-level peak "
+            "rule (Eq. 10); tokenv1/tokenv2 = the additive token-specific "
+            "rules (Eq. 13/14). The token-specific rules judge the drafted "
+            "token and defer to the exact coin with target pi_Token (Eq. 11). "
+            "Ignored unless --cascade-threshold is set. Environment: "
+            "MTPLX_FABLE_CASCADE_RULE, which this flag overrides."
+        ),
+    )
+    parser.add_argument(
         "--ngram-prewarm",
         metavar="auto|all|off|GiB",
         # Not a boolean, and default=None rather than "auto": the flag has an
@@ -37159,6 +37257,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         # this env per request, so setting it here (before serving) is what the
         # flag means. 0 (or unset) leaves the exact law in place.
         os.environ["MTPLX_FABLE_TYPICAL_THRESHOLD"] = str(float(args.typical_threshold))
+    if getattr(args, "cascade_threshold", None) is not None:
+        # Same flag-beats-env contract; generation.py reads the env per request.
+        # Unlike the typical delta, any set value (including 0) turns the lane
+        # on, so only pass --cascade-threshold to enable it.
+        os.environ["MTPLX_FABLE_CASCADE_THRESHOLD"] = str(float(args.cascade_threshold))
+    if getattr(args, "cascade_rule", None) is not None:
+        # Flag beats env; generation.py resolves the rule per request. Only the
+        # deferral rule -- inert unless --cascade-threshold turns the lane on.
+        os.environ["MTPLX_FABLE_CASCADE_RULE"] = str(args.cascade_rule)
+    # Fail loud on the mutually exclusive lossy verify rules, whether they were
+    # set by flag (stamped just above) or already present in the environment.
+    _typ_env = os.environ.get("MTPLX_FABLE_TYPICAL_THRESHOLD")
+    _cas_env = os.environ.get("MTPLX_FABLE_CASCADE_THRESHOLD")
+    _typ_on = False
+    try:
+        _typ_on = _typ_env is not None and float(_typ_env) > 0.0
+    except ValueError:
+        _typ_on = False
+    _cas_on = _cas_env is not None and str(_cas_env).strip() != ""
+    if _typ_on and _cas_on:
+        raise SystemExit(
+            "error: --typical-threshold and --cascade-threshold are mutually "
+            "exclusive lossy verify rules; set at most one "
+            f"(typical={_typ_env!r}, cascade={_cas_env!r})."
+        )
     return args
 
 
