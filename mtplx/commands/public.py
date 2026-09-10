@@ -10577,10 +10577,6 @@ def _generate_one_shot_public(
     from mtplx.generation import generate_ar, generate_mtpk
     from mtplx.runtime import load
     from mtplx.sampling import SamplerConfig
-    if getattr(args, "_resolved_expert_profile", None) is not None:
-        from mtplx.generation import install_generation_feature_policy
-
-        install_generation_feature_policy(dict(os.environ))
 
     # Serve-path memory discipline (#261, F7): pin the exact Metal allocator
     # caps the serve path applies at startup before this in-process load.

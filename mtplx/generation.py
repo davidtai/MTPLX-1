@@ -1140,38 +1140,8 @@ def _attach_runtime_diagnostics(
     )
 
 
-@dataclass(frozen=True)
-class GenerationFeaturePolicy:
-    sustained_prefill: bool
-
-
-def bind_generation_feature_policy(
-    environ: Mapping[str, str],
-) -> GenerationFeaturePolicy:
-    return GenerationFeaturePolicy(
-        sustained_prefill=str(environ.get("MTPLX_SUSTAINED_PREFILL", ""))
-        .strip()
-        .lower()
-        in {"1", "true", "yes", "on"}
-    )
-
-
-def install_generation_feature_policy(
-    environ: Mapping[str, str],
-) -> GenerationFeaturePolicy:
-    """Install one immutable policy after construction-time env is finalized."""
-
-    global _GENERATION_FEATURE_POLICY
-    policy = bind_generation_feature_policy(environ)
-    _GENERATION_FEATURE_POLICY = policy
-    return policy
-
-
-_GENERATION_FEATURE_POLICY = bind_generation_feature_policy(os.environ)
-
-
 def _sustained_prefill_enabled() -> bool:
-    return _GENERATION_FEATURE_POLICY.sustained_prefill
+    return _env_truthy("MTPLX_SUSTAINED_PREFILL")
 
 
 def _final_logits_prefill_enabled() -> bool:
@@ -3127,10 +3097,9 @@ def _prefill_restored_prompt_suffix(
     restored: Any,
     suffix: list[int],
     *,
-    base_hidden_variant: str | None,
-    mtp_hidden_variant: str | None,
+    base_hidden_variant: str,
+    mtp_hidden_variant: str,
     mtp_history_policy: str,
-    target_only: bool = False,
     abort_check: Callable[[], bool] | None = None,
     chunk_callback: Callable[[dict[str, Any]], None] | None = None,
     tokens_total: int | None = None,
@@ -3678,10 +3647,9 @@ def _restore_near_prefix_prompt_state(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
     *,
-    base_hidden_variant: str | None,
-    mtp_hidden_variant: str | None,
+    base_hidden_variant: str,
+    mtp_hidden_variant: str,
     mtp_history_policy: str,
-    target_only: bool = False,
     session_bank: Any,
     template_hash: str | None,
     draft_head_identity: str | None,
@@ -3866,7 +3834,7 @@ def _restore_near_prefix_prompt_state(
             )
             if _trim_cache_to_offset(cache, matched - 1):
                 mtp_history_cache = None
-                if not target_only and entry.mtp_history_snapshot is not None:
+                if entry.mtp_history_snapshot is not None:
                     mtp_history_cache = rt.make_mtp_cache()
                     restore_cache(mtp_history_cache, entry.mtp_history_snapshot)
                     if not _trim_cache_to_offset(mtp_history_cache, matched - 1):
@@ -4056,11 +4024,6 @@ def _restore_near_prefix_prompt_state(
             vision_splice.cursor = sum(
                 1 for token in prompt_ids[:restore_point] if token == pad_id
             )
-        suffix_boundary_sink: list[tuple[int, Any, Any]] | None = (
-            list(inherited_boundaries)
-            if _gdn_boundary_capture_enabled()
-            else None
-        )
         suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
             _prefill_restored_prompt_suffix(
                 rt,
@@ -4069,7 +4032,6 @@ def _restore_near_prefix_prompt_state(
                 base_hidden_variant=base_hidden_variant,
                 mtp_hidden_variant=mtp_hidden_variant,
                 mtp_history_policy=mtp_history_policy,
-                target_only=target_only,
                 abort_check=abort_check,
                 chunk_callback=chunk_callback,
                 tokens_total=len(prompt_ids),
@@ -4090,7 +4052,7 @@ def _restore_near_prefix_prompt_state(
             trunk_cache=cache,
             logits=suffix_logits,
             hidden=suffix_hidden,
-            committed_mtp_cache=None if target_only else mtp_history_cache,
+            committed_mtp_cache=mtp_history_cache,
             token_prefix=tuple(int(token) for token in prompt_ids),
             prompt_eval_time_s=repair_time + suffix_time + mtp_history_time,
             prompt_mtp_history_time_s=mtp_history_time,
@@ -4747,7 +4709,6 @@ def restore_or_prefill_prompt_state(
                 base_hidden_variant=base_hidden_variant,
                 mtp_hidden_variant=mtp_hidden_variant,
                 mtp_history_policy=mtp_history_policy,
-                target_only=target_only,
                 session_bank=session_bank,
                 template_hash=template_hash,
                 draft_head_identity=draft_head_identity,
@@ -4832,10 +4793,8 @@ def restore_or_prefill_prompt_state(
                 return _emit_prefill_complete(PromptState(
                     trunk_cache=restored.cache,
                     logits=restored.logits,
-                    hidden=None if target_only else restored.hidden,
-                    committed_mtp_cache=(
-                        None if target_only else restored.mtp_history_cache
-                    ),
+                    hidden=restored.hidden,
+                    committed_mtp_cache=restored.mtp_history_cache,
                     token_prefix=tuple(int(token) for token in prompt_ids),
                     prompt_eval_time_s=repage_time,
                     cache_restore_time_s=restore_elapsed_s,
@@ -4893,7 +4852,6 @@ def restore_or_prefill_prompt_state(
                     base_hidden_variant=base_hidden_variant,
                     mtp_hidden_variant=mtp_hidden_variant,
                     mtp_history_policy=mtp_history_policy,
-                    target_only=target_only,
                     abort_check=abort_check,
                     chunk_callback=prefill_callback,
                     tokens_total=len(prompt_ids),
@@ -4910,9 +4868,7 @@ def restore_or_prefill_prompt_state(
                 trunk_cache=restored.cache,
                 logits=suffix_logits,
                 hidden=suffix_hidden,
-                committed_mtp_cache=(
-                    None if target_only else restored.mtp_history_cache
-                ),
+                committed_mtp_cache=restored.mtp_history_cache,
                 token_prefix=tuple(int(token) for token in prompt_ids),
                 prompt_eval_time_s=suffix_time + mtp_history_time,
                 prompt_mtp_history_time_s=mtp_history_time,
@@ -4941,7 +4897,6 @@ def restore_or_prefill_prompt_state(
             base_hidden_variant=base_hidden_variant,
             mtp_hidden_variant=mtp_hidden_variant,
             mtp_history_policy=mtp_history_policy,
-            target_only=target_only,
             session_bank=session_bank,
             template_hash=template_hash,
             draft_head_identity=draft_head_identity,
@@ -12174,10 +12129,6 @@ def generate_mtpk(
             trace_accounting_time_s += time.perf_counter() - trace_accounting_started
         if graphbank is not None:
             event["graphbank"] = graphbank.to_dict()
-        if compiled_verify_bank is not None:
-            event.setdefault("graphbank", {})["compiled_verify"] = (
-                compiled_verify_bank.to_dict()
-            )
 
         accepted_count = 0
         rejection_correction: int | None = None
@@ -12454,26 +12405,6 @@ def generate_mtpk(
                         )
                     except Exception:  # noqa: BLE001 — telemetry never breaks decode
                         pass
-
-            if (
-                constraint_legal_prefix is not None
-                and accepted_now
-                and depth_index >= constraint_legal_prefix
-            ):
-                # The model accepted a draft the grammar forbids here; reject
-                # it and let the next cycle's masked primary resample the
-                # position from the constrained distribution. Under pure
-                # temperature sampling the committed law is exactly the
-                # masked target law (Leviathan-Chen telescopes through the
-                # drop-and-resample). Under top-k/top-p the two coincide
-                # except in sub-top-k tail mass: draft-path positions commit
-                # from restrict-then-renormalize of the SHAPED unmasked law,
-                # masked-primary positions from shaping of the MASKED row.
-                # Every committed token is grammar-legal either way; a
-                # verify-row-masked variant would close the tail gap.
-                accepted_now = False
-                accept_prob = 0.0
-                event["drafts"][depth_index]["constraint_clamped"] = True
 
             if (
                 constraint_legal_prefix is not None
