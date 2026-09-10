@@ -11,9 +11,10 @@ import re
 import subprocess
 import sys
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Mapping
 
 from .artifacts import (
     inspect_model,
@@ -82,6 +83,36 @@ def _preflight_laguna_system_memory(config: dict[str, Any]) -> None:
     )
 
 
+def _streamed_mtp_backend(model_key: str, precision: str) -> str:
+    """Resolve the strict external MTP adapter before model allocation."""
+
+    support = {
+        "hy3-q4": ("hy3", {"bf16", "q4"}),
+        "hy3-expert-only-q4": ("hy3", {"bf16"}),
+        "hy3-expert-q2": ("hy3", {"bf16"}),
+        "hy3-expert-oq2e": ("hy3", {"bf16"}),
+        # The Q4 head sibling (issue #100) is lane-agnostic: it is selectable
+        # for every GLM streamed lane: q2 and q1t have the same resident trunk,
+        # router, and layer-78 contract; only routed record storage differs.
+        "glm52-expert-q2": ("glm52", {"bf16", "q4"}),
+        "glm52-expert-q1t": ("glm52", {"bf16", "q4"}),
+        "glm52-q4": ("glm52", {"bf16", "q4"}),
+    }
+    selected = support.get(str(model_key))
+    if selected is None:
+        raise RuntimeError(f"streamed MTP is not supported for model key {model_key!r}")
+    backend, precisions = selected
+    if precision not in precisions:
+        if precisions == {"bf16"}:
+            raise RuntimeError(
+                f"streamed MTP for {model_key!r} requires the validated BF16 head"
+            )
+        raise RuntimeError(
+            f"streamed MTP precision {precision!r} is not supported for {model_key!r}"
+        )
+    return backend
+
+
 @dataclass
 class MTPLXRuntime:
     model: Any
@@ -99,6 +130,12 @@ class MTPLXRuntime:
     a3b_whole_moe_installed: bool = False
     qwen4_relaxed_draft_ties: bool = False
     qwen_row_owned_router_report: dict[str, Any] = field(default_factory=dict)
+    # Expert-streaming (SSD-MoE) wiring. ``expert_streaming`` holds the owning
+    # ExpertStreamingRuntime for a streamed checkpoint and is None for every
+    # fully-resident (upstream) load, which keeps the streaming methods below
+    # inert and preserves upstream behavior.
+    expert_streaming: Any | None = None
+    resident_load_report: dict[str, Any] | None = None
     _a3b_whole_moe_request_preflights: dict[str, dict[str, Any]] = field(
         default_factory=dict,
         init=False,
@@ -110,6 +147,17 @@ class MTPLXRuntime:
     diagnostic_counters: dict[str, int] = field(default_factory=dict)
     _forward_ar_supports_emit_logits: bool | None = field(default=None, init=False, repr=False)
     _forward_ar_supports_logits_keep: bool | None = field(default=None, init=False, repr=False)
+    _plain_ar_decode: Any = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # The promoted streamed lane has no construction-proven compiled
+        # profile. Install its eager target route once so decode never enters
+        # compiled eligibility or an eligible-or-eager fallback in the hot
+        # path. Fully resident runtimes retain the upstream opt-in route.
+        if self.expert_streaming is None:
+            self._plain_ar_decode = self._resident_plain_ar_decode
+        else:
+            self._plain_ar_decode = self._streamed_plain_ar_decode
 
     def _count(self, key: str, amount: int = 1) -> None:
         self.diagnostic_counters[key] = int(self.diagnostic_counters.get(key, 0)) + int(amount)
@@ -154,6 +202,59 @@ class MTPLXRuntime:
         text_model = getattr(self.model, "language_model", self.model)
         return text_model.model.embed_tokens(input_ids)
 
+    def _streamed_plain_ar_decode(self, input_ids, cache, _kwargs):
+        return self.model(input_ids, cache=cache)
+
+    def _resident_plain_ar_decode(self, input_ids, cache, kwargs):
+        compiled = self._compiled_ar_forward(cache)
+        if compiled is not None:
+            # Preserve the upstream fully resident diagnostic. Streamed
+            # runtimes never install this callable.
+            self._count("compiled_forward_calls")
+            return compiled(input_ids, cache)
+        if not kwargs:
+            return self.model(input_ids, cache=cache)
+        return self.model(
+            input_ids,
+            cache=cache,
+            return_hidden=False,
+            **kwargs,
+        )
+
+    def _expert_routing_context(self, input_ids: Any):
+        if self.expert_streaming is None:
+            return nullcontext()
+        from .attention_context import current_attention_phase
+        from .expert_streaming import RoutingPhase
+        from .models.expert_mlx import expert_routing_phase
+
+        attention = current_attention_phase()
+        if attention == "prefill":
+            # A one-token prefill tail chunk is still prefill traffic: the
+            # width heuristic below would classify it as decode and pollute
+            # the persistent decode hot set.
+            return expert_routing_phase(RoutingPhase.PREFILL)
+        if attention in {"ar_decode", "decode_verify", "postcommit"}:
+            # MTP verify batches are decode traffic regardless of width.
+            return expert_routing_phase(RoutingPhase.DECODE)
+
+        decode_width = 1
+        if self.mtp_enabled:
+            # MTP verify batches are decode traffic: routing them as prefill
+            # would stop the persistent decode hot set from ever training
+            # once speculation is on.  With MTP off this stays exactly the
+            # historical single-token decode classification.
+            decode_width = max(
+                decode_width,
+                int(getattr(self.model, "mtp_verify_width", 1)),
+            )
+        phase = (
+            RoutingPhase.PREFILL
+            if self._sequence_len(input_ids) > decode_width
+            else RoutingPhase.DECODE
+        )
+        return expert_routing_phase(phase)
+
     def forward_ar(
         self,
         input_ids,
@@ -196,34 +297,32 @@ class MTPLXRuntime:
                 self._count("final_logits_tokens_emitted", 1)
             else:
                 self._count("full_logits_tokens_emitted", emitted)
-        # kwargs == {"emit_logits": True} is semantically the plain call —
-        # MTP-patched wrappers advertise emit_logits via **kwargs, so on MTP
-        # runtimes the bare-kwargs case never occurs and the compiled hook
-        # must accept the default-emit form too.
-        plain_call = not kwargs or (
-            set(kwargs) == {"emit_logits"} and kwargs["emit_logits"] is True
-        )
-        if not return_hidden and hidden_variant is None and plain_call:
-            # Decode-only (seq_len == 1). Prefill is multi-token over an
-            # unprimed cache: seeding the compiled graph from its None KV
-            # leaves throws, and its shape differs from a single-token decode
-            # step, forcing a retrace. Prefill stays eager.
-            compiled = (
-                self._compiled_ar_forward(cache) if sequence_len == 1 else None
+        with self._expert_routing_context(input_ids):
+            # kwargs == {"emit_logits": True} is semantically the plain call —
+            # MTP-patched wrappers advertise emit_logits via **kwargs, so on MTP
+            # runtimes the bare-kwargs case never occurs and the compiled hook
+            # must accept the default-emit form too.
+            plain_call = not kwargs or (
+                set(kwargs) == {"emit_logits"} and kwargs["emit_logits"] is True
             )
-            if compiled is not None:
-                # Engagement proof: arm A (flag off) must report 0 here,
-                # arm B (on) > 0 — the A/B credits nothing without it.
-                self._count("compiled_forward_calls")
-                return compiled(input_ids, cache)
-            if not kwargs:
-                return self.model(input_ids, cache=cache)
-        return self.model(
-            input_ids,
-            cache=cache,
-            return_hidden=return_hidden,
-            **kwargs,
-        )
+            if not return_hidden and hidden_variant is None and plain_call:
+                # Decode-only (seq_len == 1). Prefill is multi-token over an
+                # unprimed cache: seeding the compiled graph from its None KV
+                # leaves throws, and its shape differs from a single-token
+                # decode step, forcing a retrace. Prefill stays eager. The
+                # prebound ``_plain_ar_decode`` route keeps a streamed runtime
+                # off the compiled eligibility check entirely (arm A/B proof:
+                # ``compiled_forward_calls`` counts only on the resident lane).
+                if sequence_len == 1:
+                    return self._plain_ar_decode(input_ids, cache, kwargs)
+                if not kwargs:
+                    return self.model(input_ids, cache=cache)
+            return self.model(
+                input_ids,
+                cache=cache,
+                return_hidden=return_hidden,
+                **kwargs,
+            )
 
     def _compiled_ar_forward(self, cache):
         """Compiled target forward (MTPLX_COMPILE_AR_FORWARD).
@@ -298,14 +397,15 @@ class MTPLXRuntime:
 
         from .gdn_capture import forward_with_gdn_capture
 
-        return forward_with_gdn_capture(
-            self.model,
-            input_ids,
-            cache=cache,
-            return_hidden=return_hidden,
-            hidden_variant=hidden_variant,
-            capture_backend=capture_backend,
-        )
+        with self._expert_routing_context(input_ids):
+            return forward_with_gdn_capture(
+                self.model,
+                input_ids,
+                cache=cache,
+                return_hidden=return_hidden,
+                hidden_variant=hidden_variant,
+                capture_backend=capture_backend,
+            )
 
     def _forward_ar_capture_a3b_postconv(
         self,
@@ -470,6 +570,31 @@ class MTPLXRuntime:
         configure_mtp_attention_kv_cache(cache)
         return cache
 
+    def admit_kv_tokens(self, tokens: int):
+        """Reserve request KV capacity under the streamed memory plan."""
+
+        if self.expert_streaming is None:
+            return nullcontext()
+        return self.expert_streaming.admit_kv_tokens(tokens)
+
+    def expert_streaming_snapshot(self) -> dict[str, Any] | None:
+        if self.expert_streaming is None:
+            return None
+        return self.expert_streaming.snapshot()
+
+    def expert_resource_telemetry_snapshot(self) -> dict[str, Any] | None:
+        if self.expert_streaming is None:
+            return None
+        return self.expert_streaming.resource_telemetry_snapshot()
+
+    # Name compatibility alias for the streamed resource telemetry snapshot.
+    def resource_telemetry_snapshot(self) -> dict[str, Any] | None:
+        return self.expert_resource_telemetry_snapshot()
+
+    def close(self, *, timeout: float | None = None) -> None:
+        if self.expert_streaming is not None:
+            self.expert_streaming.close(timeout=timeout)
+
 
 class LagunaARRuntime(MTPLXRuntime):
     """Target-only runtime that preserves Laguna's native cache ownership."""
@@ -563,7 +688,7 @@ def _install_architectures_declared_module_alias(config: dict[str, Any]) -> bool
     return False
 
 
-def load(
+def _load_impl(
     model_path: Path | str,
     *,
     mtp: bool = True,
@@ -574,6 +699,12 @@ def load(
     gemma4_target_distribution_mode: str | None = None,
     proj_quant: str | None = None,
     proj_requant: str | None = None,
+    expert_streaming_config: Any | None = None,
+    expert_manifest: Path | str | None = None,
+    mtp_artifacts: Path | str | None = None,
+    mtp_precision: str = "bf16",
+    expert_admission_receipt: Mapping[str, Any] | None = None,
+    _expert_runtime_owner: list[Any] | None = None,
 ) -> MTPLXRuntime:
     """Load an MLX model and optionally inject native MTP support.
 
@@ -581,13 +712,55 @@ def load(
     ``MTPLX_PROJ_REQUANT`` environment variables) quantize the trunk
     ``*_proj`` Linears at load time — see :mod:`mtplx.proj_quant`. Applied
     to the trunk only, before MTP injection, so a draft head's precision is
-    never reduced.
+    never reduced. Streamed loads encode resident projection precision in
+    ``expert_streaming_config`` so the memory plan and installed layout agree
+    before allocation.
+
+    Supplying ``expert_streaming_config`` and ``expert_manifest`` (together)
+    routes construction through the SSD-resident expert-streaming path.
+    ``mtp_artifacts`` / ``mtp_precision`` select the streamed external draft
+    head; ``expert_admission_receipt`` pins the admitted routed-expert banks.
+    ``_expert_runtime_owner`` is a private out-parameter used by :func:`load`
+    to transfer streamed-runtime ownership only on success; it defaults to a
+    fresh list so every direct caller keeps working unchanged.
     """
+    if _expert_runtime_owner is None:
+        _expert_runtime_owner = []
     path = Path(model_path)
+    from .hy3_mtp_patch import HY3_MTP_PRECISIONS
+
+    if mtp_precision not in HY3_MTP_PRECISIONS:
+        raise ValueError(
+            f"mtp_precision must be one of {HY3_MTP_PRECISIONS}; got {mtp_precision!r}"
+        )
+    streaming_requested = (
+        expert_streaming_config is not None or expert_manifest is not None
+    )
+    if (expert_streaming_config is None) != (expert_manifest is None):
+        raise ValueError(
+            "expert_streaming_config and expert_manifest must be supplied together"
+        )
+    if expert_admission_receipt is not None and not streaming_requested:
+        raise ValueError(
+            "expert_admission_receipt applies to streamed checkpoints only"
+        )
+    if streaming_requested and (proj_quant is not None or proj_requant is not None):
+        raise ValueError(
+            "streamed loads configure proj_quant/proj_requant through "
+            "expert_streaming_config so the construction-time memory plan "
+            "matches the installed resident layout"
+        )
+    if mtp_artifacts is not None and not streaming_requested:
+        raise ValueError(
+            "mtp_artifacts applies to streamed checkpoints only; non-streamed "
+            "models carry their own MTP weights"
+        )
     from .gemma4_pair import resolve_gemma4_pair_paths
 
     gemma4_pair = resolve_gemma4_pair_paths(path)
     if gemma4_pair is not None:
+        if streaming_requested:
+            raise ValueError("expert streaming does not support Gemma assistant pairs")
         if mtp:
             from .backends.gemma4_assistant import (
                 DEFAULT_DRAFT_BLOCK_SIZE,
@@ -659,6 +832,354 @@ def load(
     # qwen3_5; vLLM loads Qwen3.8-Max FP8 through the same classes). Honor the
     # checkpoint's own declaration instead of hard-failing the load.
     _install_architectures_declared_module_alias(config)
+
+    if streaming_requested:
+        runtime_metadata = _load_runtime_metadata(path)
+        contract = (
+            (contract or MTPContract())
+            .with_runtime_metadata(runtime_metadata, preserve_explicit=True)
+            .with_config_defaults(config)
+        )
+        expert_runtime = None
+        resident_load_report = None
+        streamed_mtp_backend = None
+        streamed_mtp_resident_bytes = 0
+        hy3_router_incremental_bytes = 0
+        mtp_enabled = False
+        from .expert_runtime import (
+            ExpertStreamingConfig,
+            ExpertStreamingConfigurationError,
+            ExpertStreamingRuntime,
+            apply_mlx_memory_cap,
+        )
+        from .expert_streaming_models import get_model_spec
+        from .models.expert_mlx import (
+            make_mlx_component_bank_allocator,
+            make_mlx_slot_buffer_allocator,
+        )
+        from .resident_loader import construct_resident_model
+
+        import mlx.core as mx
+
+        if not isinstance(expert_streaming_config, ExpertStreamingConfig):
+            raise TypeError("expert_streaming_config must be an ExpertStreamingConfig")
+        streaming_spec = get_model_spec(expert_streaming_config.model_key)
+        verified_artifact_context = nullcontext(None)
+        if mtp:
+            streamed_mtp_backend = _streamed_mtp_backend(
+                expert_streaming_config.model_key,
+                mtp_precision,
+            )
+            if mtp_artifacts is None:
+                raise RuntimeError(
+                    "this streamed checkpoint omits its trained MTP layer; pass "
+                    "mtp_artifacts=<validated external artifact directory> or "
+                    "load with mtp=False"
+                )
+            if streamed_mtp_backend == "glm52":
+                from .glm52_mtp_patch import _validate_glm52_mtp_contract
+
+                _validate_glm52_mtp_contract(contract)
+                if mtp_precision == "q4":
+                    from .glm52_mtp_artifact import (
+                        open_verified_glm52_mtp_layer78_q4,
+                    )
+
+                    verified_artifact_context = open_verified_glm52_mtp_layer78_q4(
+                        Path(mtp_artifacts), deep=True
+                    )
+                else:
+                    from .glm52_mtp_artifact import (
+                        open_verified_glm52_mtp_layer78,
+                    )
+
+                    verified_artifact_context = open_verified_glm52_mtp_layer78(
+                        Path(mtp_artifacts), deep=True
+                    )
+            elif streamed_mtp_backend == "hy3":
+                from .hy3_mtp_patch import open_verified_hy3_mtp_artifacts
+
+                verified_artifact_context = open_verified_hy3_mtp_artifacts(
+                    Path(mtp_artifacts),
+                    precision=mtp_precision,
+                    expected_revision=streaming_spec.source_revision,
+                )
+        with verified_artifact_context as verified_streamed_artifact:
+            if streamed_mtp_backend == "glm52":
+                receipt = verified_streamed_artifact.manifest
+                inventory = receipt.get("inventory")
+                if not isinstance(inventory, dict):
+                    raise RuntimeError("GLM-5.2 MTP manifest inventory is missing")
+                payload_bytes = inventory.get("payload_bytes")
+                if (
+                    isinstance(payload_bytes, bool)
+                    or not isinstance(payload_bytes, int)
+                    or payload_bytes <= 0
+                ):
+                    raise RuntimeError(
+                        "GLM-5.2 MTP manifest payload byte count is invalid"
+                    )
+                streamed_mtp_resident_bytes = payload_bytes
+            elif streamed_mtp_backend == "hy3":
+                streamed_mtp_resident_bytes = verified_streamed_artifact.payload_bytes
+                if (
+                    isinstance(streamed_mtp_resident_bytes, bool)
+                    or not isinstance(streamed_mtp_resident_bytes, int)
+                    or streamed_mtp_resident_bytes <= 0
+                ):
+                    raise RuntimeError("Hy3 MTP artifact payload byte count is invalid")
+
+            if (
+                str(config.get("model_type") or "") == "hy_v3"
+                and expert_streaming_config.hy3_router_kernel != "stock"
+            ):
+                from .models.hy3_mlx import (
+                    estimate_hy3_router_kernel_incremental_bytes,
+                )
+
+                hy3_router_incremental_bytes = (
+                    estimate_hy3_router_kernel_incremental_bytes(
+                        config,
+                        expert_streaming_config.hy3_router_kernel,
+                        include_mtp=streamed_mtp_backend == "hy3" and bool(mtp),
+                    )
+                )
+            additional_resident_bytes = (
+                streamed_mtp_resident_bytes + hy3_router_incremental_bytes
+            )
+            plan_kwargs = (
+                {"additional_resident_bytes": additional_resident_bytes}
+                if additional_resident_bytes
+                else {}
+            )
+            # ExpertStreamingRuntime.open computes the same discount from the
+            # manifest itself, so plan_kwargs stays free of it.
+            # Resolve a pending island_layer_count BEFORE the pre-flight plan
+            # (census-first precedence; open() re-resolves idempotently) —
+            # census-only specs previously hit the unresolved-count guard here.
+            if expert_streaming_config.island_layer_count is not None:
+                from .expert_runtime import resolve_island_placement
+
+                expert_streaming_config = resolve_island_placement(
+                    expert_streaming_config, Path(expert_manifest).parent
+                )
+            preflight_plan_kwargs = dict(plan_kwargs)
+            if expert_streaming_config.proj_quant or getattr(
+                expert_streaming_config, "proj_requant", None
+            ):
+                from .expert_manifest import load_expert_manifest
+                from .expert_runtime import (
+                    proj_quant_plan_discount,
+                    proj_requant_plan_discount,
+                )
+
+                _preflight_manifest = load_expert_manifest(expert_manifest)
+                preflight_plan_kwargs["resident_discount_bytes"] = (
+                    proj_quant_plan_discount(
+                        _preflight_manifest,
+                        expert_streaming_config.proj_quant,
+                    )
+                    + proj_requant_plan_discount(
+                        _preflight_manifest,
+                        getattr(expert_streaming_config, "proj_requant", None),
+                    )
+                )
+            if bool(getattr(streaming_spec, "is_mixed_official", False)):
+                # Mixed-official has no uniform record size; the preflight gate
+                # must see the same manifest-derived per-layer sizes as open()
+                # (issue #51 M2, D2).
+                from .expert_manifest import load_expert_manifest
+
+                preflight_plan_kwargs["layer_record_bytes"] = load_expert_manifest(
+                    expert_manifest
+                ).record_bytes_by_layer()
+            streaming_plan = expert_streaming_config.memory_plan(
+                streaming_spec,
+                **preflight_plan_kwargs,
+            )
+            if not streaming_plan.fits_fixed:
+                raise ExpertStreamingConfigurationError(
+                    "fixed expert-streaming footprint exceeds limit by "
+                    f"{-streaming_plan.unallocated_bytes} bytes"
+                )
+            prebuilt_glm_mtp = None
+            prebuilt_hy3_mtp = None
+            if mtp:
+                # Materialize external MTP heads before allocating expert-cache
+                # banks. Stacking their routed experts has a large transient
+                # footprint that can breach an otherwise-valid steady-state plan.
+                apply_mlx_memory_cap(streaming_plan, mx_module=mx)
+            if streamed_mtp_backend == "glm52":
+                from .glm52_mtp_patch import build_glm52_mtp_module
+                from .models.glm52_mlx import ModelArgs as Glm52ModelArgs
+
+                prebuilt_glm_mtp = build_glm52_mtp_module(
+                    mtp_artifacts,
+                    Glm52ModelArgs.from_dict(config),
+                    expected_revision=streaming_spec.source_revision,
+                    precision=mtp_precision,
+                    verified_artifact=verified_streamed_artifact,
+                )
+            elif streamed_mtp_backend == "hy3":
+                from .hy3_mtp_patch import build_hy3_mtp_module
+                from .models.hy3_mlx import ModelArgs as Hy3ModelArgs
+
+                prebuilt_hy3_mtp = build_hy3_mtp_module(
+                    mtp_artifacts,
+                    Hy3ModelArgs.from_dict(config),
+                    expected_revision=streaming_spec.source_revision,
+                    precision=mtp_precision,
+                    shared_kernel=expert_streaming_config.hy3_mtp_shared_kernel,
+                    shared_kernel_depth=(
+                        expert_streaming_config.hy3_mtp_shared_kernel_depth
+                    ),
+                    verified_artifacts=verified_streamed_artifact,
+                )
+            if expert_streaming_config.slot_layout == "component-banks":
+                from .expert_manifest import load_expert_manifest
+
+                streaming_manifest = load_expert_manifest(expert_manifest)
+                slot_allocator = make_mlx_component_bank_allocator(
+                    streaming_plan,
+                    streaming_spec,
+                    streaming_manifest,
+                )
+            else:
+                slot_allocator = make_mlx_slot_buffer_allocator(
+                    streaming_plan, streaming_spec
+                )
+
+            if mtp_adapter is not None or merge_mtp_adapter:
+                raise RuntimeError("MTP adapters are unavailable for streamed loading")
+            expert_runtime = ExpertStreamingRuntime.open(
+                path,
+                expert_manifest,
+                expert_streaming_config,
+                spec=streaming_spec,
+                buffer_allocator=slot_allocator,
+                device_synchronize=mx.synchronize,
+                apply_memory_cap=True,
+                mx_module=mx,
+                expert_admission_receipt=expert_admission_receipt,
+                **plan_kwargs,
+            )
+            _expert_runtime_owner[:] = [expert_runtime]
+            try:
+                resident = construct_resident_model(path, expert_runtime, config=config)
+                model = resident.model
+                resident_load_report = resident.report.as_dict()
+                tokenizer = _load_tokenizer_resilient(path, config)
+                if mtp:
+                    if streamed_mtp_backend == "hy3":
+                        from .hy3_mtp_patch import inject_hy3_streamed_mtp_support
+
+                        mtp_enabled = inject_hy3_streamed_mtp_support(
+                            model,
+                            mtp_artifacts,
+                            config,
+                            contract,
+                            expected_revision=streaming_spec.source_revision,
+                            mtp_precision=mtp_precision,
+                            shared_kernel=(
+                                expert_streaming_config.hy3_mtp_shared_kernel
+                            ),
+                            shared_kernel_depth=(
+                                expert_streaming_config.hy3_mtp_shared_kernel_depth
+                            ),
+                            mtp_module=prebuilt_hy3_mtp,
+                        )
+                    elif streamed_mtp_backend == "glm52":
+                        from .glm52_mtp_patch import (
+                            inject_glm52_streamed_mtp_support,
+                        )
+
+                        mtp_enabled = inject_glm52_streamed_mtp_support(
+                            model,
+                            mtp_artifacts,
+                            config,
+                            contract,
+                            expected_revision=streaming_spec.source_revision,
+                            verified_artifact=verified_streamed_artifact,
+                            mtp_module=prebuilt_glm_mtp,
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"unresolved streamed MTP backend {streamed_mtp_backend!r}"
+                        )
+                    if not mtp_enabled or not validate_mtp_support(model):
+                        raise RuntimeError(f"streamed MTP injection failed for {path}")
+                if (
+                    str(config.get("model_type") or "") == "hy_v3"
+                    and expert_streaming_config.hy3_router_kernel != "stock"
+                ):
+                    from .models.hy3_mlx import configure_hy3_router_kernels
+
+                    import os as _os
+
+                    # EXPERIMENT gate (2026-07-21): "all" extends the split-K
+                    # kernel to trunk routers at rows==1 (AR decode), which
+                    # historically fell back to the stock host path. Default
+                    # "mtp" preserves the measured ladder behavior exactly.
+                    router_kernel_report = configure_hy3_router_kernels(
+                        model,
+                        expert_streaming_config.hy3_router_kernel,
+                        sigmoid_mode=expert_streaming_config.hy3_router_sigmoid,
+                        splitk_m1_scope=_os.environ.get(
+                            "MTPLX_HY3_ROUTER_SPLITK_M1", "mtp"
+                        ),
+                    )
+                    actual_incremental = int(
+                        router_kernel_report.get("incremental_bytes", -1)
+                    )
+                    if actual_incremental != hy3_router_incremental_bytes:
+                        raise RuntimeError(
+                            "Hy3 router prepared-layout bytes do not match "
+                            f"admission plan: {actual_incremental} != "
+                            f"{hy3_router_incremental_bytes}"
+                        )
+                    setattr(
+                        model,
+                        "_mtplx_hy3_router_kernel_report",
+                        router_kernel_report,
+                    )
+                    if isinstance(resident_load_report, dict):
+                        resident_load_report["hy3_router_kernel"] = router_kernel_report
+            except BaseException:
+                expert_runtime.close()
+                _expert_runtime_owner.clear()
+                raise
+        # Common streamed post-construction wiring (the resident-lane tail
+        # below is skipped for streamed loads: proj-quant/MTP-injection run
+        # inside the branch above, and adapters are refused before open).
+        from .attention_split import configure_split_full_attention
+        from .native_mlp import configure_native_mlp
+
+        configure_split_full_attention(model)
+        configure_native_mlp(model)
+        from .nax_verify import install_nax_qlinear_patch, nax_env_enabled
+
+        if nax_env_enabled():
+            nax_report = install_nax_qlinear_patch()
+            logger.info("[nax-verify] %s", nax_report)
+        from .kernel_selfcheck import maybe_run_model_selfcheck
+
+        # Expert-streaming loads pass their spec so the routed expert bank's
+        # gather_qmm lane is validated at its own (possibly different) quant
+        # format, matching the resident-lane self-check.
+        maybe_run_model_selfcheck(
+            model,
+            expert_spec=getattr(expert_runtime, "spec", None),
+        )
+        runtime = MTPLXRuntime(
+            model,
+            tokenizer,
+            path,
+            mtp_enabled,
+            contract,
+            expert_streaming=expert_runtime,
+            resident_load_report=resident_load_report,
+        )
+        return runtime
 
     if is_step3p5_mtp_config(config):
         from mlx_lm.utils import load_model
@@ -1182,6 +1703,59 @@ def load(
             install_qwen3_next_packed_concats(model)
     except ImportError:
         pass
+    return runtime
+
+
+def load(
+    model_path: Path | str,
+    *,
+    mtp: bool = True,
+    contract: MTPContract | None = None,
+    mtp_adapter: Path | str | None = None,
+    merge_mtp_adapter: bool = False,
+    gemma4_draft_block_size: int | None = None,
+    gemma4_target_distribution_mode: str | None = None,
+    proj_quant: str | None = None,
+    proj_requant: str | None = None,
+    expert_streaming_config: Any | None = None,
+    expert_manifest: Path | str | None = None,
+    mtp_artifacts: Path | str | None = None,
+    mtp_precision: str = "bf16",
+    expert_admission_receipt: Mapping[str, Any] | None = None,
+) -> MTPLXRuntime:
+    """Load a model and transfer streamed-runtime ownership only on success.
+
+    Thin public wrapper over :func:`_load_impl`. It owns the streamed-runtime
+    lifecycle: a partially-opened ``ExpertStreamingRuntime`` is closed if any
+    later construction step raises, so a failed load never leaks pinned
+    routed-expert file descriptors. Non-streamed loads leave the owner list
+    empty and this is a pass-through.
+    """
+
+    expert_runtime_owner: list[Any] = []
+    try:
+        runtime = _load_impl(
+            model_path,
+            mtp=mtp,
+            contract=contract,
+            mtp_adapter=mtp_adapter,
+            merge_mtp_adapter=merge_mtp_adapter,
+            gemma4_draft_block_size=gemma4_draft_block_size,
+            gemma4_target_distribution_mode=gemma4_target_distribution_mode,
+            proj_quant=proj_quant,
+            proj_requant=proj_requant,
+            expert_streaming_config=expert_streaming_config,
+            expert_manifest=expert_manifest,
+            mtp_artifacts=mtp_artifacts,
+            mtp_precision=mtp_precision,
+            expert_admission_receipt=expert_admission_receipt,
+            _expert_runtime_owner=expert_runtime_owner,
+        )
+    except BaseException:
+        if expert_runtime_owner:
+            expert_runtime_owner[0].close()
+        raise
+    expert_runtime_owner.clear()
     return runtime
 
 
